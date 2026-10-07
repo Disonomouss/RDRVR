@@ -1,0 +1,185 @@
+# RDR.exe anchors: name kind rva [bytes]
+# kind: func = function entry (must start a .pdata function), site = an instruction inside a function,
+#       global = data address (no byte check). Expected bytes are taken from research\RDR.exe by
+#       tools\gen_anchors.py; never type them by hand. Source of each RVA in brackets.
+# --- RAGE viewport / scene (rdr-exe.md §3, research\dualview\)
+PreRender                func   0x1f3140
+VisibilityCaller         func   0x5c7920
+VisibilityBuild          func   0x5c2970
+BillboardCorners         func   0x87cc00   # (tree, viewport, direction, box min, max, corners x4): one billboard's quad
+BillboardDispatch        func   0x74a080   # (?, viewport): copies the viewport to 0x142c0cf60, starts the tree billboard generators
+ImposterDir              func   0x87ad90   # (mode, box min, max, out dir, out centre, out extent): a diffuse tree imposter's capture direction (ViewportCurrent +0x60, the camera's back row, pitch dead-zoned)
+RenderFrame              func   0x5c8720
+RenderThreadProc         func   0x5d9770
+RenderFrameSingle        func   0x5f4390
+ViewportCopy             func   0x115a50
+ViewportCopy2            func   0x394de0
+RenderCopySiteA          site   0x5c8e8c   5
+RenderCopySiteB          site   0x5c8e9f   5
+ViewportSetCurrent       func   0x130940
+ViewportPushGlobals      func   0x130e60
+ViewportRegenerate       func   0x1310f0
+ViewportPerspective      func   0x131ca0
+ViewportSetWindow        func   0x131990
+AaSetter                 func   0x5cfad0   # [graphics-options study] AA/upscaler/DRS setter {mode, framegen, dlss, fsr, sharpen, drs}
+ViewportSetCamera        func   0x132da0   # [ENGINE-NOTES 1.3] camera matrix -> +0x40/+0x140, View +0x180, cull planes, Regenerate
+SceneRender              func   0x5c36e0   # [ENGINE-NOTES 1.2] (renderer, viewport, camMtx): SetCamera, SetCurrent, phases
+SemWait                  func   0xebd8c0   # [R3] semaphore wait helper (handle at *p, timeout)
+SemRelease               func   0xebd830   # [R3] semaphore release helper (ReleaseSemaphore(*p, 1))
+SceneWaitReturn          site   0x5c38a2 5 # [R3] return address of SceneRender's wait on renderer+0x88 (frame data ready)
+SceneReleaseReturn       site   0x5c441b 5 # [R3] return address of SceneRender's release of renderer+0x68 (scene done)
+# --- R3 per-eye post (post-chain study, ENGINE-NOTES item 6): called once more for the left eye between the passes
+PostParamsBuild          func   0x5e7a50   # (*0x142ac5110): copies the frame's post parameters into PostFx (CPU)
+RenderStateSet           func   0x147110   # (state, value)
+SunRays                  func   0x6cf170   # (sun, sun+0x2b0, 0): view-dependent, per eye
+DeferredFlush            func   0x15ee40   # ()
+UnbindTargets            func   0x157d70   # (*0x142ac0a28)
+RenderStateReset         func   0x147080   # ()
+SunObject                global 0x2ad1cc8
+PostParamsObject         global 0x2ac5110
+GrcContext               global 0x2ac0a28
+LumRingCount             global 0x241c678  # luminance ring cursor (advanced once per post run)
+LumRingX                 global 0x2c8acbc
+LumRingY                 global 0x2c8acc0
+CameraCutLatch           global 0x2c8acc5
+PostChangeLatch          global 0x2c43a72
+PostPrevViewStatic       global 0x5a494ca0 # function-static previous view matrix (0x40 bytes), written per post run
+SunFlag                  global 0x2ad1ca4
+FrameUiWaitReturn        site   0x5c8ef6 7 # return address of RenderFrame's wait on renderer+0x38 (main thread's UI data)
+UiWaitGate               global 0x2b66818  # RenderFrame waits on renderer+0x38 only while this qword is 0
+PauseGate                global 0x2b73e18  # RenderFrame's inline pause-menu block runs only while this qword is 0 ...
+PauseMenuState           global 0x2c45768  # ... and *(this)+0x34 is set
+PauseTint                global 0x2c8aca8  # the block's tint alpha
+PostRun                  func   0x86bff0   # PostFx vt+0x30 (postfx, 0): the whole chain (exposure hold wraps it)
+PostTail                 func   0x678710   # (PostFx), right after RenderFrame's post chain: last eye's capture point
+# --- R4a one exposure writer (R4 study, ENGINE-NOTES item 7)
+PostDrawPass             func   0x86a4f0   # (postfx, dst, src, technique, var, +9 stack args): one full-screen pass (lock dst, draw, unlock)
+AdaptDrawReturn          site   0x67a5e6 7 # return address of the chain's CalculateAdaptedLuminance pass (dst = PostFx+0x80)
+# --- R4b particles simulated once (R4 study, ENGINE-NOTES item 7)
+RainUpdate               func   0x720960   # (): GPU rain step (ptxgpu, FUN_140a456b0) from the master camera; SceneRender only, when it rains
+RainDraw                 func   0x720dd0   # (rain 0x1422e4a30): camera-velocity smoother, then the per-eye draw (SceneRender or post chain)
+PfxCollisionMap          func   0x648c40   # (map): top-down depth view for particle collision; shifts prev <- cur per call
+RainSmoother             global 0x2c444b0  # 0x20 bytes: last master camera position (+0), smoothed velocity (+0x10)
+RainResetFlag            global 0x2ad1f74  # the smoother's reset flag (velocity zeroed while set)
+# --- R4 god-ray history per eye (cycle 20's truth capture at noon)
+SunRayParamsInit         func   0x6ca6c0   # (params): defaults of a light's ray parameter block (stores only)
+SunRayTargets            func   0x6ca910   # (params, create): 2 "Optic render target"s + "God ray accumulation 0/1" (+0x20..+0x38)
+# --- R4 ped damage/wetness once per frame (cycle 20's running-game hair residue)
+PedDamageUpdate          func   0x5e1700   # (*0x142ac50f8): per-ped wetness, blood soak and splats integrated by dt; SceneRender 0x1405c3853
+# --- R4 native TAA per eye (research\native-taa-study.md): technique 2's bookkeeping plus a mod-issued TAAResolve
+AaSlot                   func   0x873e60   # (postfx, -, -, latch): the chain's AA slot; returns the post source (FullScreenCopy for 2)
+TaaUpdate                func   0x8728f0   # (postfx, vp, flag): jitter on the projection, prev camera, NDCToPrevNDC, PrevVP
+TaaJitterApply           func   0x132080   # (vp, jitter[2]): adds the jitter to the projection (additive)
+EffectSetVar             func   0x151020   # (*(eff+0x10), eff, handle, data, size, count): an effect constant
+EffectVarDirty           func   0x14b100   # (eff, handle-1): marks an effect texture variable changed
+DrawQuad                 func   0x167020   # (eff, x0, y0, x1, y1, z, u0, v0, u1, v1, color, technique): a full-screen quad
+RainTaaReturn            site   0x7215fc 7 # return address of the rain draw's FUN_1408728f0 call (flag 1, the rain's viewport copy)
+SceneRainReturn          site   0x5c42d1 5 # return address of SceneRender's rain draw call (technique < 4)
+RenderThreadId           global 0x22722e0  # the render thread's id (the effect stores reset the bound-state cache on it)
+BindCache                global 0x2ac1e60  # the render thread's bound-state cache (qword, 0 = stale)
+QuadColor                global 0x22fde4c  # the colour the engine's full-screen quads pass
+TargetFormatFlag         global 0x2b00f48  # FullScreenCopy's format choice: set -> 6, clear -> 7 (RGBA16F)
+DefaultTexture           global 0x2ac0af8  # the texture the engine leaves in a variable after a pass
+# --- R4 cloud shadows and sun visibility once per frame (cycle 22's drying residue; agent study)
+CloudScroll              func   0x886a30   # (scroll*, cloud params, noAdvance, textures): ScrollXZ += vel*dt/0.0333 unless noAdvance; al = clouds on
+SunVisEma                global 0x22e175c  # 2 floats smoothed per bucket callback (FUN_1405c1970): 0.7/0.3 and 0.95/0.05 of a per-frame flag
+# --- round 2 (headset): the screen overlays RenderFrame draws after the post chain, only for the second eye
+LensDrops                func   0x5ed4d0   # (pppElements, 0): spawns (shared RNG), fades and draws the rain and blood drops on the lens
+ScreenOverlayGate        global 0x2b67b58  # RenderFrame calls LensDrops only while this qword is 0
+RandomState              global 0x2afe0c8  # 8 bytes: the game's shared RNG state (LensDrops spawns from it)
+RsTwoValue               global 0x2ac0b68  # current values of render states 2, 7, 8 and 0xb (RenderFrame saves them round the overlays)
+RsSevenValue             global 0x2ac0b7c
+RsEightValue             global 0x2ac0b80
+RsElevenValue            global 0x2ac0b8c
+# --- R3 split state (grass agent's study, ENGINE-NOTES item 6)
+ForestDraw               func   0x5a3020   # (forest, mode): 1 grass instances + gust shift, 0 composite + zero the counts
+LightsUpdate             func   0x62b480   # (lights), first in SceneRender: animated-light phases advance by dt
+ForestFrame              func   0x5a5c30   # (forest, renderer): adaptive forest factor from drained GPU timers
+GrassManager             global 0x2c8ab08  # counts at +0xb0c0 (runs) and +0xa0b8 (instances)
+GustWind                 global 0x23dc750  # 0x30 bytes: gust uniforms, prev (+0x10), cur (+0x20)
+ForestFactorGlobal       global 0x227ca18  # the adaptive forest factor as published by FUN_1405a5c30
+DrawVisList              func   0x641ac0   # (list, ctx, bucket masks*, int, 5 stack args): drawlog diagnostic only
+DrawMasksFn              func   0x706050 21 # prologue through sub rsp,0x748: the frame layout draw_masks.asm relies on
+DrawMaskRead1            site   0x7061f3 3 # the bucket masks' CMOVZ from a zero register (stack garbage survives when
+DrawMaskRead2            site   0x706215 3 #   the TLS slot +0x150 is set, as on the render thread): checked, not patched
+DrawMaskRead3            site   0x70623d 3
+DrawMaskRead4            site   0x70626f 4
+DrawMaskRead5            site   0x706838 4
+DrawMaskRead6            site   0x706870 4
+DrawMaskRead7            site   0x706da9 3
+DrawMaskRead8            site   0x706dd6 3
+ViewportSetWorldMtx      func   0x1329e0
+# --- TAA, post, upscalers (rdr-exe.md §2; TaaInit = TAA/DLSS/FSR init on resize, ENGINE-NOTES 1.6)
+TaaInit                  func   0x8721b0
+TaaSetup                 func   0x868150
+PostFxManager            func   0x869bd0
+DlssManager              func   0xfcfdd0
+DeviceInit               func   0xf74ca0
+# --- camera, UI, script (rdr-exe.md §3-4, ecosystem.md §3.2)
+CameraFovUpdate          func   0x378500
+CameraFovWriteSite       site   0x378572   2
+UiRender                 func   0x11a8f0
+ScrRegisterCommand       func   0x1e7140
+CameraFactoryGetCamera   func   0x3c43c0
+CrtEntry                 site   0xf4a2d8   5
+# --- globals
+RendererSingleton        global 0x2ac50d0
+ViewportCurrent          global 0x2ac0a10
+LensRainAmount           global 0x22e580c  # LensDrops: rain amount, > 0.1 sets ppp+0x2270
+LensTimers               global 0x2314d08  # LensDrops: d08 spawn scale, d18 - d10 the frame step
+CamManager               global 0x2c45738
+D3dDeviceSingleton       global 0x2893448
+WorldToScreenMatrix      global 0x2ac5088
+GlobalTimeScale          global 0x2314d84
+FrameCount               global 0x2899e30
+NativeTable              global 0x2b0d210
+ForestManager            global 0x2ac5038
+UiManager                global 0x2c45610
+PostFxSingleton          global 0x2ad2130
+ObjectsPool              global 0x2c45808
+# --- G-C body (ENGINE-NOTES "Head and hat hidden")
+DrawVisEntity            func   0x640120   # (ctx, entity record, pass, bucket, ...): record [0x10] drawable, [0x12] grmMatrixSet
+ActorPool                global 0x2c457f8
+# --- the automatic holster (ENGINE-NOTES "Automatic holster")
+AimPoseOpVtbl            global 0x1d4c1b8   # the aim-pose op's vtable (update FUN_140d487d0); op +0x28 the context, ctx +0x30 the ped
+TransOpUpdate            func   0x599d50   # transition op update (op) -> bool: def +0x30 condition list; triggered at op +0x24
+TransOpExit              func   0x599e40   # transition op exit (op): sets node +0xe1 and queues op +0x18 (the node then ends)
+WeaponOpStart            func   0xd46e20   # weapon op start (op): def +0x2c holster/draw; def +8 its start time in the node
+PlayerWeaponUpdate       func   0x34cae0   # (player info, mode): weapon controller; state +0x504, countdown +0x3e0 -> put away
+DrawTimeReset            global 0x2b24a58   # float: the countdown's reset value (set from the tuning at load)
+# --- G-C shots from the barrel (research\gc-aim.md, ENGINE-NOTES item 1)
+AimRay                   func   0x396b50   # (targeting, out 4x4 rows a b c d, yaw/pitch) -> out: the reticle ray from the gameplay camera
+FireTrigger              func   0x3480a0   # (player info, weapon manager): fires only while channel 0's camera is the gameplay camera
+SoftLockSelect           func   0x34ba30   # (player info, ped): stores the soft-lock tuning at T +0x57c0 (T = actor +0xb8)
+ProjectileLaunch         func   0x3237a0   # (p, mtx, type, vel, owner handle, launch pos, flags, c, f, visual offset): every gun projectile
+ProjectileSpawn          func   0x302a50   # (W, first projectile, count r8d, pellet matrices, speed [rsp+0x20], unused, no-bloom byte, seed, turret byte): one shot's projectiles; the bloom and the pellet directions (research\run3\accuracy.md)
+# --- round 13: the close-range execution on the fire trigger (research\round13\execution-block.md)
+ExecGate                 site   0xadebe0 8 # FUN_140adebe0 (phys) -> bool: a leaf with no .pdata entry; false skips the shot request's execution scan
+ExecGateRet              site   0xd1fa19 8 # its return address in FUN_140d1f960 (the shot request), inside the local player's branch
+PlayerInfo               global 0x22daf30   # the local player info (X): +0x5ec the actor handle, +0x410 the aim/zoom/Dead Eye state
+# --- G-C hand reload (research\gc-weapons.md 3, ENGINE-NOTES item 4)
+ReloadRequest            func   0xd1dde0   # (gun controller G) -> 1 when a reload starts (G +0x5d4 bit 0x40, WI +0x9b6); G +8 ped, ped +0x10 actor
+ReloadAfterShotRet       site   0xd1ba6f 5 # its return address in FUN_140d198f0: the automatic reload after the last round
+ReloadOnDrawRet          site   0xd198c1 5 # its return address in FUN_140d19760: an empty gun drawn with spare rounds
+ReloadCommandRet         site   0xb633da 5 # its return address in FUN_140b630d0: the weapon command's bit (P +0x248: button, empty trigger)
+OutOfAmmoSwitch          func   0x340480   # (weapon manager) -> 1 when it switched to another weapon with ammo ("PLAYER_OUT_OF_AMMO")
+# --- the forearms mode's sliver (round 7; ENGINE-NOTES round 7 follow-ups): cloth flutter off for hidden parts
+SetShaderGlobal          func   0x1490a0   # (id, src, count, type): copies into the global's cbuffer at its +0x18 (mapped by 0xec8bd0 when 0); type 5 = float4; DrawVisEntity sets the entity fade with it (0x6406bd)
+ShaderGlobalTable        global 0x2b01e40  # 16 bytes per global id: the cbuffer, then the int byte offset at +8
+WindParamsId             global 0x2c0347c  # the WindParams global's id (FUN_1405b3640); gWindParams = (time, wind x 0.03, 5, 6) each frame (FUN_1406b1480)
+# --- the gun in hand culled at the game's hand (round 7: "the gun turns invisible now and then")
+ObjectSetMatrix          func   0x2191c0   # (object, matrix): the object's vtable +0xb8 (its matrix), then FUN_1402eaa00; every object
+GunPropPlaceRet          site   0x2ff10d 7 # its return address in FUN_1402fe6d0: the held item's prop placed at W +0x80 (rdx)
+# --- dual wield (run 3 item 5, research\run3\dualwield.md): a second gun from another equip slot in the free hand
+WeaponTick               func   0x31a260   # (): every weapon object W (list DAT_142b1fe88): the aimer (W +0x188 bit 2), the fire timelines (W +0x120 bit 0: the ammo cost, the projectiles), the gunshot (bit 3)
+ScriptThreadCurrent      global 0x2c3f3b8  # the running script thread (null outside a script tick): LOCATE_PHYSINST_* read its +0x38 unchecked (research\run3\handphysics.md 6.9); the plugin's guard
+ScriptRefPool            global 0x2ac4550  # the scripts' object-reference node pool (1024 nodes): its free count at +0x20; each prop LOCATE returns pins one for the session
+GunItemVtbl              global 0x1c9c720  # the gun items' vtable (FUN_140358a40's): slot 6 (+0x30) the trigger FUN_1403b4660(item) -> 1 fired, 0 refused (empty, the trigger not released, the fire interval)
+# --- the forearms mode's sliver, round 8 (float rounding of the collapsed points at the world's coordinates)
+ThrowStart               func   0xd152d0   # (G, clip, release phase, rate, phase in, phase out, draw-model phase, focus) -> 1: AimDoThrowTrack's start (G +0x558 the release phase, +0x55c the rate; state 13)
+MeleeTrackStart          func   0xd54900   # MeleeAnimationTrack's start (self): an attack (def +0x18 == 0) sets M = [[ped +0xaa8] +0x80] +0x11c / +0x120, the strike's start and end phases
+RecorderDraw             func   0xecd690   # (recorder, topology, index count): records draw packet 0x2c, replayed by RenderThread as DrawIndexedInstanced(count, 1, 0, 0, 0); the recorder's vtable +0x190 (research\run3\deferred_draw.md)
+RecorderDrawAt           func   0xecd4f0   # (recorder, topology, start, count, base vertex): records packet 0x2b, replayed as DrawIndexedInstanced(count, 1, start, base, 0); vtable +0x188
+RecorderVtbl             global 0x105abb8  # the draw recorder's vtable (FUN_140eca8e0's): TLS +0x30 on the recording threads (the game's own D3D thread mode)
+DrawModelGeometry        func   0x167720   # (shader, model, geometry index, matrix set, ?, byte): one geometry's passes (FUN_1401672d0 begin, the geometry's vtable +8 draw, FUN_1400bfa10 end); FUN_14087f2a0 calls it per geometry of a drawable's model
+MuzzleFxMatrix           func   0x301680   # (W, &matrix ptr, &local): the muzzle flash's followed matrix (FUN_1406b6280 keeps the pointer at fx +0x170): the prop's muzzle bone, else W +0x80 (run 4 item 3: the copy's flash)

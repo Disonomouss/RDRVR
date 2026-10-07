@@ -1,0 +1,9 @@
+build/
+out/
+.vs/
+*.user
+__pycache__/
+# the RedHook SDK is fetched separately (README), never committed
+extern/
+# a maintainer's own copy of the game's executable, for tools/gen_anchors.py: never commit game files
+research/

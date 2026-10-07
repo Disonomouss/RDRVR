@@ -1,0 +1,22 @@
+#pragma once
+// Bring-up render settings forced in memory, never in graphicsOptions.xml (DESIGN §3.6; the game rewrites that file on
+// every boot from its options struct 0x1422ca340, which this module never touches):
+//   [Render] ForceAntiAliasing = -1 game's own | 0 Off | 1 FXAA   (FXAA/Off have no jitter: frames compare pixel for pixel)
+//   [Debug]  FixedRenderScale  = 0 off | 0.5..1.0                  (the DRS controller's fixed-scale path, for S10)
+// The AA/upscaler/DRS setter 0x1405cfad0 (every option setter and ApplyAll call it) gets a copy of its 6-int argument
+// {mode, frame gen, DLSS quality, FSR quality, sharpening, DRS} with mode, frame gen and DRS forced; the user's values
+// stay in the options and runtime structs. Per frame, PostFx+0x86c (the technique the render thread applies) is kept
+// at the forced technique, because frames before ApplyAll default to FSR.
+
+#include <cstddef>
+
+namespace rdrvr::render_settings {
+
+bool install();
+bool set_fixed_scale(float scale);  // 0 = off; needs ForceAntiAliasing >= 0
+void status_text(char* out, size_t len);
+
+// 0 Off, 1 FXAA, 2 native TAA (technique 2 with the mod's resolve); false unless the core forces the AA mode.
+bool set_aa(int mode);
+
+}  // namespace rdrvr::render_settings

@@ -1,0 +1,14 @@
+{
+  "name": "rdrvr",
+  "version": "0.1.0",
+  "description": "Native-stereo VR mod for Red Dead Redemption (2024 PC port): dinput8 proxy core + RedHook gameplay plugin",
+  "builtin-baseline": "771b0a2e7c473c3a6bee56553be4d5bb32bb653c",
+  "dependencies": [
+    "openxr-loader",
+    "safetyhook",
+    {
+      "name": "imgui",
+      "features": [ "dx12-binding" ]
+    }
+  ]
+}

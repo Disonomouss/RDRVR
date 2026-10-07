@@ -1,0 +1,21 @@
+#pragma once
+
+#include <openxr/openxr.h>
+
+#include <cstddef>
+
+// The holsters (and the foregrip, the loading point and each hand's test point) drawn as rings in the headset
+// ([Holsters] ShowZones, the menu's Holsters tab), to place and size them by eye. Each marker is one OpenXR quad layer
+// in the views' space, at the marker's world point carried back through the frame's camera
+// (camera_lever::world_to_local), facing the eyes, as wide as its radius. The styles are cells of one small atlas,
+// made on the CPU at boot and copied into a swapchain image once; the runtime keeps composing the image last released.
+// No game memory, no natives, no hooks.
+namespace rdrvr::zone_rings {
+
+void init();  // the bootstrap thread: the atlas pixels
+// Presenting thread, xr.cpp's frame end in a stereo frame with the projection layer: up to `max` quads for
+// holster::markers(), in `space`, facing the centre eye of `views`. Returns how many it filled.
+int frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLayerQuad* out, int max);
+void status_text(char* out, size_t len);
+
+}  // namespace rdrvr::zone_rings
