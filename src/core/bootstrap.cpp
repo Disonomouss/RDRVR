@@ -10,6 +10,7 @@
 #include "core/config.h"
 #include "core/d3d_hooks.h"
 #include "core/diag.h"
+#include "core/dlss.h"
 #include "core/dual.h"
 #include "core/dual_pass.h"
 #include "core/exit_guard.h"
@@ -102,7 +103,8 @@ DWORD WINAPI bootstrap_thread(void*) {
     diag::start_watchdog();
     test_channel::start();
 
-    anchors::verify();
+    anchors::verify();  // on another build it writes RDRVR_build_report.txt
+    if (!anchors::stand_down() && config::get_bool("Debug", "BuildReport", false)) anchors::build_report();  // the test of it
     if (anchors::stand_down()) {
         log::error("[boot] STAND DOWN: no RDR.exe hooks will be installed this run (D3D12 instruments stay)");
     } else {
@@ -115,6 +117,7 @@ DWORD WINAPI bootstrap_thread(void*) {
         dual::install();
         reload::install();
         taa::install();
+        dlss::install();
         render_settings::install();
     }
     log_modules("bootstrap done");

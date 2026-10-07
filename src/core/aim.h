@@ -16,6 +16,12 @@ namespace rdrvr::aim {
 void init();
 bool install();  // after anchors::verify()
 bool barrel_aim();
+// [Hands] Reticle (off by default): where the shot lands, the game's own reticle target point (T +0x3810, on the barrel's line at
+// the probe's hit) while aiming with a gun in hand; on_actor: an actor under it. False when none (lowered, no gun, a
+// stale or off-line point). size_deg: [Hands] ReticleSize. Any thread (SEH-guarded reads).
+bool reticle_target(float pos[3], bool* on_actor, float* size_deg);
+bool reticle_on();
+void set_reticle_on(bool on);  // also written to the user ini
 void set_barrel_aim(bool on);
 // [Hands] BlockExecutions (on; round 13): the fire trigger close to an NPC fires, never John's third-person execution,
 // pistol whip or butt strike (the shot request's close-target scan skipped for the player; NPCs keep theirs)

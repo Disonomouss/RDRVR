@@ -26,5 +26,6 @@ const char* name(Id id);
 bool verify();                    // run once after the game's code is final (after MTLX unloads)
 bool stand_down();                // true if verify() failed (or has not run)
 bool exe_matches();               // TimeDateStamp and SizeOfImage match the analysed build
+void build_report();              // where this build keeps the anchors (verify() runs it on a mismatch; reads only)
 
 }  // namespace rdrvr::anchors

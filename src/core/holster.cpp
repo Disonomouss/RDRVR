@@ -231,6 +231,10 @@ std::atomic<bool> g_weapon_choice{true}, g_any_weapon{false};
 std::atomic<bool> g_show_guns{false};
 // [Holsters] ShowBackGuns (on; round 13 item 14): off, ShowGuns leaves out the back and the left shoulder's long guns
 std::atomic<bool> g_show_back_guns{true};
+std::atomic<int> g_anchor{1};  // [Holsters] Anchor: 0 body, 1 headset (run 7 item 1d; the default)
+std::atomic<bool> g_anchor_used{false};  // the last update moved the zones with the neck
+float g_anchor_shift[3] = {0, 0, 0};    // that move (world, m); under g_zone_mutex
+float g_anchor_cam[3] = {0, 0, 0};      // the frame camera's position (the neutral head) then; under g_zone_mutex
 const int kShowZones[4] = {0, 1, 5, 6};  // the right hip, the back, the left hip, the left shoulder
 // the shown guns' error: the drawn position against the wanted one of the frame after (the walk's lag), the worst (m)
 struct ShowDiag {
@@ -385,7 +389,7 @@ void holster_frame() {
     const bool lefty = controls::left_handed();
     const float hd = pose::body_heading_deg() * 0.0174532925f;
     const float fwd[3] = {-std::sin(hd), 0.0f, -std::cos(hd)}, right[3] = {std::cos(hd), 0.0f, -std::sin(hd)}, up[3] = {0, 1, 0};
-    float zp[kZones][3];
+    float zp[kZones][3], bases[kZones][3];
     bool zok[kZones];
     for (int z = 0; z < kZones; ++z) {
         zok[z] = zones[z].enabled && bp.bone_ok[zones[z].bone];
@@ -394,12 +398,74 @@ void holster_frame() {
             const float d = (base[0] - bp.root[0]) * right[0] + (base[2] - bp.root[2]) * right[2];
             for (int k = 0; k < 3; ++k) base[k] -= 2.0f * d * right[k];
         }
+        std::memcpy(bases[z], base, sizeof(base));
         for (int k = 0; k < 3; ++k)
             zp[z][k] = base[k] + right[k] * zones[z].off[0] + up[k] * zones[z].off[1] + fwd[k] * zones[z].off[2];
         if (lefty) {  // the whole layout mirrored across the body's middle: the sidearm on the left hip
             const float d = (zp[z][0] - bp.root[0]) * right[0] + (zp[z][2] - bp.root[2]) * right[2];
             for (int k = 0; k < 3; ++k) zp[z][k] -= 2.0f * d * right[k];
         }
+    }
+    {  // [Holsters] Anchor=headset: every zone moved with the neck's offset since recentre (in the game camera's rows:
+       // the camera is the neutral head, level, facing the body), so the holsters stay with the player when the drawn
+       // body does not; with BodyFollowsHead the body already moves sideways with the head: only the height then
+        float no[3], sh[3] = {0, 0, 0};
+        const bool seated = (st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_IN_COVER)) != 0;
+        const bool use = g_anchor.load(std::memory_order_relaxed) == 1 && !seated && bp.cam_ok && camera_lever::neck_offset(no);
+        static int was_anchor = 0;  // the last update used the headset anchor (a new choice of it takes the places again)
+        if (use) {
+            // the zones' places relative to the neutral head (the camera), in the body's yaw frame: taken over 30 frames
+            // standing, after the anchor is chosen and after each recentre; then the zones rigid to the neck
+            static float acc[kZones][3], rel[kZones][3];
+            static int rel_n = -1;  // frames averaged; -1 none yet
+            static bool rel_ok = false;
+            static uint32_t rel_gen = ~0u;
+            const float* cp = bp.cam + 12;
+            const uint32_t gen = camera_lever::recentre_gen();
+            const bool standing = !(st.flags & RDRVR_ACTOR_CROUCHING);
+            if (gen != rel_gen || was_anchor != 1) {
+                rel_gen = gen;
+                rel_n = 0;
+                rel_ok = false;  // the body's places until the new ones are taken
+                std::memset(acc, 0, sizeof(acc));
+            }
+            if (rel_n >= 0 && rel_n < 30 && standing) {
+                for (int z = 0; z < kZones; ++z) {
+                    const float d[3] = {bases[z][0] - cp[0], bases[z][1] - cp[1], bases[z][2] - cp[2]};
+                    acc[z][0] += d[0] * right[0] + d[2] * right[2];
+                    acc[z][1] += d[1];
+                    acc[z][2] += d[0] * fwd[0] + d[2] * fwd[2];
+                }
+                if (++rel_n == 30) {
+                    for (int z = 0; z < kZones; ++z)
+                        for (int k = 0; k < 3; ++k) rel[z][k] = acc[z][k] / 30.0f;
+                    rel_ok = true;
+                    log::info("[holster] the headset anchor's places taken (the right hip %.2f m right, %.2f m below the head, %.2f m ahead)",
+                              rel[0][0], -rel[0][1], rel[0][2]);
+                }
+            }
+            if (rel_ok) {
+                for (int z = 0; z < kZones; ++z) {
+                    for (int k = 0; k < 3; ++k)
+                        zp[z][k] = cp[k] + right[k] * (rel[z][0] + zones[z].off[0]) + up[k] * (rel[z][1] + zones[z].off[1]) +
+                                   fwd[k] * (rel[z][2] + zones[z].off[2]);
+                    if (lefty) {  // mirrored across the camera's middle (the body's, as the body mode's)
+                        const float d = (zp[z][0] - cp[0]) * right[0] + (zp[z][2] - cp[2]) * right[2];
+                        for (int k = 0; k < 3; ++k) zp[z][k] -= 2.0f * d * right[k];
+                    }
+                }
+            }
+            const bool follow = body::follows_head();
+            const float n[3] = {follow ? 0.0f : no[0], no[1], follow ? 0.0f : no[2]};
+            for (int k = 0; k < 3; ++k) sh[k] = bp.cam[k] * n[0] + bp.cam[4 + k] * n[1] + bp.cam[8 + k] * n[2];
+            for (int z = 0; z < kZones; ++z)
+                for (int k = 0; k < 3; ++k) zp[z][k] += sh[k];
+        }
+        was_anchor = use ? 1 : 0;
+        g_anchor_used.store(use, std::memory_order_relaxed);
+        std::lock_guard lock(g_zone_mutex);
+        std::memcpy(g_anchor_shift, sh, sizeof(sh));
+        if (bp.cam_ok) std::memcpy(g_anchor_cam, bp.cam + 12, sizeof(g_anchor_cam));
     }
     // the weapon manager (actor +0x70): +0x80 the item in hand, +0x448 the current slot, +0xa8 + s * 0x70 the slots
     uintptr_t wmgr = 0, in_hand = 0;
@@ -1283,6 +1349,7 @@ void init() {
         set_load_point(lo, config::get_float("Reload", "LoadPointRadius", 0.12f), config::get_bool("Reload", "InsertOnTouch", true), false);
         g_show_guns = config::get_bool("Holsters", "ShowGuns", false);
         g_show_back_guns = config::get_bool("Holsters", "ShowBackGuns", true);
+        g_anchor = config::get_string("Holsters", "Anchor", "headset") == "body" ? 0 : 1;
         log::info("[holster] the loading point moved (%.3f %.3f %.3f) m, radius %.2f m; a round goes in on touch %d", lo[0], lo[1], lo[2], g_load_radius,
                   g_insert_touch ? 1 : 0);
         log::info("[holster] foregrip: the game's grip moved (%.3f %.3f %.3f) m, radius %.2f m; the front hand snaps on %d", off[0], off[1],
@@ -1572,6 +1639,12 @@ void set_show_guns(bool on, bool save) {
     if (g_show_guns.exchange(on) != on) log::info("[holster] the guns shown at the holsters: %s", on ? "on" : "off");
     if (save) config::set("Holsters", "ShowGuns", on ? "1" : "0");
 }
+int anchor() { return g_anchor.load(std::memory_order_relaxed); }
+void set_anchor(int a, bool save) {
+    a = a == 1 ? 1 : 0;
+    if (g_anchor.exchange(a) != a) log::info("[holster] the holsters anchored to the %s", a ? "headset (the neck's offset)" : "body");
+    if (save) config::set("Holsters", "Anchor", a ? "headset" : "body");
+}
 bool show_back_guns() { return g_show_back_guns.load(std::memory_order_relaxed); }
 void set_show_back_guns(bool on, bool save) {
     if (g_show_back_guns.exchange(on) != on) log::info("[holster] the long guns shown on the back: %s", on ? "on" : "off");
@@ -1674,6 +1747,24 @@ std::string command(const std::string& line) {
                       d.pt[0], d.pt[1], d.pt[2], off[0], off[1], off[2], r, touch ? 1 : 0, d.wrist_d, d.round_d, d.round[0], d.round[1], d.round[2], d.axis[0], d.axis[1], d.axis[2],
                       static_cast<unsigned long long>(d.inserts_touch), static_cast<unsigned long long>(d.inserts_wrist),
                       static_cast<unsigned long long>(d.inserts_let_go));
+        return b;
+    }
+    if (v == "anchor") {  // holster anchor [body|headset]: [Holsters] Anchor for the session; the last update's shift
+        std::string x;
+        in >> x;
+        if (x == "body" || x == "headset") set_anchor(x == "headset" ? 1 : 0, false);
+        float sh[3], cp[3];
+        {
+            std::lock_guard lock(g_zone_mutex);
+            std::memcpy(sh, g_anchor_shift, sizeof(sh));
+            std::memcpy(cp, g_anchor_cam, sizeof(cp));
+        }
+        float no[3] = {0, 0, 0};
+        const bool nk = camera_lever::neck_offset(no);
+        char b[240];
+        std::snprintf(b, sizeof(b), "anchor %s, used %d, shift (%.3f %.3f %.3f) | neck since recentre%s (%.3f %.3f %.3f) | camera (%.3f %.3f %.3f)",
+                      g_anchor.load() ? "headset" : "body", g_anchor_used.load() ? 1 : 0, sh[0], sh[1], sh[2], nk ? "" : " (none)", no[0],
+                      no[1], no[2], cp[0], cp[1], cp[2]);
         return b;
     }
     if (v == "guns") {  // holster guns [on|off|reset|back on|off]: [Holsters] ShowGuns (ShowBackGuns) for the session; each shown gun, its drawn error

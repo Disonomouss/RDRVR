@@ -44,6 +44,7 @@ add_library(rdrvr_core SHARED
     src/core/lum_check.cpp
     src/core/burst_grab.cpp
     src/core/taa.cpp
+    src/core/dlss.cpp
     src/core/exit_guard.cpp
     src/core/frame_grab.cpp
     src/core/gpu_timer.cpp

@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.1.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.2.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -32,9 +32,11 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 **Guns**
 - Shots leave the barrel of the gun in your hand; the right trigger alone fires; the gun stays drawn until you put it
-  away; no reticle.
-- Body holsters you grab: hips, back, left shoulder, belt, lower back, chest (rounds); a weapon chosen per holster;
-  each holster movable and resizable.
+  away.
+- An optional reticle where the shot will land, from the game's own aim (off by default: the Hands tab).
+- Holsters you grab: hips, back, left shoulder, belt, lower back, chest (rounds); a weapon chosen per holster; each
+  holster movable and resizable. They are fixed to your headset's position, so they stay with you as you step,
+  crouch and lean (or to John's body: the Holsters tab).
 - Reloading by hand: take a round at your chest and bring it to the gun (or squeeze the gun at your chest).
 - Every gun's action worked by hand (revolvers flicked open, levers, pumps, bolts, breeches, break-actions), with the
   game's own sounds on your movements; two-handed long guns; dual wielding (a second gun, or a copy of your sidearm);
@@ -63,7 +65,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.1.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.2.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file.
 3. Start your headset's runtime, then the game.
@@ -100,7 +102,12 @@ To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay i
 ## Known issues
 
 - Dual wielding two of the same gun from its own holster can leave the second gun invisible.
-- DLSS is not available in VR yet (the mod forces FXAA by default; TAA is the alternative).
+- With only one sidearm, it can show at both hips.
+- Shooting from right behind cover does not always fire, and climbing over obstacles does not work yet.
+- DLSS (in the anti-aliasing choice, from the next start) is experimental and feels laggy in the headset; FXAA is the
+  default (TAA is the alternative).
+- Only one build of the game's RDR.exe is supported. On another build the mod stands down (the game plays flat) and
+  writes `RDRVR_build_report.txt` in the game folder: please attach it, with `RDRVR.log`, to an issue.
 - The default places of the holsters, the loading and foregrip rings and the interaction spot were tuned in the
   headset by one person: if they do not suit you, move them with the menu's arrows (Holsters, Reloading, Gun in hand
   and Hands tabs).

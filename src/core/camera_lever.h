@@ -65,6 +65,11 @@ void set_xr_head_position(bool on, float separation);
 bool head_yaw_deg(float* out);
 // The centre eye's position since recentre, in the recentred frame (metres: x right, y up, z back); false before.
 bool head_offset(float out[3]);
+// The neck's offset since recentre, in the recentred frame (metres: x right, y up, z back): a pivot 0.10 m below and
+// 0.08 m behind the centre eye in the head's own axes, less where it is at the recentre (looking level, ahead), so
+// turning or nodding the head leaves it nearly still while stepping and crouching move it. False before recentre.
+bool neck_offset(float out[3]);
+uint32_t recentre_gen();  // counts the recentres (the holsters' headset anchor takes its places again after one)
 // A LOCAL pose (the controllers') in the game's world, as the eye cameras are placed: cam (the frame's game camera
 // matrix: rows right, up, back, position) + its rows times the position since recentre (unturned by the recentre
 // yaw). rot (x y z w) -> wrot, a 3x3 row-major matrix rotating column vectors into the world. False before recentre.

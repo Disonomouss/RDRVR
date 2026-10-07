@@ -28,6 +28,7 @@ constexpr uintptr_t kRendererScaleStep = 0x5ac;  // the fixed path rounds to mul
 using AaSet_t = void (*)(int* p);
 AaSet_t o_AaSet = nullptr;
 std::atomic<int> g_force_aa{-1};
+int g_dlss_quality = 0;  // [Render] DlssQuality: the game's DLSS quality index 0..5 (0 DLAA, 1 dynamic, 2 ultra perf ... 5 quality)
 std::atomic<float> g_fixed_scale{0.0f};
 std::atomic<bool> g_release_scale{false};  // fixed scale switched off: hand DRS back once
 std::atomic<int> g_calls{0};
@@ -44,6 +45,10 @@ void hk_AaSet(int* p) {
         copy[0] = force == 2 ? 1 : force;  // native TAA keeps the menu at FXAA: no DLSS/FSR setup, scale 1.0
         copy[1] = 0;                           // no frame generation
         copy[5] = g_fixed_scale.load() > 0 ? 1 : 0;   // DRS only for the fixed-scale test
+        if (force == 3) {
+            copy[2] = g_dlss_quality;  // within 0..5 (the setter's map throws past it)
+            copy[5] = 0;               // no DRS with DLSS
+        }
     }
     int n = g_calls.fetch_add(1) + 1;
     if (n <= 8)
@@ -77,7 +82,11 @@ void on_frame_end(uint64_t) {
 
 bool install() {
     g_force_aa = config::get_int("Render", "ForceAntiAliasing", -1);
-    if (g_force_aa > 2) g_force_aa = 1;  // Off, FXAA and native TAA are forced; other values are not valid targets here
+    if (g_force_aa > 3) g_force_aa = 1;  // Off, FXAA, native TAA and DLSS are forced; other values are not valid targets here
+    {
+        const int q = config::get_int("Render", "DlssQuality", 0);
+        g_dlss_quality = q < 0 ? 0 : q > 5 ? 5 : q;
+    }
     float scale = config::get_float("Debug", "FixedRenderScale", 0.0f);
     g_fixed_scale = (scale >= 0.25f && scale <= 1.0f) ? scale : 0.0f;
     if (g_force_aa < 0) return true;  // nothing to force: no hook (the fixed scale needs the forced FXAA/Off path)
@@ -85,18 +94,25 @@ bool install() {
     bool ok = hooks::install("RDR AA/upscaler setter", reinterpret_cast<void*>(anchors::addr(anchors::Id::AaSetter)), hk_AaSet,
                              &o_AaSet);
     d3d::add_frame_end_listener(on_frame_end);
-    log::info("[render] forcing AA %s, fixed render scale %s",
-              g_force_aa < 0 ? "no" : g_force_aa == 0 ? "Off" : g_force_aa == 1 ? "FXAA" : "native TAA (technique 2)",
+    log::info("[render] forcing AA %s (DLSS quality index %d), fixed render scale %s",
+              g_force_aa < 0 ? "no" : g_force_aa == 0 ? "Off" : g_force_aa == 1 ? "FXAA" : g_force_aa == 2 ? "native TAA (technique 2)"
+                                                                                                           : "DLSS (technique 5)",
+              g_dlss_quality,
               g_fixed_scale.load() > 0 ? "on" : "off");
     return ok;
 }
 
 bool set_aa(int mode) {
-    if (g_force_aa < 0 || mode < 0 || mode > 2) return false;  // only while the core forces the AA mode
+    // only while the core forces the AA mode; DLSS (3) is set at boot only: switching to or from it at run time re-creates
+    // the game's swapchain (FUN_140fd06d0), which the XR session holds
+    if (g_force_aa < 0 || g_force_aa == 3 || mode < 0 || mode > 2) return false;
     g_force_aa = mode;
     log::info("[render] AA now %s", mode == 0 ? "Off" : mode == 1 ? "FXAA" : "native TAA (technique 2)");
     return true;
 }
+
+int forced_aa() { return g_force_aa.load(); }
+int dlss_quality() { return g_dlss_quality; }
 
 bool set_fixed_scale(float scale) {
     if (g_force_aa < 0) return false;

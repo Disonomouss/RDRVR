@@ -42,6 +42,11 @@ float fire_clip_phase();
 bool show_guns();
 void set_show_guns(bool on, bool save = true);
 // [Holsters] ShowBackGuns (on; round 13 item 14): off, ShowGuns shows the hips' guns only (not the back's, the left shoulder's)
+// [Holsters] Anchor (run 7 item 1d): 0 body (the drawn body's holster bones, as before), 1 headset (the zones moved
+// with the neck's offset since recentre: they stay with the player when the drawn body does not). Riding, driving
+// and cover keep the body's anchor.
+int anchor();
+void set_anchor(int a, bool save = true);
 bool show_back_guns();
 void set_show_back_guns(bool on, bool save = true);
 // The gun hand inside a holster zone (the last frame end): no aim stance through a put-away.

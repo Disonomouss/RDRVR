@@ -156,6 +156,22 @@ ProjectileSpawn          func   0x302a50   # (W, first projectile, count r8d, pe
 # --- round 13: the close-range execution on the fire trigger (research\round13\execution-block.md)
 ExecGate                 site   0xadebe0 8 # FUN_140adebe0 (phys) -> bool: a leaf with no .pdata entry; false skips the shot request's execution scan
 ExecGateRet              site   0xd1fa19 8 # its return address in FUN_140d1f960 (the shot request), inside the local player's branch
+# --- DLSS per eye (research\run6\dlss.md H2-H5; Ghidra, 2026-10-07)
+DeferredAppend           site   0xecc9b0 10 # FUN_140ecc9b0 (recorder, fn, data, size): the deferred recorders' vt+0x2d8, a callback for the playback thread (the data copied)
+DlssEvalCallback         site   0xfced10 5 # the DLSS evaluate callback: mov rdx,rcx; xor ecx,ecx; jmp FUN_140fcf6b0 (slSetTag, slEvaluateFeature on 0x142260478)
+DlssConstsCallback       site   0xfced20 7 # the DLSS constants callback: slSetConstants(0x142aac640, [0x142aac808], 0x142aac810)
+SlSetTagThunk            site   0x100a3c6 6 # jmp [0x14104d038]
+SlSetConstantsThunk      site   0x100a3cc 6 # jmp [0x14104d030]
+SlFreeResourcesThunk     site   0x100a3d8 6 # jmp [0x14104d060]
+SlEvaluateThunk          site   0x100a3de 6 # jmp [0x14104d020]
+SlSetTagSlot             global 0x104d038   # the import slots the thunks jump through (filled at run time: the exe's imports are packed)
+SlSetConstantsSlot       global 0x104d030
+SlFreeResourcesSlot      global 0x104d060
+SlEvaluateSlot           global 0x104d020
+DlssSetOptionsPtr        global 0x2aac5f8   # slDLSSSetOptions, cached by FUN_140fd0dc0 from slGetFeatureFunction (fetched while null)
+DlssConstantsStatic      global 0x2aac640   # sl::Constants written by FUN_140fd1090 each post run (0x1c8 bytes)
+DlssTokenStatic          global 0x2aac808   # its sl::FrameToken*
+DlssEvalViewportStatic   global 0x2260478   # the evaluate's sl::ViewportHandle copy (the game's DLSS +0x10)
 PlayerInfo               global 0x22daf30   # the local player info (X): +0x5ec the actor handle, +0x410 the aim/zoom/Dead Eye state
 # --- G-C hand reload (research\gc-weapons.md 3, ENGINE-NOTES item 4)
 ReloadRequest            func   0xd1dde0   # (gun controller G) -> 1 when a reload starts (G +0x5d4 bit 0x40, WI +0x9b6); G +8 ped, ped +0x10 actor

@@ -784,6 +784,7 @@ void end_open_frame() {
     XrCompositionLayerQuad ui_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, menu_quad{XR_TYPE_COMPOSITION_LAYER_QUAD},
         wrist_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad ring_quads[holster::kMaxMarkers];
+    XrCompositionLayerQuad reticle_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     constexpr uint32_t kLayerArray = 16;
     const XrCompositionLayerBaseHeader* layers[kLayerArray] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
     uint32_t nlayers = 1;
@@ -794,8 +795,11 @@ void end_open_frame() {
     if (full && !g_cinema.load()) {
         const uint32_t cap = g_max_layers.load(std::memory_order_relaxed) < kLayerArray ? g_max_layers.load(std::memory_order_relaxed) : kLayerArray;
         const int room = static_cast<int>(cap) - static_cast<int>(nlayers) - 3;
-        const int nr = zone_rings::frame(g_frame_views, g_session, g_space, ring_quads, room < holster::kMaxMarkers ? room : holster::kMaxMarkers);
+        const int nr = zone_rings::frame(g_frame_views, g_session, g_space, ring_quads,
+                                         room - 1 < holster::kMaxMarkers ? room - 1 : holster::kMaxMarkers);  // one kept for the reticle
         for (int i = 0; i < nr; ++i) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ring_quads[i]);
+        if (room - nr >= 1 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle_quad))
+            layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&reticle_quad);
     }
     bool ui = full && !g_cinema.load() && fill_ui(ui_quad);
     if (ui) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ui_quad);

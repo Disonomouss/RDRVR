@@ -13,6 +13,8 @@
 #include <cstring>
 #include <vector>
 
+#include "core/aim.h"
+#include "core/body.h"
 #include "core/camera_lever.h"
 #include "core/d3d_hooks.h"
 #include "core/holster.h"
@@ -23,15 +25,15 @@
 namespace rdrvr::zone_rings {
 namespace {
 
-constexpr int kCell = 256, kCells = 6;
+constexpr int kCell = 256, kCells = 8;
 constexpr float kEdge = kCell * 0.5f - 2.0f;  // the outer edge, px from a cell's centre (2 px kept for filtering)
-enum Cell { kRingIdle, kRingIn, kRingHeld, kRingGun, kDotIdle, kDotIn };
+enum Cell { kRingIdle, kRingIn, kRingHeld, kRingGun, kDotIdle, kDotIn, kReticle, kReticleHot };
 std::vector<uint8_t> g_pixels;  // RGBA8: sRGB-encoded, premultiplied (init)
 std::atomic<bool> g_pixels_ready{false};
 XrSwapchain g_sc = XR_NULL_HANDLE;
 DXGI_FORMAT g_fmt = DXGI_FORMAT_UNKNOWN;
 bool g_ready = false, g_failed = false;  // the presenting thread's
-std::atomic<uint64_t> g_frames{0}, g_layers{0};
+std::atomic<uint64_t> g_frames{0}, g_layers{0}, g_reticles{0};
 std::atomic<int> g_last{0};
 
 float s2l(float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
@@ -46,10 +48,17 @@ uint8_t to_byte(float v) { return static_cast<uint8_t>(std::lround(255.0f * (v <
 // A ring: a 10 px band at the edge between 2 px dark rims, a faint fill inside. A dot: a disc in a dark rim.
 // White idle, green a hand in it, amber gripped there, blue a point on the gun.
 void texel(int cell, float r, float out[4]) {
-    static const float kCol[kCells][3] = {{1, 1, 1}, {0.30f, 1, 0.40f}, {1, 0.72f, 0.20f}, {0.35f, 0.85f, 1}, {1, 1, 1}, {0.30f, 1, 0.40f}};
+    static const float kCol[kCells][3] = {{1, 1, 1},       {0.30f, 1, 0.40f}, {1, 0.72f, 0.20f}, {0.35f, 0.85f, 1},
+                                          {1, 1, 1},       {0.30f, 1, 0.40f}, {1, 1, 1},          {1, 0.22f, 0.18f}};
     constexpr float kRimA = 0.6f, kFillA = 0.08f;
     float col, a;
-    if (cell >= kDotIdle) {
+    if (cell >= kReticle) {  // the reticle: a thin ring and a centre dot, each in a dark rim
+        const float dot = within(r, kEdge * 0.16f), dot_rim = within(r, kEdge * 0.26f) - dot;
+        const float ring = within(r, kEdge * 0.80f) - within(r, kEdge * 0.68f);
+        const float ring_rim = (within(r, kEdge * 0.88f) - within(r, kEdge * 0.80f)) + (within(r, kEdge * 0.68f) - within(r, kEdge * 0.60f));
+        col = dot + ring;
+        a = dot + ring + (dot_rim + ring_rim) * kRimA;
+    } else if (cell >= kDotIdle) {
         const float disc = within(r, kEdge * 0.75f), all = within(r, kEdge);
         col = disc;
         a = disc + (all - disc) * kRimA;
@@ -276,9 +285,42 @@ int frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLa
     return n;
 }
 
+bool reticle_frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLayerQuad* out) {
+    float p[3], deg = 1.2f;
+    bool hot = false;
+    if (!camera_lever::eyes_follow_head() || !aim::reticle_target(p, &hot, &deg)) return false;
+    body::BodyPoints bp;
+    if (!body::body_points(&bp) || !bp.cam_ok || !ensure(session)) return false;
+    float l[3];
+    if (!camera_lever::world_to_local(bp.cam, p, l)) return false;
+    const float eye[3] = {0.5f * (views[0].pose.position.x + views[1].pose.position.x), 0.5f * (views[0].pose.position.y + views[1].pose.position.y),
+                          0.5f * (views[0].pose.position.z + views[1].pose.position.z)};
+    float d[3] = {eye[0] - l[0], eye[1] - l[1], eye[2] - l[2]};
+    const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (dl < 0.4f) return false;  // at the muzzle: nothing to show
+    for (float& c : d) c /= dl;
+    // a constant angle: the drawn ring's outer edge (0.88 of the cell's edge) spans `deg` degrees at its distance
+    const float across = 2.0f * dl * std::tan(0.5f * deg * 0.0174532925f);
+    const float s = across * (kCell * 0.5f) / (kEdge * 0.88f);
+    XrCompositionLayerQuad& q = *out;
+    q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    q.space = space;
+    q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    q.subImage.swapchain = g_sc;
+    const int cell = hot ? kReticleHot : kReticle;
+    q.subImage.imageRect = {{cell * kCell, 0}, {kCell, kCell}};
+    q.pose.orientation = facing(d);
+    q.pose.position = {l[0], l[1], l[2]};
+    q.size = {s, s};
+    g_reticles.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 void status_text(char* out, size_t len) {
-    std::snprintf(out, len, "rings %s, frames %llu, layers %llu (last %d)", g_ready ? "made" : g_failed ? "failed" : "not made",
-                  static_cast<unsigned long long>(g_frames.load()), static_cast<unsigned long long>(g_layers.load()), g_last.load());
+    std::snprintf(out, len, "reticle frames %llu | rings %s, frames %llu, layers %llu (last %d)", static_cast<unsigned long long>(g_reticles.load()),
+                  g_ready ? "made" : g_failed ? "failed" : "not made", static_cast<unsigned long long>(g_frames.load()),
+                  static_cast<unsigned long long>(g_layers.load()), g_last.load());
 }
 
 }  // namespace rdrvr::zone_rings

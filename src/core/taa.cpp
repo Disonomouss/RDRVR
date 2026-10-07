@@ -10,6 +10,7 @@
 
 #include "core/anchors.h"
 #include "core/camera_lever.h"
+#include "core/config.h"
 #include "core/dual_pass.h"
 #include "core/hooks.h"
 #include "core/log.h"
@@ -78,10 +79,21 @@ thread_local int t_index_base = 0;  // the jitter index PreRender advanced to th
 
 std::atomic<bool> g_shared{false};  // positive control: one history and one TAA state for both eyes
 std::atomic<bool> g_mono_pass{true};  // a mono pass with a lever-changed camera gets its own update
+// [Render] DlssPassJitter (on): under DLSS (technique 5) the per-pass jitter and TAA state as for technique 2 (G2)
+std::atomic<bool> g_dlss_jitter{true};
 std::atomic<uint64_t> g_resolves[3], g_resets{0}, g_pass_updates{0}, g_mono_jitters{0}, g_mono_updates{0}, g_rain_restores{0},
     g_rain_skips{0}, g_size_mismatch{0};
 
 char* postfx() { return global<char*>(Id::PostFxSingleton); }
+
+// The per-pass jitter and TAA state: native TAA with its targets made, or DLSS (technique 5: its own resolve, the
+// game's jitter sequence; research\run6\dlss.md G2)
+bool jitter_active() {
+    char* p = postfx();
+    if (!p) return false;
+    const int t = at<int>(p, kTechApplied);
+    return (t == 2 && g_state == 1) || (t == 5 && g_dlss_jitter.load(std::memory_order_relaxed));
+}
 
 uintptr_t fbits(float f) {
     uint32_t u;
@@ -191,7 +203,7 @@ void* hk_AaSlot(void* pfx, void* a2, void* a3, uintptr_t latch) {
 // ---- the rain draw's TAA call (FUN_1408728f0 with flag 1 on the rain's viewport copy): it shifts the previous camera,
 // advances the jitter index and writes the negated jitter; the pass's TAA state is put back after it.
 void hk_TaaUpdate(void* pfx, void* vp, uintptr_t flag) {
-    if (g_state != 1 || reinterpret_cast<uintptr_t>(_ReturnAddress()) != g_rain_taa_ret || !pfx) {
+    if (reinterpret_cast<uintptr_t>(_ReturnAddress()) != g_rain_taa_ret || !pfx || !jitter_active()) {
         o_TaaUpdate(pfx, vp, flag);
         return;
     }
@@ -210,6 +222,7 @@ void hk_TaaUpdate(void* pfx, void* vp, uintptr_t flag) {
 
 bool install() {
     if (anchors::stand_down()) return false;
+    g_dlss_jitter = config::get_bool("Render", "DlssPassJitter", true);
     g_rain_taa_ret = anchors::addr(Id::RainTaaReturn);
     g_scene_rain_ret = anchors::addr(Id::SceneRainReturn);
     bool ok = hooks::install("RDR anti-aliasing slot (TAA resolve)", reinterpret_cast<void*>(anchors::addr(Id::AaSlot)),
@@ -260,7 +273,7 @@ void frame_start() {
 }
 
 void after_scene_wait(int pass) {
-    if (!active()) return;
+    if (!jitter_active()) return;
     char* p = postfx();
     void* vp = camera_lever::scene_viewport();
     if (!vp) return;
@@ -319,7 +332,8 @@ void status_text(char* out, size_t len) {
     char* p = anchors::stand_down() ? nullptr : postfx();
     std::snprintf(out, len,
                   "taa %s (technique %d) %dx%d%s | resolves first %llu second %llu mono %llu, resets %llu | pass updates %llu, "
-                  "mono jitters %llu, mono updates %llu (monopass %s) | rain: scene skips %llu, TAA restores %llu | size mismatches %llu",
+                  "mono jitters %llu, mono updates %llu (monopass %s) | rain: scene skips %llu, TAA restores %llu | size mismatches %llu"
+                  " | dlss pass jitter %d",
                   g_state == 1 ? "made" : g_state < 0 ? "REFUSED" : "not made", p ? at<int>(p, kTechApplied) : -1, g_w, g_h,
                   g_shared.load() ? " SHARED (control)" : "",
                   static_cast<unsigned long long>(g_resolves[0].load()), static_cast<unsigned long long>(g_resolves[1].load()),
@@ -327,7 +341,7 @@ void status_text(char* out, size_t len) {
                   static_cast<unsigned long long>(g_pass_updates.load()), static_cast<unsigned long long>(g_mono_jitters.load()),
                   static_cast<unsigned long long>(g_mono_updates.load()), g_mono_pass.load() ? "on" : "off",
                   static_cast<unsigned long long>(g_rain_skips.load()), static_cast<unsigned long long>(g_rain_restores.load()),
-                  static_cast<unsigned long long>(g_size_mismatch.load()));
+                  static_cast<unsigned long long>(g_size_mismatch.load()), g_dlss_jitter.load() ? 1 : 0);
 }
 
 }  // namespace rdrvr::taa

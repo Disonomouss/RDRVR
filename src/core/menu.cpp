@@ -333,6 +333,7 @@ struct Settings {
     bool loaded = false;
     bool auto_mode = true, ui_quad = true, cut3d = false;
     int aa = 1;
+    int dlss_q = 0;  // [Render] DlssQuality (the game's index 0..5)
     float separation = 1.0f;
     bool split[13] = {};
 };
@@ -394,6 +395,7 @@ void load_settings() {
     g_set.cut3d = config::get_string("Screen", "CutsceneMode", "Screen") == "3D";
     g_set.separation = config::get_float("Screen", "Cutscene3DSeparation", 1.0f);
     g_set.aa = config::get_int("Render", "ForceAntiAliasing", 1);
+    g_set.dlss_q = config::get_int("Render", "DlssQuality", 0);
     for (int i = 0; i < 13; ++i) {
         char key[32];
         std::snprintf(key, sizeof(key), "Split_%s", kSplits[i]);
@@ -432,14 +434,31 @@ void draw() {
             bool wrist = xr::hud_on_wrist();
             if (ImGui::Checkbox("HUD on the left wrist (look at it; the prompts stay on the quad)", &wrist)) xr::set_hud_on_wrist(wrist);
             track("HUD on the left wrist (look at it; the prompts stay on the quad)");
-            const char* aa[] = {"Off", "FXAA", "Native TAA"};
-            int a = g_set.aa < 0 ? 1 : g_set.aa > 2 ? 2 : g_set.aa;
-            if (ImGui::Combo("Anti-aliasing", &a, aa, 3)) {
-                g_set.aa = a;
-                render_settings::set_aa(a);
-                config::set("Render", "ForceAntiAliasing", std::to_string(a));
+            {  // DLSS is chosen for the next start: switching to or from it while the game runs would re-create its swapchain
+                const char* aa[] = {"Off", "FXAA", "Native TAA", "DLSS (DLAA, a history per eye; from the next start)"};
+                int a = g_set.aa < 0 ? 1 : g_set.aa > 3 ? 3 : g_set.aa;
+                if (ImGui::Combo("Anti-aliasing", &a, aa, 4)) {
+                    g_set.aa = a;
+                    if (a <= 2) render_settings::set_aa(a);  // refused (kept for the next start) while DLSS runs
+                    config::set("Render", "ForceAntiAliasing", std::to_string(a));
+                }
+                track("Anti-aliasing");
+                if (g_set.aa == 3) {  // the game's quality index: what DLSS renders before it upscales to the game's resolution
+                    static const char* const kQ[6] = {"DLAA (native resolution: the sharpest, the dearest)", "Dynamic (DLAA here)",
+                                                      "Ultra performance (1/3 per axis)", "Performance (1/2 per axis)",
+                                                      "Balanced (0.58 per axis)", "Quality (2/3 per axis)"};
+                    int q = g_set.dlss_q < 0 ? 0 : g_set.dlss_q > 5 ? 5 : g_set.dlss_q;
+                    if (ImGui::Combo("  DLSS quality (from the next start)", &q, kQ, 6)) {
+                        g_set.dlss_q = q;
+                        config::set("Render", "DlssQuality", std::to_string(q));
+                    }
+                    track("DLSS quality");
+                }
+                const int running = render_settings::forced_aa();
+                if (running >= 0 && ((running == 3) != (g_set.aa == 3) ||
+                                     (running == 3 && g_set.dlss_q != render_settings::dlss_quality())))
+                    ImGui::TextDisabled("  Restart the game to apply (DLSS can only change at the start).");
             }
-            track("Anti-aliasing");
             ImGui::EndTabItem();
         }
         bool tab_comfort = ImGui::BeginTabItem("Comfort");
@@ -573,6 +592,11 @@ void draw() {
                 config::set("Hands", "ArmIK", hc.ik ? "1" : "0");
             }
             track("Arms follow the controllers");
+            {  // 2026-10-07: the reticle where the shot lands
+                bool rt = aim::reticle_on();
+                if (ImGui::Checkbox("A reticle where the shot will land (while aiming)", &rt)) aim::set_reticle_on(rt);
+                track("A reticle where the shot will land (while aiming)");
+            }
             struct Slider {
                 const char* label;
                 const char* key;
@@ -681,6 +705,16 @@ void draw() {
             bool sb = holster::show_back_guns();  // round 13 item 14
             if (ImGui::Checkbox("  ... the long guns on the back too (off: the hips' only)", &sb)) holster::set_show_back_guns(sb);
             track("  ... the long guns on the back too (off: the hips' only)");
+            {  // run 7 item 1d
+                int an = holster::anchor();
+                ImGui::TextUnformatted("The holsters follow:");
+                ImGui::SameLine();
+                if (ImGui::RadioButton("John's body", an == 0)) holster::set_anchor(0);
+                track("John's body");
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Your headset (they stay with you as you move in the room)", an == 1)) holster::set_anchor(1);
+                track("Your headset (they stay with you as you move in the room)");
+            }
             ImGui::TextUnformatted("Each holster: offset right / up / forward from the drawn holster (m), and its size. Each arrow press: 5 mm.");
             for (int z = 0; z < holster::zone_count(); ++z) {
                 float off[3], radius = 0;

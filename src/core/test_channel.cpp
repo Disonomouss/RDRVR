@@ -26,6 +26,7 @@
 #include "core/aim.h"
 #include "core/reload.h"
 #include "core/actions.h"
+#include "core/dlss.h"
 #include "core/dual.h"
 #include "core/physics.h"
 #include "core/gestures.h"
@@ -249,6 +250,11 @@ std::string execute(const std::vector<std::string>& t) {
         char st[256];
         render_settings::status_text(st, sizeof(st));
         return st;
+    }
+    if (c == "dlss") {  // dlss [off]: per-eye DLSS's state and counters; off = the kill switch
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return dlss::command(line);
     }
     if (c == "taa" && t.size() >= 6 && t[1] == "params") {
         const float v[4] = {std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr),

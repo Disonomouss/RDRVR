@@ -69,6 +69,7 @@ SemRelease_t o_SemRelease = nullptr;
 uintptr_t g_wait_ret = 0, g_release_ret = 0, g_ui_wait_ret = 0;
 std::atomic<uint64_t> g_skipped_waits{0}, g_skipped_releases{0}, g_ui_taken{0}, g_ui_skipped{0}, g_ui_timeouts{0},
     g_post_skipped{0};
+std::atomic<bool> g_dlss_first_eye{true};  // [Render] DlssFirstEye: the first-eye post run under DLSS (technique 5)
 
 bool hk_SemWait(void* sem, int timeout) {
     uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -677,9 +678,12 @@ void first_eye_overlays(char* postfx) {
 void first_eye_post(void* renderer) {
     char* postfx = global<char*>(Id::PostFxSingleton);
     // The post-chain study covered the FXAA path (applied technique +0x868 == 1, ENGINE-NOTES 3.x) and the native TAA
-    // path (2: the same chain with the mod's resolve in the AA slot and no FXAA pass; ENGINE-NOTES item 7).
+    // path (2: the same chain with the mod's resolve in the AA slot and no FXAA pass; ENGINE-NOTES item 7). DLSS (5,
+    // [Render] DlssFirstEye, on): the game's own chain with its DLSS in the AA slot (research\run6\dlss.md G1; one
+    // DLSS viewport for both eyes until the per-eye viewport is in)
     int tech = postfx ? at<int>(postfx, 0x868) : -1;
-    if (!postfx || (tech != 1 && tech != 2) || !at<void*>(postfx, 0x6c0)) {
+    const bool dlss_ok = tech == 5 && g_dlss_first_eye.load(std::memory_order_relaxed);
+    if (!postfx || (tech != 1 && tech != 2 && !dlss_ok) || !at<void*>(postfx, 0x6c0)) {
         g_post_skipped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -731,6 +735,7 @@ void first_eye_post(void* renderer) {
 }  // namespace
 
 bool install() {
+    g_dlss_first_eye = config::get_bool("Render", "DlssFirstEye", true);
     if (anchors::stand_down()) return false;
     g_wait_ret = anchors::addr(Id::SceneWaitReturn);
     g_release_ret = anchors::addr(Id::SceneReleaseReturn);

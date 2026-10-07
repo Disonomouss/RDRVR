@@ -17,6 +17,7 @@
 #include "core/config.h"
 #include "core/dual.h"
 #include "core/hooks.h"
+#include "core/holster.h"
 #include "core/log.h"
 #include "core/pose.h"
 #include "core/reload.h"
@@ -26,6 +27,9 @@ namespace {
 
 std::atomic<bool> g_barrel{true};  // [Hands] BarrelAim
 std::atomic<bool> g_fire{true};    // [Hands] FireInFirstPerson
+std::atomic<bool> g_reticle{false};      // [Hands] Reticle (off by default)
+std::atomic<float> g_reticle_deg{1.2f};  // [Hands] ReticleSize (degrees across)
+std::atomic<uint64_t> g_reticle_shown{0}, g_reticle_offline{0};
 std::atomic<bool> g_assist{false}; // [Hands] AimAssist (soft lock and the reticle magnet in first person)
 std::atomic<bool> g_tracer{true};  // [Hands] TracerFromMuzzle
 std::atomic<bool> g_perfect{false};  // [Aim] PerfectAccuracy
@@ -533,6 +537,11 @@ void init() {
     g_tracer = config::get_bool("Hands", "TracerFromMuzzle", true);
     g_perfect = config::get_bool("Aim", "PerfectAccuracy", false);
     g_pattern = config::get_bool("Aim", "ShotgunPattern", true);
+    g_reticle = config::get_bool("Hands", "Reticle", false);
+    {
+        const float s = config::get_float("Hands", "ReticleSize", 1.2f);
+        g_reticle_deg = !(s >= 0.2f) ? 0.2f : s > 5.0f ? 5.0f : s;
+    }
     log::info("[aim] shots from the barrel %d, fire in first person %d, aim assist %d, tracer from the muzzle %d", g_barrel.load() ? 1 : 0,
               g_fire.load() ? 1 : 0, g_assist.load() ? 1 : 0, g_tracer.load() ? 1 : 0);
 }
@@ -685,6 +694,45 @@ bool install() {
 }
 
 bool barrel_aim() { return g_barrel.load(); }
+
+bool reticle_on() { return g_reticle.load(std::memory_order_relaxed); }
+void set_reticle_on(bool on) {
+    if (g_reticle.exchange(on) != on) log::info("[aim] the reticle where the shot lands: %s", on ? "on" : "off");
+    config::set("Hands", "Reticle", on ? "1" : "0");
+}
+
+bool reticle_target(float pos[3], bool* on_actor, float* size_deg) {
+    if (!g_reticle.load(std::memory_order_relaxed) || !g_barrel.load(std::memory_order_relaxed)) return false;
+    if (log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed) > 150.0) return false;  // not aiming along the barrel
+    RdrvrActorState st{};
+    if (!api::actor_state(&st) || !reload::is_gun(st.weapon)) return false;  // not the lasso, a thrown weapon or the fists
+    // only while the gun is up (the aim stance the trigger uses: holster::gun_raised), not lowered at the side
+    if (!holster::gun_raised()) return false;
+    const uintptr_t actor = player_actor();
+    uintptr_t T = 0;
+    float p[4];
+    int32_t handle = 0;
+    if (!actor || !rd(actor + 0xb8, &T) || !T || !raw(T + 0x3810, p, sizeof(p)) || !rd(T + 0x3900, &handle)) return false;
+    float m[3], d[3];
+    for (int k = 0; k < 3; ++k) m[k] = g_last_muzzle[k], d[k] = g_last_dir[k];
+    float v[3] = {p[0] - m[0], p[1] - m[1], p[2] - m[2]};
+    const float along = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
+    float off2 = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        const float e = v[k] - along * d[k];
+        off2 += e * e;
+    }
+    // on the barrel's line, ahead of the muzzle (the game's target point is the probe's hit along that line), and finite
+    if (!(along > 0.3f && along < 1200.0f) || !(off2 < 0.25f * 0.25f + 0.0004f * along * along)) {
+        g_reticle_offline.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::memcpy(pos, p, sizeof(float) * 3);
+    if (on_actor) *on_actor = handle != 0 && handle != -1;
+    if (size_deg) *size_deg = g_reticle_deg.load(std::memory_order_relaxed);
+    g_reticle_shown.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
 bool block_executions() { return g_block_exec.load(std::memory_order_relaxed); }
 void set_block_executions(bool on) {
     if (g_block_exec.exchange(on) != on) log::info("[aim] close-range executions on the trigger blocked: %d", on ? 1 : 0);
@@ -762,6 +810,19 @@ std::string command(const std::string& line) {
                       g_dir_target[0], g_dir_target[1], g_dir_target[2], g_dir_wrist[0], g_dir_wrist[1], g_dir_wrist[2], g_gun_anim[0],
                       g_gun_anim[1], g_gun_anim[2]);
         return f;
+    }
+    if (line.find(" reticle") != std::string::npos) {  // aim reticle [on|off]: where it is drawn now, its counters (on/off: the session)
+        if (line.find(" reticle on") != std::string::npos) g_reticle = true;
+        if (line.find(" reticle off") != std::string::npos) g_reticle = false;
+        float p[3] = {0, 0, 0}, sz = 0;
+        bool act = false;
+        const bool ok = reticle_target(p, &act, &sz);
+        char e[240];
+        std::snprintf(e, sizeof(e), "reticle %d, now %s (%.2f %.2f %.2f)%s, size %.1f deg | shown %llu, off the barrel's line %llu | muzzle (%.2f %.2f %.2f) dir (%.3f %.3f %.3f)",
+                      g_reticle.load() ? 1 : 0, ok ? "at" : "none", p[0], p[1], p[2], act ? " on an actor" : "", sz,
+                      static_cast<unsigned long long>(g_reticle_shown.load()), static_cast<unsigned long long>(g_reticle_offline.load()),
+                      g_last_muzzle[0], g_last_muzzle[1], g_last_muzzle[2], g_last_dir[0], g_last_dir[1], g_last_dir[2]);
+        return e;
     }
     if (line.find(" executions") != std::string::npos) {  // aim executions: the gate's calls from the shot request
         char e[160];

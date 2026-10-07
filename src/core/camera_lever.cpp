@@ -126,6 +126,7 @@ std::atomic<bool> g_findcam{false};
 std::atomic<bool> g_xr_pose{false};
 std::mutex g_recentre_mutex;
 bool g_recentred = false;
+std::atomic<uint32_t> g_recentre_gen{0};
 float g_q0[4] = {0, 0, 0, 1}, g_p0[3] = {0, 0, 0};  // recentre: yaw-only orientation and position (LOCAL)
 std::atomic<uint64_t> g_xr_pose_passes{0};
 
@@ -152,6 +153,7 @@ void recentre_from(const xr::EyeView* v) {
     g_q0[0] = 0, g_q0[1] = std::sin(0.5f * yaw), g_q0[2] = 0, g_q0[3] = std::cos(0.5f * yaw);
     std::memcpy(g_p0, mid, sizeof(mid));
     g_recentred = true;
+    g_recentre_gen.fetch_add(1, std::memory_order_relaxed);
     log::info("[cam] recentred: yaw %.2f deg, origin (%.3f %.3f %.3f)", yaw * 57.29578f, mid[0], mid[1], mid[2]);
 }
 
@@ -761,6 +763,28 @@ bool head_offset(float out[3]) {
     quat_matrix(q0c, r0);
     for (int k = 0; k < 3; ++k) d[k] = 0.5f * (v[0].position[k] + v[1].position[k]) - p0[k];
     for (int r = 0; r < 3; ++r) out[r] = r0[r * 3 + 0] * d[0] + r0[r * 3 + 1] * d[1] + r0[r * 3 + 2] * d[2];
+    return true;
+}
+
+uint32_t recentre_gen() { return g_recentre_gen.load(std::memory_order_relaxed); }
+
+bool neck_offset(float out[3]) {
+    xr::EyeView v[2];
+    if (!xr::eye_views_peek(v)) return false;
+    float q0[4], p0[3];
+    {
+        std::lock_guard lock(g_recentre_mutex);
+        if (!g_recentred) return false;
+        std::memcpy(q0, g_q0, sizeof(q0));
+        std::memcpy(p0, g_p0, sizeof(p0));
+    }
+    constexpr float kNeck[3] = {0.0f, -0.10f, 0.08f};  // the neck from the centre eye, in the head's axes (y up, z back)
+    float rh[9], q0c[4] = {-q0[0], -q0[1], -q0[2], q0[3]}, r0[9], d[3];
+    quat_matrix(v[0].orientation, rh);
+    quat_matrix(q0c, r0);
+    for (int k = 0; k < 3; ++k)
+        d[k] = 0.5f * (v[0].position[k] + v[1].position[k]) + rh[k * 3 + 0] * kNeck[0] + rh[k * 3 + 1] * kNeck[1] + rh[k * 3 + 2] * kNeck[2] - p0[k];
+    for (int r = 0; r < 3; ++r) out[r] = r0[r * 3 + 0] * d[0] + r0[r * 3 + 1] * d[1] + r0[r * 3 + 2] * d[2] - kNeck[r];
     return true;
 }
 
