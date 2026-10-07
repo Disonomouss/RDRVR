@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "core/config.h"
 #include "core/log.h"
 
 namespace rdrvr::anchors {
@@ -28,9 +29,18 @@ constexpr Entry kEntries[] = {
 #include "core/anchors.inc"
 #undef ANCHOR
 };
+constexpr int kEntryCount = static_cast<int>(sizeof(kEntries) / sizeof(kEntries[0]));
 
 std::atomic<bool> g_verified{false};
 std::atomic<bool> g_ok{false};
+std::atomic<bool> g_relocated{false};
+// This build's RVAs: the analysed ones, or the ones verify() found in another build (written before any hook is
+// installed, read-only after).
+uint32_t g_rva[kEntryCount];
+const bool g_rva_init = [] {
+    for (int i = 0; i < kEntryCount; ++i) g_rva[i] = kEntries[i].rva;
+    return true;
+}();
 
 // ---- the build report (another build of RDR.exe): what tools/gen_buildsig.py took from the analysed one
 struct Sig {
@@ -111,20 +121,55 @@ int scan_guarded(const unsigned char* lo, const unsigned char* hi, const unsigne
         return -2;
     }
 }
+// The masked pattern at s exactly (the caller keeps s..s+n inside .text)
+bool masked_eq_guarded(const unsigned char* s, const unsigned char* b, const unsigned char* m, int n) {
+    __try {
+        for (int i = 0; i < n; ++i)
+            if (m[i] && s[i] != b[i]) return false;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool read_guarded(const unsigned char* p, void* out, size_t n) {
+    __try {
+        std::memcpy(out, p, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool has_fixed_run(const unsigned char* m, int n) {
+    for (int k = 0; k + 3 < n; ++k)
+        if (m[k] == 0xff && m[k + 1] == 0xff && m[k + 2] == 0xff && m[k + 3] == 0xff) return true;
+    return false;
+}
+int entry_index(const char* name) {
+    for (int i = 0; i < kEntryCount; ++i)
+        if (std::strcmp(kEntries[i].name, name) == 0) return i;
+    return -1;
+}
+const unsigned char* u8(const char* p) { return reinterpret_cast<const unsigned char*>(p); }
 
-}  // namespace
+constexpr long long kNone = LLONG_MIN;
 
-// The report: each code anchor and each global, in this build, against the analysed one
-void build_report() {
+// The scan of this build: where it keeps each anchor, to the log ([build]) and RDRVR_build_report.txt. reloc[i] gets
+// entry i's shift (this build's RVA minus the analysed one) when it is found. True when every anchor is found and
+// checked: the code anchors by their masked bytes at the new place, the jmp [rip] stubs by the slot they jump through,
+// the globals by the instructions that address them, all globals by one shift. Reads only.
+bool scan_build(long long* reloc) {
+    const ULONGLONG t0 = GetTickCount64();
+    const auto* img = reinterpret_cast<const unsigned char*>(base());
     auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base());
     auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base() + dos->e_lfanew);
     const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
     const unsigned char *lo = nullptr, *hi = nullptr;
     for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i)
         if (std::memcmp(sec[i].Name, ".text", 5) == 0) {
-            lo = reinterpret_cast<const unsigned char*>(base() + sec[i].VirtualAddress);
+            lo = img + sec[i].VirtualAddress;
             hi = lo + sec[i].Misc.VirtualSize;
         }
+    for (int i = 0; i < kEntryCount; ++i) reloc[i] = kNone;
     wchar_t path[MAX_PATH];
     log::path_in_game_dir(L"RDRVR_build_report.txt", path, MAX_PATH);
     FILE* f = nullptr;
@@ -140,26 +185,54 @@ void build_report() {
     if (!lo) {
         out("no .text section found");
         if (f) std::fclose(f);
-        return;
+        return false;
     }
-    // the code anchors: each found once in .text gives its shift; the others (a stub, a small function found several
-    // times, one that changed) are tried where their nearest found neighbour's shift puts them
+    // the shifts found so far: each pattern is tried at them first (a whole-.text search only when none fits), so the
+    // scan of a build that differs by a few shifts takes milliseconds, not seconds (the game runs on meanwhile)
+    long long cand[16] = {0};
+    int ncand = 1;
+    auto add_cand = [&](long long c) {
+        for (int k = 0; k < ncand; ++k)
+            if (cand[k] == c) return;
+        if (ncand < 16) cand[ncand++] = c;
+    };
+    auto at_cand = [&](uint32_t rva, const unsigned char* b, const unsigned char* m, int n, long long* shift) {
+        for (int k = 0; k < ncand; ++k) {
+            const unsigned char* p = img + rva + cand[k];
+            if (p >= lo && p + n <= hi && masked_eq_guarded(p, b, m, n)) {
+                *shift = cand[k];
+                return true;
+            }
+        }
+        return false;
+    };
+    int full_scans = 0;
+
+    // the code anchors: a unique pattern at a known shift or found once in .text; the others (a jmp [rip] stub, a
+    // small function the build has several copies of) where their nearest found neighbour's shift puts them
     constexpr int kCount = static_cast<int>(sizeof(kSigs) / sizeof(kSigs[0]));
-    constexpr long long kNone = LLONG_MIN;
     static long long shift_of[kCount];
-    static int matches[kCount];
     int same = 0, moved = 0, by_neighbour = 0, lost = 0;
+    int stubs[kCount], nstubs = 0;
     for (int i = 0; i < kCount; ++i) {
         const Sig& s = kSigs[i];
-        const unsigned char* at = reinterpret_cast<const unsigned char*>(base() + s.rva);
-        const unsigned char* best = nullptr;
-        matches[i] = scan_guarded(lo, hi, reinterpret_cast<const unsigned char*>(s.b), reinterpret_cast<const unsigned char*>(s.m), s.n, at, &best);
-        shift_of[i] = matches[i] == 1 ? static_cast<long long>(best - at) : kNone;
-        if (shift_of[i] == 0) {
+        shift_of[i] = kNone;
+        if (!s.unique) continue;
+        long long sh = 0;
+        if (!at_cand(s.rva, u8(s.b), u8(s.m), s.n, &sh)) {
+            const unsigned char* at = img + s.rva;
+            const unsigned char* best = nullptr;
+            ++full_scans;
+            if (scan_guarded(lo, hi, u8(s.b), u8(s.m), s.n, at, &best) != 1) continue;
+            sh = static_cast<long long>(best - at);
+            add_cand(sh);
+        }
+        shift_of[i] = sh;
+        if (sh == 0) {
             ++same;
-        } else if (shift_of[i] != kNone) {
+        } else {
             ++moved;
-            out("CODE %s +%#x: moved to +%#llx (%+lld)", s.name, s.rva, static_cast<unsigned long long>(s.rva + shift_of[i]), shift_of[i]);
+            out("CODE %s +%#x: moved to +%#llx (%+lld)", s.name, s.rva, static_cast<unsigned long long>(s.rva + sh), sh);
         }
     }
     for (int i = 0; i < kCount; ++i) {
@@ -167,27 +240,34 @@ void build_report() {
         const Sig& s = kSigs[i];
         int nb = -1;
         for (int j = 0; j < kCount; ++j)
-            if (shift_of[j] != kNone && matches[j] == 1 &&
+            if (shift_of[j] != kNone && kSigs[j].unique &&
                 (nb < 0 || std::llabs(static_cast<long long>(kSigs[j].rva) - s.rva) < std::llabs(static_cast<long long>(kSigs[nb].rva) - s.rva)))
                 nb = j;
-        const unsigned char* want = nb >= 0 ? reinterpret_cast<const unsigned char*>(base() + s.rva + shift_of[nb]) : nullptr;
-        const unsigned char* best = nullptr;
-        const bool fits = want && want >= lo && want + s.n <= hi &&
-                          scan_guarded(want, want + s.n + 1, reinterpret_cast<const unsigned char*>(s.b), reinterpret_cast<const unsigned char*>(s.m), s.n, want, &best) == 1;
-        const bool fixed_run = matches[i] != -1;  // -1: the pattern has no 4 fixed bytes (a jmp [rip] stub): only the neighbour can place it
-        if (fits || (!fixed_run && want)) {
+        const unsigned char* want = nb >= 0 ? img + s.rva + shift_of[nb] : nullptr;
+        const bool inside = want && want >= lo && want + s.n <= hi;
+        const bool fixed_run = has_fixed_run(u8(s.m), s.n);
+        const bool fits = inside && fixed_run && masked_eq_guarded(want, u8(s.b), u8(s.m), s.n);
+        if (fits || (inside && !fixed_run)) {
             ++by_neighbour;
-            out("CODE %s +%#x: %s +%#llx (%+lld, the shift of %s +%#x; %d matches in .text)", s.name, s.rva,
-                fits ? "matches at" : "unverifiable, placed at", static_cast<unsigned long long>(s.rva + shift_of[nb]), shift_of[nb],
-                kSigs[nb].name, kSigs[nb].rva, matches[i]);
+            shift_of[i] = shift_of[nb];
+            if (!fixed_run) stubs[nstubs++] = i;  // a stub: checked below by the slot it jumps through
+            out("CODE %s +%#x: %s +%#llx (%+lld, the shift of %s +%#x)", s.name, s.rva, fits ? "matches at" : "a stub, placed at",
+                static_cast<unsigned long long>(s.rva + shift_of[nb]), shift_of[nb], kSigs[nb].name, kSigs[nb].rva);
         } else {
             ++lost;
-            out("CODE %s +%#x: NOT FOUND (%d matches in .text%s)", s.name, s.rva, matches[i], want ? "; not at its neighbour's shift either" : "");
+            out("CODE %s +%#x: NOT FOUND%s", s.name, s.rva, want ? " (not at its neighbour's shift either)" : "");
         }
     }
+    for (int i = 0; i < kCount; ++i) {
+        const int e = entry_index(kSigs[i].name);
+        if (e >= 0 && shift_of[i] != kNone) reloc[e] = shift_of[i];
+    }
     out("code anchors: %d where expected, %d moved, %d placed by a neighbour, %d not found (of %d)", same, moved, by_neighbour, lost, kCount);
+
     // the globals: each reference found gives where this build keeps it (the disp32 from the instruction's end)
     int g_same = 0, g_moved = 0, g_conflict = 0, g_none = 0;
+    bool d_uniform = true;
+    long long d_shift = kNone;  // the one shift every global found has (else no relocation)
     const char* cur = nullptr;
     long long shift = 0;
     int agree = 0, seen = 0, total = 0;
@@ -196,15 +276,23 @@ void build_report() {
         if (!seen) {
             ++g_none;
             out("DATA %s: no reference found (%d tried)", cur, total);
-        } else if (agree == seen && shift == 0) {
-            ++g_same;
-        } else if (agree == seen) {
-            ++g_moved;
-            out("DATA %s: moved %+lld (%d of %d references agree)", cur, shift, agree, total);
-        } else {
+            return;
+        }
+        if (agree != seen) {
             ++g_conflict;
             out("DATA %s: the references disagree (%d of %d found, %d agree with %+lld)", cur, seen, total, agree, shift);
+            return;
         }
+        if (shift == 0) {
+            ++g_same;
+        } else {
+            ++g_moved;
+            out("DATA %s: moved %+lld (%d of %d references agree)", cur, shift, agree, total);
+        }
+        if (d_shift == kNone) d_shift = shift;
+        if (shift != d_shift) d_uniform = false;
+        const int e = entry_index(cur);
+        if (e >= 0) reloc[e] = shift;
     };
     for (const GRef& r : kRefs) {
         if (!cur || std::strcmp(cur, r.name) != 0) {
@@ -214,13 +302,19 @@ void build_report() {
             agree = seen = total = 0;
         }
         ++total;
-        const unsigned char* at = reinterpret_cast<const unsigned char*>(base() + r.site);
-        const unsigned char* best = nullptr;
-        const int n = scan_guarded(lo, hi, reinterpret_cast<const unsigned char*>(r.b), reinterpret_cast<const unsigned char*>(r.m), kRefLen, at, &best);
-        if (n != 1 || !best) continue;
+        const unsigned char* found = nullptr;
+        long long sh = 0;
+        if (at_cand(r.site, u8(r.b), u8(r.m), kRefLen, &sh)) {
+            found = img + r.site + sh;
+        } else {
+            const unsigned char* best = nullptr;
+            ++full_scans;
+            if (scan_guarded(lo, hi, u8(r.b), u8(r.m), kRefLen, img + r.site, &best) != 1 || !best) continue;
+            found = best;
+        }
         int32_t disp = 0;
-        std::memcpy(&disp, best + r.doff, 4);
-        const long long target = static_cast<long long>(best - reinterpret_cast<const unsigned char*>(base())) + r.end + disp;
+        if (!read_guarded(found + r.doff, &disp, 4)) continue;
+        const long long target = static_cast<long long>(found - img) + r.end + disp;
         const long long s = target - static_cast<long long>(r.g);
         if (!seen) shift = s;
         ++seen;
@@ -228,13 +322,63 @@ void build_report() {
     }
     flush();
     constexpr int kNoRefs = static_cast<int>(sizeof(kNoRef) / sizeof(kNoRef[0]));
-    for (const char* n : kNoRef) out("DATA %s: no reference pattern in the analysed build (to be found by hand)", n);
-    out("data anchors: %d where expected, %d moved, %d with disagreeing references, %d unresolved, %d without a pattern", g_same, g_moved,
-        g_conflict, g_none, kNoRefs);
-    out("verdict: %s", lost || g_conflict || g_none ? "some anchors were not found: this build cannot be relocated from this report alone"
-                       : moved || g_moved ? "every anchor with a pattern found: this build could be supported by relocation"
-                                          : "every anchor with a pattern in place");
+    for (const char* n : kNoRef) {
+        const int e = entry_index(n);
+        if (e >= 0 && d_uniform && d_shift != kNone) reloc[e] = d_shift;
+        out("DATA %s: no reference pattern; %s", n, d_uniform && d_shift != kNone ? "given the shift every other global has" : "not placed");
+    }
+    out("data anchors: %d where expected, %d moved, %d with disagreeing references, %d unresolved, %d without a pattern%s", g_same, g_moved,
+        g_conflict, g_none, kNoRefs, d_uniform ? "" : "; the globals do not all have one shift");
+
+    // the stubs: each jmp [rip+disp32] must jump through the slot it jumps through in the analysed build, moved as the
+    // globals moved
+    int stubs_ok = 0;
+    for (int k = 0; k < nstubs; ++k) {
+        const Sig& s = kSigs[stubs[k]];
+        const int e = entry_index(s.name);
+        const Entry* en = e >= 0 ? &kEntries[e] : nullptr;
+        unsigned char live[6] = {};
+        bool ok = en && en->n >= 6 && static_cast<unsigned char>(en->bytes[0]) == 0xff && static_cast<unsigned char>(en->bytes[1]) == 0x25 &&
+                  d_uniform && d_shift != kNone && reloc[e] != kNone && read_guarded(img + en->rva + reloc[e], live, 6) && live[0] == 0xff &&
+                  live[1] == 0x25;
+        if (ok) {
+            int32_t d0 = 0, d1 = 0;
+            std::memcpy(&d0, en->bytes + 2, 4);
+            std::memcpy(&d1, live + 2, 4);
+            const long long was = static_cast<long long>(en->rva) + 6 + d0;
+            const long long now = static_cast<long long>(en->rva) + reloc[e] + 6 + d1;
+            ok = now == was + d_shift;
+        }
+        if (ok) {
+            ++stubs_ok;
+        } else {
+            if (e >= 0) reloc[e] = kNone;
+            out("CODE %s: the stub does not jump through its slot", s.name);
+        }
+    }
+    if (nstubs) out("stubs: %d of %d jump through their slots", stubs_ok, nstubs);
+
+    int missing = 0;
+    for (int i = 0; i < kEntryCount; ++i)
+        if (reloc[i] == kNone) {
+            ++missing;
+            out("NOT PLACED: %s", kEntries[i].name);
+        }
+    const bool can = !lost && !g_conflict && !g_none && d_uniform && stubs_ok == nstubs && !missing;
+    out("verdict: %s (%d full searches, %.0f ms)",
+        can ? (moved || by_neighbour || g_moved ? "every anchor found and checked: this build runs on the found addresses"
+                                                : "every anchor in place")
+            : "some anchors were not found or checked: this build cannot be relocated",
+        full_scans, static_cast<double>(GetTickCount64() - t0));
     if (f) std::fclose(f);
+    return can;
+}
+
+}  // namespace
+
+void build_report() {
+    static long long reloc[kEntryCount];
+    scan_build(reloc);
 }
 
 uintptr_t base() {
@@ -242,7 +386,7 @@ uintptr_t base() {
     return b;
 }
 
-uint32_t rva(Id id) { return kEntries[static_cast<int>(id)].rva; }
+uint32_t rva(Id id) { return g_rva[static_cast<int>(id)]; }
 const char* name(Id id) { return kEntries[static_cast<int>(id)].name; }
 uintptr_t addr(Id id) { return base() + rva(id); }
 
@@ -252,6 +396,8 @@ bool exe_matches() {
     return nt->FileHeader.TimeDateStamp == RDRVR_EXE_TIMESTAMP && nt->OptionalHeader.SizeOfImage == RDRVR_EXE_SIZEOFIMAGE;
 }
 
+bool relocated() { return g_relocated.load(); }
+
 bool verify() {
     auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base());
     auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base() + dos->e_lfanew);
@@ -259,7 +405,7 @@ bool verify() {
               reinterpret_cast<void*>(base()), nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage,
               RDRVR_EXE_TIMESTAMP, RDRVR_EXE_SIZEOFIMAGE);
     bool ok = exe_matches();
-    if (!ok) log::error("[anchors] STAND DOWN: this RDR.exe is not the analysed build (v42_PC-49788435)");
+    if (!ok) log::error("[anchors] this RDR.exe is not the analysed build (v42_PC-49788435): looking for its anchors");
 
     int bad = 0, checked = 0;
     for (const Entry& e : kEntries) {
@@ -274,12 +420,32 @@ bool verify() {
         }
     }
     if (bad) {
-        log::error("[anchors] STAND DOWN: %d of %d code anchors differ from research\\RDR.exe", bad, checked);
+        log::error("[anchors] %d of %d code anchors differ from research\\RDR.exe", bad, checked);
         ok = false;
     } else {
         log::info("[anchors] all %d code anchors match", checked);
     }
-    if (!ok) build_report();  // another build: where its anchors are (reads only; the mod stays stood down)
+    // another build (or [Debug] RelocateTest on this one): where it keeps the anchors; when every one is found and
+    // checked, the mod runs on those addresses ([Debug] Relocate), else it stands down
+    if (!ok || config::get_bool("Debug", "RelocateTest", false)) {
+        static long long reloc[kEntryCount];
+        const bool can = scan_build(reloc);
+        if (can && config::get_bool("Debug", "Relocate", true)) {
+            int moved = 0;
+            for (int i = 0; i < kEntryCount; ++i) {
+                g_rva[i] = static_cast<uint32_t>(static_cast<long long>(kEntries[i].rva) + reloc[i]);
+                moved += reloc[i] != 0;
+            }
+            g_relocated.store(true);
+            ok = true;
+            log::info("[anchors] RELOCATED: running on this build's addresses (%d of %d anchors moved; RDRVR_build_report.txt)", moved,
+                      kEntryCount);
+        } else {
+            ok = false;
+            log::error("[anchors] STAND DOWN: %s", can ? "this build could run relocated, but [Debug] Relocate=0"
+                                                       : "this build's anchors were not all found (RDRVR_build_report.txt)");
+        }
+    }
     g_ok.store(ok);
     g_verified.store(true);
     return ok;

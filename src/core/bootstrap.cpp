@@ -22,6 +22,7 @@
 #include "core/pose.h"
 #include "core/menu.h"
 #include "core/eye_grab.h"
+#include "core/eye_shape.h"
 #include "core/lum_check.h"
 #include "core/taa.h"
 #include "core/frame_grab.h"
@@ -35,6 +36,7 @@
 #include "core/aim.h"
 #include "core/reload.h"
 #include "core/gestures.h"
+#include "core/gun_melee.h"
 #include "core/controls.h"
 #include "core/test_channel.h"
 #include "core/xinput.h"
@@ -83,6 +85,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     eye_grab::init();
     lum_check::init();
     burst_grab::init();
+    eye_shape::init();  // before ui_layer::init: its monitor repaint's frame end runs before the UI mirror's
     ui_layer::init();
     vr_mode::init();
     hands::init();
@@ -93,6 +96,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     reload::init();
     audio::init();
     gestures::init();
+    gun_melee::init();
     dual::init();  // after holster::init: its frame-end listener runs after the holsters'
     actions::init();
     physics::init();
@@ -111,6 +115,7 @@ DWORD WINAPI bootstrap_thread(void*) {
         game_hooks::install();
         camera_lever::install();
         dual_pass::install();
+        eye_shape::install();
         body::install();
         holster::install();
         aim::install();

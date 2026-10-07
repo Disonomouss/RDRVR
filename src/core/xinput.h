@@ -36,5 +36,9 @@ uint64_t injected();        // calls that returned injected state
 uint64_t caps_queries();    // XInputGetCapabilities calls seen
 uint32_t rumble();          // last motor speeds sent to pad 0 (left << 16 | right)
 uint64_t rumble_changes();  // times those speeds changed
+uint64_t rb_presses();      // run 7 item 1e: RB presses the game read (its cover button), LB's
+uint64_t lb_presses();
+uint64_t x_presses();        // run 7 item 1f: X presses the game read (its jump), and the last one's GetTickCount64
+uint64_t x_press_tick();
 
 }  // namespace rdrvr::xinput

@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 
-#define RDRVR_API_VERSION 6u
+#define RDRVR_API_VERSION 7u
 #define RDRVR_WEAPONS 40  // eWeapon 0..37 (WeaponModel), padded
 
 #ifdef __cplusplus
@@ -35,7 +35,65 @@ typedef enum RdrvrNativeOp {
     // GRAB_END: args [0] the handle, [1] the player actor, [2] 0 let go (unfrozen, thrown with vec_in, m/s), 1 its
     // collisions with the player back on (half a second later). value = 1 done, 0 gone.
     RDRVR_NATIVE_GRAB_END = 4,
+    // v7, [Gestures] GunMelee (research\round13\gun-melee.md 5.3): one scan in one tick. args: an RdrvrGunMeleeArgs
+    // copied over args[0..11]. The object iterator on the ambient layout (type 15, a sphere of radius_cm about seg[0][1])
+    // collects up to 10 actors (16 for a scan) and is destroyed before anything else runs; each live, human actor that
+    // is not ragdolled, not the player and not held by a cutscene has its head, spine03, spine01 and pelvis tested as
+    // spheres against the strike segments; the earliest entry moving into the bone at `speed` or more goes to the core's
+    // gun_melee_hit (the game's hit is made there, in this tick). Result: value = the victim's handle (0 none) |
+    // RdrvrGunMeleeOutcome << 32 | the core's RdrvrMeleeHitCode << 40 (0xff: not asked) | the actors seen << 48 (up to
+    // 255) | the iterators made << 56 | destroyed << 60 (4 bits each); vec = the hit point (a scan: the nearest actor's
+    // position), vec[3] its distance from seg[0][1] (m; -1 none). A scan (RDRVR_GUN_MELEE_SCAN) only logs each actor.
+    RDRVR_NATIVE_GUN_MELEE = 5,
 } RdrvrNativeOp;
+
+// v7: RDRVR_NATIVE_GUN_MELEE's arguments, this struct copied over the request's args (96 bytes, the same size)
+#define RDRVR_GUN_MELEE_POINT2 1u  // seg[1] and vel[1] are set (a second strike point)
+#define RDRVR_GUN_MELEE_SCAN 2u    // list the actors in the sphere (the log), no hit
+typedef struct RdrvrGunMeleeArgs {
+    float seg[2][2][3];   // the strike points (0: a long gun's butt or a pistol's frame at the hand, 1: the barrel), each
+                          // from where it was at the last scan to where it is now (world)
+    float vel[2][3];      // each point's velocity (world, m/s): the hand's own motion, through the recentred local frame
+    uint64_t guard;       // the script thread global's address (ScriptThreadCurrent; as HAND_PUSH's args[5])
+    uint32_t actor;       // the player's actor handle (GET_PLAYER_ACTOR)
+    int32_t weapon;       // the eWeapon in hand
+    uint16_t flags;       // RDRVR_GUN_MELEE_*
+    uint16_t radius_cm;   // the iterator's sphere about seg[0][1], centimetres (the actors' positions are their roots)
+    float speed;          // the speed a hit needs (m/s; [Gestures] GunMeleeSpeed)
+} RdrvrGunMeleeArgs;
+
+typedef enum RdrvrGunMeleeOutcome {
+    RDRVR_GUN_MELEE_NONE = 0,         // no bone sphere entered fast enough
+    RDRVR_GUN_MELEE_HIT = 1,          // a bone entered: the core's answer (RdrvrMeleeHitCode) in bits 40-47
+    RDRVR_GUN_MELEE_GUARD = 2,        // no current script thread: no native called
+    RDRVR_GUN_MELEE_NO_ITERATOR = 3,  // CREATE_OBJECT_ITERATOR gave no handle
+    RDRVR_GUN_MELEE_SCANNED = 4,      // a scan: the actors logged
+    RDRVR_GUN_MELEE_NO_CORE = 5,      // the core has no gun_melee_hit
+} RdrvrGunMeleeOutcome;
+
+// v7: the hit the plugin found, for the core's gun_melee_hit
+typedef struct RdrvrMeleeHit {
+    uint32_t victim;      // the victim's actor handle (from the iterator, GET_ACTOR_FROM_OBJECT)
+    uint32_t attacker;    // the player's actor handle
+    float pos[3];         // the hit point (world): the strike point where it entered the bone's sphere
+    float dir[3];         // the strike's unit direction (world)
+    float speed;          // its speed (m/s, the hand's own motion)
+    int32_t weapon;       // the eWeapon in hand
+    char bone[16];        // the bone ("head", "spine03", "spine01", "pelvis"): the hit zone is the game's mapping of it
+} RdrvrMeleeHit;
+
+typedef enum RdrvrMeleeHitCode {
+    RDRVR_MELEE_HIT_OK = 0,         // the game's hit made (FUN_140ae1760, once)
+    RDRVR_MELEE_HIT_DRY = 1,        // built and logged, not made ([Gestures] GunMeleeDryRun)
+    RDRVR_MELEE_HIT_NOT_NOW = 2,    // GunMelee off, the anchors stood down, or not inside the plugin's script tick
+    RDRVR_MELEE_HIT_BAD_INPUT = 3,  // a point, direction or speed not finite, no bone name
+    RDRVR_MELEE_HIT_HANDLE = 4,     // a handle did not resolve (ObjectsPool, ActorPool generations), not an actor, the
+                                    // attacker not the local player, or the victim a player
+    RDRVR_MELEE_HIT_VICTIM = 5,     // the victim's parts missing (health, AI, ped, physics, its controllers) or no health left
+    RDRVR_MELEE_HIT_BLOCKED = 6,    // the victim blocks (its melee controller's state 2)
+    RDRVR_MELEE_HIT_MOUNTED = 7,    // the victim rides
+    RDRVR_MELEE_HIT_COOLDOWN = 8,   // the same victim was hit less than 500 ms ago
+} RdrvrMeleeHitCode;
 
 typedef enum RdrvrPush {
     RDRVR_PUSH_NONE = 0,     // no loose prop within the radius
@@ -136,6 +194,11 @@ typedef struct RdrvrApi {
     void (*post_native_result)(const RdrvrNativeResult* result);
     void (*get_camera_job)(RdrvrCameraJob* out);                 // v3: each tick, after on_script_tick
     void (*post_actor_state)(const RdrvrActorState* state);      // v3: after the camera was placed
+    // v7, [Gestures] GunMelee: the game's hit on an actor, made by the core synchronously (RDRVR_NATIVE_GUN_MELEE's
+    // tick); refused outside the plugin's tick (between on_script_tick and end_script_tick, on that thread).
+    // Returns an RdrvrMeleeHitCode.
+    int (*gun_melee_hit)(const RdrvrMeleeHit* hit);
+    void (*end_script_tick)(uint64_t tick);                      // v7: after the tick's requests ran
 } RdrvrApi;
 
 typedef const RdrvrApi* (*RdrvrGetApiFn)(void);

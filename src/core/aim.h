@@ -27,6 +27,10 @@ void set_barrel_aim(bool on);
 // pistol whip or butt strike (the shot request's close-target scan skipped for the player; NPCs keep theirs)
 bool block_executions();
 void set_block_executions(bool on);  // also written to the user ini
+// [Hands] ShootPastArmBlock (off; run 7 item 1e): the game's arm block (its shoulder-line sweep) lifted for the player
+// while the gun in hand is aimed along its barrel; the game's other reasons kept
+bool shoot_past_arm_block();
+void set_shoot_past_arm_block(bool on, bool save);  // save: also written to the user ini (the menu; "aim armblock" is the session's)
 // The barrel of the gun in hand in its IK target's axes (the controller with the hand calibration; it is rigid there):
 // from the latest aim ray, false when none in the last 0.5 s. Any thread.
 bool barrel_in_target(float b[3]);

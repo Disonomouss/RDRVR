@@ -744,7 +744,7 @@ void set_held(int john_hand, int family) {
 }
 
 void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* const dst[2], const D3D12_CPU_DESCRIPTOR_HANDLE rtv[2],
-            uint32_t w, uint32_t h, DXGI_FORMAT fmt, int slot) {
+            uint32_t w, uint32_t h, DXGI_FORMAT fmt, int slot, uint32_t vw, uint32_t vh, uint32_t dw, uint32_t dh) {
     if (slot < 0 || slot >= kSlots) return;
     g_records.fetch_add(1, std::memory_order_relaxed);
     g_rec_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
@@ -778,7 +778,9 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         log::info("[round] the round's pipeline %s (%ux%u, format %d)", g_ready ? "made" : "NOT made", w, h, static_cast<int>(fmt));
     }
     if (!g_ready || w != g_w || h != g_h || fmt != g_fmt) return;
-    int cx = static_cast<int>(w / 2), cy = static_cast<int>(h / 2);  // the capture's crop centre (the round's, when drawn)
+    // [XR] EyeShape: the eye image's rect at the image's origin (else the whole image)
+    const uint32_t iw = vw && vw <= w ? vw : w, ih = vh && vh <= h ? vh : h;
+    int cx = static_cast<int>(iw / 2), cy = static_cast<int>(ih / 2);  // the capture's crop centre (the round's, when drawn)
     struct AtEnd {
         ID3D12Device* dev;
         ID3D12GraphicsCommandList* cl;
@@ -876,8 +878,8 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_VERTEX_BUFFER_VIEW vbv{g_vb->GetGPUVirtualAddress(), static_cast<UINT>(g_mesh.size() * sizeof(Vtx)), sizeof(Vtx)};
     cl->IASetVertexBuffers(0, 1, &vbv);
-    D3D12_VIEWPORT vp{0, 0, static_cast<float>(w), static_cast<float>(h), 0, 1};
-    D3D12_RECT sc{0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
+    D3D12_VIEWPORT vp{0, 0, static_cast<float>(iw), static_cast<float>(ih), 0, 1};
+    D3D12_RECT sc{0, 0, static_cast<LONG>(iw), static_cast<LONG>(ih)};
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &sc);
     D3D12_GPU_DESCRIPTOR_HANDLE hg = g_srv_heap->GetGPUDescriptorHandleForHeapStart();
@@ -912,8 +914,8 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         k.zc[1] = k.zc[0] * n;
         k.zc[2] = n;
         k.zc[3] = f;
-        k.scale[0] = dm.w ? static_cast<float>(dm.w) / static_cast<float>(w) : 1.0f;
-        k.scale[1] = dm.h ? static_cast<float>(dm.h) / static_cast<float>(h) : 1.0f;
+        k.scale[0] = dw ? static_cast<float>(dw) / static_cast<float>(iw) : dm.w ? static_cast<float>(dm.w) / static_cast<float>(iw) : 1.0f;
+        k.scale[1] = dh ? static_cast<float>(dh) / static_cast<float>(ih) : dm.h ? static_cast<float>(dm.h) / static_cast<float>(ih) : 1.0f;
         k.scale[2] = bright;
         k.scale[3] = bias;
         k.dinfo[0] = static_cast<uint32_t>(dm.stride * static_cast<uint64_t>(gpar * 2 + e));
@@ -933,8 +935,8 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         if (e == g_grab_eye && vz < -0.01) {  // the round's centre in this image (the capture's crop)
             const double x = k.L[0][3], y = k.L[1][3], z = vz;
             const double nx = (2 * x / -z - (c.r + c.l)) / (c.r - c.l), ny = (2 * y / -z - (c.u + c.dn)) / (c.u - c.dn);
-            cx = static_cast<int>((nx * 0.5 + 0.5) * w);
-            cy = static_cast<int>((0.5 - ny * 0.5) * h);
+            cx = static_cast<int>((nx * 0.5 + 0.5) * iw);
+            cy = static_cast<int>((0.5 - ny * 0.5) * ih);
         }
         cl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
         cl->OMSetRenderTargets(1, &rtv[e], FALSE, &dsv);

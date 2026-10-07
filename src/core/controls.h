@@ -63,6 +63,8 @@ void set_trigger_aims_session(bool on);  // the test channel: not saved
 // [Hands] AimWhenRaised: LT held while the gun hand is raised (the aim stance up, every pull fires at once)
 bool aim_when_raised();
 void set_aim_when_raised(bool on, bool save = true);
+bool jump_drops_aim();  // [Hands] JumpDropsAim (run 7 item 1f): a jump with a gun in hand lets the aim go first
+void set_jump_drops_aim(bool on, bool save = true);
 bool sprint_drops_aim();  // [Hands] SprintDropsAim
 void set_sprint_drops_aim(bool on, bool save = true);
 void set_click_brake_session(bool on);

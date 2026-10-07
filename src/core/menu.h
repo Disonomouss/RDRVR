@@ -20,8 +20,11 @@ bool frame(const XrView* views, XrSession session, XrSpace space, XrCompositionL
 // Test aid: the LOCAL-space point at the centre of the widget labelled `label` in the last drawn frame
 // ("menu find <label>" -> "x y z"), so a synthetic hand can be aimed at it.
 std::string find(const std::string& label);
-// The test channel's "menu scroll <y>": the window scrolled to y (pixels) at its next draw, for a row below its bottom
+// The test channel's "menu scroll <y>": the page scrolled to y (pixels) at its next draw, for a row below its bottom
 void scroll(float y);
+// The test channel's "menu grab <path.bmp>" (run 7 item 5): the menu's image at its next draw, written as a 24-bit BMP
+// (1024x768, over black); "wrote <path> ..." or "ERROR ... (NOT MEASURED)". Waits up to 3 s for a drawn menu frame.
+std::string grab(const std::string& path);
 void status_text(char* out, size_t len);
 
 }  // namespace rdrvr::menu

@@ -23,9 +23,24 @@ bool init(ID3D12Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT src_format, DXG
 constexpr int kStages = 5;
 ID3D12Resource* stage(int i);
 void set_source(int eye, int stage_index);  // which staging texture this frame's eye is drawn from
+// [XR] EyeShape (eye_shape.h): the eye swapchains' size when it is not the staging textures' (init's w x h).
+void set_dst_size(uint32_t w, uint32_t h);
+// [XR] EyeShape: this frame's eye images. cw x ch: the content, the top-left of each staging texture (the whole of it
+// without the eye shape); iw x ih: the image drawn at the swapchain image's origin (the layer's imageRect). Equal sizes
+// are copied texel for texel; else the content is resampled into the image (the game's 16:9 frame in an eye-shaped
+// swapchain, while the shape is not applied). dw x dh: the scene depth's content behind the image (the round in hand;
+// 0: the whole depth target).
+struct Frame {
+    uint32_t cw, ch, iw, ih, dw, dh;
+};
 // Draws both staging textures into dst[0], dst[1] (in RENDER_TARGET, as acquired) and submits on `queue`. A list's
 // allocator is reused only after the GPU has passed it (fence); if it has not within 50 ms the frame is skipped.
-bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma);
+// frame: nullptr = the whole staging texture into the whole image (the default, without EyeShape).
+bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma, const Frame* frame = nullptr);
+// [XR] EyeShape: the monitor's back buffer `bb` (in PRESENT) repainted with the left eye's content (the top-left cw x ch
+// of its staging texture) scaled to fit and centred (black beside it), in the game's final gamma. The presenting thread,
+// at the frame end, before the UI mirror draws over it.
+bool repaint(ID3D12CommandQueue* queue, ID3D12Resource* bb, uint32_t cw, uint32_t ch, float gamma);
 // The Gamma the game's back-buffer blit reads (PostFx+0x88c), or `def` without a PostFx object.
 float game_gamma(float def);
 // Positive control: a fixed Gamma instead of the game's ("xr gamma <value>"); 0 = the game's again ("xr gamma live").

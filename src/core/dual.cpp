@@ -87,6 +87,7 @@ std::atomic<bool> g_copy_en{false};
 std::atomic<bool> g_same_at_its{true};  // [Hands] DualWieldSameAtItsHolster
 std::atomic<bool> g_own_model{false};  // [Hands] DualWieldOwnModel (run 5 item 2)
 std::atomic<int> g_copy_model{-1};
+std::atomic<bool> g_copy_as_prop{true};  // [Hands] CopyAsProp (run 7 item 1)
 std::atomic<uintptr_t> g_copy_W{0}, g_copy_item{0};  // the game thread's: the gun in hand's W and item while a copy is out
 std::atomic<float> g_copy_clip{0.0f}, g_copy_max{0.0f};  // the copy's own rounds (the frame end's count) and its capacity
 std::atomic<int> g_copy_weapon{-1};
@@ -492,6 +493,7 @@ void init() {
     g_copy_en = config::get_bool("Hands", "DualWieldCopy", false);
     g_own_model = config::get_bool("Hands", "DualWieldOwnModel", false);
     g_same_at_its = config::get_bool("Hands", "DualWieldSameAtItsHolster", true);
+    g_copy_as_prop = config::get_bool("Hands", "CopyAsProp", true);
     log::info("[wield] the copy %d: the free hand at the other hip, a sidearm in hand, takes the same sidearm", g_copy_en.load() ? 1 : 0);
     d3d::add_frame_end_listener([](uint64_t) { frame(); });
 }
@@ -519,6 +521,11 @@ void set_copy_model(int weapon) {
     if (weapon >= 0) log::info("[wield] the copy's model: weapon %d (%s)", weapon, sidearm_fragment(weapon) ? sidearm_fragment(weapon) : "?");
 }
 int copy_model() { return g_copy_model.load(std::memory_order_relaxed); }
+bool copy_as_prop() { return g_copy_as_prop.load(std::memory_order_relaxed); }
+void set_copy_as_prop(bool on, bool save) {
+    if (g_copy_as_prop.exchange(on) != on) log::info("[wield] the copy of the same model shown as a prop of that model: %s", on ? "on" : "off");
+    if (save) config::set("Hands", "CopyAsProp", on ? "1" : "0");
+}
 const char* sidearm_fragment(int weapon) {
     static const char* const kFrag[8] = {"pistol_volcanic01x", "pistol_semiauto01x", "pistol_highpower01x", "pistol_mauser01x",
                                          "revolver_cattleman01x", "revolver_schofield01x", "revolver_doubleaction01x", "revolver_lemat01x"};
@@ -688,6 +695,10 @@ std::string command(const std::string& line) {
             std::string v;
             in >> v;
             g_own_model.store(v != "off");
+        } else if (w == "asprop") {  // dual asprop on|off: CopyAsProp for this session (run 7 item 1)
+            std::string v;
+            in >> v;
+            set_copy_as_prop(v != "off", false);
         } else if (w == "sameits") {  // dual sameits on|off: DualWieldSameAtItsHolster for this session
             std::string v;
             in >> v;

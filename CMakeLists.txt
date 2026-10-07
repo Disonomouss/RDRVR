@@ -40,7 +40,9 @@ add_library(rdrvr_core SHARED
     src/core/camera_lever.cpp
     src/core/dual_pass.cpp
     src/core/draw_masks.asm
+    src/core/exec_gate_thunk.asm
     src/core/eye_grab.cpp
+    src/core/eye_shape.cpp
     src/core/lum_check.cpp
     src/core/burst_grab.cpp
     src/core/taa.cpp
@@ -68,6 +70,7 @@ add_library(rdrvr_core SHARED
     src/core/aim.cpp
     src/core/reload.cpp
     src/core/gestures.cpp
+    src/core/gun_melee.cpp
     src/core/dual.cpp
     src/core/actions.cpp
     src/core/physics.cpp

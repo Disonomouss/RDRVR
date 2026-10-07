@@ -89,6 +89,12 @@ std::atomic<bool> g_aim_raised{true}, g_ready_gate{true};
 std::atomic<bool> g_sprint_drops{true};  // [Hands] SprintDropsAim: on foot, the game's sprint button lets the raised gun's LT go
 float g_sprint_hold_ms = 700.0f;         // [Hands] SprintHoldMs: how long after the last sprint press it stays let go
 double g_sprint_until = 0;
+std::atomic<bool> g_jump_drops{false};  // [Hands] JumpDropsAim (run 7 item 1f, off until the headset round)
+float g_jump_hold_ms = 1500.0f;         // [Hands] JumpHoldMs: LT let go that long from the jump's press (a vault's length)
+double g_jump_until = 0, g_jump_since = 0, g_jump_pulse_until = 0;
+bool g_jump_prev = false, g_jump_pending = false;
+std::atomic<uint64_t> g_jump_presses{0}, g_jump_waits{0};
+std::atomic<float> g_jump_wait_ms{0.0f};
 std::atomic<uint64_t> g_sprint_frames{0};
 std::atomic<bool> g_draw_any{true};     // [Hands] DrawToGrabbingHand
 std::atomic<int> g_draw_hand{-1};       // the controller that drew the gun in hand (-1: the layout's)
@@ -173,6 +179,10 @@ void init() {
     g_sprint_drops = config::get_bool("Hands", "SprintDropsAim", true);
     g_sprint_hold_ms = config::get_float("Hands", "SprintHoldMs", 700.0f);
     g_sprint_hold_ms = g_sprint_hold_ms < 0 ? 0 : g_sprint_hold_ms > 5000 ? 5000 : g_sprint_hold_ms;
+    g_jump_drops = config::get_bool("Hands", "JumpDropsAim", false);
+    g_jump_hold_ms = config::get_float("Hands", "JumpHoldMs", 1500.0f);
+    g_jump_hold_ms = !(g_jump_hold_ms >= 0) ? 0 : g_jump_hold_ms > 5000 ? 5000 : g_jump_hold_ms;
+    log::info("[controls] a jump with a gun in hand lets the aim go first (JumpDropsAim) %d, for %.0f ms", g_jump_drops.load() ? 1 : 0, g_jump_hold_ms);
     g_draw_any = config::get_bool("Hands", "DrawToGrabbingHand", true);
     g_ready_gate = config::get_bool("Hands", "TriggerAimReady", true);
     g_aim_tail_ms = config::get_float("Hands", "TriggerAimTailMs", 500.0f);
@@ -379,8 +389,36 @@ bool pad(xinput::PadState* out) {
         // still aims and fires; riding, A spurs and the stance stays.
         if (!riding && (p.buttons & XINPUT_GAMEPAD_A)) g_sprint_until = now + g_sprint_hold_ms;
         const bool sprint = !riding && g_sprint_drops.load(std::memory_order_relaxed) && now < g_sprint_until;
+        // [Hands] JumpDropsAim (run 7 item 1f): with a gun in hand the game takes no jump from its aim stance (the
+        // simulator: the press reached the game, the aim pose dropped, no jump; with the fists the same press jumped).
+        // The game's jump (X, from whichever button drives it) on foot with a gun: LT let go from the press for
+        // JumpHoldMs, and the press itself held back until the aim pose is down (at most 250 ms), then sent as a pulse
+        // of 150 ms (a tap shorter than the wait is not lost).
+        {
+            const bool x = (p.buttons & XINPUT_GAMEPAD_X) != 0;
+            const bool on = !riding && gun && g_jump_drops.load(std::memory_order_relaxed);
+            if (on && x && !g_jump_prev && !g_jump_pending && now >= g_jump_pulse_until) {
+                g_jump_until = now + g_jump_hold_ms;
+                g_jump_pending = true;
+                g_jump_since = now;
+                g_jump_presses.fetch_add(1, std::memory_order_relaxed);
+            }
+            g_jump_prev = x;
+            if (g_jump_pending) {
+                if (!holster::aim_pose() || now - g_jump_since >= 250.0) {
+                    g_jump_pending = false;
+                    g_jump_pulse_until = now + 150.0;
+                    g_jump_waits.fetch_add(1, std::memory_order_relaxed);
+                    g_jump_wait_ms.store(static_cast<float>(now - g_jump_since), std::memory_order_relaxed);
+                } else {
+                    p.buttons &= static_cast<WORD>(~XINPUT_GAMEPAD_X);  // held back while the aim pose is up
+                }
+            }
+            if (now < g_jump_pulse_until) p.buttons |= XINPUT_GAMEPAD_X;
+        }
+        const bool jump = !riding && g_jump_drops.load(std::memory_order_relaxed) && now < g_jump_until;
         const bool raised = base && g_aim_raised.load(std::memory_order_relaxed) && (g_aims_riding.load(std::memory_order_relaxed) || !riding) &&
-                            holster::gun_raised() && !sprint;
+                            holster::gun_raised() && !sprint && !jump;
         if (sprint && base && holster::gun_raised()) g_sprint_frames.fetch_add(1, std::memory_order_relaxed);
         if (raised) g_raised_frames.fetch_add(1, std::memory_order_relaxed);
         auto stop = [&] {
@@ -398,7 +436,7 @@ bool pad(xinput::PadState* out) {
                 }
                 g_aim_until = now + g_aim_tail_ms;  // two-handed or raised: the tail runs from when it ends
             }
-            if (!pulled && (holster::gun_at_zone() || sprint) && g_aim_until > now) g_aim_until = now;  // into a holster, or sprinting: no tail
+            if (!pulled && (holster::gun_at_zone() || sprint || jump) && g_aim_until > now) g_aim_until = now;  // into a holster, sprinting, jumping: no tail
             // held while pulled, two-handed, the tail, and never let go in Dead Eye (that fires the marks)
             if (g_aim_inj && (two || raised || pulled || now < g_aim_until || de)) {
                 lt = 1.0f;
@@ -510,6 +548,11 @@ void set_aim_when_raised(bool on, bool save) {
     g_aim_raised = on;
     if (save) config::set("Hands", "AimWhenRaised", on ? "1" : "0");
 }
+bool jump_drops_aim() { return g_jump_drops.load(); }
+void set_jump_drops_aim(bool on, bool save) {
+    if (g_jump_drops.exchange(on) != on) log::info("[controls] a jump with a gun in hand lets the aim go first: %d", on ? 1 : 0);
+    if (save) config::set("Hands", "JumpDropsAim", on ? "1" : "0");
+}
 bool sprint_drops_aim() { return g_sprint_drops.load(); }
 void set_sprint_drops_aim(bool on, bool save) {
     g_sprint_drops = on;
@@ -558,7 +601,8 @@ void status_text(char* out, size_t len) {
     std::snprintf(out, len,
                   "controls: %s, frames %llu, last pad buttons %#06x LT %u RT %u L (%d %d) R (%d %d), starts %llu, menu toggles %llu, "
                   "left-handed %d, chord %d, click brake %d (route %d, brakes %llu), trigger aims %d (injects %llu, RT held back %llu frames, "
-                  "aim pose %d, fire-ready %d, raised %d (frames %llu), LT tail frames %llu, let go for a sprint %llu frames)",
+                  "aim pose %d, fire-ready %d, raised %d (frames %llu), LT tail frames %llu, let go for a sprint %llu frames) | jump drops aim %d: "
+                  "presses %llu, sent %llu (the last after %.0f ms)",
                   g_was_in_use ? "in use" : "idle", static_cast<unsigned long long>(g_frames_in_use.load()), p.buttons, p.lt, p.rt, p.lx,
                   p.ly, p.rx, p.ry, static_cast<unsigned long long>(g_starts.load()), static_cast<unsigned long long>(g_toggles.load()),
                   g_left_handed.load() ? 1 : 0, g_menu_chord_on ? 1 : 0, g_click_brake.load() ? 1 : 0, g_click_route,
@@ -566,7 +610,8 @@ void status_text(char* out, size_t len) {
                   static_cast<unsigned long long>(g_aim_injects.load()), static_cast<unsigned long long>(g_rt_held.load()),
                   holster::aim_pose() ? 1 : 0, holster::fire_ready() ? 1 : 0, holster::gun_raised() ? 1 : 0,
                   static_cast<unsigned long long>(g_raised_frames.load()), static_cast<unsigned long long>(g_aim_tail_frames.load()),
-                  static_cast<unsigned long long>(g_sprint_frames.load()));
+                  static_cast<unsigned long long>(g_sprint_frames.load()), g_jump_drops.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_jump_presses.load()), static_cast<unsigned long long>(g_jump_waits.load()), g_jump_wait_ms.load());
 }
 
 }  // namespace rdrvr::controls

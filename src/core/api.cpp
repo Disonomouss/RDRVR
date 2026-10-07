@@ -7,12 +7,16 @@
 #include <deque>
 #include <unordered_map>
 
+#include "core/gun_melee.h"
 #include "core/log.h"
 
 namespace rdrvr::api {
 namespace {
 
 SRWLOCK g_lock = SRWLOCK_INIT;
+// v7: the plugin's tick, open from on_script_tick to end_script_tick, on the thread that reported it
+std::atomic<bool> g_in_tick{false};
+std::atomic<DWORD> g_tick_thread{0};
 CONDITION_VARIABLE g_cv = CONDITION_VARIABLE_INIT;
 std::deque<RdrvrNativeRequest> g_requests;
 std::unordered_map<uint64_t, RdrvrNativeResult> g_results;
@@ -34,6 +38,8 @@ void api_log(int level, const char* text) {
 
 void api_on_script_tick(uint64_t tick, double /*script_ms*/) {
     if (!g_attached.exchange(true)) log::info("[api] gameplay plugin attached; first script tick %llu", tick);
+    g_tick_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_in_tick.store(true, std::memory_order_release);
     g_ticks.store(tick, std::memory_order_relaxed);
     g_last_tick_ms.store(log::now_ms(), std::memory_order_relaxed);
     int n = g_watch_count.load(std::memory_order_acquire);
@@ -92,9 +98,14 @@ void api_post_actor_state(const RdrvrActorState* st) {
     ReleaseSRWLockExclusive(&g_cam_lock);
 }
 
+static_assert(sizeof(RdrvrGunMeleeArgs) == sizeof(RdrvrNativeRequest::args), "the gun melee's arguments are copied over args");
+int api_gun_melee_hit(const RdrvrMeleeHit* hit) { return gun_melee::hit(hit); }
+
+void api_end_script_tick(uint64_t /*tick*/) { g_in_tick.store(false, std::memory_order_release); }
+
 const RdrvrApi g_api = {
     RDRVR_API_VERSION, api_log, api_on_script_tick, api_pop_native_request, api_post_native_result,
-    api_get_camera_job, api_post_actor_state,
+    api_get_camera_job, api_post_actor_state, api_gun_melee_hit, api_end_script_tick,
 };
 
 }  // namespace
@@ -146,9 +157,26 @@ bool wait_native(uint64_t id, RdrvrNativeResult* out, uint32_t timeout_ms) {
     return false;
 }
 
+bool cancel_op(uint64_t id) {
+    AcquireSRWLockExclusive(&g_lock);
+    bool removed = false;
+    for (auto it = g_requests.begin(); it != g_requests.end(); ++it)
+        if (it->id == id) {
+            g_requests.erase(it);
+            removed = true;
+            break;
+        }
+    if (!removed) g_results.erase(id);  // already answered and not read: dropped too
+    ReleaseSRWLockExclusive(&g_lock);
+    return removed;
+}
+
 uint64_t script_ticks() { return g_ticks.load(std::memory_order_relaxed); }
 double last_script_tick_ms() { return g_last_tick_ms.load(std::memory_order_relaxed); }
 bool plugin_attached() { return g_attached.load(); }
+bool in_script_tick() {
+    return g_in_tick.load(std::memory_order_acquire) && g_tick_thread.load(std::memory_order_relaxed) == GetCurrentThreadId();
+}
 
 void set_camera_job(const RdrvrCameraJob& job) {
     AcquireSRWLockExclusive(&g_cam_lock);

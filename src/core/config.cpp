@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -102,6 +103,10 @@ void set_user_path(const wchar_t* path) {
 
 bool set(const char* section, const char* key, const std::string& value) {
     if (!g_user_path[0]) return false;
+    // one writer at a time: the menu, the test channel and the grips' saves each read, rewrite and rename the user file
+    // through one .tmp (run 7 item 6's review)
+    static std::mutex s_write;
+    std::lock_guard write_lock(s_write);
     // read the user file's lines; replace the key's line in its section, or add it (and the section) at the end
     std::vector<std::string> lines;
     if (FILE* f = nullptr; _wfopen_s(&f, g_user_path, L"rb") == 0 && f) {

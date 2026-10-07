@@ -14,6 +14,7 @@
 #include "core/camera_lever.h"
 #include "core/config.h"
 #include "core/d3d_hooks.h"
+#include "core/eye_shape.h"
 #include "core/ring_probe.h"
 #include "core/hooks.h"
 #include "core/taa.h"
@@ -224,7 +225,18 @@ void ring_set(const Ring& r) {
     global<int>(Id::LumRingY) = r.y;
 }
 
+void post_run(void* postfx, int arg);
+
+// [XR] EyeShape (eye_shape.h): the post output's logical size is the eye's for this run only (both eyes' runs come
+// through here: first_eye_post calls the vtable's +0x30, RenderFrame its own), so the UI pass after it sees W x H.
 void hk_PostRun(void* postfx, int arg) {
+    eye_shape::RunPoke shape;
+    eye_shape::begin_run(postfx, &shape);
+    post_run(postfx, arg);
+    eye_shape::end_run(postfx, shape);
+}
+
+void post_run(void* postfx, int arg) {
     bool second = t_pass == 0 && t_exposure_kept;  // RenderFrame's own run after a first-eye run that kept its exposure
     bool frame_end = t_pass == 0 && t_double;       // the double frame's last post run
     if (t_pass == 0) t_exposure_kept = false;

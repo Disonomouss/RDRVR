@@ -46,9 +46,10 @@ void set_held(int john_hand, int family);
 // The presenting thread, in xr_blit::blit's list after both eye images are drawn (the list's allocator slot `slot`,
 // whose previous use the GPU has passed): the round into each eye's swapchain image dst[e] (RENDER_TARGET, its RTV
 // rtv[e]). Changes the list's state (root signature, heaps, pipeline, targets): nothing may be drawn after it without
-// setting its own.
+// setting its own. [XR] EyeShape: vw x vh, the eye image at the swapchain image's origin (0: all of w x h), and dw x dh,
+// the scene depth's content behind it (0: the whole depth target).
 void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* const dst[2], const D3D12_CPU_DESCRIPTOR_HANDLE rtv[2],
-            uint32_t w, uint32_t h, DXGI_FORMAT fmt, int slot);
+            uint32_t w, uint32_t h, DXGI_FORMAT fmt, int slot, uint32_t vw = 0, uint32_t vh = 0, uint32_t dw = 0, uint32_t dh = 0);
 
 // [Reload] ShowAmmo (off; run 6 item 6b): while a round could go in now (the holsters say), a row of `n` rounds of the
 // gun's family (as set_held's) standing at the chest's ammo zone `at`, side by side along the body's right (world:

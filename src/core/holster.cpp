@@ -304,6 +304,7 @@ std::atomic<bool> g_consumed[2] = {false, false};
 std::atomic<bool> g_wanted[2] = {false, false};  // grip_wanted: as of the last frame end
 float g_grip_on = 0.6f;
 std::atomic<uint64_t> g_draws{0}, g_puts{0}, g_entries{0};
+std::atomic<uint64_t> g_twin_hidden{0};  // run 7 item 1b: frames a twin hip hid the gun its partner shows
 // the frame end's last view, for the status line
 struct HolsterDiag {
     bool valid = false;
@@ -485,6 +486,12 @@ void holster_frame() {
     static int slot_weapon[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     static int zone_last[kZones] = {-1, -1, -1, -1, -1, -1, -1, -1};  // the gun each zone drew last (a twin keeps its own)
     static int drawn_from = -1;  // the zone of the last draw (round 13 item 10: the gun in hand's own holster)
+    static int put_zone_of[kWeapons];  // run 7 item 1b: the zone each gun was last put away in (-1: not known)
+    static const bool put_zone_init = [] {
+        for (int& z : put_zone_of) z = -1;
+        return true;
+    }();
+    (void)put_zone_init;
     controls::commit_draw_hand(st.weapon, in_hand != 0);  // a draw by the other hand: its hand once the gun is in it
     if (in_hand && cur >= 0 && cur < 8 && st.weapon >= 0 && st.weapon < kWeapons) slot_weapon[cur] = st.weapon;
     // a gun goes back to the holster that chose it; else to any holster of its slot
@@ -746,7 +753,7 @@ void holster_frame() {
             // round 13 item 10 ([Hands] DualWieldSameAtItsHolster): the gun in hand's own holster gives its own model
             const bool its_own = dual::same_at_its_holster() && drawn_from == in_z[h] && zone_last[in_z[h]] == st.weapon;
             if (its_own) {
-                dual::set_copy_model(-1);
+                dual::set_copy_model(dual::copy_as_prop() ? st.weapon : -1);  // run 7 item 1: its own model as a prop
                 log::info("[wield] %s hand at the %s, the %s's own holster: a second %s", h ? "right" : "left", z.key, kWeaponLabel[st.weapon],
                           kWeaponLabel[st.weapon]);
             } else {  // [Hands] DualWieldOwnModel: the copy's model, the hip's weapon if another owned sidearm, else the first owned revolver
@@ -754,7 +761,9 @@ void holster_frame() {
                 int other = own(z.weapon) ? z.weapon : -1;
                 static const int kPref[8] = {4, 5, 6, 7, 0, 1, 2, 3};
                 for (int w : kPref)
-                    if (other < 0 && own(w)) other = w;
+                    if (other < 0 && dual::own_model() && own(w)) other = w;
+                if (!dual::own_model()) other = -1;
+                if (other < 0 && dual::copy_as_prop()) other = st.weapon;  // run 7 item 1: the same model, as a prop
                 dual::set_copy_model(other);
             }
             dual::begin(h, jh, dual::kCopySlot, z.key);
@@ -916,6 +925,7 @@ void holster_frame() {
                 const uint64_t args[1] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor))};
                 api::queue_native(kPutItemAway, args, 1, 0, nullptr);
                 g_puts.fetch_add(1, std::memory_order_relaxed);
+                if (st.weapon >= 0 && st.weapon < kWeapons) put_zone_of[st.weapon] = in_z[h];  // item 1b: where it was put away
                 const bool fists = g_unarmed.load(std::memory_order_relaxed);
                 if (fists) {
                     const uint64_t m[2] = {1, 1};
@@ -986,7 +996,7 @@ void holster_frame() {
         const bool shell = rh >= 0 && round_draw::mode() == 2 && audio::click_family(st.weapon) == 3 && round_draw::pose(bp, rh, pz);
         held_prop::want(0, shell ? "p_gen_shellshotgun01x" : nullptr, pz);
         // the copy's own model (body.cpp wants it at each placement while the copy is out with another model)
-        if (!dual::own_model() || !dual::copy_W() || !dual::sidearm_fragment(dual::copy_model())) held_prop::want(1, nullptr, nullptr);
+        if (!dual::copy_W() || !dual::sidearm_fragment(dual::copy_model())) held_prop::want(1, nullptr, nullptr);
         // [Holsters] ShowGuns: each gun zone's gun at it (the gun it draws; automatic: its slot's last gun in hand, else
         // the highest owned of its slot), none while that gun is in a hand (the gun in hand, the second gun)
         const bool show = g_show_guns.load(std::memory_order_relaxed);
@@ -1004,20 +1014,34 @@ void holster_frame() {
             int gw = -1;
             if (show && zok[zi] && (show_back || (i != 1 && i != 3))) {  // 1, 3: the back, the left shoulder
                 gw = draw_weapon(zi);
-                const bool chosen = gw >= 0;
                 const int s0 = zones[zi].slots[0];
                 if (gw < 0 && s0 >= 0 && s0 < 8) gw = slot_weapon[s0];
                 if (gw < 0 && choosing)
                     for (int w = kWeapons - 1; w >= 0 && gw < 0; --w)
                         if (owns(w) && st.equip_slot[w] == s0) gw = w;
-                // a twin's automatic gun is not the one its partner shows (one sidearm owned: one hip shows it)
-                const int ptn = zones[zi].partner;
-                for (int j = 0; j < i && !chosen; ++j)
-                    if (kShowZones[j] == ptn && shown_w[j] == gw) gw = -1;
                 if ((in_hand && gw == st.weapon) || (ds.on && gw == ds.weapon)) gw = -1;
-                if (ds.on && ds.copy && dual::own_model() && gw == dual::copy_model()) gw = -1;  // the copy shows that model
+                if (ds.on && ds.copy && gw == dual::copy_model()) gw = -1;  // the copy shows that model
             }
             shown_w[i] = gw;
+        }
+        // run 7 item 1b: twins never show the same gun (one sidearm owned: one hip shows it). Before, only a twin's
+        // automatic gun was checked against its partner's, so a twin's own last gun (draw_weapon) could be the gun its
+        // partner shows by its slot's fallback (one sidearm, last drawn from the left hip: both hips showed it). The
+        // hip it was last put away in keeps it, else the one that has it by choice or by its own last draw, else the
+        // first; the other shows nothing. (The table names the partner on the left twin only.)
+        for (int i = 0; i < 4; ++i)
+            for (int j = i + 1; j < 4; ++j) {
+                const int zi = kShowZones[i], zj = kShowZones[j], gw = shown_w[i];
+                if (gw < 0 || gw != shown_w[j] || (zones[zi].partner != zj && zones[zj].partner != zi)) continue;
+                auto has = [&](int z) { return zones[z].weapon == gw || zone_last[z] == gw; };
+                const int put = gw < kWeapons ? put_zone_of[gw] : -1;
+                const bool keep_i = put == zi ? true : put == zj ? false : has(zi) || !has(zj);
+                shown_w[keep_i ? j : i] = -1;
+                g_twin_hidden.fetch_add(1, std::memory_order_relaxed);
+            }
+        for (int i = 0; i < 4; ++i) {
+            const int zi = kShowZones[i];
+            const int gw = shown_w[i];
             const char* frag = gw >= 0 ? gun_fragment(gw) : nullptr;
             float gp[12];
             if (frag) {
@@ -1557,6 +1581,7 @@ void set_foregrip_snap(bool on, bool save) {
     if (save) config::set("Reload", "TwoHandedSnap", on ? "1" : "0");
 }
 const char* weapon_label(int w) { return w >= 0 && w < kWeapons ? kWeaponLabel[w] : ""; }
+const char* weapon_token(int w) { return w >= 0 && w < kWeapons ? kWeaponToken[w] : ""; }
 bool weapon_choice() { return g_weapon_choice.load(); }
 void set_weapon_choice(bool on) {
     g_weapon_choice = on;
@@ -1791,7 +1816,8 @@ std::string command(const std::string& line) {
                           static_cast<unsigned long long>(g_show_diag.over[i]));
             o += b;
         }
-        std::snprintf(b, sizeof(b), " | frames %llu", static_cast<unsigned long long>(g_show_diag.frames));
+        std::snprintf(b, sizeof(b), " | frames %llu | twins hidden %llu", static_cast<unsigned long long>(g_show_diag.frames),
+                      static_cast<unsigned long long>(g_twin_hidden.load()));
         return o + b;
     }
     if (v == "gun") {  // holster gun: the gun in hand's adjustments in effect (round 13 item 8), its own or every gun's

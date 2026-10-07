@@ -1004,6 +1004,7 @@ HeldSample g_copy_ring[4];
 size_t g_copy_next = 0;
 std::atomic<uint32_t> g_copy_ring_seq{0};
 std::atomic<uint64_t> g_copy_placements{0}, g_copy_refused{0}, g_copy_draws{0}, g_copy_nomatch{0};
+std::atomic<uint32_t> g_copy_by_pass[8] = {}, g_copy_stale_by_pass[8] = {};  // run 7 item 1: the copy's draws, as the held gun's
 std::atomic<int> g_copy_why{0};
 std::atomic<uint64_t> g_sec_near{0};  // draws within 0.3 m of the second gun's newest sample, matched to none
 std::atomic<uintptr_t> g_sec_drawable{0};  // the second gun's drawable (rec[0x10]), learned from its exactly matched draws
@@ -3153,7 +3154,7 @@ bool place_copy(uintptr_t W, const float* P, int j) {
     // [Hands] DualWieldOwnModel (run 5 item 2): the other sidearm's model held at C (held_prop slot 1, its draw moved onto
     // C); the shot moved on by the two models' muzzles' difference (the gun in hand's muzzle locator, W +0x338 -> [0] when
     // L +0x140 is set: an offset from bone [+0x20], the root: the model's axes; the other's from dual's table)
-    if (dual::own_model()) {
+    if (dual::copy_model() >= 0) {  // another model (DualWieldOwnModel) or the same one (CopyAsProp): a held prop
         const char* frag = dual::sidearm_fragment(dual::copy_model());
         float pose[12];
         for (int r = 0; r < 4; ++r)
@@ -3183,6 +3184,253 @@ bool place_copy(uintptr_t W, const float* P, int j) {
     g_copy_placements.fetch_add(1, std::memory_order_relaxed);
     dual::note_copy_placed(W, T);
     return true;
+}
+
+// Run 7 item 1c ([Hands] FixedGunGrip, off): the long gun held in the drawn hand as the game holds it while aiming. The
+// placed gun's relation to the drawn wrist is the game's gun in its animated wrist (the hand's correction is rigid), and
+// the game changes that between its aiming pose (the gun held by its grip) and its lowered and carry poses (held
+// higher: the user's grip captures, research\round13\grip-*.jpg). Each long gun's aiming relation (the gun in the
+// animated wrist's frame, rel = G W^-1 in row vectors) is learned while the game aims and steady, kept for the session
+// and saved in the user ini ([Grips] GunHand.<weapon>), and the gun placed with it in every pose: G' = rel W. Before a
+// gun's is learned: the built-in (measured in the simulator), else the last learned on any long gun (the template),
+// else the game's own. The muzzle, the barrel ray, the shots, the copy and the second gun follow the placed gun.
+std::atomic<bool> g_fixed_grip{false};
+struct GunRel {
+    bool valid = false;
+    float m[16] = {};  // the gun in the animated wrist's frame (rows: the axes, then the position)
+};
+GunRel g_gun_rel[kGripW];    // learned per eWeapon (game thread; copied out under g_fg_mutex)
+GunRel g_gun_rel_tpl;        // the last learned on any long gun
+std::mutex g_fg_mutex;
+struct FixedGripDiag {
+    int weapon = -1, aiming = 0, src = -1, side = -1;  // src: 0 learned, 1 built-in, 2 template, 3 the game's, -1 off
+    float now[16] = {};      // the game's gun in the animated wrist this update
+    float placed[16] = {};   // the placed gun in the drawn wrist (the correction's map of the animated one)
+    float aim_max_mm = 0, aim_max_deg = 0, low_max_mm = 0, low_max_deg = 0;  // the game's, against the learned, by pose
+    float placed_max_mm = 0, placed_max_deg = 0;  // the placed relation against the learned (fixed: ~0)
+    uint64_t learns = 0, fixed = 0, frames = 0, saved = 0;
+    float wrist_pos[3] = {}, gun_pos[3] = {}, att_pos[3] = {};  // the raw positions read (the matrices' spaces)
+    int why = 0;  // the last early return: 1 no wrist bone, 2 the wrist not read, 3 not rigid, 4 not a long gun
+};
+FixedGripDiag g_fg_diag;
+std::atomic<uint64_t> g_fg_aim_frames{0};
+bool is_long_gun_w(int w) { return w >= 8 && w <= 20; }
+bool rigid_axes(const float* m) {  // the three axis rows unit and orthogonal (the position anywhere)
+    for (int i = 0; i < 3; ++i) {
+        const float* a = m + i * 4;
+        const float l = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+        if (!(l > 0.98f && l < 1.02f)) return false;
+        for (int j = i + 1; j < 3; ++j) {
+            const float* b = m + j * 4;
+            if (!(std::fabs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) < 0.02f)) return false;
+        }
+    }
+    return std::isfinite(m[12]) && std::isfinite(m[13]) && std::isfinite(m[14]);
+}
+void rel_diff(const float* a, const float* b, float* mm, float* deg) {  // position (mm) and turn (degrees) between two frames
+    const float dx = a[12] - b[12], dy = a[13] - b[13], dz = a[14] - b[14];
+    *mm = 1000.0f * std::sqrt(dx * dx + dy * dy + dz * dz);
+    float tr = 0;  // trace of Ra Rb^T (rows are the axes)
+    for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 3; ++k) tr += a[r * 4 + k] * b[r * 4 + k];
+    const float c = std::fmax(-1.0f, std::fmin(1.0f, (tr - 1.0f) * 0.5f));
+    *deg = std::acos(c) * 57.29578f;
+}
+void ortho_rows(float* m) {  // Gram-Schmidt on the three axis rows (after a blend)
+    float* x = m;
+    float* y = m + 4;
+    float* z = m + 8;
+    auto norm = [](float* v) {
+        const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (l > 1e-6f)
+            for (int k = 0; k < 3; ++k) v[k] /= l;
+    };
+    norm(x);
+    const float d = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    for (int k = 0; k < 3; ++k) y[k] -= d * x[k];
+    norm(y);
+    z[0] = x[1] * y[2] - x[2] * y[1];
+    z[1] = x[2] * y[0] - x[0] * y[2];
+    z[2] = x[0] * y[1] - x[1] * y[0];
+}
+// the built-in aiming relations, measured in the simulator (none yet: filled from item 1c's measurement)
+bool builtin_gun_rel(int w, float* out) {
+    (void)w;
+    (void)out;
+    return false;
+}
+// the learned holds saved: once a session per gun, and only with FixedGunGrip on (run 7 item 6's review: off, the hook
+// wrote the user ini on every re-equip)
+std::atomic<bool> g_gun_rel_saved[holster::kWeapons] = {};
+struct GunRelSave {
+    int w;
+    float m[16];
+};
+void save_gun_rel(int w, const float* m);
+DWORD WINAPI save_gun_rel_work(void* p) {  // a thread-pool work item: the ini written off the game thread
+    GunRelSave* s = static_cast<GunRelSave*>(p);
+    save_gun_rel(s->w, s->m);
+    delete s;
+    return 0;
+}
+void save_gun_rel(int w, const float* m) {
+    if (w < 0 || w >= holster::kWeapons) return;
+    char b[400];
+    std::snprintf(b, sizeof(b), "%.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f", m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9],
+                  m[10], m[12], m[13], m[14]);
+    config::set("Grips", (std::string("GunHand.") + holster::weapon_token(w)).c_str(), b);
+}
+void load_gun_rels() {
+    for (int w = 8; w <= 20; ++w) {
+        const std::string s = config::get_string("Grips", (std::string("GunHand.") + holster::weapon_token(w)).c_str(), "");
+        float v[12];
+        if (s.empty() || sscanf_s(s.c_str(), "%f %f %f %f %f %f %f %f %f %f %f %f", v, v + 1, v + 2, v + 3, v + 4, v + 5, v + 6, v + 7, v + 8,
+                                     v + 9, v + 10, v + 11) != 12)
+            continue;
+        GunRel& g = g_gun_rel[w];
+        const int map[12] = {0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14};
+        std::memset(g.m, 0, sizeof(g.m));
+        for (int i = 0; i < 12; ++i) g.m[map[i]] = v[i];
+        g.m[15] = 1.0f;
+        ortho_rows(g.m);
+        g.valid = rigid_axes(g.m) && g.m[12] * g.m[12] + g.m[13] * g.m[13] + g.m[14] * g.m[14] < 1.0f;
+        if (g.valid) log::info("[body] FixedGunGrip: the %s's aiming hold read from the user ini", holster::weapon_token(w));
+    }
+}
+// The game thread (hk_obj_set_matrix): src (the game's gun, this update) replaced by the aiming hold at the animated
+// wrist when [Hands] FixedGunGrip is on and the gun is a long gun; always measured (the readback).
+void fixed_grip(int side, float* src) {
+    const uintptr_t skel = g_skel_game.load(std::memory_order_relaxed);
+    const int wi = side >= 0 && side < 2 ? g_rig.wrist[side] : -1;
+    uintptr_t mtx = 0;
+    alignas(16) float Wr[16], Wi[16], rel[16], Ab[16];
+    auto fail = [](int why) {
+        std::lock_guard lock(g_fg_mutex);
+        g_fg_diag.why = why;
+    };
+    if (wi < 0 || !skel) return fail(1);
+    if (!raw(skel + 0x28, &mtx, sizeof(mtx)) || !mtx || !raw(mtx + static_cast<uintptr_t>(wi) * 0x40, Wr, sizeof(Wr))) return fail(2);
+    const int ab = g_att_bone[side].load(std::memory_order_relaxed);
+    const bool ab_ok = ab >= 0 && raw(mtx + static_cast<uintptr_t>(ab) * 0x40, Ab, sizeof(Ab));
+    // affine 4x3: the game keeps other data in the fourth column (src [3] [7] [11]), so the products take it as 0 0 0 1
+    alignas(16) float S[16];
+    std::memcpy(S, src, sizeof(S));
+    S[3] = S[7] = S[11] = 0.0f;
+    S[15] = 1.0f;
+    Wr[3] = Wr[7] = Wr[11] = 0.0f;
+    Wr[15] = 1.0f;
+    if (!rigid_axes(Wr) || !inv44(Wr, Wi)) return fail(3);
+    RdrvrActorState ws{};
+    const int w = api::actor_state(&ws) && ws.valid ? ws.weapon : -1;
+    if (!is_long_gun_w(w)) return fail(4);
+    mul44r(S, Wi, rel);
+    const bool aiming = holster::aim_pose() || aim::aiming();  // the gun controller's aim pose (G +0x5d6 & 0x40), or the zoom
+    const uint64_t af = aiming ? g_fg_aim_frames.fetch_add(1, std::memory_order_relaxed) + 1 : (g_fg_aim_frames.store(0), 0);
+    std::lock_guard lock(g_fg_mutex);
+    FixedGripDiag& d = g_fg_diag;
+    if (d.weapon != w) {
+        d = FixedGripDiag{};
+        d.weapon = w;
+    }
+    ++d.frames;
+    d.aiming = aiming ? 1 : 0;
+    d.side = side;
+    d.why = 0;
+    std::memcpy(d.now, rel, sizeof(rel));
+    for (int k = 0; k < 3; ++k) {
+        d.wrist_pos[k] = Wr[12 + k];
+        d.gun_pos[k] = src[12 + k];
+        d.att_pos[k] = ab_ok ? Ab[12 + k] : 0.0f;
+    }
+    GunRel& g = g_gun_rel[w];
+    if (aiming && af > 20 && rigid_axes(rel) && rel[12] * rel[12] + rel[13] * rel[13] + rel[14] * rel[14] < 1.0f) {  // steady aiming: learn (an easing)
+        if (!g.valid) {
+            std::memcpy(g.m, rel, sizeof(rel));
+            g.valid = true;
+        } else {
+            for (int i = 0; i < 15; ++i) g.m[i] += 0.1f * (rel[i] - g.m[i]);
+            ortho_rows(g.m);
+        }
+        g_gun_rel_tpl = g;
+        if (++d.learns == 60 && g_fixed_grip.load(std::memory_order_relaxed) && !g_gun_rel_saved[w].exchange(true)) {
+            // a second of aiming, the switch on: saved once a session per gun, written by a work item (no file I/O here)
+            GunRelSave* s = new GunRelSave{w, {}};
+            std::memcpy(s->m, g.m, sizeof(s->m));
+            if (QueueUserWorkItem(save_gun_rel_work, s, WT_EXECUTEDEFAULT)) {
+                ++d.saved;
+            } else {
+                delete s;
+                g_gun_rel_saved[w] = false;
+            }
+        }
+    }
+    float ref[16];
+    int src_kind = 3;
+    if (g.valid) {
+        std::memcpy(ref, g.m, sizeof(ref));
+        src_kind = 0;
+    } else if (builtin_gun_rel(w, ref)) {
+        src_kind = 1;
+    } else if (g_gun_rel_tpl.valid) {
+        std::memcpy(ref, g_gun_rel_tpl.m, sizeof(ref));
+        src_kind = 2;
+    }
+    if (src_kind < 3) {
+        float mm = 0, deg = 0;
+        rel_diff(rel, ref, &mm, &deg);
+        float& m1 = aiming ? d.aim_max_mm : d.low_max_mm;
+        float& d1 = aiming ? d.aim_max_deg : d.low_max_deg;
+        m1 = std::fmax(m1, mm);
+        d1 = std::fmax(d1, deg);
+        // for the headset's logs: the game's hold slid off the aiming hold (at most a line every 5 s)
+        static double last_log = 0;
+        const double now = log::now_ms();
+        if ((mm > 10.0f || deg > 5.0f) && now - last_log > 5000.0) {  // at most a line every 5 s
+            last_log = now;
+            log::info("[grip] the %s's hold in the wrist %.1f mm and %.1f deg off its aiming hold (src %d): aiming %d, fixed %d",
+                      holster::weapon_token(w), mm, deg, src_kind, aiming ? 1 : 0, g_fixed_grip.load() ? 1 : 0);
+        }
+    }
+    d.src = g_fixed_grip.load(std::memory_order_relaxed) ? src_kind : -1;
+    if (d.src >= 0 && d.src < 3 && rigid_axes(ref)) {
+        ref[3] = ref[7] = ref[11] = 0.0f;
+        ref[15] = 1.0f;
+        alignas(16) float out[16];
+        mul44r(ref, Wr, out);  // the gun at the animated wrist as the aiming pose holds it
+        for (int r = 0; r < 4; ++r)
+            for (int k = 0; k < 3; ++k) src[r * 4 + k] = out[r * 4 + k];  // the game's fourth column kept
+        ++d.fixed;
+    }
+}
+void fixed_grip_placed(int side, const float* A, const double* ad, const float* placed) {  // the placed gun in the drawn wrist's frame
+    const uintptr_t skel = g_skel_game.load(std::memory_order_relaxed);
+    const int wi = side >= 0 && side < 2 ? g_rig.wrist[side] : -1;
+    uintptr_t mtx = 0;
+    alignas(16) float Wr[16], D[16], Di[16], rel[16], P[16];
+    if (wi < 0 || !skel || !raw(skel + 0x28, &mtx, sizeof(mtx)) || !mtx || !raw(mtx + static_cast<uintptr_t>(wi) * 0x40, Wr, sizeof(Wr)))
+        return;
+    std::memcpy(P, placed, sizeof(P));
+    P[3] = P[7] = P[11] = 0.0f;  // affine (as fixed_grip)
+    P[15] = 1.0f;
+    for (int i = 0; i < 3; ++i) {  // the drawn wrist: the correction's map of the animated one (as the gun's)
+        for (int k = 0; k < 3; ++k) D[i * 4 + k] = A[k * 3] * Wr[i * 4] + A[k * 3 + 1] * Wr[i * 4 + 1] + A[k * 3 + 2] * Wr[i * 4 + 2];
+        D[i * 4 + 3] = 0.0f;
+    }
+    for (int k = 0; k < 3; ++k)
+        D[12 + k] = static_cast<float>(static_cast<double>(A[k * 3]) * Wr[12] + static_cast<double>(A[k * 3 + 1]) * Wr[13] +
+                                       static_cast<double>(A[k * 3 + 2]) * Wr[14] + ad[k]);
+    D[15] = 1.0f;
+    if (!inv44(D, Di)) return;
+    mul44r(P, Di, rel);
+    std::lock_guard lock(g_fg_mutex);
+    FixedGripDiag& d = g_fg_diag;
+    std::memcpy(d.placed, rel, sizeof(rel));
+    if (d.weapon >= 0 && d.weapon < kGripW && g_gun_rel[d.weapon].valid) {
+        float mm = 0, deg = 0;
+        rel_diff(rel, g_gun_rel[d.weapon].m, &mm, &deg);
+        d.placed_max_mm = std::fmax(d.placed_max_mm, mm);
+        d.placed_max_deg = std::fmax(d.placed_max_deg, deg);
+    }
 }
 
 // The game thread: the player's held prop placed at the drawn hand (see g_held_at_hand_cfg), and the second gun's.
@@ -3233,6 +3481,7 @@ uint64_t hk_obj_set_matrix(uintptr_t obj, const float* m) {
     double ad[3] = {};
     if (!item_correction(lf ? 0 : 1, A, a, &ik, ad) || !ik || !raw(reinterpret_cast<uintptr_t>(m), src, sizeof(src)))
         return o_obj_set_matrix(obj, m);
+    fixed_grip(lf ? 0 : 1, src);  // run 7 item 1c: measured always; with [Hands] FixedGunGrip the long gun held by its aiming hold
     for (int i = 0; i < 3; ++i) {
         for (int k = 0; k < 3; ++k) g_place_buf[i * 4 + k] = A[k * 3] * src[i * 4] + A[k * 3 + 1] * src[i * 4 + 1] + A[k * 3 + 2] * src[i * 4 + 2];
         g_place_buf[i * 4 + 3] = src[i * 4 + 3];
@@ -3241,6 +3490,7 @@ uint64_t hk_obj_set_matrix(uintptr_t obj, const float* m) {
         g_place_buf[12 + k] = static_cast<float>(static_cast<double>(A[k * 3]) * src[12] + static_cast<double>(A[k * 3 + 1]) * src[13] +
                                                  static_cast<double>(A[k * 3 + 2]) * src[14] + ad[k]);
     g_place_buf[15] = src[15];
+    fixed_grip_placed(lf ? 0 : 1, A, ad, g_place_buf);
     g_placed_seq.fetch_add(1, std::memory_order_acq_rel);  // odd while writing
     g_placed.W = W;
     g_placed.build = g_vis_builds.load(std::memory_order_relaxed);
@@ -3431,6 +3681,22 @@ void pose_to34(const float* pose, float* m) {  // the axes X, Y, Z (world vector
     for (int i = 0; i < 3; ++i) {
         for (int j = 0; j < 3; ++j) m[i * 4 + j] = pose[j * 3 + i];
         m[i * 4 + 3] = pose[9 + i];
+    }
+}
+// run 7 item 1: the last copy draw's kind and its root before and after apply_copy (world), under g_draw_mutex
+struct CopyWhere {
+    int kind = 0;
+    uint64_t pass = 0;
+    float pre[3] = {}, post[3] = {};
+    uint64_t n = 0;
+};
+CopyWhere g_copy_where;
+void copy_root(const CopyJob& cj, float* out) {
+    if (cj.kind == 3 && cj.sm && cj.mset) {
+        const float* po = reinterpret_cast<const float*>(cj.mset + 0x10);
+        for (int k = 0; k < 3; ++k) out[k] = cj.sm[k * 4 + 3] + po[k];
+    } else if (cj.rc) {
+        for (int k = 0; k < 3; ++k) out[k] = cj.rc[12 + k];
     }
 }
 void apply_copy(const CopyJob& cj) {
@@ -4058,14 +4324,21 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
     if (wind_y >= 0.0f) wind_hold(&wind, wind_y);
     t_cull_show = cull_show;
     o_DrawVisEntity(ctx, rec, pass, bucket, a5, a6, a7);
-    if (cj.kind && dual::own_model() && held_prop::shown(1)) {  // run 5: the other sidearm's own model is drawn there instead
+    if (cj.kind && dual::copy_model() >= 0 && held_prop::shown(1)) {  // run 5: the copy's model as a prop is drawn there instead
         cj.kind = 0;
         g_copy_own_skips.fetch_add(1, std::memory_order_relaxed);
     }
     if (cj.kind) {  // the copy: the same draw moved onto the free hand (restored with the rest below)
         {
             std::lock_guard lock(g_draw_mutex);
+            float pre[3] = {};
+            copy_root(cj, pre);
             apply_copy(cj);
+            g_copy_where.kind = cj.kind;
+            g_copy_where.pass = t_draw_pass;
+            std::memcpy(g_copy_where.pre, pre, sizeof(pre));
+            copy_root(cj, g_copy_where.post);
+            ++g_copy_where.n;
             if (cj.kind == 3 && g_follow_rec.load(std::memory_order_relaxed)) {  // run 6 item 1, "skel follow": the copy
                 const float* po = reinterpret_cast<const float*>(cj.mset + 0x10);
                 float m[12];
@@ -4078,6 +4351,8 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
             }
         }
         g_copy_draws.fetch_add(1, std::memory_order_relaxed);
+        g_copy_by_pass[t_draw_pass & 7].fetch_add(1, std::memory_order_relaxed);
+        if (g_corr_frame != g_body_frame) g_copy_stale_by_pass[t_draw_pass & 7].fetch_add(1, std::memory_order_relaxed);
         o_DrawVisEntity(ctx, rec, pass, bucket, a5, a6, a7);
     }
     t_cull_show = 0;
@@ -4195,6 +4470,11 @@ bool gun_in_gun_hand() { return g_gun_hand_cfg.load(); }
 void set_gun_in_gun_hand(bool on) {
     if (g_gun_hand_cfg.exchange(on) != on) log::info("[body] left-handed: the gun in John's left hand, each arm on its own controller %d", on ? 1 : 0);
     config::set("Hands", "GunInGunHand", on ? "1" : "0");
+}
+bool fixed_gun_grip() { return g_fixed_grip.load(std::memory_order_relaxed); }
+void set_fixed_gun_grip(bool on, bool save) {
+    if (g_fixed_grip.exchange(on) != on) log::info("[body] FixedGunGrip: the long guns held by their aiming hold %d", on ? 1 : 0);
+    if (save) config::set("Hands", "FixedGunGrip", on ? "1" : "0");
 }
 int transplant_fingers() { return g_fingers_cfg.load(); }
 void set_transplant_fingers(int mode) {
@@ -4367,6 +4647,8 @@ bool install() {
         g_pin_cfg = config::get_bool("Hands", "TransplantPin", true);
         g_mirror_cfg = config::get_bool("Hands", "TransplantMirror", true);
         g_own_follow = config::get_bool("Hands", "OwnModelFollow", true);
+        g_fixed_grip = config::get_bool("Hands", "FixedGunGrip", false);
+        load_gun_rels();
         g_copy_grip_cfg = config::get_bool("Hands", "CopyGrip", true);
         g_same_frame_cfg = config::get_bool("Reload", "TwoHandedSteady", true);
         g_twist_cfg = config::get_bool("Hands", "ArmTwist", true);
@@ -4764,26 +5046,35 @@ void before_scene(const float* cam) {
        // eyes'), those of the second gun or the own model, the draws matched to an older sample, frames in hand without a
        // draw. Counts since the last line.
         static double last_ms = 0;
-        static uint32_t h0[8] = {}, s0[8] = {}, o0[8] = {}, os0[8] = {};
-        static uint64_t older0 = 0, newest0 = 0, frames0 = 0, missed0 = 0;
+        static uint32_t h0[8] = {}, s0[8] = {}, o0[8] = {}, os0[8] = {}, c0[8] = {}, cs0[8] = {};
+        static uint64_t older0 = 0, newest0 = 0, frames0 = 0, missed0 = 0, cp0 = 0, cr0 = 0, cn0 = 0;
         const double now = log::now_ms();
         if (now - last_ms >= 10000.0) {
             last_ms = now;
-            uint32_t hb[8], sb[8], ob[8], osb[8];
+            uint32_t hb[8], sb[8], ob[8], osb[8], cb[8], csb[8];
             for (int i = 0; i < 8; ++i) {
+                cb[i] = g_copy_by_pass[i].load(std::memory_order_relaxed);
+                csb[i] = g_copy_stale_by_pass[i].load(std::memory_order_relaxed);
                 hb[i] = g_held_by_pass[i].load(std::memory_order_relaxed);
                 sb[i] = g_stale_by_pass[i].load(std::memory_order_relaxed);
                 ob[i] = g_other_by_pass[i].load(std::memory_order_relaxed);
                 osb[i] = g_other_stale_by_pass[i].load(std::memory_order_relaxed);
             }
             const uint64_t older = g_held_older.load(), newest = g_held_newest.load(), frames = g_held_frames.load(), missed = g_held_missed.load();
-            if (frames != frames0 || ob[1] != o0[1])
+            const uint64_t cp = g_copy_placements.load(), cr = g_copy_refused.load(), cn = g_copy_nomatch.load();
+            if (frames != frames0 || ob[1] != o0[1] || cp != cp0 || cr != cr0)
                 log::info("[lag] 10 s: held draws by pass 0/1/3 %u/%u/%u, stale %u/%u/%u | the second gun or own model %u/%u/%u, stale %u/%u/%u | "
-                          "matched the newest %llu, an older sample %llu | frames in hand %llu, without a draw %llu",
+                          "matched the newest %llu, an older sample %llu | frames in hand %llu, without a draw %llu | the copy: placed %llu, refused "
+                          "%llu (why %d), unmatched %llu, draws by pass 0/1/3 %u/%u/%u, stale %u/%u/%u",
                           hb[0] - h0[0], hb[1] - h0[1], hb[3] - h0[3], sb[0] - s0[0], sb[1] - s0[1], sb[3] - s0[3], ob[0] - o0[0], ob[1] - o0[1], ob[3] - o0[3],
                           osb[0] - os0[0], osb[1] - os0[1], osb[3] - os0[3], static_cast<unsigned long long>(newest - newest0),
                           static_cast<unsigned long long>(older - older0), static_cast<unsigned long long>(frames - frames0),
-                          static_cast<unsigned long long>(missed - missed0));
+                          static_cast<unsigned long long>(missed - missed0), static_cast<unsigned long long>(cp - cp0),
+                          static_cast<unsigned long long>(cr - cr0), g_copy_why.load(), static_cast<unsigned long long>(cn - cn0), cb[0] - c0[0],
+                          cb[1] - c0[1], cb[3] - c0[3], csb[0] - cs0[0], csb[1] - cs0[1], csb[3] - cs0[3]);
+            std::memcpy(c0, cb, sizeof(c0));
+            std::memcpy(cs0, csb, sizeof(cs0));
+            cp0 = cp, cr0 = cr, cn0 = cn;
             std::memcpy(h0, hb, sizeof(h0));
             std::memcpy(s0, sb, sizeof(s0));
             std::memcpy(o0, ob, sizeof(o0));
@@ -5365,6 +5656,56 @@ std::string command(const std::string& line) {
                       static_cast<unsigned long long>(g_hprop_draws.load()), static_cast<unsigned long long>(g_hprop_skinned.load()),
                       static_cast<unsigned long long>(g_hprop_rigid.load()), d.path, d.count, d.flags, d.before[0], d.before[1], d.before[2],
                       d.target[0], d.target[1], d.target[2], d.after[0], d.after[1], d.after[2], d.xb[0], d.xb[1], d.xb[2], d.xa[0], d.xa[1], d.xa[2]);
+        return b;
+    }
+    if (sub == "grip") {  // skel grip [on|off|reset]: [Hands] FixedGunGrip (the session); the long gun in the animated wrist's frame
+        if (line.find(" grip on") != std::string::npos) g_fixed_grip = true;
+        if (line.find(" grip off") != std::string::npos) g_fixed_grip = false;
+        FixedGripDiag d;
+        GunRel g;
+        {
+            std::lock_guard lock(g_fg_mutex);
+            if (line.find(" grip reset") != std::string::npos) {
+                g_fg_diag.aim_max_mm = g_fg_diag.aim_max_deg = g_fg_diag.low_max_mm = g_fg_diag.low_max_deg = 0;
+                g_fg_diag.placed_max_mm = g_fg_diag.placed_max_deg = 0;
+            }
+            d = g_fg_diag;
+            if (d.weapon >= 0 && d.weapon < kGripW) g = g_gun_rel[d.weapon];
+        }
+        float mm = -1, deg = -1;
+        if (g.valid) rel_diff(d.now, g.m, &mm, &deg);
+        char b[1000];
+        std::snprintf(b, sizeof(b),
+                      "fixed grip %s | weapon %d side %d aiming %d src %d | now (%.4f %.4f %.4f) x (%.3f %.3f %.3f) | learned %d (%.4f %.4f %.4f) "
+                      "now off it %.1f mm %.2f deg | max off it: aiming %.1f mm %.2f deg, lowered %.1f mm %.2f deg | placed (%.4f %.4f %.4f) max "
+                      "off it %.1f mm %.2f deg | learns %llu fixed %llu frames %llu saved %llu | why %d | wrist at (%.2f %.2f %.2f) gun (%.2f %.2f %.2f) "
+                      "attachment (%.2f %.2f %.2f)",
+                      g_fixed_grip.load() ? "on" : "off", d.weapon, d.side, d.aiming, d.src, d.now[12], d.now[13], d.now[14], d.now[0], d.now[1],
+                      d.now[2], g.valid ? 1 : 0, g.m[12], g.m[13], g.m[14], mm, deg, d.aim_max_mm, d.aim_max_deg, d.low_max_mm, d.low_max_deg,
+                      d.placed[12], d.placed[13], d.placed[14], d.placed_max_mm, d.placed_max_deg, static_cast<unsigned long long>(d.learns),
+                      static_cast<unsigned long long>(d.fixed), static_cast<unsigned long long>(d.frames), static_cast<unsigned long long>(d.saved), d.why,
+                      d.wrist_pos[0], d.wrist_pos[1], d.wrist_pos[2], d.gun_pos[0], d.gun_pos[1], d.gun_pos[2], d.att_pos[0], d.att_pos[1], d.att_pos[2]);
+        return b;
+    }
+    if (sub == "copy" && line.find("where") != std::string::npos) {  // skel copy where: the last copy draw's place (run 7 item 1)
+        CopyWhere w;
+        {
+            std::lock_guard lock(g_draw_mutex);
+            w = g_copy_where;
+        }
+        BodyPoints bp;
+        const bool hb = body_points(&bp);
+        auto d = [](const float* a, const float* b) {
+            const float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+            return std::sqrt(x * x + y * y + z * z);
+        };
+        char b[520];
+        std::snprintf(b, sizeof(b),
+                      "copy where: draws %llu, the last kind %d pass %llu: the gun in hand's draw at (%.3f %.3f %.3f), the copy's at (%.3f %.3f %.3f), "
+                      "%.3f m apart | hands %d: left (%.3f %.3f %.3f) right (%.3f %.3f %.3f); the copy %.3f m from the left, %.3f from the right",
+                      static_cast<unsigned long long>(w.n), w.kind, static_cast<unsigned long long>(w.pass), w.pre[0], w.pre[1], w.pre[2], w.post[0],
+                      w.post[1], w.post[2], d(w.pre, w.post), hb ? 1 : 0, bp.hand[0][0], bp.hand[0][1], bp.hand[0][2], bp.hand[1][0], bp.hand[1][1],
+                      bp.hand[1][2], hb ? d(w.post, bp.hand[0]) : -1.0f, hb ? d(w.post, bp.hand[1]) : -1.0f);
         return b;
     }
     if (sub == "copy") {  // skel copy: [Hands] DualWieldCopy's placements and draws

@@ -36,6 +36,7 @@ const RdrvrApi* find_core() {
 
 void hand_push(const RdrvrNativeRequest& req, RdrvrNativeResult* res);
 void grab_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res);
+void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res);
 
 void run_request(const RdrvrNativeRequest& req, uint64_t tick) {
     RdrvrNativeResult res{};
@@ -48,6 +49,11 @@ void run_request(const RdrvrNativeRequest& req, uint64_t tick) {
     }
     if (req.op == RDRVR_NATIVE_GRAB || req.op == RDRVR_NATIVE_GRAB_MOVE || req.op == RDRVR_NATIVE_GRAB_END) {
         grab_op(req, &res);
+        g_api->post_native_result(&res);
+        return;
+    }
+    if (req.op == RDRVR_NATIVE_GUN_MELEE) {
+        gun_melee_op(req, &res);
         g_api->post_native_result(&res);
         return;
     }
@@ -189,6 +195,184 @@ void grab_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
     if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] > 1e-4f) invoke(0x28425D8C, {h, reinterpret_cast<uint64_t>(v)});  // SET_PROP_VELOCITY
     for (int k = 0; k < 3; ++k) res->vec[k] = v[k];
     res->value = 1;
+}
+
+// ---- [Gestures] GunMelee (API v7, research\round13\gun-melee.md 5.3): the gun's strike segments against the actors
+// near them, in this one tick. The object iterator on the ambient layout (actors, type 15, in a sphere) gives their
+// object handles and is destroyed at once, before anything else runs, every time one was made (counted, and reported
+// in the result); the handles are then used only with natives that check their generation. The earliest bone sphere
+// a strike point enters, moving into it fast enough, goes to the core's gun_melee_hit, which makes the game's hit in
+// this same tick.
+uint64_t g_gm_ops = 0, g_gm_made = 0, g_gm_destroyed = 0;
+struct GmBone {
+    const char* name;  // static: the native keeps the pointer only for the call
+    float r;           // the bone's sphere (m)
+};
+const GmBone kGmBones[] = {{"head", 0.12f}, {"spine03", 0.20f}, {"spine01", 0.18f}, {"pelvis", 0.18f}};
+constexpr int kGmBoneCount = static_cast<int>(sizeof(kGmBones) / sizeof(kGmBones[0]));
+constexpr float kGmStrikeR = 0.06f;  // the strike point's own sphere
+
+// where (0 - 1) the segment a -> a + d enters the sphere (c, r): 0 when a is already inside; -1 when it does not
+float gm_enter(const float* a, const float* d, const float* c, float r) {
+    const float f[3] = {a[0] - c[0], a[1] - c[1], a[2] - c[2]};
+    const float cc = f[0] * f[0] + f[1] * f[1] + f[2] * f[2] - r * r;
+    if (cc <= 0.0f) return 0.0f;
+    const float aa = d[0] * d[0] + d[1] * d[1] + d[2] * d[2], bb = f[0] * d[0] + f[1] * d[1] + f[2] * d[2];
+    if (aa < 1e-10f || bb >= 0.0f) return -1.0f;  // not moving, or not toward it
+    const float disc = bb * bb - aa * cc;
+    if (disc < 0.0f) return -1.0f;
+    const float t = (-bb - sqrtf(disc)) / aa;
+    return t >= 0.0f && t <= 1.0f ? t : -1.0f;
+}
+float gm_dist(const float* p, const float* q) {
+    const float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+    return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
+    RdrvrGunMeleeArgs a;
+    static_assert(sizeof(a) == sizeof(req.args), "RdrvrGunMeleeArgs is copied over the request's args");
+    std::memcpy(&a, req.args, sizeof(a));
+    ++g_gm_ops;
+    uint32_t made = 0, destroyed = 0, seen = 0;
+    auto done = [&](uint32_t victim, RdrvrGunMeleeOutcome o, uint32_t answer) {
+        res->value = victim | static_cast<uint64_t>(o & 0xff) << 32 | static_cast<uint64_t>(answer & 0xff) << 40 |
+                     static_cast<uint64_t>(seen > 255 ? 255 : seen) << 48 | static_cast<uint64_t>(made & 0xf) << 56 |
+                     static_cast<uint64_t>(destroyed & 0xf) << 60;
+    };
+    res->vec[3] = -1.0f;
+    if (!script_thread_ok(a.guard)) return done(0, RDRVR_GUN_MELEE_GUARD, 0xff);
+    const bool scan = (a.flags & RDRVR_GUN_MELEE_SCAN) != 0;
+    const int npts = (a.flags & RDRVR_GUN_MELEE_POINT2) ? 2 : 1;
+    const float* c = a.seg[0][1];
+    const float radius = static_cast<float>(a.radius_cm) * 0.01f;
+    // the actors' objects: the iterator made, filtered, walked and destroyed here, with nothing else in between
+    uint32_t objs[16];
+    int n = 0;
+    {
+        const uint64_t layout = invoke(0xB52A3D48, {}) & 0xffffffffu;    // GET_AMBIENT_LAYOUT
+        const uint64_t it = invoke(0xD8A12B74, {layout}) & 0xffffffffu;  // CREATE_OBJECT_ITERATOR
+        if (!it) return done(0, RDRVR_GUN_MELEE_NO_ITERATOR, 0xff);
+        made = 1;
+        ++g_gm_made;
+        invoke(0xBE553F84, {it, 15});                                        // ITERATE_ON_OBJECT_TYPE: actors
+        invoke(0x2243FA6E, {it, vec2(c[0], c[1]), f32(c[2]), f32(radius)});  // ITERATE_IN_SPHERE(it, xy, z, r)
+        const int cap = scan ? 16 : 10;
+        for (uint32_t o = static_cast<uint32_t>(invoke(0xE96A0318, {it})); o && n < cap;) {  // START_OBJECT_ITERATOR
+            objs[n++] = o;
+            if (n < cap) o = static_cast<uint32_t>(invoke(0xD88DC865, {it}));  // OBJECT_ITERATOR_NEXT
+        }
+        invoke(0xE284A10C, {it});  // DESTROY_ITERATOR
+        destroyed = 1;
+        ++g_gm_destroyed;
+    }
+    struct Best {
+        float t = 2.0f;
+        uint32_t h = 0;
+        int bone = -1;
+        float p[3] = {}, v[3] = {}, s = 0.0f;
+    } best;
+    uint32_t near_h = 0;
+    float near_d = 1e9f, near_p[3] = {};
+    for (int i = 0; i < n; ++i) {
+        const uint32_t h = static_cast<uint32_t>(invoke(0x34F0AD96, {objs[i]}));  // GET_ACTOR_FROM_OBJECT
+        if (!h || h == a.actor) continue;
+        ++seen;
+        const uint64_t hh = h;
+        const bool alive = (invoke(0x2F232639, {hh}) & 0xff) != 0;  // IS_ACTOR_ALIVE
+        const bool human = (invoke(0x882C84DC, {hh}) & 0xff) != 0;  // IS_ACTOR_HUMAN
+        const bool rag = (invoke(0x3918D335, {hh}) & 0xff) != 0;    // IS_ACTOR_RAGDOLL
+        const bool cut = (invoke(0x776999DB, {hh}) & 0xff) != 0;    // ACTOR_IS_GRABBED_BY_CUTSCENE
+        const bool fit = alive && human && !rag && !cut;
+        alignas(16) float bpos[kGmBoneCount][4] = {};
+        bool bok[kGmBoneCount] = {};
+        if (scan || fit)
+            for (int b = 0; b < kGmBoneCount; ++b)  // GET_OBJECT_NAMED_BONE_POSITION(object, name, out)
+                bok[b] = (invoke(0x30516389, {objs[i], reinterpret_cast<uint64_t>(kGmBones[b].name), reinterpret_cast<uint64_t>(bpos[b])}) & 0xff) != 0;
+        if (scan) {
+            alignas(16) float pos[4] = {};
+            invoke(0x99BD9D6F, {hh, reinterpret_cast<uint64_t>(pos)});  // GET_POSITION
+            const float d = gm_dist(pos, c);
+            if (d < near_d) {
+                near_d = d;
+                near_h = h;
+                std::memcpy(near_p, pos, sizeof(near_p));
+            }
+            char line[256];
+            std::snprintf(line, sizeof(line),
+                          "gunmelee scan: actor 0x%x %.2f m away at (%.2f %.2f %.2f): alive %d human %d ragdoll %d cutscene %d; bones head %d (%.2f %.2f %.2f) "
+                          "spine03 %d spine01 %d pelvis %d",
+                          h, d, pos[0], pos[1], pos[2], alive ? 1 : 0, human ? 1 : 0, rag ? 1 : 0, cut ? 1 : 0, bok[0] ? 1 : 0, bpos[0][0], bpos[0][1], bpos[0][2],
+                          bok[1] ? 1 : 0, bok[2] ? 1 : 0, bok[3] ? 1 : 0);
+            g_api->log(0, line);
+            continue;
+        }
+        if (!fit) continue;
+        for (int b = 0; b < kGmBoneCount; ++b) {
+            if (!bok[b]) continue;
+            for (int k = 0; k < npts; ++k) {
+                const float* p0 = a.seg[k][0];
+                const float d[3] = {a.seg[k][1][0] - p0[0], a.seg[k][1][1] - p0[1], a.seg[k][1][2] - p0[2]};
+                const float t = gm_enter(p0, d, bpos[b], kGmBones[b].r + kGmStrikeR);
+                if (t < 0.0f || t >= best.t) continue;
+                const float* v = a.vel[k];
+                const float s = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                if (!(s >= a.speed) || s < 1e-3f) continue;
+                const float p[3] = {p0[0] + t * d[0], p0[1] + t * d[1], p0[2] + t * d[2]};
+                if (v[0] * (bpos[b][0] - p[0]) + v[1] * (bpos[b][1] - p[1]) + v[2] * (bpos[b][2] - p[2]) <= 0.0f) continue;  // into the bone
+                best.t = t;
+                best.h = h;
+                best.bone = b;
+                std::memcpy(best.p, p, sizeof(p));
+                for (int j = 0; j < 3; ++j) best.v[j] = v[j];
+                best.s = s;
+            }
+        }
+    }
+    if (scan) {
+        if (near_h) {
+            for (int j = 0; j < 3; ++j) res->vec[j] = near_p[j];
+            res->vec[3] = near_d;
+        }
+        char line[220];
+        std::snprintf(line, sizeof(line), "gunmelee scan: %u actor(s) within %.1f m of (%.2f %.2f %.2f); iterators made %llu, destroyed %llu (%llu ops)", seen,
+                      radius, c[0], c[1], c[2], static_cast<unsigned long long>(g_gm_made), static_cast<unsigned long long>(g_gm_destroyed),
+                      static_cast<unsigned long long>(g_gm_ops));
+        g_api->log(0, line);
+        return done(near_h, RDRVR_GUN_MELEE_SCANNED, 0xff);
+    }
+    if (!best.h) return done(0, RDRVR_GUN_MELEE_NONE, 0xff);
+    for (int j = 0; j < 3; ++j) res->vec[j] = best.p[j];
+    res->vec[3] = gm_dist(best.p, c);
+    if (!g_api->gun_melee_hit) return done(best.h, RDRVR_GUN_MELEE_NO_CORE, 0xff);
+    RdrvrMeleeHit hit{};
+    hit.victim = best.h;
+    hit.attacker = a.actor;
+    for (int j = 0; j < 3; ++j) {
+        hit.pos[j] = best.p[j];
+        hit.dir[j] = best.v[j] / best.s;
+    }
+    hit.speed = best.s;
+    hit.weapon = a.weapon;
+    std::snprintf(hit.bone, sizeof(hit.bone), "%s", kGmBones[best.bone].name);
+    const int code = g_api->gun_melee_hit(&hit);  // the game's hit, made by the core now (or its dry run)
+    if (code == RDRVR_MELEE_HIT_OK) {
+        // the game's own readbacks of the hit (research 6.3.2), in this tick: the attacker, the flags, the damage, the
+        // KO points and the health it recorded, and whether the victim reacts yet
+        const uint64_t hh = best.h;
+        const uint32_t attacker = static_cast<uint32_t>(invoke(0x2C0F211D, {hh}));  // GET_LAST_ATTACKER
+        const int32_t flags = static_cast<int32_t>(invoke(0x08308EBA, {hh}));      // GET_LAST_HIT_FLAGS
+        const float dmg = as_f32(invoke(0x45556269, {hh}));                         // GET_LAST_DAMAGE
+        const float ko = as_f32(invoke(0x44787A58, {hh}));                          // GET_ACTOR_KO_POINTS
+        const float hp = as_f32(invoke(0xF246F15D, {hh}));                          // GET_ACTOR_HEALTH
+        const int react = (invoke(0xBFD6AE3D, {hh}) & 0xff) != 0 ? 1 : 0;           // IS_ACTOR_REACTING
+        char line[240];
+        std::snprintf(line, sizeof(line),
+                      "gunmelee readback 0x%x (%s): last attacker 0x%x (the player 0x%x), hit flags %d, damage %.1f, KO points %.1f, health %.1f, reacting %d", best.h,
+                      kGmBones[best.bone].name, attacker, a.actor, flags, dmg, ko, hp, react);
+        g_api->log(0, line);
+    }
+    return done(best.h, RDRVR_GUN_MELEE_HIT, static_cast<uint32_t>(code));
 }
 
 // The player's posture for the core's automatic body modes (RDRVR_ACTOR_*).
@@ -430,6 +614,7 @@ void script_main() {
         RdrvrNativeRequest req;
         int budget = 64;  // bound per tick so a flood cannot stall the script VM
         while (budget-- > 0 && g_api->pop_native_request(&req)) run_request(req, tick);
+        if (g_api->end_script_tick) g_api->end_script_tick(tick);  // v7: the core's in-tick window (gun_melee_hit) closes
         ScriptWait(0);
     }
 }

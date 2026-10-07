@@ -50,6 +50,9 @@ bool item_correction(int g, float A[9], float a[3], bool* ik, double* ad = nullp
 // (0 unchanged, 1 the gun hand takes the gripping hand's curl and the other the game's empty hand's, 2 the other open)
 bool gun_in_gun_hand();
 void set_gun_in_gun_hand(bool on);  // also written to the user ini
+// [Hands] FixedGunGrip (off; run 7 item 1c): each long gun held in the drawn hand by its aiming hold in every pose
+bool fixed_gun_grip();
+void set_fixed_gun_grip(bool on, bool save);  // save: also written to the user ini (the menu; "skel grip on|off" is the session's)
 int transplant_fingers();
 void set_transplant_fingers(int mode);  // also written to the user ini
 // The visibility build (camera_lever.cpp's hook, the update thread, just before the game builds its draw records):

@@ -472,7 +472,8 @@ void frame() {
     }
     // revolvers (and the break action): open by the stick flick (filter_stick), close by a flick of the gun hand
     if (opens(k) && !deadeye) {
-        if (g_open_req.exchange(false) && !g_open) {
+        // run 7 item 5: a flick while the menu is open is the menu's (its stick scrolls the page): taken, nothing opened
+        if (g_open_req.exchange(false) && !g_open && !menu::visible()) {
             g_open = true;
             g_open_ms = now;
             g_close_hits = 0;
@@ -1045,8 +1046,9 @@ void frame() {
         g_held.fetch_add(1, std::memory_order_relaxed);
         controllers::pulse(gun_h, 0.45f, 35);  // felt, and unlike the empty click (round 10: an open full revolver felt dead)
         // round 13 item 13: "guns should click when attempting to fire without having performed the necessary reload
-        // actions yet": the gun's family's click too ([Reload] EmptyClick's mode, volume and sounds)
-        if (g_held_click.load(std::memory_order_relaxed)) audio::empty_click(gun_h, w);
+        // actions yet": the gun's family's click too ([Reload] EmptyClick's mode, volume and sounds). Not while it is
+        // open (round 10: "an open revolver sounded empty": a buzz only; run 4's check, item8_actions, run 7's G2)
+        if (g_held_click.load(std::memory_order_relaxed) && !g_open) audio::empty_click(gun_h, w);
         log::info("[actions] fire held back: the %s %s (pulls %llu)", kind_name(k), g_open || (bparts && g_bolt_up) ? "is open" : "is not worked",
                   static_cast<unsigned long long>(g_held.load()));
     }

@@ -29,5 +29,10 @@ bool is_thrown(int32_t weapon);  // the thrown weapons by eWeapon (fire bottle, 
 bool throw_launch(float vel[3], float origin[3]);
 
 std::string command(const std::string& line);  // "gestures [throw|melee|lasso on|off]": the switches, counters, speeds
+// Run 7 item 2, [Gestures] GunMelee (gun_melee.h; the swing's detector lives here, beside the punch's): "gunmelee [on|off]
+// [dry on|off] [reset] [scan [radius m]]" (the switches for the session; a scan lists the actors near the strike point):
+// the settings, the swing's state and counters (armed, requests, scans, actors seen, the iterators made and destroyed,
+// hits, dry hits, refusals, the swings suppressed by each window) and the hit side's (gun_melee::status)
+std::string gun_melee_command(const std::string& line);
 
 }  // namespace rdrvr::gestures

@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.2.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.3.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -20,6 +20,10 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   wetness and blood, cloud shadows.
 - Culling, tree billboards and distant trees follow your head, and stay upright.
 - FXAA or the game's TAA run per eye; the game's own colour and gamma.
+- Optional (new in 0.3.0, off by default, not yet tried in a headset; the General tab, under the anti-aliasing, with
+  FXAA only): each eye rendered in your headset's own shape and size, with square pixels, instead of the game's 16:9
+  frame stretched over it: fewer pixels drawn for the same sharpness. Restart the game after turning it on: the eye
+  images take their size at the start.
 - The HUD on a floating panel, or on your wrist like a watch (radar, meters, ammo shown when you look at it).
 - Automatic view modes: stereo in gameplay, a cinema screen for loading, menus and videos; cutscenes on the screen or
   in 3D.
@@ -38,16 +42,23 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   holster movable and resizable. They are fixed to your headset's position, so they stay with you as you step,
   crouch and lean (or to John's body: the Holsters tab).
 - Reloading by hand: take a round at your chest and bring it to the gun (or squeeze the gun at your chest).
-- Every gun's action worked by hand (revolvers flicked open, levers, pumps, bolts, breeches, break-actions), with the
-  game's own sounds on your movements; two-handed long guns; dual wielding (a second gun, or a copy of your sidearm);
+- Every gun's action worked by hand except the magazine pistols' (revolvers flicked open, levers, pumps, bolts,
+  breeches, break-actions), with the game's own sounds on your movements; two-handed long guns; dual wielding (a second gun, or a copy of your sidearm);
   perfect accuracy; the guns shown at their holsters; throwing, punching and the lasso by swinging. All on by default,
   each can be switched off in the menu. Off by default: pushing and grabbing loose objects.
 - No executions: the trigger fires at close range instead of starting John's third-person execution.
+- New in 0.3.0, off by default (each in the menu, not yet tried in a headset): a gun-butt melee, the gun in your
+  hand swung into someone landing the game's own melee blow where it meets them (knock-out damage, as a punch does;
+  the Gestures tab, "Gun-butt melee"); shooting from right behind cover (the Hands tab, "Shoot past the arm block");
+  jumping, and so vaulting and climbing, with a gun raised (the Controls tab, "Jumping lowers the raised gun"); the
+  gun hand kept at each long gun's aiming grip in every pose (the Hands tab, "Long guns held by their aiming grip").
 
 **Controls and comfort**
 - The controllers drive the game's gamepad (every button remappable), with the game's rumble on the controllers.
 - Smooth or snap turning; on a horse, steering by the stick or by your view, the left stick click brakes.
-- An in-headset menu (laser and trigger) with every setting; adjustments by arrows, one step a press.
+- An in-headset menu (laser and trigger) with every setting, grouped under headings with a help line for the row
+  under the laser; the tabs are two rows of buttons, and each tab's page scrolls with your gun hand's stick (the
+  laser on the page); adjustments by arrows, one step a press.
 
 ## Requirements
 
@@ -65,7 +76,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.2.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.3.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file.
 3. Start your headset's runtime, then the game.
@@ -86,8 +97,9 @@ To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay i
 
 ## Tips
 
-- **Sharpness:** each eye shows the game's own frame at the game's resolution (16:9). For a sharper image on a
-  high-resolution headset, run the game at 3840x2160 (with NVIDIA DSR/DLDSR on a 1440p monitor) if your GPU allows.
+- **Sharpness:** each eye shows the game's own frame at the game's resolution (16:9), or, with "Eyes in the
+  headset's shape" on, a frame in the headset's own shape. For a sharper image on a high-resolution headset, run the
+  game at 3840x2160 (with NVIDIA DSR/DLDSR on a 1440p monitor) if your GPU allows.
 - **Frame generation** layers (frame interpolation in the OpenXR runtime or a layer) make the guns lag behind your
   hands: the generated frames cannot follow the gun. Prefer a lower refresh rate (72 or 80 Hz) with real frames.
 
@@ -98,16 +110,29 @@ To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay i
   have no A/B buttons: the trackpad's click gives them (upper half B/Y, lower A/X).
 - Only Touch controllers on a Quest 3 have been tested on real hardware. If a controller type sits differently in your
   hand, the Hands tab's "Controller fit" moves and turns the hands for that type.
+- The game's own builds: the mod was made on one build of `RDR.exe`. On another build it looks for the game code and
+  data it uses by their bytes (new in 0.3.0, not yet tried on a real other build). If it finds and checks every one,
+  it runs; if not, it stands down (the game plays flat). Either way it writes `RDRVR_build_report.txt` in the game
+  folder: if the mod stands down or misbehaves, please attach it, with `RDRVR.log`, to an issue. RedHook, which runs
+  the gameplay plugin, has to work on that build too.
 
 ## Known issues
 
-- Dual wielding two of the same gun from its own holster can leave the second gun invisible.
-- With only one sidearm, it can show at both hips.
-- Shooting from right behind cover does not always fire, and climbing over obstacles does not work yet.
+- Shooting from right behind cover can be refused by the game's "gun against a wall" check, which looks from John's
+  shoulder, not from your gun: "Shoot past the arm block" (the Hands tab, off by default, new in 0.3.0) lifts it.
+- Standing or walking with a gun raised, the game takes no jump, so no vault or climb: "Jumping lowers the raised gun"
+  (the Controls tab, off by default, new in 0.3.0) lowers the gun for the jump. Vaulting over a fence or a low wall
+  has not been checked yet.
 - DLSS (in the anti-aliasing choice, from the next start) is experimental and feels laggy in the headset; FXAA is the
   default (TAA is the alternative).
-- Only one build of the game's RDR.exe is supported. On another build the mod stands down (the game plays flat) and
-  writes `RDRVR_build_report.txt` in the game folder: please attach it, with `RDRVR.log`, to an issue.
+- Rarely, the game freezes or slows to a few frames a second (seen a few times in the developer's simulator tests;
+  the cause is not known yet). If it happens, please attach `RDRVR.log` to an issue: it records what the game's
+  render threads were doing.
+- The holsters' guns cost frame time by how many are shown: the back's long guns (off by default) are the expensive
+  part.
+- John's gun hand can sit a few centimetres up a long gun (at the receiver, not the stock's wrist) when it is lowered
+  or carried: "Long guns held by their aiming grip" (the Hands tab, off by default, new in 0.3.0) holds each long gun
+  by its aiming grip in every pose.
 - The default places of the holsters, the loading and foregrip rings and the interaction spot were tuned in the
   headset by one person: if they do not suit you, move them with the menu's arrows (Holsters, Reloading, Gun in hand
   and Hands tabs).
@@ -132,7 +157,9 @@ powershell -ExecutionPolicy Bypass -File tools\package.ps1               # build
 Without the SDK only `dinput8.dll` is built. The game's code addresses the mod hooks are in `src/core/anchors.txt`;
 `src/core/anchors.inc` is generated from it with `tools/gen_anchors.py` against your own copy of `RDR.exe` (placed at
 `research/RDR.exe`, which is never committed), and each one is checked against the running game's bytes at startup:
-if the game is updated and they no longer match, the mod installs no game hooks.
+on another build (or after a game update) the mod looks for each one by its signature (`src/core/anchors_sig.inc`,
+from `tools/gen_buildsig.py`) and runs on the found addresses only when every one is found and checked; otherwise it
+installs no game hooks.
 
 ## How it works (briefly)
 

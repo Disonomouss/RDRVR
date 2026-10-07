@@ -24,6 +24,7 @@
 #include "core/controllers.h"
 #include "core/controls.h"
 #include "core/d3d_hooks.h"
+#include "core/eye_shape.h"
 #include "core/hands.h"
 #include "core/anchors.h"
 #include "core/holster.h"
@@ -180,6 +181,8 @@ std::atomic<uint64_t> g_recentres{0};
 bool g_scroll_down = false;  // XR thread
 XrView g_frame_views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 uint32_t g_w = 0, g_h = 0;
+uint32_t g_sw = 0, g_sh = 0;  // the eye swapchains: g_w x g_h, or the eye size with [XR] EyeShape (eye_shape.h)
+std::atomic<uint32_t> g_rect_w{0}, g_rect_h{0};  // the last layer's imageRect
 // The post chain's output the eye images come from: [0] the Post FXAA Target (FXAA), [1] FXAATarget (every other
 // technique, native TAA among them; post_target.h).
 std::atomic<ID3D12Resource*> g_target[2]{};
@@ -341,7 +344,21 @@ void copy_eye_to(ID3D12GraphicsCommandList* cl, int eye, int dst_stage) {
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     bool src_transition = st != D3D12_RESOURCE_STATE_COPY_SOURCE;
     cl->ResourceBarrier(src_transition ? 2 : 1, src_transition ? b : b + 1);
-    cl->CopyResource(dst, src);
+    if (dst_stage < 0 && (g_sw != g_w || g_sh != g_h)) {
+        // [XR] EyeShape, raw copies: the eye rect (the top-left) into the eye-shaped image; without the shape applied the
+        // frame's top-left only (a raw copy cannot resample)
+        uint32_t cw = g_w, ch = g_h;
+        if (!eye_shape::frame_rect(&cw, &ch)) log::limited("xr.rawshape", 1, "[xr] raw copies into eye-shaped swapchains: the frame cropped while the shape is not applied");
+        D3D12_TEXTURE_COPY_LOCATION dl{}, sl{};
+        dl.pResource = dst;
+        dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        sl.pResource = src;
+        sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const D3D12_BOX box{0, 0, 0, cw < g_sw ? cw : g_sw, ch < g_sh ? ch : g_sh, 1};
+        cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, &box);
+    } else {
+        cl->CopyResource(dst, src);
+    }
     for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
     cl->ResourceBarrier(src_transition ? 2 : 1, src_transition ? b : b + 1);
     if (eye >= 0) g_filled.fetch_or(1 << eye, std::memory_order_relaxed);
@@ -389,9 +406,48 @@ void xr_bind_tap(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESC
     g_fxaa_binds = 0;
 }
 
-// Presenting thread, once the session runs: the eye swapchains, sized like the Post FXAA Target. With [XR] ColourBlit
-// (default) they are sRGB and filled by the colour blit (xr_blit.h); otherwise they take the target's own format and
-// raw copies (R5 step 1: geometry and pacing only, the colours wrong).
+// [XR] EyeShape: the eyes' FOV tangents (l r u d) for the session's eye size, before the first submitted frame: the
+// views located so far, else one empty XR frame here to locate them (the presenting thread, under the frame mutex,
+// before the first layer).
+bool shape_views(float tan[2][4]) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        {
+            std::lock_guard lock(g_views_mutex);
+            if (g_views_valid) {
+                for (int e = 0; e < 2; ++e)
+                    for (int k = 0; k < 4; ++k) tan[e][k] = std::tan(g_views[e].fov[k]);
+                return true;
+            }
+        }
+        if (attempt) break;
+        XrFrameState fs{XR_TYPE_FRAME_STATE};
+        XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
+        if (XR_FAILED(xrWaitFrame(g_session, &wi, &fs))) return false;
+        XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
+        if (XR_FAILED(xrBeginFrame(g_session, &bi))) return false;
+        XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+        li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        li.displayTime = fs.predictedDisplayTime;
+        li.space = g_space;
+        XrViewState vs{XR_TYPE_VIEW_STATE};
+        XrView v[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        uint32_t nv = 0;
+        if (XR_SUCCEEDED(xrLocateViews(g_session, &li, &vs, 2, &nv, v)) && nv == 2 && (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+            store_views(v, g_frames.load() + 1);
+        XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
+        ei.displayTime = fs.predictedDisplayTime;
+        ei.environmentBlendMode = g_blend;
+        ei.layerCount = 0;
+        xrEndFrame(g_session, &ei);
+        ++g_frames;
+        g_empty.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+}
+
+// Presenting thread, once the session runs: the eye swapchains, sized like the Post FXAA Target (or at the eye size,
+// [XR] EyeShape). With [XR] ColourBlit (default) they are sRGB and filled by the colour blit (xr_blit.h); otherwise they
+// take the target's own format and raw copies (R5 step 1: geometry and pacing only, the colours wrong).
 bool make_swapchains() {
     auto* target = static_cast<ID3D12Resource*>(const_cast<void*>(d3d::unique_resource("Post FXAA Target")));
     auto* target_taa = static_cast<ID3D12Resource*>(const_cast<void*>(d3d::unique_resource("FXAATarget")));
@@ -404,6 +460,13 @@ bool make_swapchains() {
             target_taa = nullptr;
         }
     }
+    // [XR] EyeShape: the eye size for this session (eye-shaped swapchains when configured; else the game's frame)
+    uint32_t sw = static_cast<uint32_t>(d.Width), sh = d.Height;
+    {
+        float tan[2][4];
+        const bool have = eye_shape::configured() && shape_views(tan);
+        eye_shape::plan_session(static_cast<uint32_t>(d.Width), d.Height, have ? tan : nullptr, &sw, &sh);
+    }
     uint32_t nf = 0;
     int64_t formats[64];
     xrEnumerateSwapchainFormats(g_session, 64, &nf, formats);
@@ -415,6 +478,7 @@ bool make_swapchains() {
             xr_blit::init(state::device.load(), static_cast<uint32_t>(d.Width), d.Height, d.Format, want)) {
             fmt = want;
             g_blit = true;
+            xr_blit::set_dst_size(sw, sh);
         } else {
             log::error("[xr] colour blit unavailable: raw copies (colours wrong)");
         }
@@ -430,8 +494,8 @@ bool make_swapchains() {
         ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         ci.format = static_cast<int64_t>(fmt);
         ci.sampleCount = 1;
-        ci.width = static_cast<uint32_t>(d.Width);
-        ci.height = d.Height;
+        ci.width = sw;
+        ci.height = sh;
         ci.faceCount = 1;
         ci.arraySize = 1;
         ci.mipCount = 1;
@@ -448,6 +512,8 @@ bool make_swapchains() {
     }
     g_w = static_cast<uint32_t>(d.Width);
     g_h = d.Height;
+    g_sw = sw;
+    g_sh = sh;
     ID3D12Resource* targets[2] = {target, target_taa};
     for (int t = 0; t < 2; ++t) {
         if (!targets[t]) continue;
@@ -456,9 +522,9 @@ bool make_swapchains() {
         d3d::watch_add(targets[t]);
     }
     d3d::set_bind_tap(d3d::kBindTapXr, xr_bind_tap);
-    log::info("[xr] submission: 2 swapchains %ux%u format %d (%s), %zu images each, RTVs: Post FXAA Target %d, FXAATarget %d",
-              g_w, g_h, static_cast<int>(fmt), g_blit ? "colour blit" : "raw copies", g_chain[0].images.size(),
-              g_target_nrtv[0], g_target_nrtv[1]);
+    log::info("[xr] submission: 2 swapchains %ux%u format %d (%s), %zu images each, RTVs: Post FXAA Target %d, FXAATarget %d%s",
+              g_sw, g_sh, static_cast<int>(fmt), g_blit ? "colour blit" : "raw copies", g_chain[0].images.size(),
+              g_target_nrtv[0], g_target_nrtv[1], g_sw != g_w || g_sh != g_h ? " (EyeShape: the eye size; the post output is larger)" : "");
     return true;
 }
 
@@ -763,10 +829,20 @@ void end_open_frame() {
     ID3D12Resource* acquired[2] = {g_dst[0].load(), g_dst[1].load()};
     g_dst[0] = nullptr;
     g_dst[1] = nullptr;
+    // [XR] EyeShape: the eye content (the post output's top-left eye rect, else all of it) and the image submitted (the
+    // content itself when it fits the swapchain image, else the swapchain image, resampled into); without EyeShape the
+    // whole post output, as before
+    uint32_t cw = g_w, ch = g_h, rw = 0, rh = 0;
+    const bool rect = eye_shape::frame_rect(&cw, &ch, &rw, &rh);
+    const uint32_t iw = cw <= g_sw ? cw : g_sw, ih = ch <= g_sh ? ch : g_sh;
     if (g_blit && g_filled.load() == 3) {
         ID3D12CommandQueue* q = state::present_queue.load();
-        if (!q || !xr_blit::blit(q, acquired, xr_blit::game_gamma(1.0f))) g_filled = 0;  // not converted: no layer
+        const xr_blit::Frame f{cw, ch, iw, ih, rect ? rw : 0, rect ? rh : 0};
+        const bool plain = !rect && g_sw == g_w && g_sh == g_h;
+        if (!q || !xr_blit::blit(q, acquired, xr_blit::game_gamma(1.0f), plain ? nullptr : &f)) g_filled = 0;  // not converted: no layer
     }
+    g_rect_w.store(iw, std::memory_order_relaxed);
+    g_rect_h.store(ih, std::memory_order_relaxed);
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     for (auto& c : g_chain) xrReleaseSwapchainImage(c.sc, &ri);
     XrCompositionLayerProjectionView pv[2];
@@ -775,7 +851,7 @@ void end_open_frame() {
         pv[i].pose = g_frame_views[i].pose;
         pv[i].fov = g_frame_views[i].fov;
         pv[i].subImage.swapchain = g_chain[i].sc;
-        pv[i].subImage.imageRect = {{0, 0}, {static_cast<int32_t>(g_w), static_cast<int32_t>(g_h)}};
+        pv[i].subImage.imageRect = {{0, 0}, {static_cast<int32_t>(iw), static_cast<int32_t>(ih)}};
     }
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     layer.space = g_space;
@@ -1030,6 +1106,22 @@ DWORD WINAPI session_thread(void*) {
         g_max_layers = sp.graphicsProperties.maxLayerCount;
         log::info("[xr] system: %s (vendor %u), up to %u layers", sp.systemName, sp.vendorId, sp.graphicsProperties.maxLayerCount);
     }
+    {  // the runtime's recommended eye image ([XR] EyeShape sizes the eyes from it)
+        XrViewConfigurationView vv[2] = {{XR_TYPE_VIEW_CONFIGURATION_VIEW}, {XR_TYPE_VIEW_CONFIGURATION_VIEW}};
+        uint32_t nvv = 0;
+        r = xrEnumerateViewConfigurationViews(inst, sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &nvv, vv);
+        if (XR_SUCCEEDED(r) && nvv == 2) {
+            for (int i = 0; i < 2; ++i)
+                log::info("[xr] %s eye image: recommended %ux%u (max %ux%u), %u samples", i ? "right" : "left", vv[i].recommendedImageRectWidth,
+                          vv[i].recommendedImageRectHeight, vv[i].maxImageRectWidth, vv[i].maxImageRectHeight, vv[i].recommendedSwapchainSampleCount);
+            auto big = [](uint32_t a, uint32_t b) { return a > b ? a : b; };
+            eye_shape::set_recommended(big(vv[0].recommendedImageRectWidth, vv[1].recommendedImageRectWidth),
+                                       big(vv[0].recommendedImageRectHeight, vv[1].recommendedImageRectHeight),
+                                       big(vv[0].maxImageRectWidth, vv[1].maxImageRectWidth), big(vv[0].maxImageRectHeight, vv[1].maxImageRectHeight));
+        } else {
+            log::warn("[xr] xrEnumerateViewConfigurationViews -> %s (%u views): no recommended eye size", result_name(inst, r), nvv);
+        }
+    }
 
     PFN_xrGetD3D12GraphicsRequirementsKHR get_req = nullptr;
     xrGetInstanceProcAddr(inst, "xrGetD3D12GraphicsRequirementsKHR", reinterpret_cast<PFN_xrVoidFunction*>(&get_req));
@@ -1267,11 +1359,11 @@ void rings_status(char* out, size_t len) {
 }
 
 void submit_status(char* out, size_t len) {
-    char blit[96];
+    char blit[160];
     xr_blit::status_text(blit, sizeof(blit));
     std::snprintf(out, len, "%s, frames with the layer %llu, without %llu, copies %llu, misses %llu, first eye after overlays %llu, %ux%u | %s | poses: this frame's %llu, "
                   "another frame's %llu, no XR views %llu | late latch %llu (misses %llu, mean %.3f max %.3f deg) | ui quad %llu | "
-                  "cinema %d (%llu frames)",
+                  "cinema %d (%llu frames) | eye swapchains %ux%u, imageRect %ux%u",
                   g_session_running.load() && g_submit.load() ? "submitting" : (g_submit_mode.load() ? "submit mode, waiting" : "off"),
                   static_cast<unsigned long long>(g_submitted.load()), static_cast<unsigned long long>(g_empty.load()),
                   static_cast<unsigned long long>(g_copies.load()), static_cast<unsigned long long>(g_misses.load()),
@@ -1280,7 +1372,8 @@ void submit_status(char* out, size_t len) {
                   static_cast<unsigned long long>(g_pose_stale.load()), static_cast<unsigned long long>(g_pose_none.load()),
                   static_cast<unsigned long long>(g_latched.load()), static_cast<unsigned long long>(g_latch_misses.load()),
                   g_latched.load() ? g_latch_sum_deg.load() / static_cast<float>(g_latched.load()) : 0.0f, g_latch_max_deg.load(),
-                  static_cast<unsigned long long>(g_ui_frames.load()), g_cinema.load() ? 1 : 0, static_cast<unsigned long long>(g_cinema_frames.load()));
+                  static_cast<unsigned long long>(g_ui_frames.load()), g_cinema.load() ? 1 : 0, static_cast<unsigned long long>(g_cinema_frames.load()),
+                  g_sw, g_sh, g_rect_w.load(), g_rect_h.load());
 }
 
 bool submitting() { return g_session_running.load() && g_submit.load(); }

@@ -46,7 +46,11 @@ bool copy_T(float T[16]);  // the last placement's T
 bool own_model();
 void set_own_model(bool on);  // also written to the user ini
 void set_copy_model(int weapon);
-int copy_model();  // the eWeapon shown for the copy, or -1 (the gun in hand's model)
+int copy_model();  // the eWeapon shown for the copy as a held prop (held_prop slot 1), or -1: the gun in hand's draw made twice
+// [Hands] CopyAsProp (on; run 7 item 1): the copy of the same model as a held prop of that model too (the gun in hand's
+// skinned draw made a second time with its bones moved was never seen at the free hand)
+bool copy_as_prop();
+void set_copy_as_prop(bool on, bool save);  // save: also written to the user ini (the menu; "dual asprop" is the session's)
 // [Hands] DualWieldSameAtItsHolster (on; round 13 item 10): with DualWieldOwnModel, the free hand at the gun in hand's own
 // holster (the one it was drawn from) takes a second of that gun, its own model (another hip: the other sidearm's)
 bool same_at_its_holster();

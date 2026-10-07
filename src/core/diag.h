@@ -6,6 +6,8 @@
 //  - Device removal: polls GetDeviceRemovedReason every 0.5 s and dumps the DRED breadcrumbs and page-fault
 //    allocations when the device goes away. RDR2VR's "freezes" were device removals behind an invisible box.
 
+#include <string>
+
 namespace rdrvr::diag {
 
 // Test diagnostic: searches the process's committed read-write memory (image and private; not write-combined or
@@ -20,5 +22,13 @@ void start_watchdog();          // after the D3D12 hooks are installed
 bool force_device_removal();
 const char* removal_test_status();   // "not run", "running", "passed: ...", "failed: ..."
 void dump_dred(const char* why);     // the game's device
+// [Debug] HangRecorderDump's reads (the game's D3D command recorder, its queues and chunks, the renderer's frame
+// semaphores; reads only, SEH-guarded), logged as "[hang] rec ...": at a hang with the stuck frames' registers, or on
+// demand ("recdump", the test channel) to check the reads against a running game.
+void dump_recorder();
+// "sample [n]" (the test channel): n samples, 50 ms apart, of every thread's RIP and stack top (each thread suspended
+// only for its context: no unwind); the threads that used over 10% of a core meanwhile logged with their commonest RIPs
+// ("[sample] ..."). Returns a one-line summary.
+std::string sample_threads(int n);
 
 }  // namespace rdrvr::diag

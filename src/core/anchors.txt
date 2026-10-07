@@ -156,6 +156,10 @@ ProjectileSpawn          func   0x302a50   # (W, first projectile, count r8d, pe
 # --- round 13: the close-range execution on the fire trigger (research\round13\execution-block.md)
 ExecGate                 site   0xadebe0 8 # FUN_140adebe0 (phys) -> bool: a leaf with no .pdata entry; false skips the shot request's execution scan
 ExecGateRet              site   0xd1fa19 8 # its return address in FUN_140d1f960 (the shot request), inside the local player's branch
+ArmBlock                 func   0xd1e640   # FUN_140d1e640(G): the arm block, the game's "gun against a wall" (run 7 item 1e): a sweep from John's shoulder toward the target point; a hit sets G +0x400 = 1, reason G +0x410 = 2
+# --- run 7 item 2: the gun-butt melee (research\round13\gun-melee.md 3, 5.4; Ghidra 2026-10-08)
+ActorHit                 func   0xae1760   # FUN_140ae1760(actor, DamageInfo*): the actor takes a hit (its AI's attacker memory, KO points or health, the hit record its action tree reacts to, the hit event); the fist melee FUN_140d007f0 and KILL_ACTOR_WITH_KILLER's FUN_140ad1f60 call it
+GameTime                 global 0x2314d3c  # float: the game's clock (s) the melee stamps its DamageInfo with (info +0x90, FUN_140d007f0 0x140d01ab6) and FUN_140ae1760 its AI records
 # --- DLSS per eye (research\run6\dlss.md H2-H5; Ghidra, 2026-10-07)
 DeferredAppend           site   0xecc9b0 10 # FUN_140ecc9b0 (recorder, fn, data, size): the deferred recorders' vt+0x2d8, a callback for the playback thread (the data copied)
 DlssEvalCallback         site   0xfced10 5 # the DLSS evaluate callback: mov rdx,rcx; xor ecx,ecx; jmp FUN_140fcf6b0 (slSetTag, slEvaluateFeature on 0x142260478)
@@ -199,3 +203,24 @@ RecorderDrawAt           func   0xecd4f0   # (recorder, topology, start, count, 
 RecorderVtbl             global 0x105abb8  # the draw recorder's vtable (FUN_140eca8e0's): TLS +0x30 on the recording threads (the game's own D3D thread mode)
 DrawModelGeometry        func   0x167720   # (shader, model, geometry index, matrix set, ?, byte): one geometry's passes (FUN_1401672d0 begin, the geometry's vtable +8 draw, FUN_1400bfa10 end); FUN_14087f2a0 calls it per geometry of a drawable's model
 MuzzleFxMatrix           func   0x301680   # (W, &matrix ptr, &local): the muzzle flash's followed matrix (FUN_1406b6280 keeps the pointer at fx +0x170): the prop's muzzle bone, else W +0x80 (run 4 item 3: the copy's flash)
+# --- run 7 item 4: eyes in the headset's own shape (research\run7\eye-shape.md 7; Ghidra 2026-10-08, every func a .pdata entry)
+DrsSubregion             func   0x5c26a0   # FUN_1405c26a0(renderer, W, H): renderer +0x554/+0x558 = round(+0x550 x W, H), then SetSize (used, used, W, H) on the render class (renderer +0x540/+0x548, the lighting +0x878, PostFxSetSizes, the shadow collector, the grass, ExtraSceneTarget)
+DrsController            func   0x5c7d80   # FUN_1405c7d80(renderer): once a frame (RenderFrame 0x1405c88b2, render thread): clears the RTs' +0x2c dirty bytes, then DrsSubregion when the scale or the technique changed
+PostFxSetSizes           func   0x868700   # FUN_140868700(postfx, rw, rh, ow, oh): FullScreenCopy, velocity, reactivity and (FXAA) FXAATarget at (rw, rh); the Post FXAA Target, the bloom chain at (ow, oh); QualityRcpFrame 1/(rw, rh)
+GrassSetSize             func   0x9e4eb0   # FUN_1409e4eb0(grass, rw, rh, W, H): the grass manager's +0xb130/+0xb128 RTs
+RtSetSize                func   0x1557d0   # FUN_1401557d0(rt, usedW, usedH, allocW, allocH, fmt): the RT class's vt+0xe0 (logical size at +0xb0/+0xb2); checked, never hooked
+RtVtbl                   global 0x1c70f68  # the RT class's vtable (FUN_1401559b0): +0x38/+0x40 the logical width/height (FUN_140154220/230), +0xe0 RtSetSize; the name at RT +0x60
+ScreenWidth              global 0x22722d4  # the screen width (main thread's), DrsSubregion's W
+ScreenWidthRT            global 0x22722d8  # its render-thread copy (a lock sets it to the bound target's logical width)
+ScreenHeight             global 0x22722cc  # the screen height (main thread's), DrsSubregion's H
+ScreenHeightRT           global 0x22722d0  # its render-thread copy
+LightingManager          global 0x2ad1ce0  # +0x878 its RT (resized while +0x9c80 is set)
+ShadowCollectorOwner     global 0x2ad2150  # +0x40 "Shadow Collector", +0x48 "Shadow Collector Depth Buffer" (the main scene depth)
+GrassEnabled             global 0x2ac5128  # DrsSubregion resizes the grass targets while this is non-zero
+ExtraSceneTarget         global 0x2ac5050  # an RT pointer (null-checked) DrsSubregion resizes with the render class
+# --- run 7: the hang detector's recorder dump ([Debug] HangRecorderDump; research\run7\freeze.md 5; every func a .pdata entry)
+ReplayChunk              func   0xecdd30   # the playback thread's replay of a chunk (FUN_140ecdd30; its count == 0 spin at 0x140ecdd70): at a hang, Rbp the chunk, [R14] the read offset, Rsi the immediate context
+PlaybackLoop             func   0xecfad0   # "RenderThread", the D3D12 playback loop (FUN_140ecfad0, made in DeviceInit): Rbp the recorder, Rbx the chunk
+RecorderWaitDone         func   0xecfd80   # the recorder's wait for the finished chunk (MsgWaitForMultipleObjects on recorder +0xd0, then FUN_140ecea30): Rdi the recorder
+RecorderEndFrame         func   0xecda50   # the recorder's EndFrame (vtable +0x28): packet 2 (the immediate context's EndFrame), packet 0x50, then RecorderWaitDone
+ImmCtxVtbl               global 0x1094568  # the immediate context's vtable (the playback side; D3dDeviceSingleton +0x50 -> +0x128)

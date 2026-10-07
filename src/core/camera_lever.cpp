@@ -844,6 +844,8 @@ bool eyes_follow_head() {
            g_xr_head_position.load(std::memory_order_relaxed);
 }
 
+bool xr_double() { return g_xr_pose.load(std::memory_order_relaxed) && g_double.load(std::memory_order_relaxed); }
+
 bool local_rel(const float* pos, float* prel) {
     float q0[4], p0[3];
     {

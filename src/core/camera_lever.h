@@ -85,6 +85,9 @@ bool world_to_local(const float* cam, const float* wpos, float* lpos);
 // The eye cameras follow the located views with the head's position (the XR pose, the double pass and the head
 // position on): LOCAL and the world are then one rigid frame through world_to_local.
 bool eyes_follow_head();
+// The double pass with the eye cameras from the located XR views (the stereo view or 3D cutscenes): the frame's two
+// images are the headset's eyes ([XR] EyeShape renders them in the eyes' own shape only then). Any thread.
+bool xr_double();
 uint64_t scene_calls();  // SceneRender calls so far (a frame without one shows a flat source: loading, bink, front end)
 // The render thread's time in SceneRender so far (microseconds, both passes of a stereo frame) and the frames timed:
 // the perf status's mean over its window.

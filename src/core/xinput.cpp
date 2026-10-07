@@ -28,6 +28,10 @@ std::atomic<ULONGLONG> g_until{0};
 std::atomic<bool> g_sticks_on{false};               // the press holds the sticks too (test aid "stick")
 std::atomic<SHORT> g_lx{0}, g_ly{0}, g_rx{0}, g_ry{0};
 std::atomic<uint64_t> g_polls{0}, g_injected{0}, g_caps{0}, g_rumbles{0};
+// run 7 item 1e: the shoulder buttons' presses the game read (RB is its cover button, LB its own): rising edges
+std::atomic<uint64_t> g_rb_presses{0}, g_lb_presses{0}, g_x_presses{0};  // X: the game's jump (item 1f)
+std::atomic<uint64_t> g_x_press_ms{0};
+WORD g_last_buttons = 0;
 std::atomic<uint32_t> g_rumble{0};  // last motor speeds sent to pad 0: left << 16 | right
 std::atomic<DWORD> g_packet{0x52445652};
 std::atomic<bool> g_was_injecting{false};
@@ -141,6 +145,16 @@ DWORD WINAPI hk_GetState(DWORD user, XINPUT_STATE* st) {
             g_injected.fetch_add(1);
         }
     }
+    if (user == 0 && st && r == ERROR_SUCCESS) {
+        const WORD b = st->Gamepad.wButtons, up = static_cast<WORD>(b & ~g_last_buttons);
+        if (up & XINPUT_GAMEPAD_RIGHT_SHOULDER) g_rb_presses.fetch_add(1, std::memory_order_relaxed);
+        if (up & XINPUT_GAMEPAD_LEFT_SHOULDER) g_lb_presses.fetch_add(1, std::memory_order_relaxed);
+        if (up & XINPUT_GAMEPAD_X) {
+            g_x_presses.fetch_add(1, std::memory_order_relaxed);
+            g_x_press_ms.store(GetTickCount64(), std::memory_order_relaxed);
+        }
+        g_last_buttons = b;
+    }
     return r;
 }
 
@@ -220,5 +234,9 @@ uint64_t injected() { return g_injected.load(); }
 uint64_t caps_queries() { return g_caps.load(); }
 uint32_t rumble() { return g_rumble.load(); }
 uint64_t rumble_changes() { return g_rumbles.load(); }
+uint64_t rb_presses() { return g_rb_presses.load(std::memory_order_relaxed); }
+uint64_t lb_presses() { return g_lb_presses.load(std::memory_order_relaxed); }
+uint64_t x_presses() { return g_x_presses.load(std::memory_order_relaxed); }
+uint64_t x_press_tick() { return g_x_press_ms.load(std::memory_order_relaxed); }
 
 }  // namespace rdrvr::xinput

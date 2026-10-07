@@ -8,19 +8,23 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 
 #include "core/anchors.h"
 #include "core/api.h"
 #include "core/body.h"
 #include "core/gestures.h"
+#include "core/gun_melee.h"
 #include "core/config.h"
+#include "core/d3d_hooks.h"
 #include "core/dual.h"
 #include "core/hooks.h"
 #include "core/holster.h"
 #include "core/log.h"
 #include "core/pose.h"
 #include "core/reload.h"
+#include "core/xinput.h"
 
 namespace rdrvr::aim {
 namespace {
@@ -35,6 +39,9 @@ std::atomic<bool> g_tracer{true};  // [Hands] TracerFromMuzzle
 std::atomic<bool> g_perfect{false};  // [Aim] PerfectAccuracy
 std::atomic<bool> g_pattern{true};   // [Aim] ShotgunPattern
 std::atomic<bool> g_spawn_hooked{false};
+// hk_spawn: the muzzle-blocked flip (DoProbeCheck: W +0x9b1 = 1, +0x9b2 = 0) at the player's shots, whatever
+// PerfectAccuracy is (its undo, (a) in hk_spawn, runs only with it on)
+std::atomic<uint64_t> g_flips_seen{0}, g_flips_left{0};
 std::atomic<uint64_t> g_spawns{0}, g_player_spawns{0}, g_bloom_zeroed{0}, g_block_fixes{0}, g_aligned{0}, g_speed_drops{0},
     g_straightened{0};
 // one shot's pellets as hk_launch sees them inside the spawn (the game thread only): the first's numbers, the widest
@@ -394,6 +401,13 @@ void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, 
     // fixes below, (a) and (b), are not for it (a W that was once in hand keeps W +0x9b2, and (b) turned its shot onto
     // the gun in hand's shoot-from row: the simulator, 6.7 degrees off a second sidearm's barrel)
     const bool second = dual::is_secondary_W(W);
+    {  // run 7 item 1e: the muzzle-blocked flip at this shot (W +0x9b1 = 1, +0x9b2 = 0), counted whatever PerfectAccuracy is
+        uint8_t f1 = 0, f2 = 0;
+        if (rd(W + 0x9b1, &f1) && rd(W + 0x9b2, &f2) && f1 && !f2) {
+            g_flips_seen.fetch_add(1, std::memory_order_relaxed);
+            if (!pa) g_flips_left.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (pa) {
         const bool marks = dead_eye_firing_marks() || second;
         const bool fresh = g_barrel.load(std::memory_order_relaxed) && pose::anchor_active() &&
@@ -574,15 +588,210 @@ ExecGate_t o_exec_gate = nullptr;
 std::atomic<bool> g_block_exec{true};
 std::atomic<uint64_t> g_exec_seen{0}, g_exec_blocked{0};
 
-bool hk_exec_gate(uintptr_t phys) {
-    if (reinterpret_cast<uintptr_t>(_ReturnAddress()) == anchors::addr(anchors::Id::ExecGateRet)) {
+// Run 7 item 1e ("unable to shoot when right behind cover"; research\run7\cover-climb.md A.2): the shot request
+// FUN_140d1f960 drops a request (no shot, no ammo) at its end (a) for the arm block, the game's "gun against a wall":
+// FUN_140d1e640 sweeps from John's shoulder height toward the barrel ray's target point, as far as John's animated gun
+// reaches, and a hit sets G +0x400 = 1 (reason G +0x410 = 2); once G +0x404 has eased above 0 the request is dropped;
+// (b) in the game's cover (C +0x18 != 0), when the target point is less than 1 m beyond John's root along the barrel
+// (FUN_14039dee0). The gate hook runs inside the request before both: the fields read there (SEH), the drops
+// predicted as the game's code would take them, counted and logged, only while "aim cover log on" (and only with
+// BlockExecutions on: see rdrvr_exec_gate_impl).
+struct ReqDiag {
+    uint64_t seq = 0;
+    double ms = 0;
+    float g400 = 0, g404 = 0, g40c = 0, g3c4 = 0;
+    uint8_t g410 = 0, g450 = 0, g5d4 = 0, g5d5 = 0, g5d6 = 0, g5d8 = 0, g5ea = 0, t57e4 = 0, t6088 = 0;
+    int32_t g3bc = -1, cover = -1;
+    uint32_t cbc = 0;
+    float origin[3] = {}, c[3] = {}, target[3] = {}, start[3] = {}, root[3] = {};
+    float t3840 = 0, depth = 0;
+    bool arm_drop = false, cover_drop = false;
+};
+ReqDiag g_req;
+std::mutex g_req_mutex;
+std::atomic<bool> g_req_log{false};
+std::atomic<uint64_t> g_reqs{0}, g_arm_drops{0}, g_cover_drops{0};
+
+void note_shot_request() {
+    ReqDiag d;
+    const uintptr_t actor = player_actor();
+    uintptr_t ped = 0, comp = 0, G = 0, C = 0, T = 0, phys = 0, pm = 0;
+    if (!actor || !rd(actor + 0x38, &ped) || !ped || !rd(ped + 0xaa8, &comp) || !comp || !rd(comp + 8, &G) || !G) return;
+    rd(G + 0x400, &d.g400);
+    rd(G + 0x404, &d.g404);
+    rd(G + 0x40c, &d.g40c);
+    rd(G + 0x3c4, &d.g3c4);
+    rd(G + 0x410, &d.g410);
+    rd(G + 0x450, &d.g450);
+    rd(G + 0x5d4, &d.g5d4);
+    rd(G + 0x5d5, &d.g5d5);
+    rd(G + 0x5d6, &d.g5d6);
+    rd(G + 0x5d8, &d.g5d8);
+    rd(G + 0x5ea, &d.g5ea);
+    rd(G + 0x3bc, &d.g3bc);
+    if (rd(comp + 0x18, &C) && C) {
+        rd(C + 0x18, &d.cover);
+        rd(C + 0xbc, &d.cbc);
+    }
+    if (rd(actor + 0xb8, &T) && T) {
+        rd(T + 0x57e4, &d.t57e4);
+        rd(T + 0x6088, &d.t6088);
+        raw(T + 0x3740, d.origin, sizeof(d.origin));
+        raw(T + 0x3730, d.c, sizeof(d.c));
+        raw(T + 0x3810, d.target, sizeof(d.target));
+        raw(T + 0x3830, d.start, sizeof(d.start));
+        rd(T + 0x3840, &d.t3840);
+    }
+    if (rd(actor + 0xb0, &phys) && phys && rd(phys + 0x18, &pm) && pm) raw(pm + 0x30, d.root, sizeof(d.root));
+    // FUN_14039dee0: depth(p) = -(p - origin) . c; the rule wants depth(target) - depth(root) >= 1.0
+    d.depth = -((d.target[0] - d.root[0]) * d.c[0] + (d.target[1] - d.root[1]) * d.c[1] + (d.target[2] - d.root[2]) * d.c[2]);
+    d.arm_drop = d.g404 != 0.0f && !(d.g450 & 0x10) && d.g400 > 0.0f;
+    d.cover_drop = !d.arm_drop && !(d.g5ea & 1) && d.cover != 0 && !(d.t57e4 && d.depth >= 1.0f);
+    d.seq = g_reqs.fetch_add(1, std::memory_order_relaxed) + 1;
+    d.ms = log::now_ms();
+    if (d.arm_drop) g_arm_drops.fetch_add(1, std::memory_order_relaxed);
+    if (d.cover_drop) g_cover_drops.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(g_req_mutex);
+        g_req = d;
+    }
+    if (g_req_log.load(std::memory_order_relaxed) || d.arm_drop || d.cover_drop)
+        log::info("[aim] shot request %llu: %s | arm %.2f/%.2f reason %u reach %.2f flags 450=0x%x | cover %d (bc 0x%x, 5ea 0x%x) depth %.2f | "
+                  "gun state %d raise %.2f 5d4-6/8 %02x %02x %02x %02x | T armed %u no-shoot %u | origin (%.2f %.2f %.2f) target (%.2f %.2f %.2f) "
+                  "start (%.2f %.2f %.2f) %.2f | root (%.2f %.2f %.2f)",
+                  static_cast<unsigned long long>(d.seq), d.arm_drop ? "DROPPED by the arm block" : d.cover_drop ? "DROPPED by the 1 m cover rule" : "goes on",
+                  d.g400, d.g404, d.g410, d.g40c, d.g450, d.cover, d.cbc, d.g5ea, d.depth, d.g3bc, d.g3c4, d.g5d4, d.g5d5, d.g5d6, d.g5d8, d.t57e4,
+                  d.t6088, d.origin[0], d.origin[1], d.origin[2], d.target[0], d.target[1], d.target[2], d.start[0], d.start[1], d.start[2],
+                  d.t3840, d.root[0], d.root[1], d.root[2]);
+}
+
+// The gate's hook is reached through exec_gate_thunk.asm (rdrvr_exec_gate_stub): the gate is a leaf the shot request
+// keeps r9 across (0x140d1fa28), so the stub saves the volatile registers around this C++ part and passes the game's
+// return address (run 7: with the readback added here, r9 was clobbered and the game crashed on the gate's true path).
+extern "C" void rdrvr_exec_gate_stub();
+extern "C" bool rdrvr_exec_gate_impl(uintptr_t phys, uintptr_t ret) {
+    if (ret == anchors::addr(anchors::Id::ExecGateRet)) {
         g_exec_seen.fetch_add(1, std::memory_order_relaxed);
-        if (g_block_exec.load(std::memory_order_relaxed)) {
+        // run 7 item 1e's readback, only while a test asks for it ("aim cover log on") and only on the blocked path:
+        // with it on the gate's true path (BlockExecutions off) the game hung in the simulator (cycle N: the main
+        // thread waiting on the render thread, cause not traced); without it the true path passes (cycle O). Off,
+        // this hook is as it was before run 7, the stub keeping the registers
+        const bool block = g_block_exec.load(std::memory_order_relaxed);
+        if (block && g_req_log.load(std::memory_order_relaxed)) note_shot_request();
+        if (block) {
             g_exec_blocked.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
     }
     return o_exec_gate(phys);
+}
+
+// [Hands] ShootPastArmBlock (run 7 item 1e): FUN_140d1e640(G), the arm block, sweeps from John's (the game body's)
+// shoulder toward the barrel ray's target point; in VR the drawn gun is the player's, held over a wall John's
+// shoulder line is inside (BodyFollowsHead=0 leaves him where he stands), so every pull was dropped there. After the
+// game's own update, a block from that sweep (reason G +0x410 = 2) is cleared for the player while the barrel ray is
+// fresh; the game's other reasons (1: a friendly's "ArmUp" or the no-shoot target, 3, 4: its own states) are kept.
+using ArmBlock_t = uint64_t (*)(uintptr_t G);
+ArmBlock_t o_arm_block = nullptr;
+std::atomic<bool> g_past_arm_block{false};
+std::atomic<uint64_t> g_arm_cleared{0};
+uintptr_t player_gun_ctl() {  // the player's G: [[actor +0x38 (ped)] +0xaa8] +8
+    uintptr_t ped = 0, comp = 0, G = 0;
+    const uintptr_t actor = player_actor();
+    return actor && rd(actor + 0x38, &ped) && ped && rd(ped + 0xaa8, &comp) && comp && rd(comp + 8, &G) ? G : 0;
+}
+uint64_t hk_arm_block(uintptr_t G) {
+    const uint64_t r = o_arm_block(G);
+    if (!g_past_arm_block.load(std::memory_order_relaxed)) return r;
+    uint8_t reason = 0;
+    float up = 0.0f;
+    if (rd(G + 0x410, &reason) && reason == 2 && rd(G + 0x400, &up) && up > 0.0f && pose::anchor_active() &&
+        log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed) < 500.0 && G == player_gun_ctl() && wr<float>(G + 0x400, 0.0f))
+        g_arm_cleared.fetch_add(1, std::memory_order_relaxed);
+    return r;
+}
+
+// Run 7 item 1f ("can't seem to climb over things"; research\run7\cover-climb.md B): the game vaults when its traversal
+// probe (along the stick's heading, else John's facing) finds an edge it accepts (L +0x1d0 bit 0, VaultIncoming; from
+// farther than its tune's distance only at a jog or faster) and the jump node turns that into VaultRequested (bit 1);
+// L +0xf8 is then the ledge state (8 the vault). K = [ped +0xaa8]: L = K +0x48, the locomotion K +0x58 (+0x16f4 the
+// movement state, +0x17b8 the speed), G = K +8 (+0x5d6 bit 6: the aim pose); ped +0xc6f: jumping; the mover actor
+// +0x88 (+0x930 an edge near, +0x70 the position). Read on demand ("aim ledge") and, traced, at the frame end.
+struct LedgeRead {
+    bool ok = false;
+    int32_t state = -1, move = -1;
+    uint8_t b1d0 = 0, b1d1 = 0, b1d2 = 0, jumping = 0, aim = 0;
+    float dist = 0, speed = 0, root[3] = {}, normal[3] = {}, point[3] = {};
+    bool edge_near = false;
+};
+LedgeRead read_ledge() {
+    LedgeRead r;
+    const uintptr_t actor = player_actor();
+    uintptr_t ped = 0, K = 0, L = 0, loco = 0, G = 0, mover = 0, edge = 0;
+    if (!actor || !rd(actor + 0x38, &ped) || !ped || !rd(ped + 0xaa8, &K) || !K || !rd(K + 0x48, &L) || !L) return r;
+    rd(L + 0xf8, &r.state);
+    rd(L + 0x1d0, &r.b1d0);
+    rd(L + 0x1d1, &r.b1d1);
+    rd(L + 0x1d2, &r.b1d2);
+    rd(L + 0x1a4, &r.dist);
+    raw(L + 0x110, r.normal, sizeof(r.normal));
+    raw(L + 0x120, r.point, sizeof(r.point));
+    if (rd(K + 0x58, &loco) && loco) {
+        rd(loco + 0x16f4, &r.move);
+        rd(loco + 0x17b8, &r.speed);
+    }
+    uint8_t fl = 0;
+    if (rd(K + 8, &G) && G && rd(G + 0x5d6, &fl)) r.aim = (fl & 0x40) ? 1 : 0;
+    rd(ped + 0xc6f, &r.jumping);
+    if (rd(actor + 0x88, &mover) && mover) {
+        raw(mover + 0x70, r.root, sizeof(r.root));
+        r.edge_near = rd(mover + 0x930, &edge) && edge;
+    }
+    r.ok = true;
+    return r;
+}
+std::atomic<bool> g_ledge_trace{false};
+std::atomic<uint64_t> g_ledge_frames{0}, g_vault_incoming{0}, g_vault_requested{0}, g_ledge_states{0};
+std::atomic<float> g_ledge_rise{0.0f}, g_ledge_step{0.0f};  // the root's rise in a traced window, its largest step a frame
+void ledge_frame() {
+    if (!g_ledge_trace.load(std::memory_order_relaxed)) return;
+    static uint64_t last_x = 0, win_x = 0;
+    static float y0 = 0, last[3] = {};
+    static bool in = false;
+    const uint64_t xt = xinput::x_press_tick(), now = GetTickCount64();
+    const LedgeRead r = read_ledge();
+    if (!r.ok) return;
+    const bool window = (xt && now - xt < 2000) || r.state != 0;
+    if (!window) {
+        in = false;
+        return;
+    }
+    if (!in || xt != win_x) {  // a new window (a press): its start
+        in = true;
+        win_x = xt;
+        y0 = r.root[1];
+        std::memcpy(last, r.root, sizeof(last));
+        g_ledge_rise = 0.0f;
+        g_ledge_step = 0.0f;
+        log::info("[ledge] X pressed (%llu so far): state %d vault bits 0x%02x 0x%02x 0x%02x, edge near %d dist %.2f, move %d speed %.2f, aim %u, "
+                  "root (%.3f %.3f %.3f)",
+                  static_cast<unsigned long long>(xinput::x_presses()), r.state, r.b1d0, r.b1d1, r.b1d2, r.edge_near ? 1 : 0, r.dist, r.move, r.speed,
+                  r.aim, r.root[0], r.root[1], r.root[2]);
+    }
+    (void)last_x;
+    const float dx = r.root[0] - last[0], dy = r.root[1] - last[1], dz = r.root[2] - last[2];
+    const float step = std::sqrt(dx * dx + dy * dy + dz * dz);
+    std::memcpy(last, r.root, sizeof(last));
+    // the view's jump in a climb: the root's vertical step a frame (the walk's own travel is not one)
+    if (std::fabs(dy) > g_ledge_step.load(std::memory_order_relaxed)) g_ledge_step = std::fabs(dy);
+    if (r.root[1] - y0 > g_ledge_rise.load(std::memory_order_relaxed)) g_ledge_rise = r.root[1] - y0;
+    g_ledge_frames.fetch_add(1, std::memory_order_relaxed);
+    if (r.b1d0 & 1) g_vault_incoming.fetch_add(1, std::memory_order_relaxed);
+    if (r.b1d0 & 2) g_vault_requested.fetch_add(1, std::memory_order_relaxed);
+    if (r.state != 0) g_ledge_states.fetch_add(1, std::memory_order_relaxed);
+    log::info("[ledge] +%llu ms: state %d bits 0x%02x 0x%02x 0x%02x edge %d %.2f move %d %.2f jump %u aim %u y %+.3f step %.3f",
+              static_cast<unsigned long long>(now - xt), r.state, r.b1d0, r.b1d1, r.b1d2, r.edge_near ? 1 : 0, r.dist, r.move, r.speed, r.jumping,
+              r.aim, r.root[1] - y0, step);
 }
 
 bool is_player_ped(uintptr_t ped) {
@@ -618,6 +827,7 @@ uint64_t hk_melee_start(uintptr_t self) {
         !is_player_ped(ped) || !rd(ped + 0xaa8, &comp) || !comp || !rd(comp + 0x80, &m) || !m || !rd(m + 0xc0, &st) || st != 1 ||
         !rd(m + 0x11c, &s) || !(s >= 0.0f && s <= 1.0f) || !rd(m + 0x120, &e) || !(e >= s && e <= 1.0f))
         return r;
+    gun_melee::note_punch(m);  // run 7 item 2: the game's melee force scale at a punch, logged (GunMelee on only)
     g_probe_ms.store(log::now_ms(), std::memory_order_relaxed);  // the probe: this punch's strike, timed (melee_probe)
     g_probe_k.store(k, std::memory_order_relaxed);
     g_probe_m.store(m, std::memory_order_release);
@@ -663,6 +873,7 @@ bool install() {
     g_throw_rate = config::get_float("Gestures", "ThrowRate", 1.5f);
     g_melee_strike = config::get_float("Gestures", "MeleeStrike", 0.35f);
     g_block_exec = config::get_bool("Hands", "BlockExecutions", true);
+    g_past_arm_block = config::get_bool("Hands", "ShootPastArmBlock", false);
     {
         const float a = g_throw_release.load(), b = g_throw_rate.load(), c = g_melee_strike.load();
         g_throw_release = !(a >= 0.05f) ? 0.05f : a > 1.0f ? 1.0f : a;
@@ -677,8 +888,12 @@ bool install() {
                          &o_melee_start);
     ok &= hooks::install("RDR reticle ray (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::AimRay)), hk_aim_ray, &o_aim_ray);
     ok &= hooks::install("RDR fire trigger (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::FireTrigger)), hk_fire, &o_fire);
-    ok &= hooks::install("RDR execution gate (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ExecGate)), hk_exec_gate, &o_exec_gate);
+    ok &= hooks::install("RDR execution gate (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ExecGate)),
+                         reinterpret_cast<void*>(&rdrvr_exec_gate_stub), reinterpret_cast<void**>(&o_exec_gate));
     log::info("[aim] close-range executions on the trigger blocked: %d", g_block_exec.load() ? 1 : 0);
+    ok &= hooks::install("RDR arm block (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ArmBlock)), hk_arm_block, &o_arm_block);
+    log::info("[aim] shots past the game's arm block (its shoulder-line probe): %d", g_past_arm_block.load() ? 1 : 0);
+    d3d::add_frame_end_listener([](uint64_t) { ledge_frame(); });  // run 7 item 1f: "aim ledge trace" (off: one flag check)
     ok &= hooks::install("RDR soft-lock tuning (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::SoftLockSelect)), hk_soft_lock,
                          &o_soft_lock);
     ok &= hooks::install("RDR projectile launch (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ProjectileLaunch)), hk_launch,
@@ -737,6 +952,11 @@ bool block_executions() { return g_block_exec.load(std::memory_order_relaxed); }
 void set_block_executions(bool on) {
     if (g_block_exec.exchange(on) != on) log::info("[aim] close-range executions on the trigger blocked: %d", on ? 1 : 0);
     config::set("Hands", "BlockExecutions", on ? "1" : "0");
+}
+bool shoot_past_arm_block() { return g_past_arm_block.load(std::memory_order_relaxed); }
+void set_shoot_past_arm_block(bool on, bool save) {
+    if (g_past_arm_block.exchange(on) != on) log::info("[aim] shots past the game's arm block (its shoulder-line probe): %d", on ? 1 : 0);
+    if (save) config::set("Hands", "ShootPastArmBlock", on ? "1" : "0");
 }
 
 bool held_item_matrix(float m[16], bool* left, uintptr_t* Wout, uintptr_t* wmgr_out) {
@@ -822,6 +1042,54 @@ std::string command(const std::string& line) {
                       g_reticle.load() ? 1 : 0, ok ? "at" : "none", p[0], p[1], p[2], act ? " on an actor" : "", sz,
                       static_cast<unsigned long long>(g_reticle_shown.load()), static_cast<unsigned long long>(g_reticle_offline.load()),
                       g_last_muzzle[0], g_last_muzzle[1], g_last_muzzle[2], g_last_dir[0], g_last_dir[1], g_last_dir[2]);
+        return e;
+    }
+    if (line.find(" ledge") != std::string::npos) {  // aim ledge [trace on|off|reset]: the climb state (run 7 item 1f)
+        if (line.find(" trace on") != std::string::npos) g_ledge_trace = true;
+        if (line.find(" trace off") != std::string::npos) g_ledge_trace = false;
+        if (line.find(" reset") != std::string::npos) {
+            g_ledge_frames = g_vault_incoming = g_vault_requested = g_ledge_states = 0;
+            g_ledge_rise = g_ledge_step = 0.0f;
+        }
+        const LedgeRead r = read_ledge();
+        char e[600];
+        std::snprintf(e, sizeof(e),
+                      "ledge: read %d state %d vault bits 0x%02x 0x%02x 0x%02x edge near %d dist %.2f normal (%.2f %.2f %.2f) point (%.2f %.2f %.2f) | "
+                      "move %d speed %.2f jumping %u aim %u root (%.3f %.3f %.3f) | X presses %llu | trace %d: frames %llu, incoming %llu, requested "
+                      "%llu, ledge states %llu, the last window's rise %.3f m, largest step %.3f m",
+                      r.ok ? 1 : 0, r.state, r.b1d0, r.b1d1, r.b1d2, r.edge_near ? 1 : 0, r.dist, r.normal[0], r.normal[1], r.normal[2], r.point[0],
+                      r.point[1], r.point[2], r.move, r.speed, r.jumping, r.aim, r.root[0], r.root[1], r.root[2],
+                      static_cast<unsigned long long>(xinput::x_presses()), g_ledge_trace.load() ? 1 : 0,
+                      static_cast<unsigned long long>(g_ledge_frames.load()), static_cast<unsigned long long>(g_vault_incoming.load()),
+                      static_cast<unsigned long long>(g_vault_requested.load()), static_cast<unsigned long long>(g_ledge_states.load()),
+                      g_ledge_rise.load(), g_ledge_step.load());
+        return e;
+    }
+    if (line.find(" armblock") != std::string::npos) {  // aim armblock [on|off]: [Hands] ShootPastArmBlock for the session
+        if (line.find(" armblock on") != std::string::npos) g_past_arm_block = true;
+        if (line.find(" armblock off") != std::string::npos) g_past_arm_block = false;
+        return std::string("shoot past the arm block ") + (g_past_arm_block.load() ? "on" : "off") + ", cleared " + std::to_string(g_arm_cleared.load());
+    }
+    if (line.find(" cover") != std::string::npos) {  // aim cover [log on|off]: the last shot request's arm block, cover and depth
+        if (line.find(" log on") != std::string::npos) g_req_log = true;
+        if (line.find(" log off") != std::string::npos) g_req_log = false;
+        ReqDiag d;
+        {
+            std::lock_guard lock(g_req_mutex);
+            d = g_req;
+        }
+        char e[700];
+        std::snprintf(e, sizeof(e),
+                      "cover: requests %llu, dropped by the arm block %llu, by the 1 m cover rule %llu | muzzle-block flips %llu (left in, PerfectAccuracy "
+                      "off: %llu) | RB presses %llu, LB %llu | log %d | last %llu (%.0f ms ago): %s, arm %.2f/%.2f reason %u reach %.2f 450=0x%x, cover %d "
+                      "bc 0x%x, depth %.2f, raise %.2f, gun state %d, no-shoot %u, target (%.2f %.2f %.2f), root (%.2f %.2f %.2f), start %.2f",
+                      static_cast<unsigned long long>(g_reqs.load()), static_cast<unsigned long long>(g_arm_drops.load()),
+                      static_cast<unsigned long long>(g_cover_drops.load()), static_cast<unsigned long long>(g_flips_seen.load()),
+                      static_cast<unsigned long long>(g_flips_left.load()), static_cast<unsigned long long>(xinput::rb_presses()),
+                      static_cast<unsigned long long>(xinput::lb_presses()), g_req_log.load() ? 1 : 0, static_cast<unsigned long long>(d.seq),
+                      d.ms > 0 ? log::now_ms() - d.ms : -1.0, d.arm_drop ? "dropped (arm)" : d.cover_drop ? "dropped (cover)" : "went on", d.g400,
+                      d.g404, d.g410, d.g40c, d.g450, d.cover, d.cbc, d.depth, d.g3c4, d.g3bc, d.t6088, d.target[0], d.target[1], d.target[2],
+                      d.root[0], d.root[1], d.root[2], d.t3840);
         return e;
     }
     if (line.find(" executions") != std::string::npos) {  // aim executions: the gate's calls from the shot request

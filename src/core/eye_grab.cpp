@@ -12,6 +12,7 @@
 #include "core/anchors.h"
 #include "core/camera_lever.h"
 #include "core/d3d_hooks.h"
+#include "core/eye_shape.h"
 #include "core/log.h"
 #include "core/post_target.h"
 #include "core/state.h"
@@ -58,6 +59,7 @@ UINT64 g_row_bytes = 0;
 uint32_t g_w = 0, g_h = 0, g_fmt = 0;
 uint64_t g_frame = 0;
 char g_sequence[96] = "";
+uint32_t g_rect = 0;               // [XR] EyeShape: the eye rect in the images (w | h << 16; 0: the whole image)
 ID3D12Fence* g_fence = nullptr;
 uint64_t g_fence_value = 0;
 HANDLE g_fence_event = nullptr;
@@ -143,6 +145,8 @@ void bind_tap(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_CPU_DESCRIPTOR_
     } else if (g_fxaa_binds == 1) {
         record(cl, 0);
     }
+    uint32_t cw = 0, ch = 0;
+    g_rect = eye_shape::frame_rect(&cw, &ch) ? (cw & 0xffffu) | (ch << 16) : 0u;
     std::snprintf(g_sequence, sizeof(g_sequence), "%d FXAA bind(s) then the UI bind%s", g_fxaa_binds,
                   g_fxaa_binds >= 2 ? (k == 1 ? ", first eye before bind 2" : k == 2 ? ", first eye before bind 3" : ", first eye before bind 4") : "");
     g_fxaa_binds = 0;
@@ -197,6 +201,7 @@ std::string arm(uint64_t frame) {
     g_first = g_pick = 0;
     g_frame = frame + 1;
     g_sequence[0] = 0;
+    g_rect = 0;
     g_res = res;
     d3d::watch_add(res);
     log::info("[eyegrab] armed at frame %llu: %s at object%s, %d RTV(s), %ux%u format %u", static_cast<unsigned long long>(frame),
@@ -267,7 +272,7 @@ std::string write_rde(const std::string& path, const Slot& s, int eye) {
     FILE* f = nullptr;
     if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0 || !f) return "ERROR cannot open " + path;
     const uint32_t hdr[8] = {0x31454452u /* RDE1 */, g_w, g_h, g_fmt, static_cast<uint32_t>(eye),
-                             static_cast<uint32_t>(g_frame), static_cast<uint32_t>(g_row_bytes), 0};
+                             static_cast<uint32_t>(g_frame), static_cast<uint32_t>(g_row_bytes), g_rect};
     fwrite(hdr, 1, sizeof(hdr), f);
     fwrite(s.pixels.data(), 1, s.pixels.size(), f);
     bool ok = fclose(f) == 0 && MoveFileExW(tmp.c_str(), wpath.c_str(), MOVEFILE_REPLACE_EXISTING);
@@ -308,9 +313,9 @@ std::string grab(const std::string& prefix, unsigned timeout_ms) {
         s.pixels.clear();
         s.pixels.shrink_to_fit();
     }
-    char head[192];
-    std::snprintf(head, sizeof(head), "frame %llu %ux%u format %u, %s", static_cast<unsigned long long>(g_frame), g_w, g_h, g_fmt,
-                  g_sequence);
+    char head[224];
+    std::snprintf(head, sizeof(head), "frame %llu %ux%u format %u, %s%s", static_cast<unsigned long long>(g_frame), g_w, g_h, g_fmt,
+                  g_sequence, g_rect ? (", eye rect " + std::to_string(g_rect & 0xffffu) + "x" + std::to_string(g_rect >> 16)).c_str() : "");
     log::info("[eyegrab] %s%s", head, out.c_str());
     return head + out;
 }

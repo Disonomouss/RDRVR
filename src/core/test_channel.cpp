@@ -20,6 +20,7 @@
 #include "core/diag.h"
 #include "core/dual_pass.h"
 #include "core/eye_grab.h"
+#include "core/eye_shape.h"
 #include "core/frame_grab.h"
 #include "core/game_hooks.h"
 #include "core/holster.h"
@@ -244,6 +245,11 @@ std::string execute(const std::vector<std::string>& t) {
         return st;
     }
     if (c == "grabeyes" && t.size() >= 2) return eye_grab::grab(t[1]);
+    if (c == "eyeshape") {  // eyeshape [on|off|scale <x>|status|rts]: the eyes in the headset's own shape (EyeShape; the session)
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return eye_shape::command(line);
+    }
     if (c == "aa" && t.size() >= 2) {
         int m = t[1] == "off" ? 0 : t[1] == "fxaa" ? 1 : t[1] == "taa" ? 2 : -1;
         if (m < 0 || !render_settings::set_aa(m)) return "ERROR usage: aa off|fxaa|taa (needs [Render] ForceAntiAliasing >= 0)";
@@ -304,7 +310,12 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "grabui" && t.size() >= 2) return ui_layer::grab(t[1]);
     if (c == "menu") {
-        // menu | menu on|off | menu find <label> | menu scroll <y>
+        // menu | menu on|off | menu find <label> | menu scroll <y> | menu grab <path.bmp>
+        if (t.size() >= 3 && t[1] == "grab") {
+            std::string path;
+            for (size_t i = 2; i < t.size(); ++i) path += (i > 2 ? " " : "") + t[i];
+            return menu::grab(path);
+        }
         if (t.size() >= 3 && t[1] == "scroll") {
             menu::scroll(static_cast<float>(std::atof(t[2].c_str())));
             return "menu scrolled to " + t[2];
@@ -387,6 +398,11 @@ std::string execute(const std::vector<std::string>& t) {
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return gestures::command(line);
     }
+    if (c == "gunmelee") {  // gunmelee [on|off] [dry on|off] [reset] [scan [radius]]: the gun-butt melee (GunMelee; the session)
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return gestures::gun_melee_command(line);
+    }
     if (c == "rings") {  // the holster rings' layers
         char b[240];
         xr::rings_status(b, sizeof(b));
@@ -416,11 +432,12 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 3 && t[1] == "drawhand") controls::set_draw_to_grabbing_hand(t[2] == "on", false);  // the session only
         if (t.size() >= 3 && t[1] == "clickbrake") controls::set_click_brake_session(t[2] == "on");
         if (t.size() >= 3 && t[1] == "sprint") controls::set_sprint_drops_aim(t[2] == "on", false);  // this session only
+        if (t.size() >= 3 && t[1] == "jump") controls::set_jump_drops_aim(t[2] == "on", false);  // run 7 item 1f, this session only
         if (t.size() >= 2 && t[1] == "reset") controls::reset_mapping();
         std::string r = "map:";
         for (int s = 0; s < controls::kSources; ++s)
             r += std::string(" ") + controls::source_key(s) + "=" + controls::target_name(controls::mapping(s));
-        char b[700];
+        char b[900];
         controls::status_text(b, sizeof(b));
         return r + " || " + b;
     }
@@ -431,7 +448,7 @@ std::string execute(const std::vector<std::string>& t) {
             const float a[3] = {std::strtof(t[5].c_str(), nullptr), std::strtof(t[6].c_str(), nullptr), std::strtof(t[7].c_str(), nullptr)};
             controllers::set_fit(1, o, a, false);
         }
-        char a[1024], b[700];
+        char a[1024], b[900];
         controllers::status_text(a, sizeof(a));
         controls::status_text(b, sizeof(b));
         return std::string(a) + " || " + b;
@@ -601,6 +618,13 @@ std::string execute(const std::vector<std::string>& t) {
         return "pressed";
     }
     if (c == "forceremove") return diag::force_device_removal() ? "removing a WARP test device" : "ERROR could not start the removal test";
+    if (c == "sample") {  // where the busy threads are: "[sample]" lines (RIP histograms; no unwind)
+        return diag::sample_threads(t.size() >= 2 ? std::atoi(t[1].c_str()) : 20);
+    }
+    if (c == "recdump") {  // the hang's recorder dump now (reads only): "[hang] rec ..." lines in the log
+        diag::dump_recorder();
+        return "logged the recorder's state ([hang] rec lines)";
+    }
     if (c == "dred") {
         diag::dump_dred("requested");
         return "dumped";
