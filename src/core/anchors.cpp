@@ -37,6 +37,7 @@ std::atomic<bool> g_relocated{false};
 // This build's RVAs: the analysed ones, or the ones verify() found in another build (written before any hook is
 // installed, read-only after).
 uint32_t g_rva[kEntryCount];
+bool g_prechecked[kEntryCount];  // precheck(): matched before verify() (the bootstrap thread, before verify())
 const bool g_rva_init = [] {
     for (int i = 0; i < kEntryCount; ++i) g_rva[i] = kEntries[i].rva;
     return true;
@@ -390,6 +391,18 @@ uint32_t rva(Id id) { return g_rva[static_cast<int>(id)]; }
 const char* name(Id id) { return kEntries[static_cast<int>(id)].name; }
 uintptr_t addr(Id id) { return base() + rva(id); }
 
+bool precheck(Id id) {
+    const int i = static_cast<int>(id);
+    const Entry& e = kEntries[i];
+    if (g_verified.load() || !exe_matches() || e.kind == Kind::Global) return false;
+    if (std::memcmp(reinterpret_cast<const unsigned char*>(base() + e.rva), e.bytes, e.n) != 0) {
+        log::error("[anchors] precheck: %s at +%#x differs from research\\RDR.exe", e.name, e.rva);
+        return false;
+    }
+    g_prechecked[i] = true;
+    return true;
+}
+
 bool exe_matches() {
     auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base());
     auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base() + dos->e_lfanew);
@@ -411,6 +424,7 @@ bool verify() {
     for (const Entry& e : kEntries) {
         if (e.kind == Kind::Global) continue;
         ++checked;
+        if (g_prechecked[&e - kEntries]) continue;  // checked before it was hooked (precheck)
         const auto* p = reinterpret_cast<const unsigned char*>(base() + e.rva);
         if (std::memcmp(p, e.bytes, e.n) != 0) {
             char got[64] = {};

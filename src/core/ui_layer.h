@@ -15,7 +15,12 @@
 namespace rdrvr::ui_layer {
 
 void init();  // installs the RTV substitution and a frame-end listener
+// The UI target is made from the game's post output at the first frame end with the redirect on (the session's start).
 void set_redirect(bool on);
+// xr's live-resize guard: the game made its frame again (its new targets may take the old views' handles), so the
+// redirect is off for this start and set_redirect(true) keeps it off; the UI stays in the game's own image.
+void stop(const char* why);
+bool stopped();
 std::string grab(const std::string& path, unsigned timeout_ms = 3000);
 void status_text(char* out, size_t len);
 // Step 2. While the redirect is on, each frame's UI is also drawn back onto the monitor's back buffer (blended in
@@ -24,9 +29,10 @@ void status_text(char* out, size_t len);
 // image (linear premultiplied, coverage = sqrt(stored alpha)).
 bool has_ui();
 void size(uint32_t* w, uint32_t* h);
-// The whole UI into `dst`, without the UI pixels in `hole` (x0 y0 x1 y1; the wrist HUD's part) when given.
+// The whole UI into `dst`, without the UI pixels in `hole` (x0 y0 x1 y1; the wrist HUD's part) when given. Texel for
+// texel when `dst` is the UI's size; smaller (the quad's swapchain capped), box-filtered so text does not alias.
 bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4] = nullptr);
-// The wrist HUD: the UI from pixel (x0, y0) on, the size of `dst`.
-bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0);
+// The wrist HUD: the UI's cw x ch pixels from (x0, y0) into all of `dst` (texel for texel at that size, else filtered).
+bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw, uint32_t ch);
 
 }  // namespace rdrvr::ui_layer

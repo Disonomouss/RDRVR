@@ -302,6 +302,7 @@ const void* rtv_resource(SIZE_T ptr) {
 
 std::atomic<BindTapFn> g_bind_tap[4];
 std::atomic<RtvSubstFn> g_rtv_subst{nullptr};
+std::atomic<FrameSizeFn> g_frame_size{nullptr};
 std::atomic<bool> g_present_unsynced{false};
 std::atomic<uint64_t> g_unsynced_presents{0};
 
@@ -608,6 +609,12 @@ HRESULT STDMETHODCALLTYPE hk_ResourceSetName(ID3D12Object* obj, LPCWSTR name) {
         target = (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0;
         r->Release();
+        // the frame's own targets: the live-resize guard's first sign (the game names them before its ResizeBuffers).
+        // Not FXAATarget: [XR] EyeShape's sizes make the game re-make it at the eye's size (a false resize in the
+        // simulator, 2026-10-08); a real resize re-makes the Post FXAA Target and the back buffer too
+        if (FrameSizeFn fs = g_frame_size.load(std::memory_order_acquire);
+            fs && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && (n == "Post FXAA Target" || n == "Main Backbuffer"))
+            fs(n.c_str(), static_cast<uint32_t>(d.Width), d.Height);
     }
     bool log_it = false;
     {
@@ -855,6 +862,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags
 
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w, UINT h, DXGI_FORMAT f, UINT flags) {
     log::info("[dxgi] ResizeBuffers(count %u, %ux%u, fmt %d, flags %#x)", count, w, h, static_cast<int>(f), flags);
+    if (FrameSizeFn fs = g_frame_size.load(std::memory_order_acquire)) fs("ResizeBuffers", w, h);
     HRESULT hr = o_ResizeBuffers(sc, count, w, h, f, flags);
     if (SUCCEEDED(hr)) {
         DXGI_SWAP_CHAIN_DESC d{};
@@ -863,6 +871,7 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* sc, UINT count, UINT 
             state::swap_height = d.BufferDesc.Height;
             state::swap_format = d.BufferDesc.Format;
             state::swap_buffers = d.BufferCount;
+            if (FrameSizeFn fs = g_frame_size.load(std::memory_order_acquire)) fs("ResizeBuffers done", d.BufferDesc.Width, d.BufferDesc.Height);
         }
     }
     return hr;
@@ -890,10 +899,11 @@ void on_swapchain(IUnknown* device_or_queue, HWND hwnd, IDXGISwapChain* sc) {
         state::swap_height = d.BufferDesc.Height;
         state::swap_format = d.BufferDesc.Format;
         state::swap_buffers = d.BufferCount;
-        log::info("[dxgi] swapchain %p on queue %p hwnd %p: %ux%u fmt %d buffers %u swap effect %d flags %#x windowed %d",
+        // the usage too: whether the buffers take a shader view (the cinema's resample copies them first either way)
+        log::info("[dxgi] swapchain %p on queue %p hwnd %p: %ux%u fmt %d buffers %u swap effect %d flags %#x windowed %d usage %#x",
                   static_cast<void*>(sc), static_cast<void*>(q), static_cast<void*>(hwnd), d.BufferDesc.Width,
                   d.BufferDesc.Height, static_cast<int>(d.BufferDesc.Format), d.BufferCount, static_cast<int>(d.SwapEffect),
-                  d.Flags, d.Windowed);
+                  d.Flags, d.Windowed, static_cast<unsigned>(d.BufferUsage));
     }
     std::call_once(g_swapchain_once, [sc] {
         hooks::install("IDXGISwapChain::Present", hooks::vtable_entry(sc, 8), hk_Present, &o_Present);
@@ -1152,6 +1162,8 @@ void set_present_unsynced(bool on) {
 void set_bind_tap(int slot, BindTapFn fn) {
     if (slot >= 0 && slot < 4) g_bind_tap[slot] = fn;
 }
+
+void set_frame_size_listener(FrameSizeFn fn) { g_frame_size.store(fn, std::memory_order_release); }
 
 
 

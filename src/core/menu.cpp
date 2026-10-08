@@ -48,6 +48,7 @@
 #include "core/vr_mode.h"
 #include "core/xr.h"
 #include "core/round_draw.h"
+#include "core/render_res.h"
 
 namespace rdrvr::menu {
 namespace {
@@ -371,7 +372,7 @@ bool g_page_changed = false;      // a new page opens at its top
 std::string g_help;               // this frame's help line (the row under the laser)
 std::atomic<float> g_scroll_max{0.0f};
 std::atomic<int> g_page_shared{kGeneral};
-const char kIdleHelp[] = "Point at a setting to read about it here. The right stick scrolls the page under the pointer.";
+const char kIdleHelp[] = "Point at a setting to read about it here. Your gun hand's stick scrolls the page under the pointer.";
 
 // A label's part shown (before "##") and its name for track() and the tests (after "##", else the whole label), as
 // ImGui's own "label##id": a short label keeps a test's name
@@ -604,6 +605,43 @@ void page_general() {
         if (!eye_shape::set_enabled(eye, true)) note("Not available: the hooks it needs are not installed (see the log).");
     }
     sub_end();
+    // [Render] RenderResolution: the game's frame at a headset's height, apart from the monitor (from the next start)
+    heading("Resolution");
+    {
+        const int cur = render_res::choice();
+        char why[192];
+        std::string preview = cur >= 0 ? render_res::choice_label(cur) : std::string("Custom (the ini's RenderResolution)");
+        uint32_t w = 0, h = 0;
+        if (cur == 1 && render_res::choice_size(1, &w, &h)) preview += " (" + std::to_string(w) + " x " + std::to_string(h) + ")";
+        ImGui::TextUnformatted("Render resolution");
+        ImGui::SetNextItemWidth(560);
+        const bool open = ImGui::BeginCombo("##Render resolution", preview.c_str());
+        if (!open) track("Render resolution");
+        help("What the game renders, apart from its window and your monitor's modes, from the next start. Each eye is the game's "
+             "frame (with \"Eyes in the headset's shape\", each eye at most this tall): a height at or above what your headset "
+             "asks for gives it its full sharpness. Larger is dearer on the GPU. Windowed mode keeps your window's size.");
+        if (open) {
+            for (int i = 0; i < render_res::choice_count(); ++i) {
+                const bool ok = render_res::choice_allowed(i, why, sizeof(why));
+                ImGui::PushID(i);
+                if (ImGui::Selectable(render_res::choice_label(i), cur == i, ok ? 0 : ImGuiSelectableFlags_Disabled) && ok)
+                    render_res::set_choice(i);
+                ImGui::PopID();
+                track(render_res::choice_label(i));
+                help(why[0] ? why : nullptr);
+            }
+            ImGui::EndCombo();
+        }
+        char st[256];
+        render_res::status_text(st, sizeof(st));
+        note((std::string("Now: ") + st).c_str());
+        if (cur >= 0 && render_res::choice_allowed(cur, why, sizeof(why)) && why[0]) note(why);
+        uint32_t want_w = 0, want_h = 0, run_w = 0, run_h = 0;
+        const bool want = cur >= 0 && render_res::choice_size(cur, &want_w, &want_h);
+        const bool run = render_res::active(&run_w, &run_h);
+        if (xr::frame_resized()) note("The game's frame changed size while running (its Graphics menu): restart the game for the VR view.");
+        else if (want != run || (want && (want_w != run_w || want_h != run_h))) note("Restart the game to apply.");
+    }
 }
 
 void page_comfort() {

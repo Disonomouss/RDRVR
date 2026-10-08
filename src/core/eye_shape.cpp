@@ -147,7 +147,8 @@ void kill(const char* fmt, ...) {
     log::error("[eye] KILL SWITCH: %s; the game's uniform render size again at the next DRS controller call (\"eyeshape on\" re-arms)", buf);
 }
 
-// ---- the eye size
+// ---- the eye size: within the game's frame, the swapchains (cap) and the runtime's largest image (g_max: [Render]
+// RenderResolution can make the frame larger than a runtime takes)
 bool compute(uint32_t W, uint32_t H, uint32_t cap_w, uint32_t cap_h, bool log_it, uint32_t* ew, uint32_t* eh) {
     const uint32_t rec_h = g_rec_h.load();
     const float a = g_aspect.load(), s = g_scale.load();
@@ -155,9 +156,13 @@ bool compute(uint32_t W, uint32_t H, uint32_t cap_w, uint32_t cap_h, bool log_it
         if (log_it) log::error("[eye] no eye size: recommended height %u, game %ux%u, FOV aspect %.3f", rec_h, W, H, a);
         return false;
     }
+    const uint32_t max_w = g_max_w.load(), max_h = g_max_h.load();
+    if (max_w && cap_w > max_w) cap_w = max_w;
+    if (max_h && cap_h > max_h) cap_h = max_h;
     const double want_h = static_cast<double>(rec_h) * s;
     uint32_t h = static_cast<uint32_t>(std::lround(want_h));
     if (h > H) h = H;
+    const bool runtime_caps = h > cap_h && cap_h == max_h;
     if (h > cap_h) h = cap_h;
     h &= ~1u;
     uint32_t w = static_cast<uint32_t>(std::lround(static_cast<double>(h) * a));
@@ -169,9 +174,10 @@ bool compute(uint32_t W, uint32_t H, uint32_t cap_w, uint32_t cap_h, bool log_it
         return false;
     }
     if (log_it) {
-        log::info("[eye] recommended %ux%u (max %ux%u), scale %.2f, FOV aspect %.3f (%s), game %ux%u -> eye %ux%u%s", g_rec_w.load(),
-                  rec_h, g_max_w.load(), g_max_h.load(), s, a, g_aspect_from.load() == 1 ? "the located FOV" : "the recommended rect", W, H,
-                  w, h, want_h > H + 0.5 ? " (the game's height caps it: raise the game's resolution for full density)" : "");
+        log::info("[eye] recommended %ux%u (max %ux%u), scale %.2f, FOV aspect %.3f (%s), game %ux%u -> eye %ux%u%s%s", g_rec_w.load(),
+                  rec_h, max_w, max_h, s, a, g_aspect_from.load() == 1 ? "the located FOV" : "the recommended rect", W, H, w, h,
+                  want_h > H + 0.5 ? " (the game's height caps it: raise the game's resolution for full density)" : "",
+                  runtime_caps ? " (the runtime's largest image caps it)" : "");
     }
     *ew = w;
     *eh = h;
@@ -340,7 +346,7 @@ int decide(char* r) {
     const uint32_t W = g_W.load(std::memory_order_relaxed), H = g_H.load(std::memory_order_relaxed);
     const uint32_t ew = g_ew.load(std::memory_order_relaxed), eh = g_eh.load(std::memory_order_relaxed);
     if (!W || !ew || !eh) return kNoSize;
-    if (!xr::submitting()) return kNoXr;
+    if (!xr::submitting() || xr::frame_resized()) return kNoXr;
     if (!camera_lever::xr_double()) return kNotStereo;
     char* postfx = global<char*>(Id::PostFxSingleton);
     int tech = -1;
@@ -374,7 +380,8 @@ void hk_DrsCtl(void* renderer) {
 // ---- the monitor: the left eye pillarboxed onto the back buffer (the gamma blit drew the eye rect in its top-left
 // and stale pixels beside it), before the UI mirror draws the UI over it
 void on_frame_end(uint64_t) {
-    if (!g_run_shaped.load(std::memory_order_relaxed) || !xr::submitting()) return;
+    // not once the game's frame was made again at another size (xr's live-resize guard: the stages are the old frame's)
+    if (!g_run_shaped.load(std::memory_order_relaxed) || !xr::submitting() || xr::frame_resized()) return;
     IDXGISwapChain* sc = state::swapchain.load();
     ID3D12CommandQueue* q = state::present_queue.load();
     if (!sc || !q) return;
@@ -467,6 +474,10 @@ void set_recommended(uint32_t rec_w, uint32_t rec_h, uint32_t max_w, uint32_t ma
 
 bool configured() { return g_on.load() && g_hooked.load() && render_settings::forced_aa() == 1; }
 
+void stop(const char* why) {
+    if (g_on.load() || g_applied.load()) kill("%s", why);
+}
+
 bool enabled() { return g_on.load(); }
 
 bool set_enabled(bool on, bool save) {
@@ -485,18 +496,21 @@ bool set_enabled(bool on, bool save) {
     return true;
 }
 
-void plan_session(uint32_t w, uint32_t h, const float (*tan)[4], uint32_t* sw, uint32_t* sh) {
+void plan_session(uint32_t w, uint32_t h, uint32_t fw, uint32_t fh, const float (*tan)[4], uint32_t* sw, uint32_t* sh) {
     g_W = w;
     g_H = h;
-    g_sw = w;
-    g_sh = h;
+    g_sw = fw;
+    g_sh = fh;
     g_ew = 0;
     g_eh = 0;
-    *sw = w;
-    *sh = h;
+    *sw = fw;
+    *sh = fh;
     set_aspect_from(tan);
     if (!g_on.load()) {
-        log::info("[eye] EyeShape off: the eye swapchains are the game's %ux%u frame", w, h);
+        if (fw == w && fh == h)
+            log::info("[eye] EyeShape off: the eye swapchains are the game's %ux%u frame", w, h);
+        else
+            log::info("[eye] EyeShape off: the eye swapchains are the game's %ux%u frame at %ux%u (the runtime's largest image)", w, h, fw, fh);
         return;
     }
     if (!g_hooked.load()) {
@@ -509,7 +523,7 @@ void plan_session(uint32_t w, uint32_t h, const float (*tan)[4], uint32_t* sw, u
         return;
     }
     uint32_t ew = 0, eh = 0;
-    if (!compute(w, h, w, h, true, &ew, &eh)) return;
+    if (!compute(w, h, w, h, true, &ew, &eh)) return;  // within the runtime's largest image (compute's g_max)
     g_ew = ew;
     g_eh = eh;
     g_sw = ew;

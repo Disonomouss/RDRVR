@@ -43,6 +43,7 @@
 #include "core/xr.h"
 #include "core/zone_rings.h"
 #include "core/round_draw.h"
+#include "core/render_res.h"
 
 namespace rdrvr::bootstrap {
 namespace {
@@ -75,6 +76,9 @@ DWORD WINAPI bootstrap_thread(void*) {
     log_modules("after MTLX");
 
     config::load();
+    // [Render] RenderResolution: before the game's device init reads its size (about 300 ms from here at best); on
+    // another build after anchors::verify() below
+    render_res::early_arm();
     // D3D12 first: the game creates its device soon after its real entry point, and DRED must be armed before.
     d3d::install_startup_hooks();
     xinput::install();
@@ -112,6 +116,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     if (anchors::stand_down()) {
         log::error("[boot] STAND DOWN: no RDR.exe hooks will be installed this run (D3D12 instruments stay)");
     } else {
+        render_res::install();  // another build: the render resolution, if the game has not read its size yet
         game_hooks::install();
         camera_lever::install();
         dual_pass::install();

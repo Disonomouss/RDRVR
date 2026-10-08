@@ -81,8 +81,10 @@ void on_frame_end(uint64_t) {
     int force = g_force_cutscene.load(std::memory_order_relaxed);
     if (force >= 0) cutscene = force == 1;
     bool stalled = g_tick_stall > 20;
-    bool flat = g_no_scene >= 2 || paused || stalled || faded;
-    g_flags = (g_no_scene >= 2 ? 1 : 0) | (paused ? 2 : 0) | (stalled ? 4 : 0) | (faded ? 8 : 0) | (cutscene ? 16 : 0);
+    // the game's frame made again at another size (xr's live-resize guard): the flat game on the cinema screen for good
+    const bool resized = xr::frame_resized();
+    bool flat = g_no_scene >= 2 || paused || stalled || faded || resized;
+    g_flags = (g_no_scene >= 2 ? 1 : 0) | (paused ? 2 : 0) | (stalled ? 4 : 0) | (faded ? 8 : 0) | (cutscene ? 16 : 0) | (resized ? 32 : 0);
     bool cut3d = g_cut3d.load(std::memory_order_relaxed);
     View want = flat ? View::Cinema : cutscene ? (cut3d ? View::Cutscene3D : View::Cinema) : View::Stereo;
     if (want == g_view) {
@@ -92,8 +94,8 @@ void on_frame_end(uint64_t) {
     // into the cinema at once; out of it (or between the stereo views) after ten frames of the new state
     if (want != View::Cinema && g_view == View::Cinema && ++g_clear < 10) return;
     g_clear = 0;
-    std::snprintf(g_reason, sizeof(g_reason), "%s%s%s%s%s", g_no_scene >= 2 ? "no scene " : "", paused ? "paused " : "",
-                  stalled ? "script stalled " : "", faded ? "faded " : "", cutscene ? "cutscene" : "");
+    std::snprintf(g_reason, sizeof(g_reason), "%s%s%s%s%s%s", resized ? "frame resized " : "", g_no_scene >= 2 ? "no scene " : "",
+                  paused ? "paused " : "", stalled ? "script stalled " : "", faded ? "faded " : "", cutscene ? "cutscene" : "");
     log::info("[mode] %s -> %s (%s)", view_name(g_view), view_name(want), g_reason[0] ? g_reason : "gameplay");
     g_view = want;
     g_switches.fetch_add(1, std::memory_order_relaxed);
@@ -137,11 +139,11 @@ bool gameplay_stereo() { return g_auto.load() && g_view == View::Stereo; }
 
 void status_text(char* out, size_t len) {
     int f = g_flags.load();
-    std::snprintf(out, len, "auto %s, view %s, cutscenes %s%s, switches %llu | now: %s%s%s%s%s", g_auto.load() ? "on" : "off",
+    std::snprintf(out, len, "auto %s, view %s, cutscenes %s%s, switches %llu | now: %s%s%s%s%s%s", g_auto.load() ? "on" : "off",
                   view_name(g_view), g_cut3d.load() ? "3D" : "screen", g_force_cutscene.load() >= 0 ? " (FORCED)" : "",
                   static_cast<unsigned long long>(g_switches.load()),
                   f & 1 ? "no-scene " : "", f & 2 ? "paused " : "", f & 4 ? "stalled " : "", f & 8 ? "faded " : "",
-                  f & 16 ? "cutscene" : "");
+                  f & 16 ? "cutscene" : "", f & 32 ? " resized" : "");
 }
 
 }  // namespace rdrvr::vr_mode

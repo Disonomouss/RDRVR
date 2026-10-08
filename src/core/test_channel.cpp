@@ -50,6 +50,7 @@
 #include "core/config.h"
 #include "core/round_draw.h"
 #include "core/held_prop.h"
+#include "core/render_res.h"
 
 namespace rdrvr::test_channel {
 namespace {
@@ -245,6 +246,7 @@ std::string execute(const std::vector<std::string>& t) {
         return st;
     }
     if (c == "grabeyes" && t.size() >= 2) return eye_grab::grab(t[1]);
+    if (c == "renderres") return render_res::command(c);  // renderres: [Render] RenderResolution's state this start
     if (c == "eyeshape") {  // eyeshape [on|off|scale <x>|status|rts]: the eyes in the headset's own shape (EyeShape; the session)
         std::string line;
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
@@ -292,13 +294,21 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "xr" && t.size() >= 3 && t[1] == "submit") {
         xr::set_submit(t[2] == "on");
-        char st[512];
+        char st[1024];
         xr::submit_status(st, sizeof(st));
         return st;
     }
     if (c == "xr" && t.size() >= 3 && t[1] == "gamma") {
         xr_blit::set_gamma_override(t[2] == "live" ? 0.0f : static_cast<float>(std::atof(t[2].c_str())));
-        char st[512];
+        char st[1024];
+        xr::submit_status(st, sizeof(st));
+        return st;
+    }
+    if (c == "xr" && t.size() >= 2 && (t[1] == "status" || t[1] == "resized")) {
+        // xr status: the submission's (also the status file's xr_submit); xr resized: the live-resize guard's stop as at
+        // a real resize, for the rest of this start (the eyes stop, the cinema screen shows the flat game)
+        if (t[1] == "resized") xr::force_frame_resized();
+        char st[1024];
         xr::submit_status(st, sizeof(st));
         return st;
     }
@@ -497,7 +507,7 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "cinema" && t.size() >= 2) {
         xr::set_cinema(t[1] == "on");
-        char st[512];
+        char st[1024];
         xr::submit_status(st, sizeof(st));
         return st;
     }
@@ -648,7 +658,7 @@ void json_escape(const char* in, char* out, size_t len) {
 }
 
 void write_status() {
-    char res[512], fg[256], census[512], hooks_txt[2048], hooks_esc[2048], rt[160], ring_txt[320], ring[400], cam[400], rset[256],
+    char res[2048], fg[256], census[512], hooks_txt[2048], hooks_esc[2048], rt[160], ring_txt[320], ring[400], cam[400], rset[256],
         mchk[900], dual_txt[768], dual[900], taa_txt[400];
     json_escape(g_result.c_str(), res, sizeof(res));
     json_escape(d3d::framegraph_status(), fg, sizeof(fg));
@@ -663,11 +673,11 @@ void write_status() {
     ring_probe::matrix_text(mchk, sizeof(mchk));
     dual_pass::status_text(dual_txt, sizeof(dual_txt));
     json_escape(dual_txt, dual, sizeof(dual));
-    char xsub[512], vmode[256];
+    char xsub[1024], vmode[256];
     vr_mode::status_text(vmode, sizeof(vmode));
     xr::submit_status(xsub, sizeof(xsub));
     taa::status_text(taa_txt, sizeof(taa_txt));
-    char buf[8192];
+    char buf[16384];  // every field at its buffer's length fits (the XR status is up to 1024)
     int n = std::snprintf(
         buf, sizeof(buf),
         "{\n  \"pid\": %lu,\n  \"uptime_ms\": %.0f,\n  \"cmd_seq\": %ld,\n  \"cmd_result\": \"%s\",\n"

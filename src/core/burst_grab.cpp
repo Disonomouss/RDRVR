@@ -46,6 +46,8 @@ D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_fp{};
 UINT64 g_row_bytes = 0, g_frame_bytes = 0;
 D3D12_BOX g_box{};
 uint32_t g_w = 0, g_h = 0, g_fmt = 0;
+uint64_t g_src_w = 0;  // the armed target's size (the crop's box is inside it)
+uint32_t g_src_h = 0;
 uint64_t g_first_frame = 0;
 ID3D12Fence* g_fence = nullptr;
 uint64_t g_fence_value = 0;
@@ -57,6 +59,10 @@ void record(ID3D12GraphicsCommandList* cl, int eye) {
     ID3D12GraphicsCommandList* wcl = nullptr;
     uint32_t st = 0;
     if (!d3d::watched_state(g_res, &wcl, &st) || wcl != cl) return;  // this frame's copy is not measured
+    // the crop box and footprint are the armed target's: never copied from a target the game made again since (live:
+    // its barrier is in this list) at another size or format
+    const D3D12_RESOURCE_DESC d = g_res->GetDesc();
+    if (d.Width != g_src_w || d.Height != g_src_h || static_cast<uint32_t>(d.Format) != g_fmt) return;
     const auto state = static_cast<D3D12_RESOURCE_STATES>(st);
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -174,6 +180,8 @@ std::string arm(uint64_t frame, int crop_w, int crop_h) {
     g_w = w;
     g_h = h;
     g_fmt = static_cast<uint32_t>(d.Format);
+    g_src_w = d.Width;
+    g_src_h = d.Height;
     g_swap = camera_lever::swap_order();
     g_first_frame = frame + 1;
     g_res = res;

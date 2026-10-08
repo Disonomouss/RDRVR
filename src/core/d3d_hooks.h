@@ -86,6 +86,14 @@ void set_rtv_substitute(RtvSubstFn fn);
 // refresh and xrWaitFrame paces it (the game's own frame limiter still applies).
 void set_present_unsynced(bool on);
 
+// The game making its frame again (its Graphics menu's resolution; research\run7\eye-shape.md, the resize row: the
+// render class's targets are made again and named, then ResizeBuffers, then the "Main Backbuffer" RTs): called with
+// the size of each "Post FXAA Target" or "Main Backbuffer" named (not FXAATarget: EyeShape re-makes it at the eye's
+// size; SetName: the game's main or render thread), and around each ResizeBuffers ("ResizeBuffers" before it, with its arguments, 0 meaning the window's;
+// "ResizeBuffers done" after it, with the buffers' size). One listener: xr's live-resize guard. It must be quick.
+using FrameSizeFn = void (*)(const char* what, uint32_t w, uint32_t h);
+void set_frame_size_listener(FrameSizeFn fn);
+
 // Draw and query calls the calling thread has recorded so far (frame-graph hooks), for per-call attribution in tests.
 uint64_t thread_draws();
 uint64_t thread_queries();

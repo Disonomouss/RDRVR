@@ -38,6 +38,7 @@ std::string g_result;
 std::atomic<int> g_phase{0};
 int g_frames = 8, g_frames_waited = 0;  // presenting thread
 ID3D12Resource* g_lum[2] = {};
+DXGI_FORMAT g_lum_fmt[2] = {};  // as armed
 ID3D12Resource* g_rb = nullptr;
 D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_fp[2]{};
 uint64_t g_rtv[8];
@@ -56,6 +57,10 @@ void copy_one(ID3D12GraphicsCommandList* cl, int s, int r) {
     ID3D12GraphicsCommandList* wcl = nullptr;
     uint32_t st = 0;
     if (!d3d::watched_state(res, &wcl, &st) || wcl != cl) return;  // not seen in this list: not measured
+    // the slot's footprint is a 1x1 target's: never copied from one the game made again since the arm at another size
+    // (live: its barrier is in this list)
+    const D3D12_RESOURCE_DESC d = res->GetDesc();
+    if (d.Width != 1 || d.Height != 1 || d.Format != g_lum_fmt[r]) return;
     const auto state = static_cast<D3D12_RESOURCE_STATES>(st);
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -159,6 +164,7 @@ std::string arm() {
         dev->Release();
         if (total > kSlotBytes) return "ERROR an adapted luminance footprint is larger than its slot";
         g_lum[r] = res;
+        g_lum_fmt[r] = d.Format;
     }
     if (!g_fence_event) g_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_rb || !g_fence || !g_fence_event) return "ERROR could not create the readback objects";

@@ -214,6 +214,16 @@ ScreenWidth              global 0x22722d4  # the screen width (main thread's), D
 ScreenWidthRT            global 0x22722d8  # its render-thread copy (a lock sets it to the bound target's logical width)
 ScreenHeight             global 0x22722cc  # the screen height (main thread's), DrsSubregion's H
 ScreenHeightRT           global 0x22722d0  # its render-thread copy
+# --- [Render] RenderResolution (the render resolution study, 2026-10-08; render_res.h)
+SysParamWidth            global 0x22bdc48  # the sysParam "width"'s value (a string), read only by the device init FUN_14012e420 (0x14012e511, strtol) over the xml's size
+SysParamHeight           global 0x22bdc80  # the sysParam "height"'s value (read at 0x14012e533)
+GraphicsOptions          global 0x22ca340  # rage__GraphicsOptions (graphicsOptions.xml): +0 Fullscreen (u8), +1 Monitor, +4 ResolutionX, +8 ResolutionY
+WindowSizeW              global 0x225b088  # the client width FUN_140ec38b0 creates the window at (FUN_140ebfa60 sets it from the boot size, 0x14012e642)
+WindowSizeH              global 0x225b08c  # its height
+WindowCreate             func   0xec3770   # (1, fullscreen, ?, ?): the grcWindow made (FUN_140ec38b0 reads WindowSizeW/H); its only caller 0x14012e65d
+OptionsSave              func   0x158be0   # (): graphicsOptions.xml written from GraphicsOptions (the Graphics menu's applies, ApplyAll at boot)
+EnumDisplaySettingsSlot  global 0x104c870  # RDR.exe's import slot of user32!EnumDisplaySettingsW (the mode list FUN_140f8b9c0 calls through it)
+ModeListRetNext          site   0xf8bc08 8 # the return address of the mode list's next-mode call (EnumDisplaySettingsW(device, i, &mode), i >= 1)
 LightingManager          global 0x2ad1ce0  # +0x878 its RT (resized while +0x9c80 is set)
 ShadowCollectorOwner     global 0x2ad2150  # +0x40 "Shadow Collector", +0x48 "Shadow Collector Depth Buffer" (the main scene depth)
 GrassEnabled             global 0x2ac5128  # DrsSubregion resizes the grass targets while this is non-zero

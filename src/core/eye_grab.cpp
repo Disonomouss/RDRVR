@@ -91,6 +91,13 @@ void record(ID3D12GraphicsCommandList* cl, int i) {
         s.note = "the target's state was not seen in this list";
         return;
     }
+    // the footprint is the armed target's: the target as it is now (live: its barrier is in this list) must match, so
+    // a frame the game made again at another size since the arm is never copied into it
+    const D3D12_RESOURCE_DESC d = res->GetDesc();
+    if (d.Width != g_w || d.Height != g_h || static_cast<uint32_t>(d.Format) != g_fmt) {
+        s.note = "the target was made again at another size or format since the arm";
+        return;
+    }
     const auto state = static_cast<D3D12_RESOURCE_STATES>(st);
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

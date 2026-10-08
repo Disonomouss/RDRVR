@@ -55,11 +55,11 @@ std::atomic<uint64_t> g_blits{0}, g_skips{0};
 std::atomic<float> g_last_gamma{0.0f}, g_override{0.0f};
 
 // ---- [XR] EyeShape's paths (eye_shape.h), made only when first used: their own root signature (a linear sampler),
-// the resample into an eye-shaped swapchain and the monitor's repaint
+// the resample into an eye-shaped (or the runtime's largest) swapchain, the monitor's repaint and the cinema's resample
 const char kShapeShader[] = R"(
 Texture2D<float4> src : register(t0);
 SamplerState lin : register(s0);
-cbuffer K : register(b0) { float gamma; float pad0; float2 image; float2 content; float2 stage; float2 dst; float2 pad1; };
+cbuffer K : register(b0) { float gamma; float decode; float2 image; float2 content; float2 stage; float2 dst; float2 pad1; };
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
@@ -68,8 +68,20 @@ float3 fetch(float2 p) {  // p: in the staging texture's texels, kept inside the
     p = clamp(p, 0.5, content - 0.5);
     return saturate(src.SampleLevel(lin, p / stage, 0).rgb);
 }
+// The content over an image pixel's footprint around p, s content texels a pixel: one bilinear tap up to 2 (its 2 x 2
+// texels take every texel there), else ceil(s / 2) taps a side spread over the footprint (at most 4), so no texel is
+// skipped (a frame larger than the image: [Render] RenderResolution, the cinema's screen).
+float3 fetch_box(float2 p, float2 s) {
+    int2 n = clamp(int2(ceil(s * 0.5 - 0.001)), 1, 4);
+    float3 c = 0;
+    [loop] for (int y = 0; y < n.y; ++y)
+        [loop] for (int x = 0; x < n.x; ++x)
+            c += fetch(p + s * ((float2(x, y) + 0.5) / float2(n) - 0.5));
+    return saturate(c / float(n.x * n.y));
+}
 float4 ps_resample(float4 pos : SV_Position) : SV_Target {
-    float3 d = pow(fetch(pos.xy * content / image), gamma);
+    float2 s = content / image;
+    float3 d = pow(fetch_box(pos.xy * s, s), gamma);
     float3 l = d <= 0.04045 ? d / 12.92 : pow((d + 0.055) / 1.055, 2.4);
     return float4(l, 1);
 }
@@ -78,6 +90,14 @@ float4 ps_mirror(float4 pos : SV_Position) : SV_Target {
     float2 p = (pos.xy - 0.5 * (dst - content * s)) / s;
     if (p.x < 0 || p.y < 0 || p.x >= content.x || p.y >= content.y) return float4(0, 0, 0, 1);
     return float4(pow(fetch(p), gamma), 1);
+}
+// The cinema: the back buffer's copy (content = stage: its size) into the quad image's top-left `image`, read through
+// an sRGB view (the filter averages light); decode: the view is not sRGB but the image is (decoded after the filter).
+float4 ps_cinema(float4 pos : SV_Position) : SV_Target {
+    float2 s = content / image;
+    float3 c = fetch_box(pos.xy * s, s);
+    if (decode > 0.5) c = c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+    return float4(c, 1);
 }
 )";
 uint32_t g_dw = 0, g_dh = 0;  // the eye swapchains (0: the staging textures' size)
@@ -95,6 +115,25 @@ HANDLE g_m_event = nullptr;
 uint64_t g_m_value = 0, g_m_slot_value[kLists] = {};
 int g_m_slot = 0;
 std::atomic<uint64_t> g_resamples{0}, g_rects{0}, g_mirrors{0};
+
+// ---- the cinema's resample (cinema_resample): its own pipeline, lists, fence and views, and the back buffer's copy
+ID3DBlob* g_ps_cinema = nullptr;
+ID3D12PipelineState* g_pso_cinema = nullptr;
+DXGI_FORMAT g_cinema_fmt = DXGI_FORMAT_UNKNOWN;  // the pipeline's (the quad image's)
+bool g_c_made = false, g_c_failed = false;
+ID3D12CommandAllocator* g_c_alloc[kLists] = {};
+ID3D12GraphicsCommandList* g_c_list = nullptr;
+ID3D12DescriptorHeap* g_c_srv = nullptr;  // shader visible: the copy's view
+ID3D12DescriptorHeap* g_c_rtv = nullptr;  // the quad image's view, written per frame
+ID3D12Fence* g_c_fence = nullptr;
+HANDLE g_c_event = nullptr;
+uint64_t g_c_value = 0, g_c_slot_value[kLists] = {};
+int g_c_slot = 0;
+ID3D12Resource* g_c_copy = nullptr;  // the back buffer's copy (its size and format)
+uint32_t g_c_w = 0, g_c_h = 0;
+DXGI_FORMAT g_c_fmt = DXGI_FORMAT_UNKNOWN, g_c_view = DXGI_FORMAT_UNKNOWN;  // the back buffer's format, the copy's view
+std::atomic<uint64_t> g_c_resamples{0};
+std::atomic<uint32_t> g_c_shown_w{0}, g_c_shown_h{0};
 
 using Compile_t = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT,
                                    ID3DBlob**, ID3DBlob**);
@@ -224,6 +263,35 @@ DXGI_FORMAT unorm_of(DXGI_FORMAT f) {
         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
         default: return f;
     }
+}
+
+bool is_srgb(DXGI_FORMAT f) { return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB; }
+
+// The cinema's copy of the back buffer: typeless for the 8-bit formats, so an sRGB view can read the display's bytes
+// (the same group, so CopyResource takes it), else the back buffer's own format.
+DXGI_FORMAT typeless_of(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        default: return f;
+    }
+}
+// Its view: sRGB for an sRGB image when the copy is typeless, else a plain one.
+DXGI_FORMAT copy_view_of(DXGI_FORMAT copy, bool srgb) {
+    switch (copy) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM;
+        default: return copy;
+    }
+}
+
+// The cinema's lists have passed every use (the copy or the pipeline may be replaced), within `ms`.
+bool cinema_idle(DWORD ms) {
+    if (!g_c_fence || g_c_fence->GetCompletedValue() >= g_c_value) return true;
+    g_c_fence->SetEventOnCompletion(g_c_value, g_c_event);
+    return WaitForSingleObject(g_c_event, ms) == WAIT_OBJECT_0;
 }
 
 // The shape shader's constants: gamma, -, image, content, stage, dst, -.
@@ -439,6 +507,140 @@ bool repaint(ID3D12CommandQueue* queue, ID3D12Resource* bb, uint32_t cw, uint32_
     g_m_slot = (s + 1) % kLists;
     g_mirrors.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+bool cinema_resample(ID3D12Device* dev, ID3D12CommandQueue* queue, ID3D12Resource* bb, ID3D12Resource* dst, DXGI_FORMAT dst_format,
+                     uint32_t w, uint32_t h) {
+    if (!dev || !queue || !bb || !dst || !w || !h) return false;
+    if (!g_dev) g_dev = dev;  // raw copies ([XR] ColourBlit=0): the eye blit was not made
+    if (g_dev != dev || !ensure_shape()) return false;
+    if (!g_c_made) {  // its shader, lists, fence and views, once (one attempt; the reason is logged)
+        if (g_c_failed) return false;
+        g_c_failed = true;
+        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        auto fn = dc ? reinterpret_cast<Compile_t>(GetProcAddress(dc, "D3DCompile")) : nullptr;
+        if (!fn || !(g_ps_cinema = compile(fn, "ps_cinema", "ps_5_0", kShapeShader, sizeof(kShapeShader) - 1))) return false;
+        D3D12_DESCRIPTOR_HEAP_DESC hs{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC hv{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        for (auto& a : g_c_alloc)
+            if (FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)))) return false;
+        if (FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_c_alloc[0], nullptr, IID_PPV_ARGS(&g_c_list))) ||
+            FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_c_fence))) ||
+            FAILED(g_dev->CreateDescriptorHeap(&hs, IID_PPV_ARGS(&g_c_srv))) || FAILED(g_dev->CreateDescriptorHeap(&hv, IID_PPV_ARGS(&g_c_rtv)))) {
+            log::error("[xr] cinema: the resample's objects were not created");
+            return false;
+        }
+        g_c_list->Close();
+        g_c_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        g_c_made = true;
+        g_c_failed = false;
+    }
+    const D3D12_RESOURCE_DESC bd = bb->GetDesc(), dd = dst->GetDesc();
+    if (bd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || bd.SampleDesc.Count != 1 || bd.DepthOrArraySize != 1 || !bd.Width ||
+        !bd.Height || w > dd.Width || h > dd.Height)
+        return false;
+    const int s = g_c_slot;
+    if (g_c_fence->GetCompletedValue() < g_c_slot_value[s]) {
+        g_c_fence->SetEventOnCompletion(g_c_slot_value[s], g_c_event);
+        if (WaitForSingleObject(g_c_event, 50) != WAIT_OBJECT_0) return false;
+    }
+    // the copy, made again when the back buffer's size or format changes (the game's frame resized), and the pipeline
+    // for the quad image's format: each replaced only once the GPU has passed every list that used the old one
+    const bool srgb = is_srgb(dst_format);
+    if (!g_c_copy || g_c_w != bd.Width || g_c_h != bd.Height || g_c_fmt != bd.Format || copy_view_of(typeless_of(bd.Format), srgb) != g_c_view) {
+        if (!cinema_idle(100)) return false;
+        if (g_c_copy) g_c_copy->Release();
+        g_c_copy = nullptr;
+        g_c_w = g_c_h = 0;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = bd.Width;
+        td.Height = bd.Height;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = typeless_of(bd.Format);
+        td.SampleDesc.Count = 1;
+        if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                                  IID_PPV_ARGS(&g_c_copy)))) {
+            g_c_copy = nullptr;
+            log::limited("xr.cinema.copy", 4, "[xr] cinema: the back buffer's copy (%llux%u format %d) was not created",
+                         static_cast<unsigned long long>(bd.Width), bd.Height, static_cast<int>(bd.Format));
+            return false;
+        }
+        g_c_copy->SetName(L"RDRVR cinema copy");
+        g_c_view = copy_view_of(td.Format, srgb);
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = g_c_view;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        g_dev->CreateShaderResourceView(g_c_copy, &sv, g_c_srv->GetCPUDescriptorHandleForHeapStart());
+        g_c_w = static_cast<uint32_t>(bd.Width);
+        g_c_h = bd.Height;
+        g_c_fmt = bd.Format;
+        log::info("[xr] cinema: the back buffer %ux%u format %d resampled into the quad image (%ux%u shown, format %d), its copy's view %d",
+                  g_c_w, g_c_h, static_cast<int>(bd.Format), w, h, static_cast<int>(dst_format), static_cast<int>(g_c_view));
+    }
+    if (!g_pso_cinema || g_cinema_fmt != dst_format) {
+        if (g_pso_cinema) {
+            if (!cinema_idle(100)) return false;
+            g_pso_cinema->Release();
+        }
+        g_pso_cinema = make_shape_pso(g_ps_cinema, dst_format);
+        g_cinema_fmt = dst_format;
+        if (!g_pso_cinema) return false;
+    }
+    if (FAILED(g_c_alloc[s]->Reset()) || FAILED(g_c_list->Reset(g_c_alloc[s], g_pso_cinema))) return false;
+    D3D12_RESOURCE_BARRIER b[2]{};
+    for (auto& x : b) {
+        x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    b[0].Transition.pResource = bb;
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = g_c_copy;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g_c_list->ResourceBarrier(2, b);
+    g_c_list->CopyResource(g_c_copy, bb);  // the same size, the same format group
+    for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    g_c_list->ResourceBarrier(2, b);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_c_rtv->GetCPUDescriptorHandleForHeapStart();
+    D3D12_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = dst_format;
+    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    g_dev->CreateRenderTargetView(dst, &rv, rtv);
+    g_c_list->SetGraphicsRootSignature(g_root2);
+    g_c_list->SetDescriptorHeaps(1, &g_c_srv);
+    const float k[12] = {1.0f, srgb && !is_srgb(g_c_view) ? 1.0f : 0.0f, static_cast<float>(w), static_cast<float>(h),
+                         static_cast<float>(g_c_w), static_cast<float>(g_c_h), static_cast<float>(g_c_w), static_cast<float>(g_c_h),
+                         0.0f, 0.0f, 0.0f, 0.0f};
+    g_c_list->SetGraphicsRoot32BitConstants(0, 12, k, 0);
+    g_c_list->SetGraphicsRootDescriptorTable(1, g_c_srv->GetGPUDescriptorHandleForHeapStart());
+    g_c_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_VIEWPORT vp{0, 0, static_cast<float>(w), static_cast<float>(h), 0, 1};
+    D3D12_RECT sc{0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
+    g_c_list->RSSetViewports(1, &vp);
+    g_c_list->RSSetScissorRects(1, &sc);
+    g_c_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g_c_list->DrawInstanced(3, 1, 0, 0);
+    if (FAILED(g_c_list->Close())) return false;
+    d3d::submit_internal(queue, g_c_list);
+    g_c_slot_value[s] = ++g_c_value;
+    queue->Signal(g_c_fence, g_c_value);
+    g_c_slot = (s + 1) % kLists;
+    g_c_shown_w.store(w, std::memory_order_relaxed);
+    g_c_shown_h.store(h, std::memory_order_relaxed);
+    g_c_resamples.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void cinema_status(uint64_t* resamples, uint32_t* w, uint32_t* h) {
+    *resamples = g_c_resamples.load(std::memory_order_relaxed);
+    *w = g_c_shown_w.load(std::memory_order_relaxed);
+    *h = g_c_shown_h.load(std::memory_order_relaxed);
 }
 
 float game_gamma(float def) {

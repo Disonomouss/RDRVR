@@ -22,6 +22,9 @@ namespace rdrvr::ui_layer {
 namespace {
 
 std::atomic<bool> g_redirect{false};
+// xr's live-resize guard: the game's targets were made again (their views may be the old ones' handles), so the
+// redirect stays off for this start (stop())
+std::atomic<bool> g_stopped{false};
 std::mutex g_mutex;  // creation and the grab (presenting thread, test thread)
 ID3D12Resource* g_ui = nullptr;
 ID3D12DescriptorHeap* g_rtv_heap = nullptr;
@@ -81,7 +84,8 @@ bool make_target(ID3D12Device* dev, const D3D12_RESOURCE_DESC& like) {
     return true;
 }
 
-// Presenting thread: the game's targets and the mod's UI target, once.
+// Presenting thread: the game's targets and the mod's UI target, once, when the redirect is first on (the session's
+// start: the frame the eyes use, not the game's first one, which its Graphics menu may change before it).
 void ensure() {
     if (g_ready.load()) return;
     std::lock_guard lock(g_mutex);
@@ -122,8 +126,9 @@ void ensure() {
 // of the menu's UI pixels exactly, mean error 1.0/255; overlapping translucent layers make the rest).
 const char kShader[] = R"(
 Texture2D<float4> ui : register(t0);
-// src: the UI pixel drawn at the destination's origin (the wrist HUD's crop); hole: UI pixels left out (x0 y0 x1 y1)
-cbuffer K : register(b0) { float gamma; float2 src; float pad; float4 hole; };
+// src: the UI pixel drawn at the destination's origin (the wrist HUD's crop); hole: UI pixels left out (x0 y0 x1 y1);
+// scale: UI pixels a destination pixel, size: the UI target's (ps_quad_box only)
+cbuffer K : register(b0) { float gamma; float2 src; float pad; float4 hole; float2 scale; float2 size; };
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
@@ -147,6 +152,32 @@ float4 ps_mirror(float4 pos : SV_Position) : SV_Target {
     float3 d = display(int2(pos.xy), a);
     return float4(d, a);
 }
+// A destination smaller than the UI under it (a frame wider than [XR] UiQuadMaxWidth, or the runtime's largest
+// image): each pixel the mean of the UI pixels it covers, each weighted by its overlap (a box filter), taken in the
+// quad's linear premultiplied form, so text does not alias as one texel in two would.
+float4 ps_quad_box(float4 pos : SV_Position) : SV_Target {
+    float2 lo = src + floor(pos.xy) * scale, hi = lo + scale;
+    int2 a = int2(floor(lo)), b = min(int2(ceil(hi)) - 1, int2(size) - 1);
+    float4 s = 0;
+    float wsum = 0;
+    [loop] for (int y = a.y; y <= b.y && y < a.y + 8; ++y) {
+        float wy = min(hi.y, y + 1.0) - max(lo.y, (float)y);
+        [loop] for (int x = a.x; x <= b.x && x < a.x + 8; ++x) {
+            float w = wy * (min(hi.x, x + 1.0) - max(lo.x, (float)x));
+            float4 t = 0;
+            if (!(x >= hole.x && x < hole.z && y >= hole.y && y < hole.w)) {  // display(), then ps_quad's
+                float4 u = ui.Load(int3(x, y, 0));
+                float al = sqrt(saturate(u.a));
+                float3 d = al > 1e-4 ? pow(saturate(u.rgb / al), gamma) : float3(0, 0, 0);
+                float3 lin = d <= 0.04045 ? d / 12.92 : pow(saturate((d + 0.055) / 1.055), 2.4);
+                t = float4(lin * al, al);
+            }
+            s += w * t;
+            wsum += w;
+        }
+    }
+    return wsum > 0 ? s / wsum : float4(0, 0, 0, 0);
+}
 )";
 
 constexpr int kSlots = 3;
@@ -158,13 +189,15 @@ struct Draw {
 };
 ID3D12RootSignature* g_root = nullptr;
 ID3D12PipelineState* g_pso_quad = nullptr;
+ID3D12PipelineState* g_pso_quad_box = nullptr;
 ID3D12PipelineState* g_pso_mirror = nullptr;
-DXGI_FORMAT g_quad_fmt = DXGI_FORMAT_UNKNOWN, g_mirror_fmt = DXGI_FORMAT_UNKNOWN;
+DXGI_FORMAT g_quad_fmt = DXGI_FORMAT_UNKNOWN, g_quad_box_fmt = DXGI_FORMAT_UNKNOWN, g_mirror_fmt = DXGI_FORMAT_UNKNOWN;
 ID3D12DescriptorHeap* g_srv_heap = nullptr;
 ID3D12DescriptorHeap* g_draw_rtv_heap = nullptr;  // [0] the back buffer, [1] the quad image, [2] the wrist image
 UINT g_rtv_step = 0;
 ID3DBlob* g_vs = nullptr;
 ID3DBlob* g_ps_quad = nullptr;
+ID3DBlob* g_ps_quad_box = nullptr;
 ID3DBlob* g_ps_mirror = nullptr;
 Draw g_draw_mirror, g_draw_quad, g_draw_wrist;
 ID3D12Fence* g_draw_fence = nullptr;
@@ -172,7 +205,7 @@ HANDLE g_draw_event = nullptr;
 uint64_t g_draw_value = 0;
 bool g_draw_failed = false;
 std::atomic<bool> g_drawn_this_frame{false};
-std::atomic<uint64_t> g_mirrors{0}, g_quads{0}, g_draw_skips{0};
+std::atomic<uint64_t> g_mirrors{0}, g_quads{0}, g_draw_skips{0}, g_boxed{0};
 
 using Compile_t = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT,
                                    ID3DBlob**, ID3DBlob**);
@@ -234,12 +267,13 @@ bool ensure_draw(ID3D12Device* dev) {
     if (!fn) return false;
     g_vs = compile(fn, "vs", "vs_5_0");
     g_ps_quad = compile(fn, "ps_quad", "ps_5_0");
+    g_ps_quad_box = compile(fn, "ps_quad_box", "ps_5_0");
     g_ps_mirror = compile(fn, "ps_mirror", "ps_5_0");
-    if (!g_vs || !g_ps_quad || !g_ps_mirror) return false;
+    if (!g_vs || !g_ps_quad || !g_ps_quad_box || !g_ps_mirror) return false;
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 8};  // gamma, src x y, pad, hole x0 y0 x1 y1
+    params[0].Constants = {0, 0, 12};  // gamma, src x y, pad, hole x0 y0 x1 y1, scale x y, size x y
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {1, &range};
@@ -270,11 +304,13 @@ bool ensure_draw(ID3D12Device* dev) {
 }
 
 // Records one full-screen draw of the UI target into `dst` (in state `dst_state`, returned to it) and submits it.
+// scale: UI pixels a destination pixel (ps_quad_box; else 1).
 bool draw_ui(Draw& d, ID3D12PipelineState* pso, ID3D12Resource* dst, DXGI_FORMAT view_fmt, D3D12_RESOURCE_STATES dst_state, int rtv_slot,
-             float gamma, const float src[2] = nullptr, const int hole[4] = nullptr) {
-    const float k[8] = {gamma, src ? src[0] : 0.0f, src ? src[1] : 0.0f, 0.0f, hole ? static_cast<float>(hole[0]) : 0.0f,
-                        hole ? static_cast<float>(hole[1]) : 0.0f, hole ? static_cast<float>(hole[2]) : 0.0f,
-                        hole ? static_cast<float>(hole[3]) : 0.0f};
+             float gamma, const float src[2] = nullptr, const int hole[4] = nullptr, const float scale[2] = nullptr) {
+    const float k[12] = {gamma, src ? src[0] : 0.0f, src ? src[1] : 0.0f, 0.0f, hole ? static_cast<float>(hole[0]) : 0.0f,
+                         hole ? static_cast<float>(hole[1]) : 0.0f, hole ? static_cast<float>(hole[2]) : 0.0f,
+                         hole ? static_cast<float>(hole[3]) : 0.0f, scale ? scale[0] : 1.0f, scale ? scale[1] : 1.0f,
+                         static_cast<float>(g_w), static_cast<float>(g_h)};
     ID3D12CommandQueue* q = state::present_queue.load();
     ID3D12Device* dev = state::device.load();
     if (!q || !dev || !pso) return false;
@@ -308,7 +344,7 @@ bool draw_ui(Draw& d, ID3D12PipelineState* pso, ID3D12Resource* dst, DXGI_FORMAT
     d.list->ResourceBarrier(dst_transition ? 2 : 1, b);
     d.list->SetGraphicsRootSignature(g_root);
     d.list->SetDescriptorHeaps(1, &g_srv_heap);
-    d.list->SetGraphicsRoot32BitConstants(0, 8, k, 0);
+    d.list->SetGraphicsRoot32BitConstants(0, 12, k, 0);
     d.list->SetGraphicsRootDescriptorTable(1, g_srv_heap->GetGPUDescriptorHandleForHeapStart());
     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_RESOURCE_DESC dd = dst->GetDesc();
@@ -381,7 +417,7 @@ bool subst(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR
 }
 
 void on_frame_end(uint64_t frame) {
-    ensure();
+    if (g_redirect.load(std::memory_order_relaxed)) ensure();
     uint64_t n = g_subst.load();
     bool drawn = n != g_subst_at_frame_end.exchange(n);
     g_drawn_this_frame = drawn;
@@ -423,9 +459,21 @@ void init() {
 }
 
 void set_redirect(bool on) {
+    if (on && g_stopped.load()) {
+        log::limited("ui.stopped", 4, "[ui] redirect stays off: the game's frame was made again at another size (restart the game)");
+        return;
+    }
     g_redirect = on;
     log::info("[ui] redirect %s", on ? "on: the UI pass draws into the mod's UI target" : "off");
 }
+
+void stop(const char* why) {
+    if (g_stopped.exchange(true)) return;
+    g_redirect = false;
+    log::error("[ui] redirect off for this start: %s (the UI stays in the game's own image)", why);
+}
+
+bool stopped() { return g_stopped.load(); }
 
 std::string grab(const std::string& path, unsigned timeout_ms) {
     if (!g_ready.load()) return "ERROR the UI target is not made (NOT MEASURED)";
@@ -476,36 +524,60 @@ void size(uint32_t* w, uint32_t* h) {
     *h = g_h;
 }
 
+// The pipeline for a quad image: texel for texel when it is the UI's size there (as before), else the box filter.
+ID3D12PipelineState* quad_pso(ID3D12Device* dev, DXGI_FORMAT fmt, bool box) {
+    if (box) {
+        if (!g_pso_quad_box || fmt != g_quad_box_fmt) {
+            if (g_pso_quad_box) g_pso_quad_box->Release();
+            g_pso_quad_box = make_pso(dev, g_ps_quad_box, fmt, false);
+            g_quad_box_fmt = fmt;
+        }
+        return g_pso_quad_box;
+    }
+    if (!g_pso_quad || fmt != g_quad_fmt) {
+        if (g_pso_quad) g_pso_quad->Release();
+        g_pso_quad = make_pso(dev, g_ps_quad, fmt, false);
+        g_quad_fmt = fmt;
+    }
+    return g_pso_quad;
+}
+
 bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4]) {
     ID3D12Device* dev = state::device.load();
     if (!has_ui() || !dev || !ensure_draw(dev)) return false;
-    if (!g_pso_quad || fmt != g_quad_fmt) {
-        if (g_pso_quad) g_pso_quad->Release();
-        g_pso_quad = make_pso(dev, g_ps_quad, fmt, false);
-        g_quad_fmt = fmt;
-    }
-    bool ok = draw_ui(g_draw_quad, g_pso_quad, dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 1, xr_blit::game_gamma(1.0f), nullptr, hole);
+    const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+    if (!dd.Width || !dd.Height || dd.Width > g_w || dd.Height > g_h) return false;
+    const bool box = dd.Width != g_w || dd.Height != g_h;
+    const float scale[2] = {static_cast<float>(g_w) / static_cast<float>(dd.Width), static_cast<float>(g_h) / static_cast<float>(dd.Height)};
+    bool ok = draw_ui(g_draw_quad, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 1, xr_blit::game_gamma(1.0f),
+                      nullptr, hole, box ? scale : nullptr);
     if (ok) g_quads.fetch_add(1, std::memory_order_relaxed);
+    if (ok && box) g_boxed.fetch_add(1, std::memory_order_relaxed);
     return ok;
 }
 
-bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0) {
+bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw, uint32_t ch) {
     ID3D12Device* dev = state::device.load();
     if (!has_ui() || !dev || !ensure_draw(dev)) return false;
-    if (!g_pso_quad || fmt != g_quad_fmt) {
-        if (g_pso_quad) g_pso_quad->Release();
-        g_pso_quad = make_pso(dev, g_ps_quad, fmt, false);
-        g_quad_fmt = fmt;
-    }
+    const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+    if (!dd.Width || !dd.Height || x0 < 0 || y0 < 0 || !cw || !ch || static_cast<uint64_t>(x0) + cw > g_w ||
+        static_cast<uint64_t>(y0) + ch > g_h || dd.Width > cw || dd.Height > ch)
+        return false;
+    const bool box = dd.Width != cw || dd.Height != ch;
     const float src[2] = {static_cast<float>(x0), static_cast<float>(y0)};
-    return draw_ui(g_draw_wrist, g_pso_quad, dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 2, xr_blit::game_gamma(1.0f), src, nullptr);
+    const float scale[2] = {static_cast<float>(cw) / static_cast<float>(dd.Width), static_cast<float>(ch) / static_cast<float>(dd.Height)};
+    return draw_ui(g_draw_wrist, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 2, xr_blit::game_gamma(1.0f), src,
+                   nullptr, box ? scale : nullptr);
 }
 
 void status_text(char* out, size_t len) {
-    std::snprintf(out, len, "ui target %s, redirect %s, binds redirected %llu, frames with UI %llu, mirrored %llu, quads %llu, skipped %llu",
+    std::snprintf(out, len,
+                  "ui target %s, redirect %s, binds redirected %llu, frames with UI %llu, mirrored %llu, quads %llu, skipped %llu | "
+                  "target %ux%u, quads filtered %llu%s",
                   g_ready.load() ? "made" : "not made", g_redirect.load() ? "on" : "off", static_cast<unsigned long long>(g_subst.load()),
                   static_cast<unsigned long long>(g_frames_drawn.load()), static_cast<unsigned long long>(g_mirrors.load()),
-                  static_cast<unsigned long long>(g_quads.load()), static_cast<unsigned long long>(g_draw_skips.load()));
+                  static_cast<unsigned long long>(g_quads.load()), static_cast<unsigned long long>(g_draw_skips.load()), g_w, g_h,
+                  static_cast<unsigned long long>(g_boxed.load()), g_stopped.load() ? ", STOPPED (the game's frame made again)" : "");
 }
 
 }  // namespace rdrvr::ui_layer

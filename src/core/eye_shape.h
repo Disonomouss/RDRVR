@@ -29,15 +29,19 @@ namespace rdrvr::eye_shape {
 void init();     // bootstrap, before ui_layer::init: the settings, and the monitor repaint's frame end (before the UI mirror's)
 bool install();  // with the RDR.exe hooks: DrsSubregion, DrsController
 
-// The XR session thread, after xrGetSystem: the runtime's recommended and largest eye image (the larger of the two eyes).
+// The XR session thread, after xrGetSystem: the runtime's recommended eye image and the largest image it takes (the
+// larger of the two eyes; min of maxSwapchainImage and the views' maxImageRect). The eye size never exceeds the latter.
 void set_recommended(uint32_t rec_w, uint32_t rec_h, uint32_t max_w, uint32_t max_h);
 // Is the mode configured for the session about to start ([XR] EyeShape on now, FXAA forced)? The presenting thread asks
 // before make_swapchains, to locate the eyes' FOV first.
 bool configured();
 // The presenting thread, at make_swapchains: this session's eye size from the post output's W x H and the eyes' FOV
 // tangents (tan[eye] = l r u d, l < 0 < r, d < 0 < u; nullptr: none located, the recommended rect's aspect is used).
-// Returns the eye swapchains' size: the eye size when configured(), else W x H.
-void plan_session(uint32_t w, uint32_t h, const float (*tan)[4], uint32_t* sw, uint32_t* sh);
+// fw x fh: the frame's swapchain size (W x H, or W x H fitted into the runtime's largest image: xr's sizing). Returns
+// the eye swapchains' size: the eye size when configured(), else fw x fh; a later "eyeshape on" sizes the eye in them.
+void plan_session(uint32_t w, uint32_t h, uint32_t fw, uint32_t fh, const float (*tan)[4], uint32_t* sw, uint32_t* sh);
+// xr's live-resize guard (the game's frame made again at another size): the kill switch, with the reason.
+void stop(const char* why);
 // The last post run's content: true when it was rendered in the eye shape, with the eye image's size (cw x ch: the
 // top-left of the post output) and the scene's render size behind it (rw x rh). Any thread.
 bool frame_rect(uint32_t* cw, uint32_t* ch, uint32_t* rw = nullptr, uint32_t* rh = nullptr);

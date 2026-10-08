@@ -5,6 +5,7 @@
 #include "core/config.h"
 #include "core/hooks.h"
 #include "core/log.h"
+#include "core/render_res.h"
 
 namespace rdrvr::exit_guard {
 namespace {
@@ -14,17 +15,22 @@ namespace {
 using RtlExitUserProcess_t = void(NTAPI*)(LONG);
 RtlExitUserProcess_t o_RtlExitUserProcess = nullptr;
 
+bool g_terminate = true;  // [Compat] TerminateAtExit
+
 void NTAPI hk_RtlExitUserProcess(LONG status) {
-    log::info("[exit] process exit (status %#lx): TerminateProcess, so no DLL detach runs (RedHook's crashes)",
-              static_cast<unsigned long>(status));
-    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
-    o_RtlExitUserProcess(status);  // not reached
+    render_res::on_exit();  // a clean exit: a new render resolution's boot sentinel cleared
+    if (g_terminate) {
+        log::info("[exit] process exit (status %#lx): TerminateProcess, so no DLL detach runs (RedHook's crashes)",
+                  static_cast<unsigned long>(status));
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
+    }
+    o_RtlExitUserProcess(status);  // TerminateAtExit=0: the normal exit (the DLL detach runs)
 }
 
 }  // namespace
 
 bool install() {
-    if (!config::get_bool("Compat", "TerminateAtExit", true)) return true;
+    g_terminate = config::get_bool("Compat", "TerminateAtExit", true);  // off: the hook only marks the exit clean
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     void* fn = ntdll ? reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlExitUserProcess")) : nullptr;
     if (!fn) return false;

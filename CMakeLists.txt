@@ -43,6 +43,7 @@ add_library(rdrvr_core SHARED
     src/core/exec_gate_thunk.asm
     src/core/eye_grab.cpp
     src/core/eye_shape.cpp
+    src/core/render_res.cpp
     src/core/lum_check.cpp
     src/core/burst_grab.cpp
     src/core/taa.cpp

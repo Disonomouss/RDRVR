@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.3.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.4.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -24,6 +24,16 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   FXAA only): each eye rendered in your headset's own shape and size, with square pixels, instead of the game's 16:9
   frame stretched over it: fewer pixels drawn for the same sharpness. Restart the game after turning it on: the eye
   images take their size at the start.
+- Optional (new in 0.4.0, off by default, not yet tried in a headset; the General tab, "Render resolution", from the
+  next start): the game's frame at your headset's height, apart from your monitor's modes and without DSR. Choose
+  Automatic (16:9 at the height your headset's OpenXR runtime asked for in its last session, never below your own
+  resolution; the game's own size until a first session with that runtime) or a height named for the headsets (and
+  Virtual Desktop quality levels) it fits, 1600 to 3264 tall, for example "2208 tall: Quest 3 (3926 x 2208)". In
+  Windowed mode your window keeps its size (the frame is scaled into it). The game's Graphics menu shows the size, and
+  `graphicsOptions.xml` keeps your own resolution. With "Eyes in the headset's shape" on, each eye is drawn at the size
+  your headset asks for, at most this tall. Larger is sharper and costs more GPU time. A size too large for the
+  graphics card's memory is greyed out in the menu, and a size whose start ended (a crash) within two minutes is not
+  used again until you choose it again; the row's "Now:" line says which size runs, or why not.
 - The HUD on a floating panel, or on your wrist like a watch (radar, meters, ammo shown when you look at it).
 - Automatic view modes: stereo in gameplay, a cinema screen for loading, menus and videos; cutscenes on the screen or
   in 3D.
@@ -76,7 +86,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.3.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.4.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file.
 3. Start your headset's runtime, then the game.
@@ -97,9 +107,10 @@ To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay i
 
 ## Tips
 
-- **Sharpness:** each eye shows the game's own frame at the game's resolution (16:9), or, with "Eyes in the
-  headset's shape" on, a frame in the headset's own shape. For a sharper image on a high-resolution headset, run the
-  game at 3840x2160 (with NVIDIA DSR/DLDSR on a 1440p monitor) if your GPU allows.
+- **Sharpness:** each eye shows the game's own frame (16:9), or, with "Eyes in the headset's shape" on, a frame in
+  the headset's own shape. For a sharper image on a high-resolution headset, choose the "Render resolution" (the General
+  tab) named for your headset, a taller one, or Automatic, if your GPU allows (new in 0.4.0, not yet tried in a
+  headset); "Eyes in the headset's shape" (FXAA only) makes it cheaper.
 - **Frame generation** layers (frame interpolation in the OpenXR runtime or a layer) make the guns lag behind your
   hands: the generated frames cannot follow the gun. Prefer a lower refresh rate (72 or 80 Hz) with real frames.
 
@@ -133,6 +144,14 @@ To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay i
 - John's gun hand can sit a few centimetres up a long gun (at the receiver, not the stock's wrist) when it is lowered
   or carried: "Long guns held by their aiming grip" (the Hands tab, off by default, new in 0.3.0) holds each long gun
   by its aiming grip in every pose.
+- "Render resolution" has been tried (in the developer's simulator) in Windowed mode only (the game's Screen Type):
+  use Windowed with it for now. In Fullscreen the game may undo a size smaller than your monitor's at the start (the
+  row's "Now:" line then says the game changed its size).
+- Changing the resolution in the game's Graphics menu while in the headset stops the headset view (the flat game on
+  the cinema screen) until you restart the game.
+- Frames wider than 2560 (a 4K monitor, DSR, or "Render resolution") show the HUD panel and the cinema screen filtered
+  to 2560 wide (new in 0.4.0): `[XR] UiQuadMaxWidth=0` and `CinemaMaxWidth=0` in `RDRVR.ini` bring back 0.3.0's
+  full-size images.
 - The default places of the holsters, the loading and foregrip rings and the interaction spot were tuned in the
   headset by one person: if they do not suit you, move them with the menu's arrows (Holsters, Reloading, Gun in hand
   and Hands tabs).

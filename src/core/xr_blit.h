@@ -28,8 +28,10 @@ void set_dst_size(uint32_t w, uint32_t h);
 // [XR] EyeShape: this frame's eye images. cw x ch: the content, the top-left of each staging texture (the whole of it
 // without the eye shape); iw x ih: the image drawn at the swapchain image's origin (the layer's imageRect). Equal sizes
 // are copied texel for texel; else the content is resampled into the image (the game's 16:9 frame in an eye-shaped
-// swapchain, while the shape is not applied). dw x dh: the scene depth's content behind the image (the round in hand;
-// 0: the whole depth target).
+// swapchain, while the shape is not applied; or a frame larger than the runtime's largest image, [Render]
+// RenderResolution): one bilinear tap per pixel up to 2 content texels a pixel (it reads every texel), more over the
+// pixel's footprint above that. dw x dh: the scene depth's content behind the image (the round in hand; 0: the whole
+// depth target).
 struct Frame {
     uint32_t cw, ch, iw, ih, dw, dh;
 };
@@ -41,6 +43,17 @@ bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma, 
 // of its staging texture) scaled to fit and centred (black beside it), in the game's final gamma. The presenting thread,
 // at the frame end, before the UI mirror draws over it.
 bool repaint(ID3D12CommandQueue* queue, ID3D12Resource* bb, uint32_t cw, uint32_t ch, float gamma);
+// The cinema (xr.cpp, R5 step 3), when its quad image is not the back buffer's size and format (a CopyResource needs
+// both: a frame larger than [XR] CinemaMaxWidth or the runtime's largest image, or the game's frame resized while it
+// runs): the back buffer `bb` (in PRESENT) drawn filtered into the top-left w x h of the quad image `dst` (in
+// RENDER_TARGET, as acquired; format `dst_format`). The buffers may take no shader view (the swapchain's usage), so the
+// back buffer is first copied into a texture of its own size and format, made again when either changes; read through
+// an sRGB view into an sRGB image, so the filter averages light, as the runtime reads the copied bytes. Its own lists
+// and fence on `queue`; the presenting thread, at the frame end.
+bool cinema_resample(ID3D12Device* dev, ID3D12CommandQueue* queue, ID3D12Resource* bb, ID3D12Resource* dst, DXGI_FORMAT dst_format,
+                     uint32_t w, uint32_t h);
+// The cinema's resamples drawn, and the last one's size in the quad image (0 x 0: none yet).
+void cinema_status(uint64_t* resamples, uint32_t* w, uint32_t* h);
 // The Gamma the game's back-buffer blit reads (PostFx+0x88c), or `def` without a PostFx object.
 float game_gamma(float def);
 // Positive control: a fixed Gamma instead of the game's ("xr gamma <value>"); 0 = the game's again ("xr gamma live").

@@ -26,6 +26,9 @@ uint32_t rva(Id id);
 const char* name(Id id);
 
 bool verify();                    // run once after the game's code is final (after MTLX unloads)
+// Before verify(), on the analysed build: this one code anchor's bytes match now. verify() then counts it as matching
+// (render_res hooks it before verify() runs, at the game's boot).
+bool precheck(Id id);
 bool stand_down();                // true if verify() failed (or has not run)
 bool exe_matches();               // TimeDateStamp and SizeOfImage match the analysed build
 void build_report();              // where this build keeps the anchors (verify() runs it on a mismatch; reads only)

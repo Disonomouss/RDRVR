@@ -32,7 +32,10 @@ void rings_status(char* out, size_t len);  // the holster rings' layers and the 
 const char* session_state();      // "none", "idle", "ready", "synchronized", "visible", "focused", "stopping", ...
 uint64_t frames();                // xrEndFrame calls
 const char* runtime_name();
-void submit_status(char* out, size_t len);  // R5: frames submitted, copies, misses
+// R5: frames submitted, copies, misses, ..., then " | cap WxH | ui quad WxH of WxH, wrist WxH of WxH | cinema quad WxH,
+// shown WxH (copies n, resampled n) | resized 0|1 (what)": the runtime's largest image, each quad's swapchain against
+// its source, and the live-resize guard (frame_resized). 1024 characters hold it.
+void submit_status(char* out, size_t len);
 bool submitting();  // the frame loop runs on the presenting thread with the eye swapchains made
 // R5 late latch (DESIGN 3.8, [XR] LateLatch): render thread, just before a double frame's first eye pass: the views
 // are located again for the same predicted display time, and their new orientations (positions kept from the frame's
@@ -52,6 +55,15 @@ void perf_status(char* out, size_t len);
 // head pose taken when it is switched on, world-locked, in a dark room (no projection layer). The back buffer is copied
 // into a quad swapchain of the sRGB variant of its format, so the runtime reads its display-referred bytes as sRGB.
 void set_cinema(bool on);
+// The live-resize guard: the game made its frame again at another size while the session runs (its Graphics menu's
+// resolution: a "Post FXAA Target" or "Main Backbuffer" named at another size, or ResizeBuffers to one;
+// the first sign, the targets are named ~6 ms before ResizeBuffers). From then on the eye images stop (no projection
+// layer, the bind tap and the target watch removed), the UI redirect and EyeShape are off, and the flat game is shown on
+// the cinema screen (resampled to its quad); a restart of the game brings the headset view back (for the menu's note).
+// Any thread.
+bool frame_resized();
+// Test aid ("xr resized"): the guard's stop as at a real resize (the frame's size unchanged), for this start.
+void force_frame_resized();
 // The HUD's place ([XR] Hud, the menu's XR tab): the floating quad (the default) or the off hand's wrist, shown while
 // you look at it (the radar's corner of the UI, [XR] WristHudRect; the prompts stay on the quad). Writes the user ini.
 bool hud_on_wrist();
