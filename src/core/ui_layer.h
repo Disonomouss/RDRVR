@@ -31,8 +31,9 @@ bool has_ui();
 void size(uint32_t* w, uint32_t* h);
 // The whole UI into `dst`, without the UI pixels in `hole` (x0 y0 x1 y1; the wrist HUD's part) when given. Texel for
 // texel when `dst` is the UI's size; smaller (the quad's swapchain capped), box-filtered so text does not alias.
-bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4] = nullptr);
+bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4] = nullptr, const int hole2[4] = nullptr);
 // The wrist HUD: the UI's cw x ch pixels from (x0, y0) into all of `dst` (texel for texel at that size, else filtered).
-bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw, uint32_t ch);
+// which: 0 the wrist HUD's image (its own list and view), 1 the hand-placed wheel's (run 8 item 5)
+bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw, uint32_t ch, int which = 0);
 
 }  // namespace rdrvr::ui_layer

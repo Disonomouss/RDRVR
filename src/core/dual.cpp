@@ -21,6 +21,7 @@
 #include "core/menu.h"
 #include "core/pose.h"
 #include "core/reload.h"
+#include "core/whistle.h"
 
 namespace rdrvr::dual {
 namespace {
@@ -450,7 +451,7 @@ void frame() {
             log::info("[wield] the second gun's prop shown (ACTOR_FORCE_WEAPON_RENDER slot %d)", slot);
         }
     }
-    const float t = hands::get(ctrl).trigger;
+    const float t = whistle::suppressed(ctrl) ? 0.0f : hands::get(ctrl).trigger;  // run 8: the whistle's trigger fires nothing
     const bool was = down;
     down = t > 0.6f ? true : t < 0.4f ? false : was;
     const bool copy = g_want_slot.load(std::memory_order_relaxed) == kCopySlot;

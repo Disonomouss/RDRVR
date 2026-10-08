@@ -99,6 +99,7 @@ bool body_points(BodyPoints* out);
 // hidden not drawn), 2 filter (also the mixed ones drawn without their hidden triangles that span two cuts: the sliver)
 int hidden_geometry();
 void set_hidden_geometry(int mode);  // also written to the user ini
+const char* grip_source_name();  // the foregrip's grip now: "the weapon's", "<gun>'s (borrowed)", "the template", "built-in"
 bool auto_shows();           // [Body] AutoShow: forearms and hands while crouching, in cover, riding or driving
 void set_auto_shows(bool on);
 bool locks_torso();          // [Body] LockTorso: the upper body kept over the hips horizontally (running leans)

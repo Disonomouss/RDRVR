@@ -63,7 +63,8 @@ typedef struct RdrvrGunMeleeArgs {
 } RdrvrGunMeleeArgs;
 
 typedef enum RdrvrGunMeleeOutcome {
-    RDRVR_GUN_MELEE_NONE = 0,         // no bone sphere entered fast enough
+    RDRVR_GUN_MELEE_NONE = 0,         // no bone sphere entered fast enough (run 8: vec[3] the nearest a strike segment came to a
+                                      // tested bone's sphere, m, 0 inside; vec[0] the speed there, vec[1] the bone; -1 none tested)
     RDRVR_GUN_MELEE_HIT = 1,          // a bone entered: the core's answer (RdrvrMeleeHitCode) in bits 40-47
     RDRVR_GUN_MELEE_GUARD = 2,        // no current script thread: no native called
     RDRVR_GUN_MELEE_NO_ITERATOR = 3,  // CREATE_OBJECT_ITERATOR gave no handle

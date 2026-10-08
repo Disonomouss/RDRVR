@@ -37,6 +37,7 @@
 #include "core/ui_layer.h"
 #include "core/menu.h"
 #include "core/xinput.h"
+#include "core/wheel.h"
 #include "core/zone_rings.h"
 
 namespace rdrvr::xr {
@@ -79,6 +80,8 @@ Perf g_perf;  // presenting thread (g_perf_mutex)
 struct TimingWin {
     double start_ms = 0;
     uint64_t frames = 0, missed = 0, late = 0;
+    uint64_t slips = 0;  // gaps over 1.05 periods (run 8 item 6a: Virtual Desktop shifts a late frame's predicted time by
+                         // part of a period instead of skipping one, so the "missed" over 1.5 read 0 while frames slipped)
     double longest = 0, cpu_sum = 0, gpu_sum = 0, wait_sum = 0, wait_max = 0, open_sum = 0, open_max = 0, period_ms = 0;
     float open[4096];
     uint32_t nopen = 0;
@@ -933,6 +936,86 @@ XrPosef ui_pose() {
     return p;
 }
 
+// ---- the hand-placed wheel (run 8 item 5): while the mod holds the game's weapon wheel open, its rect of the UI
+// target on its own quad where the hand was at the press, facing the head as it was then; the floating quad leaves it out
+XrSwapchain g_wh_sc = XR_NULL_HANDLE;
+std::vector<ID3D12Resource*> g_wh_images;
+int g_wh_x0 = 0, g_wh_y0 = 0;
+uint32_t g_wh_cw = 0, g_wh_ch = 0, g_wh_w = 0, g_wh_h = 0;
+bool g_wh_failed = false, g_wh_on = false;  // on: this frame's wheel quad drawn (the floating quad's hole)
+std::atomic<uint64_t> g_wh_frames{0};
+bool make_wheel_swapchain(const float rect[4]) {
+    if (g_wh_sc != XR_NULL_HANDLE) return true;
+    if (g_wh_failed || !make_ui_swapchain()) return false;
+    g_wh_failed = true;
+    auto px = [](float f, uint32_t n) {
+        const int v = static_cast<int>(f * static_cast<float>(n));
+        return v < 0 ? 0 : v > static_cast<int>(n) ? static_cast<int>(n) : v;
+    };
+    g_wh_x0 = px(rect[0], g_ui_tw);
+    g_wh_y0 = px(rect[1], g_ui_th);
+    const int x1 = px(rect[2], g_ui_tw), y1 = px(rect[3], g_ui_th);
+    if (x1 - g_wh_x0 < 16 || y1 - g_wh_y0 < 16) return false;
+    g_wh_cw = static_cast<uint32_t>(x1 - g_wh_x0);
+    g_wh_ch = static_cast<uint32_t>(y1 - g_wh_y0);
+    uint32_t max_w = g_wh_cw;
+    if (g_ui_w != g_ui_tw) {
+        max_w = static_cast<uint32_t>(std::lround(static_cast<double>(g_wh_cw) * g_ui_w / g_ui_tw));
+        if (max_w < 16) max_w = 16;
+    }
+    fit_image(g_wh_cw, g_wh_ch, max_w, g_cap_h.load(), &g_wh_w, &g_wh_h);
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.format = static_cast<int64_t>(g_ui_fmt);
+    ci.sampleCount = 1;
+    ci.width = g_wh_w;
+    ci.height = g_wh_h;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+    XrResult r = xrCreateSwapchain(g_session, &ci, &g_wh_sc);
+    if (XR_FAILED(r)) {
+        log::error("[xr] the hand's wheel: xrCreateSwapchain -> %s", result_name(g_inst, r));
+        g_wh_sc = XR_NULL_HANDLE;
+        return false;
+    }
+    uint32_t ni = 0;
+    xrEnumerateSwapchainImages(g_wh_sc, 0, &ni, nullptr);
+    std::vector<XrSwapchainImageD3D12KHR> imgs(ni, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    xrEnumerateSwapchainImages(g_wh_sc, ni, &ni, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+    for (auto& im : imgs) g_wh_images.push_back(im.texture);
+    g_wh_failed = false;
+    log::info("[xr] the hand's wheel swapchain %ux%u from UI pixel (%d, %d), the UI's %ux%u there", g_wh_w, g_wh_h, g_wh_x0, g_wh_y0, g_wh_cw, g_wh_ch);
+    return true;
+}
+// Presenting thread, frame end, before fill_ui (which leaves the rect out while this shows)
+bool fill_wheel(XrCompositionLayerQuad& quad) {
+    g_wh_on = false;
+    float pos[3], q[4], rect[4];
+    if (!wheel::hand_quad(pos, q, rect) || !ui_layer::has_ui() || !make_wheel_swapchain(rect)) return false;
+    uint32_t index = 0;
+    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wsi.timeout = 100000000;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_wh_sc, &ai, &index))) return false;
+    bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_wh_sc, &wsi)) && index < g_wh_images.size() &&
+              ui_layer::draw_crop(g_wh_images[index], g_ui_fmt, g_wh_x0, g_wh_y0, g_wh_cw, g_wh_ch, 1);
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_wh_sc, &ri);
+    if (!ok) return false;
+    quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    quad.space = g_space;
+    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quad.subImage.swapchain = g_wh_sc;
+    quad.subImage.imageRect = {{0, 0}, {static_cast<int32_t>(g_wh_w), static_cast<int32_t>(g_wh_h)}};
+    quad.pose.orientation = {q[0], q[1], q[2], q[3]};
+    quad.pose.position = {pos[0], pos[1], pos[2]};
+    quad.size = {0.34f, 0.34f * static_cast<float>(g_wh_h) / static_cast<float>(g_wh_w)};
+    g_wh_on = true;
+    g_wh_frames.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 // Presenting thread, frame end: this frame's UI into an acquired quad image. False when there is none.
 bool fill_ui(XrCompositionLayerQuad& quad) {
     if (!ui_layer::has_ui() || !make_ui_swapchain()) return false;
@@ -944,8 +1027,9 @@ bool fill_ui(XrCompositionLayerQuad& quad) {
     // with the HUD on the wrist, its corner is left out here (the prompts stay; in the UI target's pixels)
     const bool wrist = g_hud_wrist.load(std::memory_order_relaxed) && g_wr_sc != XR_NULL_HANDLE;
     const int hole[4] = {g_wr_x0, g_wr_y0, g_wr_x0 + static_cast<int>(g_wr_cw), g_wr_y0 + static_cast<int>(g_wr_ch)};
+    const int hole2[4] = {g_wh_x0, g_wh_y0, g_wh_x0 + static_cast<int>(g_wh_cw), g_wh_y0 + static_cast<int>(g_wh_ch)};  // the hand's wheel
     bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_ui_sc, &wsi)) && index < g_ui_images.size() &&
-              ui_layer::draw_quad(g_ui_images[index], g_ui_fmt, wrist ? hole : nullptr);
+              ui_layer::draw_quad(g_ui_images[index], g_ui_fmt, wrist ? hole : nullptr, g_wh_on ? hole2 : nullptr);
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g_ui_sc, &ri);
     if (!ok) return false;
@@ -1144,7 +1228,7 @@ void end_open_frame() {
     layer.viewCount = 2;
     layer.views = pv;
     XrCompositionLayerQuad ui_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, menu_quad{XR_TYPE_COMPOSITION_LAYER_QUAD},
-        wrist_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        wrist_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, wheel_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad ring_quads[holster::kMaxMarkers];
     XrCompositionLayerQuad reticle_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     constexpr uint32_t kLayerArray = 16;
@@ -1153,19 +1237,21 @@ void end_open_frame() {
     bool full = g_should_render && g_filled.load() == 3 && !resized;
     if (full) check_poses(g_frames.load() + 1);
     const bool cinema_on = g_cinema.load() || resized;
-    // the holster rings over the scene, under the HUD, the wrist and the menu (which keep three places); never more
-    // layers than the runtime takes (a frame over it is dropped whole)
+    // the holster rings over the scene, under the HUD, the wrist, the hand's wheel and the menu (which keep four places);
+    // never more layers than the runtime takes (a frame over it is dropped whole)
     if (full && !cinema_on) {
         const uint32_t cap = g_max_layers.load(std::memory_order_relaxed) < kLayerArray ? g_max_layers.load(std::memory_order_relaxed) : kLayerArray;
-        const int room = static_cast<int>(cap) - static_cast<int>(nlayers) - 3;
+        const int room = static_cast<int>(cap) - static_cast<int>(nlayers) - (wheel::wheel_mode() ? 4 : 3);
         const int nr = zone_rings::frame(g_frame_views, g_session, g_space, ring_quads,
                                          room - 1 < holster::kMaxMarkers ? room - 1 : holster::kMaxMarkers);  // one kept for the reticle
         for (int i = 0; i < nr; ++i) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ring_quads[i]);
         if (room - nr >= 1 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle_quad))
             layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&reticle_quad);
     }
+    const bool wheel_q = full && !cinema_on && fill_wheel(wheel_quad);  // first: the floating quad leaves its rect out
     bool ui = full && !cinema_on && fill_ui(ui_quad);
     if (ui) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ui_quad);
+    if (wheel_q) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&wheel_quad);
     if (ui && fill_wrist(wrist_quad)) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&wrist_quad);
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     const XrCompositionLayerBaseHeader* quad_layers[2] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad)};
@@ -1240,6 +1326,7 @@ void timing_window(const XrFrameState& fs) {
                 g_tw.missed += static_cast<uint64_t>(gap + 0.5) - 1;
                 ++g_tw.late;
             }
+            if (gap > 1.05) ++g_tw.slips;
             if (gap > g_tw.longest) g_tw.longest = gap;
         }
         prev = fs.predictedDisplayTime;
@@ -1257,14 +1344,18 @@ void timing_window(const XrFrameState& fs) {
     }
     const double n = g_tw.frames ? static_cast<double>(g_tw.frames) : 1.0, no = g_tw.nopen ? static_cast<double>(g_tw.nopen) : 1.0;
     const uint64_t lat = g_latched.load() - g_tw.latch0;
+    // the frames against the window's time at the display rate: the shortfall counts every slip, whatever its size
+    const double expected = g_tw.period_ms > 0 ? secs * 1000.0 / g_tw.period_ms : 0.0;
+    const double shortfall = expected > static_cast<double>(g_tw.frames) ? expected - static_cast<double>(g_tw.frames) : 0.0;
     log::info("[xr] timing %.1f s: %llu frames (%.2f Hz, display period %.3f ms), missed periods %llu (%.2f%%) in %llu late frames, "
-              "longest gap %.2f periods | xrWaitFrame wait mean %.2f max %.2f ms | frame open mean %.2f p95 %.2f max %.2f ms | "
+              "longest gap %.2f periods, gaps over 1.05 periods %llu, frames %.0f short of the display rate | xrWaitFrame wait mean %.2f max %.2f ms | frame open mean %.2f p95 %.2f max %.2f ms | "
               "CPU %.2f GPU %.2f ms | poses this frame %llu, another %llu, none %llu | late latch %llu, mean %.3f deg | eye copies %llu, "
               "missed %llu, first eye late %llu",
               secs, static_cast<unsigned long long>(g_tw.frames), g_tw.frames / secs, g_tw.period_ms,
               static_cast<unsigned long long>(g_tw.missed),
               100.0 * static_cast<double>(g_tw.missed) / static_cast<double>(g_tw.frames + g_tw.missed ? g_tw.frames + g_tw.missed : 1),
-              static_cast<unsigned long long>(g_tw.late), g_tw.longest, g_tw.wait_sum / no, g_tw.wait_max, g_tw.open_sum / no, p95,
+              static_cast<unsigned long long>(g_tw.late), g_tw.longest, static_cast<unsigned long long>(g_tw.slips), shortfall,
+              g_tw.wait_sum / no, g_tw.wait_max, g_tw.open_sum / no, p95,
               g_tw.open_max, g_tw.cpu_sum / n, g_tw.gpu_sum / n,
               static_cast<unsigned long long>(g_pose_match.load() - g_tw.pose_m0), static_cast<unsigned long long>(g_pose_stale.load() - g_tw.pose_s0),
               static_cast<unsigned long long>(g_pose_none.load() - g_tw.pose_n0), static_cast<unsigned long long>(lat),
@@ -1750,10 +1841,10 @@ void force_frame_resized() {
 
 bool hud_on_wrist() { return g_hud_wrist.load(); }
 void hud_status(char* out, size_t len) {
-    std::snprintf(out, len, "hud %s, wrist swapchain %ux%u from (%d, %d), shown frames %llu, hidden frames %llu, now %s, top (%.2f %.2f %.2f)",
+    std::snprintf(out, len, "hud %s, wrist swapchain %ux%u from (%d, %d), shown frames %llu, hidden frames %llu, now %s, top (%.2f %.2f %.2f) | the hand's wheel %ux%u from (%d, %d), frames %llu",
                   g_hud_wrist.load() ? "wrist" : "quad", g_wr_w, g_wr_h, g_wr_x0, g_wr_y0, static_cast<unsigned long long>(g_wr_frames.load()),
                   static_cast<unsigned long long>(g_wr_hidden.load()), g_wr_shown ? "shown" : "hidden", g_wr_up[0].load(), g_wr_up[1].load(),
-                  g_wr_up[2].load());
+                  g_wr_up[2].load(), g_wh_w, g_wh_h, g_wh_x0, g_wh_y0, static_cast<unsigned long long>(g_wh_frames.load()));
 }
 void set_hud_on_wrist(bool on) {
     if (g_hud_wrist.exchange(on) != on) log::info("[xr] HUD %s", on ? "on the wrist (when you look at it)" : "on the floating quad");

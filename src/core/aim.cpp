@@ -37,12 +37,14 @@ std::atomic<bool> g_reticle_dot{false};    // [Hands] ReticleStyle=dot: a dot on
 std::atomic<uint64_t> g_reticle_shown{0}, g_reticle_offline{0};
 std::atomic<bool> g_assist{false}; // [Hands] AimAssist (soft lock and the reticle magnet in first person)
 std::atomic<bool> g_tracer{true};  // [Hands] TracerFromMuzzle
-std::atomic<bool> g_perfect{false};  // [Aim] PerfectAccuracy
+std::atomic<bool> g_perfect{true};   // [Aim] PerfectAccuracy (on by default since run 8)
 std::atomic<bool> g_pattern{true};   // [Aim] ShotgunPattern
 std::atomic<bool> g_spawn_hooked{false};
 // hk_spawn: the muzzle-blocked flip (DoProbeCheck: W +0x9b1 = 1, +0x9b2 = 0) at the player's shots, whatever
 // PerfectAccuracy is (its undo, (a) in hk_spawn, runs only with it on)
 std::atomic<uint64_t> g_flips_seen{0}, g_flips_left{0};
+std::atomic<uint64_t> g_npc_spawns{0}, g_npc_bloomed{0};  // others' shots (left to the game) and those with the game's bloom drawn
+std::atomic<float> g_npc_sigma{0.0f};                      // the last such shot's bloom size
 std::atomic<uint64_t> g_spawns{0}, g_player_spawns{0}, g_bloom_zeroed{0}, g_block_fixes{0}, g_aligned{0}, g_speed_drops{0},
     g_straightened{0};
 // one shot's pellets as hk_launch sees them inside the spawn (the game thread only): the first's numbers, the widest
@@ -387,6 +389,15 @@ void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, 
     if (no_bloom || turret || !rd(anchors::addr(anchors::Id::PlayerInfo), &X) || !X || !rd(X + 0x5e9, &live) || !live || !rd(X + 0x5ec, &me) ||
         !rd(W + 0x20, &owner) || owner != me || !rd(W + 0x28, &info) || !info || !rd(info + 8, &wtype) || wtype == 21 ||
         gestures::is_thrown(wtype)) {
+        if (me && owner && owner != me) {  // another's shot, left to the game: its bloom read for the check (run 8 item 0b)
+            float b0 = 0.0f, b1 = 0.0f;
+            uint8_t drawn = 1;
+            g_npc_spawns.fetch_add(1, std::memory_order_relaxed);
+            if (rd(W + 0x1d0, &b0) && rd(W + 0x1d4, &b1) && rd(W + 0x9b0, &drawn) && !drawn && (b0 > 0.0f || b1 > 0.0f)) {
+                g_npc_bloomed.fetch_add(1, std::memory_order_relaxed);
+                g_npc_sigma.store(b0 > b1 ? b0 : b1, std::memory_order_relaxed);
+            }
+        }
         o_spawn(W, proj, count, pellets, speed, u6, no_bloom, seed, turret);
         return;
     }
@@ -550,7 +561,7 @@ void init() {
     g_fire = config::get_bool("Hands", "FireInFirstPerson", true);
     g_assist = config::get_bool("Hands", "AimAssist", false);
     g_tracer = config::get_bool("Hands", "TracerFromMuzzle", true);
-    g_perfect = config::get_bool("Aim", "PerfectAccuracy", false);
+    g_perfect = config::get_bool("Aim", "PerfectAccuracy", true);
     g_pattern = config::get_bool("Aim", "ShotgunPattern", true);
     g_reticle = config::get_bool("Hands", "Reticle", false);
     g_reticle_dot = config::get_string("Hands", "ReticleStyle", "ring") == "dot";
@@ -1109,15 +1120,16 @@ std::string command(const std::string& line) {
         return e;
     }
     if (line.find(" spawns") != std::string::npos) {
-        char sp[320];
+        char sp[420];
         std::snprintf(sp, sizeof(sp),
                       "spawn hook %d, perfect accuracy %d, shotgun pattern %d | spawns %llu, the player's %llu: bloom zeroed %llu, muzzle "
-                      "fixes %llu, aligned %llu, speed left out %llu, pellets straightened %llu",
+                      "fixes %llu, aligned %llu, speed left out %llu, pellets straightened %llu | others' %llu, with the game's bloom %llu (last %.3f)",
                       g_spawn_hooked.load() ? 1 : 0, g_perfect.load() ? 1 : 0, g_pattern.load() ? 1 : 0,
                       static_cast<unsigned long long>(g_spawns.load()), static_cast<unsigned long long>(g_player_spawns.load()),
                       static_cast<unsigned long long>(g_bloom_zeroed.load()), static_cast<unsigned long long>(g_block_fixes.load()),
                       static_cast<unsigned long long>(g_aligned.load()), static_cast<unsigned long long>(g_speed_drops.load()),
-                      static_cast<unsigned long long>(g_straightened.load()));
+                      static_cast<unsigned long long>(g_straightened.load()), static_cast<unsigned long long>(g_npc_spawns.load()),
+                      static_cast<unsigned long long>(g_npc_bloomed.load()), static_cast<double>(g_npc_sigma.load()));
         return sp;
     }
     while (in >> w >> v) {

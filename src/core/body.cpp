@@ -1108,8 +1108,13 @@ constexpr int kGripW = 40;
 std::atomic<bool> g_fallback_cfg{true};  // [Reload] GripFallback
 GripRel g_grips[kGripW][2];  // [eWeapon][0 lowered, 1 aiming]
 GripRel g_grip_tpl[2];       // the last grip learned on any long gun
-int g_grip_src = 0;          // what the current grip is: 0 the weapon's, 1 the template, 2 the built-in
+int g_grip_src = 0;          // what the current grip is: 0 the weapon's, 1 the template, 2 the built-in, 3 a sibling's
+std::atomic<int> g_grip_src_pub{-1}, g_grip_pose_pub{-1};  // for grip_source_name (other threads)
+std::atomic<bool> g_sawed_grip{true};  // [Reload] SawedOffGrip (run 8 item 2)
+std::atomic<bool> g_steady_grip{true};  // [Reload] SteadyRing (run 8 item 2): a learned grip the mean of its first 30 samples, then kept
+int g_grip_n[40][2] = {};               // the samples in each weapon's pose's grip (kGripW weapons)
 GripRel g_grip_builtin[2];   // filled at first use (built_in_grips)
+GripRel g_grip_sawed[2];     // the Sawed-off's (run 8 item 2; built_in_grips)
 void built_in_grips() {
     static bool done = false;
     if (done) return;
@@ -1124,6 +1129,14 @@ void built_in_grips() {
     std::memcpy(g_grip_builtin[0].O, O0, sizeof(O0));
     std::memcpy(g_grip_builtin[1].O, O1, sizeof(O1));
     g_grip_builtin[0].valid = g_grip_builtin[1].valid = true;
+    // run 8 item 2: the Sawed-off, the Double-barrel's grips (skel two in the simulator, the run of 2026-10-05 14:58:08:
+    // lowered (-0.080 0.008 -0.137), aiming (-0.061 -0.003 -0.165), the grip turn as above)
+    const float s0[3] = {-0.080f, 0.008f, -0.137f}, s1[3] = {-0.061f, -0.003f, -0.165f};
+    std::memcpy(g_grip_sawed[0].p, s0, sizeof(s0));
+    std::memcpy(g_grip_sawed[1].p, s1, sizeof(s1));
+    std::memcpy(g_grip_sawed[0].O, O0, sizeof(O0));
+    std::memcpy(g_grip_sawed[1].O, O1, sizeof(O1));
+    g_grip_sawed[0].valid = g_grip_sawed[1].valid = true;
 }
 int g_grip_pose = 0;
 GripRel g_grip_cur;          // the one used: toward the game's pose's grip, a quarter of the way a frame (no jump
@@ -1995,27 +2008,59 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                         ++pair_frames;
                     }
                     const bool keep = f.two_blend > 0.0f && g_same_frame_cfg.load(std::memory_order_relaxed);  // TwoHandedSteady: held
+                    // the pose's hysteresis (run 8 item 2): the learned pose changes only when the other offset is nearer
+                    // by 1 cm; the aim flag's only once it has held 300 ms
+                    const bool hyst = g_sawed_grip.load(std::memory_order_relaxed);
+                    int learned = da < dh ? 1 : 0;
+                    if (hyst && learned != g_grip_pose && std::fabs(std::sqrt(da) - std::sqrt(dh)) < 0.01f) learned = g_grip_pose;
+                    static int flag_was = -1;
+                    static double flag_since = 0.0;
+                    const int flag = hs->aiming ? 1 : 0;
+                    if (flag != flag_was) {
+                        flag_was = flag;
+                        flag_since = log::now_ms();
+                    }
+                    const int flag_pose = !hyst || log::now_ms() - flag_since >= 300.0 ? flag : g_grip_pose;
                     if (keep) {
                         // the grip and its pose kept while the front hand holds the gun
                     } else if (pair_frames >= 5 && has_ik && std::fmin(da, dh) < 0.06f * 0.06f) {
                         if (f.two_blend > 0.0f) {  // "skel lag": learning while the front hand holds the gun
                             ++g_two_learns;
-                            if ((da < dh ? 1 : 0) != g_grip_pose) ++g_two_flips;
+                            if (learned != g_grip_pose) ++g_two_flips;
                         }
-                        g_grip_pose = da < dh ? 1 : 0;
+                        g_grip_pose = learned;
+                        const int slot_pose = da < dh ? 1 : 0;  // the sample is the nearer pose's, whichever is used
                         GripRel scratch;
-                        GripRel& gr = f.weapon >= 0 && f.weapon < kGripW ? g_grips[f.weapon][g_grip_pose] : scratch;
-                        std::memcpy(gr.p, rel, sizeof(rel));
-                        std::memcpy(gr.O, rO, sizeof(rO));
-                        gr.W = hs->W;
-                        std::memcpy(gr.ik, hs->ik, 12);
-                        std::memcpy(gr.ik + 3, hs->ik_hold, 12);
-                        gr.valid = true;
-                        g_grip_tpl[g_grip_pose] = gr;
+                        const bool known_w = f.weapon >= 0 && f.weapon < kGripW;
+                        GripRel& gr = known_w ? g_grips[f.weapon][slot_pose] : scratch;
+                        // [Reload] SteadyRing: the mean of the first 30 samples, then kept (the game's wrist sways about the
+                        // grip: re-learned each frame, the grip and its ring followed the sway, 1-4 cm)
+                        int dummy_n = 0;
+                        int& n = known_w ? g_grip_n[f.weapon][slot_pose] : dummy_n;
+                        const bool steady = g_steady_grip.load(std::memory_order_relaxed);
+                        if (!steady || !gr.valid || n < 30) {
+                            if (steady && gr.valid && n > 0) {
+                                const float w = 1.0f / static_cast<float>(n + 1);
+                                for (int k = 0; k < 3; ++k) gr.p[k] += (rel[k] - gr.p[k]) * w;
+                            } else {
+                                std::memcpy(gr.p, rel, sizeof(rel));
+                            }
+                            std::memcpy(gr.O, rO, sizeof(rO));
+                            gr.W = hs->W;
+                            std::memcpy(gr.ik, hs->ik, 12);
+                            std::memcpy(gr.ik + 3, hs->ik_hold, 12);
+                            gr.valid = true;
+                            if (n < 1000) ++n;
+                            g_grip_tpl[slot_pose] = gr;
+                        }
                         g_grip_learns.fetch_add(1, std::memory_order_relaxed);
                     } else if (!has_ik || std::fmin(da, dh) >= 0.06f * 0.06f) {
-                        if (f.two_blend > 0.0f && (hs->aiming ? 1 : 0) != g_grip_pose) ++g_two_flips;
-                        g_grip_pose = hs->aiming ? 1 : 0;  // no grip learned this frame: the game's aim state picks the pose
+                        const bool own = f.weapon >= 0 && f.weapon < kGripW && (g_grips[f.weapon][0].valid || g_grips[f.weapon][1].valid);
+                        // no grip learned this frame: the game's aim state picks the pose; a gun with no grip of its own
+                        // (it borrows one) keeps the aiming pose (run 8 item 2: the aim flag slid its ring 3-10 cm)
+                        const int pose = own || !g_sawed_grip.load(std::memory_order_relaxed) ? flag_pose : 1;
+                        if (f.two_blend > 0.0f && pose != g_grip_pose) ++g_two_flips;
+                        g_grip_pose = pose;
                     }
                 }
                 built_in_grips();
@@ -2027,6 +2072,10 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                     else if (g_grips[f.weapon][1 - g_grip_pose].valid)
                         want = &g_grips[f.weapon][1 - g_grip_pose], src = 0;
                 }
+                // the Sawed-off (15): the game never holds it two-handed, so it learns no grip; the Double-barrel's
+                // as learned in the simulator (the same bones and IK offsets), before the template (the last long
+                // gun's, in that gun's own frame: the ring sat elsewhere each session)
+                if (!want && f.weapon == 15 && g_sawed_grip.load(std::memory_order_relaxed)) want = &g_grip_sawed[g_grip_pose], src = 3;
                 if (!want && g_fallback_cfg.load(std::memory_order_relaxed)) {
                     if (g_grip_tpl[g_grip_pose].valid)
                         want = &g_grip_tpl[g_grip_pose], src = 1;
@@ -2052,7 +2101,12 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                             corr_point(c0, gq_o, gdq_o);
                             for (int k = 0; k < 3; ++k) Tq[k] = f.ik_t[fh][k] - off[k] - gdq_o[k];
                             for (int i = 0; i < 3; ++i) rt[i] = Gdq[0 * 3 + i] * Tq[0] + Gdq[1 * 3 + i] * Tq[1] + Gdq[2 * 3 + i] * Tq[2];
-                            lock_z = rt[2] < -0.65f ? -0.65f : rt[2] > -0.08f ? -0.08f : rt[2];
+                            // short of the muzzle (6 cm in from the gun's MuzzleOffset: the Sawed-off's 0.65 m reached
+                            // past its barrels), else a rifle's 0.65 m
+                            float zmin = -0.65f;
+                            if (g_sawed_grip.load(std::memory_order_relaxed) && hs->mo_ok && hs->mo[2] < -0.15f && hs->mo[2] + 0.06f > zmin)
+                                zmin = hs->mo[2] + 0.06f;
+                            lock_z = rt[2] < zmin ? zmin : rt[2] > -0.08f ? -0.08f : rt[2];
                             z_locked = true;
                         }
                     }
@@ -2062,7 +2116,11 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                         want = &fbk;
                     }
                 }
-                if (slot == 0) g_grip_src = want ? src : -1;
+                if (slot == 0) {
+                    g_grip_src = want ? src : -1;
+                    g_grip_src_pub.store(g_grip_src, std::memory_order_relaxed);
+                    g_grip_pose_pub.store(g_grip_pose, std::memory_order_relaxed);
+                }
                 if (want && slot == 0 && g_grip_cur_frame != g_body_frame) {
                     g_grip_cur_frame = g_body_frame;
                     if (!g_grip_cur.valid) {
@@ -4497,6 +4555,15 @@ void set_hidden_geometry(int mode) {
     config::set("Body", "HiddenGeometry", mode == 2 ? "filter" : mode == 1 ? "skip" : "draw");
 }
 
+const char* grip_source_name() {
+    static const char* const kSrc[] = {"the weapon's own grip", "the template (another gun's)", "the built-in grip", "the Sawed-off's (the Double-barrel's grip)"};
+    static const char* const kPose[] = {" lowered", " aiming"};
+    static thread_local char b[64];
+    const int s = g_grip_src_pub.load(std::memory_order_relaxed), p = g_grip_pose_pub.load(std::memory_order_relaxed);
+    std::snprintf(b, sizeof(b), "%s%s", s >= 0 && s < 4 ? kSrc[s] : "none", p == 0 || p == 1 ? kPose[p] : "");
+    return b;
+}
+
 bool auto_shows() {
     std::lock_guard lock(g_cfg_mutex);
     return g_cfg_auto_show;
@@ -4653,6 +4720,8 @@ bool install() {
         g_same_frame_cfg = config::get_bool("Reload", "TwoHandedSteady", true);
         g_twist_cfg = config::get_bool("Hands", "ArmTwist", true);
         g_fallback_cfg = config::get_bool("Reload", "GripFallback", true);
+        g_sawed_grip = config::get_bool("Reload", "SawedOffGrip", true);
+        g_steady_grip = config::get_bool("Reload", "SteadyRing", true);
         {
             const float ts = config::get_float("Hands", "ForearmTwistShare", 0.5f);
             g_twist_share = !(ts >= 0.0f) ? 0.0f : ts > 1.0f ? 1.0f : ts;
@@ -5203,6 +5272,17 @@ std::string command(const std::string& line) {
                       g_rig.mirror_ok ? "the finger mirror on" : "the finger mirror off");
         return b;
     }
+    if (sub == "grips" && (line.find(" steadyring on") != std::string::npos || line.find(" steadyring off") != std::string::npos)) {
+        // skel grips steadyring on|off: SteadyRing (the session); the samples counted afresh
+        g_steady_grip = line.find(" steadyring on") != std::string::npos;
+        std::memset(g_grip_n, 0, sizeof(g_grip_n));
+        return std::string("the learned grips ") + (g_steady_grip.load() ? "steadied (the mean of 30, then kept)" : "re-learned each frame");
+    }
+    if (sub == "two" && line.find(" sawed ") != std::string::npos) {  // skel two sawed on|off: SawedOffGrip (the session only)
+        g_sawed_grip = line.find(" sawed on") != std::string::npos;
+        return std::string("the Sawed-off's own grip (the Double-barrel's), a borrowed grip's pose fixed, the hold short of the muzzle ") +
+               (g_sawed_grip.load() ? "on" : "off");
+    }
     if (sub == "two" && line.find(" steady ") != std::string::npos) {  // skel two steady on|off: TwoHandedSteady (the session only)
         g_same_frame_cfg = line.find(" steady on") != std::string::npos;
         return std::string("two-handed steady (the same frame's barrel, the grip kept while held) ") + (g_same_frame_cfg.load() ? "on" : "off");
@@ -5229,7 +5309,7 @@ std::string command(const std::string& line) {
         std::snprintf(b2, sizeof(b2), " || learned for weapon %d: lowered %d (%.3f %.3f %.3f) aiming %d (%.3f %.3f %.3f), pose now %s, grip from %s, "
                       "learns %llu, snaps %llu, the drawn front wrist %.3f m from the snap | grip turn %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f",
                       g_frame.weapon, gr[0].valid ? 1 : 0, gr[0].p[0], gr[0].p[1], gr[0].p[2], gr[1].valid ? 1 : 0, gr[1].p[0], gr[1].p[1], gr[1].p[2],
-                      pose ? "aiming" : "lowered", src == 0 ? "the weapon" : src == 1 ? "the template" : src == 2 ? "the built-in" : "none",
+                      pose ? "aiming" : "lowered", src == 0 ? "the weapon" : src == 1 ? "the template" : src == 2 ? "the built-in" : src == 3 ? "the Double-barrel's" : "none",
                       static_cast<unsigned long long>(g_grip_learns.load()), static_cast<unsigned long long>(g_snaps.load()), miss, gO[0], gO[1],
                       gO[2], gO[3], gO[4], gO[5], gO[6], gO[7], gO[8]);
         log::info("[body] skel two%s", b2);

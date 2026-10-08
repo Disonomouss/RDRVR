@@ -31,6 +31,8 @@
 #include "core/reload.h"
 #include "core/round_draw.h"
 #include "core/held_prop.h"
+#include "core/wheel.h"
+#include "core/whistle.h"
 
 namespace rdrvr::holster {
 namespace {
@@ -41,11 +43,64 @@ std::atomic<bool> g_aim_pose{false};      // the gun controller's +0x5d6 bit 0x4
 std::atomic<bool> g_fire_ready{false};
 std::atomic<float> g_fire_phase{-1.0f};  // the gun controller's fire clip (G +0x24): its phase, below 0 when none plays    // FUN_140d16400's fire test, at the last frame end
 std::atomic<bool> g_raised{false}, g_gun_at_zone{false};
+// run 8 item 2: the foregrip ring in the drawn gun's frame (R^T (ring - o)), each holster frame with a long gun
+struct ForeTrace {
+    int weapon = -1;
+    uint64_t frames = 0, jumps = 0;  // jumps: over 5 mm from the frame before
+    float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f}, last[3] = {}, max_step = 0.0f;
+    bool have = false;
+};
+std::mutex g_fore_mutex;
+ForeTrace g_fore_trace;
+float g_log_ref[3] = {};
+int g_log_weapon = -1;
+double g_log_ms = -1e12;
+void fore_trace(int weapon, const float* R, const float* o, const float* ring, double now) {
+    float d[3], g[3];
+    for (int k = 0; k < 3; ++k) d[k] = ring[k] - o[k];
+    for (int i = 0; i < 3; ++i) g[i] = R[0 * 3 + i] * d[0] + R[1 * 3 + i] * d[1] + R[2 * 3 + i] * d[2];  // the columns: the gun's axes
+    {
+        std::lock_guard lock(g_fore_mutex);
+        ForeTrace& t = g_fore_trace;
+        if (weapon != t.weapon) t = ForeTrace{}, t.weapon = weapon;
+        if (t.have) {
+            const float s = std::sqrt((g[0] - t.last[0]) * (g[0] - t.last[0]) + (g[1] - t.last[1]) * (g[1] - t.last[1]) + (g[2] - t.last[2]) * (g[2] - t.last[2]));
+            if (s > 0.005f) ++t.jumps;
+            if (s > t.max_step) t.max_step = s;
+        }
+        for (int k = 0; k < 3; ++k) {
+            t.lo[k] = std::fmin(t.lo[k], g[k]);
+            t.hi[k] = std::fmax(t.hi[k], g[k]);
+            t.last[k] = g[k];
+        }
+        t.have = true;
+        ++t.frames;
+    }
+    // the log: a move over 1 cm in the gun's frame since the last line (once a second at most), the weapon kept
+    if (weapon != g_log_weapon) {
+        g_log_weapon = weapon;
+        std::memcpy(g_log_ref, g, sizeof(g));
+        return;
+    }
+    const float m = std::sqrt((g[0] - g_log_ref[0]) * (g[0] - g_log_ref[0]) + (g[1] - g_log_ref[1]) * (g[1] - g_log_ref[1]) +
+                              (g[2] - g_log_ref[2]) * (g[2] - g_log_ref[2]));
+    if (m > 0.01f && now - g_log_ms > 1000.0) {
+        g_log_ms = now;
+        log::info("[holster] the foregrip ring moved %.0f mm in the gun's frame (weapon %d): now (%.3f %.3f %.3f), the grip from %s", m * 1000.0f,
+                  weapon, g[0], g[1], g[2], body::grip_source_name());
+        std::memcpy(g_log_ref, g, sizeof(g));
+    }
+}
 std::atomic<uint64_t> g_raises{0};
 float g_raise_pmin = -35.0f, g_raise_pmax = 60.0f, g_raise_reach = 0.25f;  // [Hands] RaisedPitchMin/Max, RaisedReach
 std::atomic<float> g_raise_dbg[4] = {};  // the last frame's pitch, reach, ahead, and the conditions (bits) for "holster"
 std::atomic<bool> g_unarmed{true};        // [Holsters] UnarmedAfterHolster
-std::atomic<bool> g_show_zones{false};    // [Holsters] ShowZones
+std::atomic<bool> g_show_zones{false};    // [Holsters] ShowZones: the holster rings (run 8 item 5b: those only)
+std::atomic<bool> g_ring_gun_axes{true};
+std::atomic<bool> g_steady_ring{true};  // [Reload] SteadyRing (run 8 item 2): the ring's place on the gun locked after the draw
+std::atomic<uint64_t> g_ring_locks{0};  // [Reload] RingInGunAxes (run 8 item 2): the ring's offset along the drawn gun's axes
+std::atomic<bool> g_show_dots{false};     // [Holsters] ShowHandDots (run 8 item 5b; absent: ShowZones')
+std::atomic<bool> g_show_points{false};   // [Holsters] ShowWeaponPoints: the foregrip ring, the load point, the action hints
 // [Holsters] ReleaseMargin: a grip pressed in a zone counts as let go there within this times its radius (run 4: with a
 // gun in hand the drawn wrist sits near the hip zone's edge, and a release drifted just outside it)
 std::atomic<float> g_release_margin{1.3f};
@@ -393,7 +448,8 @@ void holster_frame() {
     float zp[kZones][3], bases[kZones][3];
     bool zok[kZones];
     for (int z = 0; z < kZones; ++z) {
-        zok[z] = zones[z].enabled && bp.bone_ok[zones[z].bone];
+        // the wheel mode (run 8 item 5): no holster draws or put-aways, the chest's rounds kept
+        zok[z] = zones[z].enabled && bp.bone_ok[zones[z].bone] && (z == kAmmoZone || !wheel::wheel_mode());
         float base[3] = {bp.bone[zones[z].bone][0], bp.bone[zones[z].bone][1], bp.bone[zones[z].bone][2]};
         if (zones[z].mirror) {  // the twin's bone: mirrored across the body's middle
             const float d = (base[0] - bp.root[0]) * right[0] + (base[2] - bp.root[2]) * right[2];
@@ -584,7 +640,7 @@ void holster_frame() {
     // the empty gun clicks: the gun hand's trigger pulled with nothing loaded (with or without spare rounds), not while
     // the menu has the controllers. [Reload] EmptyClick: a click sound from the gun hand's side, the buzz, both or none
     {
-        const bool t = hands::get(gun_h).trigger > 0.6f;
+        const bool t = hands::get(gun_h).trigger > 0.6f && !whistle::suppressed(gun_h);  // run 8: the whistle's trigger clicks nothing
         if (t && !trig_down && gun && st.clip < 0.5f && reload::hand_reload() && !menu::visible() &&
             !actions::fire_blocked()) {  // an open revolver or an unworked action: its own buzz, never the empty click (round 10)
             audio::empty_click(gun_h, st.weapon);  // the family's click (round 9: the user's sounds)
@@ -606,6 +662,39 @@ void holster_frame() {
     // the foregrip point (body.cpp: the game's grip on the drawn gun, moved by ForegripOffset) within its radius; until
     // the game's grip is known, the old test: near the barrel line, 0.12 - 0.85 m ahead of the gun hand
     float fore_r = 0.20f, fore_d = 1e9f, fore_zone[3] = {bp.fore[0], bp.fore[1], bp.fore[2]};
+    {  // [Reload] SteadyRing: the grip point's mean in the drawn gun's frame 0.4-1.2 s after the draw, kept for that draw
+        static int lock_w = -2;
+        static double lock_t0 = 0.0;
+        static float sum[3] = {}, locked[3] = {};
+        static int n = 0;
+        static bool have = false;
+        if (st.weapon != lock_w || !long_gun) {
+            lock_w = st.weapon;
+            lock_t0 = now_ms;
+            sum[0] = sum[1] = sum[2] = 0.0f;
+            n = 0;
+            have = false;
+        }
+        // (run 8: the lock caught the template before the gun's own grip was learned; the grip itself is steadied
+        // now in body.cpp, so the ring is the grip point again: the lock stays off)
+        if (false && long_gun && bp.fore_ok && bp.gun_frame_ok && g_steady_ring.load(std::memory_order_relaxed)) {
+            const float* G = bp.gun_frame_R;  // columns: the gun's axes
+            if (!have) {
+                const double age = now_ms - lock_t0;
+                if (age >= 400.0 && age <= 1200.0) {
+                    const float d[3] = {bp.fore[0] - bp.gun_frame_o[0], bp.fore[1] - bp.gun_frame_o[1], bp.fore[2] - bp.gun_frame_o[2]};
+                    for (int i = 0; i < 3; ++i) sum[i] += G[0 * 3 + i] * d[0] + G[1 * 3 + i] * d[1] + G[2 * 3 + i] * d[2];
+                    ++n;
+                } else if (age > 1200.0 && n > 0) {
+                    for (int i = 0; i < 3; ++i) locked[i] = sum[i] / static_cast<float>(n);
+                    have = true;
+                    g_ring_locks.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (have)
+                for (int k = 0; k < 3; ++k) fore_zone[k] = bp.gun_frame_o[k] + G[k * 3] * locked[0] + G[k * 3 + 1] * locked[1] + G[k * 3 + 2] * locked[2];
+        }
+    }
     {  // [Reload] ForegripZoneOffset / ForegripZoneRadius: the ring, apart from where John's hand sits (bp.fore)
         float zo[3];
         gun_adjust(st.weapon, kAdjForeRing, zo, &fore_r);  // round 13 item 8: the gun's own ring, else every gun's
@@ -616,13 +705,22 @@ void holster_frame() {
             for (float& x : upv) x /= ul;
         else
             upv[0] = upv[2] = 0.0f, upv[1] = 1.0f;
-        for (int k = 0; k < 3; ++k) fore_zone[k] = bp.fore[k] + rgt[k] * zo[0] + upv[k] * zo[1] + u[k] * zo[2];
+        if (bp.gun_frame_ok && g_ring_gun_axes.load(std::memory_order_relaxed)) {
+            // run 8 item 2: the drawn gun's own axes (columns: x right, y up, z back), so the ring keeps its place on the gun
+            // whatever the hand's turn against it (the Sawed-off's ring offset, 6 cm across, swung about the gun as the
+            // controller's axes and the drawn gun's parted)
+            const float* G = bp.gun_frame_R;
+            for (int k = 0; k < 3; ++k) fore_zone[k] += G[k * 3] * zo[0] + G[k * 3 + 1] * zo[1] - G[k * 3 + 2] * zo[2];
+        } else {
+            for (int k = 0; k < 3; ++k) fore_zone[k] += rgt[k] * zo[0] + upv[k] * zo[1] + u[k] * zo[2];
+        }
     }
     if (bp.fore_ok) {
         float dd = 0.0f;
         for (int k = 0; k < 3; ++k) dd += (gb[fj][k] - fore_zone[k]) * (gb[fj][k] - fore_zone[k]);
         fore_d = std::sqrt(dd);
     }
+    if (bp.fore_ok && bp.gun_frame_ok && long_gun) fore_trace(st.weapon, bp.gun_frame_R, bp.gun_frame_o, fore_zone, now_ms);
     const dual::State ds = dual::state();  // [Hands] DualWield: the second gun, if one is out
     const bool fore_near = !ds.on && long_gun && reload::two_handed() && bp.hand_ok[0] && bp.hand_ok[1] &&
                            (bp.fore_ok ? fore_d < fore_r : fore_along > 0.12f && fore_along < 0.85f && fore_perp < 0.18f);
@@ -1088,7 +1186,8 @@ void holster_frame() {
     float hint_pos[3] = {};
     const int ahint = gun ? actions::hint(hint_pos) : 0;  // [Reload] ActionHints
     const bool zones_shown = g_show_zones.load(std::memory_order_relaxed);
-    if ((zones_shown || ahint) && bp.cam_ok) {
+    const bool dots_shown = g_show_dots.load(std::memory_order_relaxed), points_shown = g_show_points.load(std::memory_order_relaxed);
+    if ((zones_shown || dots_shown || points_shown) && bp.cam_ok) {
         Markers& mk = g_markers;
         std::memcpy(mk.cam, bp.cam, sizeof(mk.cam));
         mk.n = 0;
@@ -1112,7 +1211,7 @@ void holster_frame() {
             }
             add(zp[z], zones[z].radius, kRing, ms, z);
         }
-        if (zones_shown && long_gun && reload::two_handed() && bp.hand_ok[0] && bp.hand_ok[1]) {
+        if (points_shown && long_gun && reload::two_handed() && bp.hand_ok[0] && bp.hand_ok[1]) {
             const MarkerState fs = two_hold[off_h] ? kHeld : fore_ok ? kHandIn : kGunIdle;
             if (bp.fore_ok) {
                 add(fore_zone, fore_r, kRing, fs, kZones);  // the foregrip ring: where the front hand engages, its radius
@@ -1125,11 +1224,11 @@ void holster_frame() {
                 add(c, 0.18f, kRing, fs, kZones);
             }
         }
-        if (round_held[off_h]) add(load_pt, lr, kRing, kGunIdle, kZones + 1);  // where the round goes in
+        if (points_shown && round_held[off_h]) add(load_pt, lr, kRing, kGunIdle, kZones + 1);  // where the round goes in
         // the action's want: the revolver open (where rounds go in), the bolt's zone, the lever or pump gun
-        if (ahint == 2) add(hint_pos, 0.05f, kRing, kHeld, kZones + 4);
-        else if (ahint) add(load_pt, ahint == 1 ? 0.06f : 0.04f, kRing, kHeld, kZones + 4);
-        for (int h = 0; h < 2 && zones_shown; ++h) {
+        if (points_shown && ahint == 2) add(hint_pos, 0.05f, kRing, kHeld, kZones + 4);
+        else if (points_shown && ahint) add(load_pt, ahint == 1 ? 0.06f : 0.04f, kRing, kHeld, kZones + 4);
+        for (int h = 0; h < 2 && dots_shown; ++h) {
             const int jh = bp.ctrl[0] == h ? 0 : 1;
             if (bp.hand_ok[jh]) add(gb[jh], 0.025f, kDot, in_z[h] >= 0 || (h == off_h && fore_ok) ? kHandIn : kIdle, kZones + 2 + h);
         }
@@ -1331,6 +1430,10 @@ void init() {
     g_raise_pmax = config::get_float("Hands", "RaisedPitchMax", 60.0f);
     g_raise_reach = config::get_float("Hands", "RaisedReach", 0.25f);
     g_show_zones = config::get_bool("Holsters", "ShowZones", false);
+    g_show_dots = config::get_bool("Holsters", "ShowHandDots", g_show_zones.load());
+    g_ring_gun_axes = config::get_bool("Reload", "RingInGunAxes", true);
+    g_steady_ring = config::get_bool("Reload", "SteadyRing", true);
+    g_show_points = config::get_bool("Holsters", "ShowWeaponPoints", g_show_zones.load());
     g_release_margin = config::get_float("Holsters", "ReleaseMargin", 1.3f);
     g_weapon_choice = config::get_bool("Holsters", "WeaponChoice", true);
     g_any_weapon = config::get_bool("Holsters", "AnyWeapon", false);
@@ -1379,7 +1482,8 @@ void init() {
         log::info("[holster] foregrip: the game's grip moved (%.3f %.3f %.3f) m, radius %.2f m; the front hand snaps on %d", off[0], off[1],
                   off[2], g_fore_radius, g_fore_snap.load() ? 1 : 0);
     }
-    log::info("[holster] a put-away selects the fists %d; the holsters shown as rings %d", g_unarmed.load() ? 1 : 0, g_show_zones.load() ? 1 : 0);
+    log::info("[holster] a put-away selects the fists %d; shown: the holster rings %d, the hand dots %d, the weapon points %d", g_unarmed.load() ? 1 : 0,
+              g_show_zones.load() ? 1 : 0, g_show_dots.load() ? 1 : 0, g_show_points.load() ? 1 : 0);
     d3d::add_frame_end_listener([](uint64_t) {
         uintptr_t actor = player_actor(), ped = 0;
         if (actor) rd(actor + 0x38, &ped);
@@ -1644,12 +1748,26 @@ bool show_zones() { return g_show_zones.load(); }
 void set_show_zones(bool on) {
     set_show_zones_session(on);
     config::set("Holsters", "ShowZones", on ? "1" : "0");
+    // the other two written as they are, so they no longer follow ShowZones at the next start (the review's finding)
+    config::set("Holsters", "ShowHandDots", g_show_dots.load() ? "1" : "0");
+    config::set("Holsters", "ShowWeaponPoints", g_show_points.load() ? "1" : "0");
 }
 void set_show_zones_session(bool on) {
     if (g_show_zones.exchange(on) != on) log::info("[holster] rings %s", on ? "shown" : "hidden");
 }
+bool show_hand_dots() { return g_show_dots.load(); }
+bool show_weapon_points() { return g_show_points.load(); }
+void set_show_hand_dots(bool on, bool save) {
+    if (g_show_dots.exchange(on) != on) log::info("[holster] the hand dots %s", on ? "shown" : "hidden");
+    if (save) config::set("Holsters", "ShowHandDots", on ? "1" : "0");
+}
+void set_show_weapon_points(bool on, bool save) {
+    if (g_show_points.exchange(on) != on) log::info("[holster] the weapon points %s", on ? "shown" : "hidden");
+    if (save) config::set("Holsters", "ShowWeaponPoints", on ? "1" : "0");
+}
 bool markers(Markers* out) {
-    if (!g_show_zones.load(std::memory_order_relaxed)) return false;
+    if (!g_show_zones.load(std::memory_order_relaxed) && !g_show_dots.load(std::memory_order_relaxed) && !g_show_points.load(std::memory_order_relaxed))
+        return false;
     std::lock_guard lock(g_hdiag_mutex);
     if (!g_markers_valid || log::now_ms() - g_markers_ms > 100.0) return false;
     *out = g_markers;
@@ -1849,9 +1967,37 @@ std::string command(const std::string& line) {
                       bp.hand[1][1], bp.hand[1][2]);
         return b;
     }
-    if (v == "fore") {  // holster fore [set <right> <up> <forward> [radius] | snap on|off] (the session only)
+    if (v == "fore") {  // holster fore [set <right> <up> <forward> [radius] | snap on|off | trace [reset]] (the session only)
         std::string x;
         in >> x;
+        if (x == "steady") {  // holster fore steady on|off: SteadyRing for the session (the learned grips, body.cpp)
+            std::string y;
+            in >> y;
+            g_steady_ring = y != "off";
+            return body::command(std::string("skel grips steadyring ") + (g_steady_ring.load() ? "on" : "off"));
+        }
+        if (x == "axes") {  // holster fore axes gun|controller: the ring offset's axes (RingInGunAxes, the session)
+            std::string y;
+            in >> y;
+            g_ring_gun_axes = y != "controller";
+            return std::string("the ring offset along the ") + (g_ring_gun_axes.load() ? "drawn gun's axes" : "controller's axes");
+        }
+        if (x == "trace") {  // the ring in the drawn gun's frame since the reset (run 8 item 2)
+            std::string y;
+            in >> y;
+            std::lock_guard lock(g_fore_mutex);
+            if (y == "reset") g_fore_trace = ForeTrace{};
+            const ForeTrace& t = g_fore_trace;
+            char b[400];
+            std::snprintf(b, sizeof(b),
+                          "fore trace: weapon %d, %llu frames, the ring in the gun's frame now (%.3f %.3f %.3f), range x %.1f y %.1f z %.1f mm, steps over "
+                          "5 mm %llu (the largest %.1f mm) | the grip from %s",
+                          t.weapon, static_cast<unsigned long long>(t.frames), t.last[0], t.last[1], t.last[2],
+                          t.have ? (t.hi[0] - t.lo[0]) * 1000.0f : -1.0f, t.have ? (t.hi[1] - t.lo[1]) * 1000.0f : -1.0f,
+                          t.have ? (t.hi[2] - t.lo[2]) * 1000.0f : -1.0f, static_cast<unsigned long long>(t.jumps), t.max_step * 1000.0f,
+                          body::grip_source_name());
+            return b;
+        }
         float off[3], r = 0;
         foregrip(off, &r);
         if (x == "set") {
@@ -1892,10 +2038,19 @@ std::string command(const std::string& line) {
         std::string x;
         in >> x;
         if (x == "on" || x == "off") set_show_zones_session(x == "on");
-        const std::string only = x == "on" || x == "off" ? std::string() : x;
+        if (x == "dots" || x == "points") {  // holster rings dots|points on|off: the hand dots, the weapon points (the session)
+            std::string y;
+            in >> y;
+            if (x == "dots") set_show_hand_dots(y == "on", false);
+            else set_show_weapon_points(y == "on", false);
+        }
+        const std::string only = x == "on" || x == "off" || x == "dots" || x == "points" ? std::string() : x;
         Markers mk;
-        if (!markers(&mk)) return std::string("rings ") + (g_show_zones.load() ? "on, no markers yet" : "off");
-        std::string r = "rings on, " + std::to_string(mk.n) + " markers:";
+        char sw[96];
+        std::snprintf(sw, sizeof(sw), "(holsters %d, hand dots %d, weapon points %d) ", g_show_zones.load() ? 1 : 0, g_show_dots.load() ? 1 : 0,
+                      g_show_points.load() ? 1 : 0);
+        if (!markers(&mk)) return std::string("rings ") + sw + (g_show_zones.load() || g_show_dots.load() || g_show_points.load() ? "on, no markers yet" : "off");
+        std::string r = std::string("rings ") + sw + "on, " + std::to_string(mk.n) + " markers:";
         static const char* const kState[4] = {"idle", "hand in", "held", "gun"};
         for (int i = 0; i < mk.n; ++i) {
             const Marker& m = mk.m[i];

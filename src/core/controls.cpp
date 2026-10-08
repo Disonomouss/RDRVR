@@ -24,6 +24,8 @@
 #include "core/menu.h"
 #include "core/pose.h"
 #include "core/reload.h"
+#include "core/wheel.h"
+#include "core/whistle.h"
 #include "core/xr.h"
 
 namespace rdrvr::controls {
@@ -215,10 +217,18 @@ bool pad(xinput::PadState* out) {
     if (!use) {
         g_menu_was = false;
         g_combo_since = 0;
+        wheel::cancel();
         return false;
     }
     if (!use_l) l = hands::Hand{};
     if (!use_r) r = hands::Hand{};
+    bool whistle_btn = false;
+    {  // [Gestures] Whistle (run 8 item 4): a hand at the mouth, its trigger: the whistle (D-pad up); that trigger kept
+        float trig[2] = {l.trigger, r.trigger};
+        whistle_btn = whistle::poll(now, trig);
+        l.trigger = trig[0];
+        r.trigger = trig[1];
+    }
     if (const dual::State ds = dual::state(); ds.on) (ds.ctrl ? r : l).trigger = 0.0f;  // [Hands] DualWield: the second gun's own
     if (g_left_handed.load(std::memory_order_relaxed)) std::swap(l, r);  // the mirror: every role swapped
     {  // the gun in the layout's other hand (drawn by it): its trigger fires, the other aims; changed only with both let go
@@ -266,6 +276,7 @@ bool pad(xinput::PadState* out) {
     }
     g_menu_was = menu_down;
     if (now < g_start_until) p.buttons |= XINPUT_GAMEPAD_START;
+    if (whistle_btn) p.buttons |= XINPUT_GAMEPAD_DPAD_UP;  // the game's GENERIC.WHISTLE
     // the wrist menu: with the wrist HUD in view (the palm flat, looked at), the off hand's Y held MenuHoldMs toggles
     // the menu. Y is the mod's from its press while the HUD shows (the hold keeps it if the HUD goes); a shorter press
     // reaches the game as a tap at the release
@@ -303,7 +314,10 @@ bool pad(xinput::PadState* out) {
         g_combo_fired = false;
     }
     actions::filter_stick(&rx, &ry);  // [Reload] ManualActions: a revolver opens by a flick down (that cone consumed)
-    if (menu::visible()) return false;  // the menu has the controllers
+    if (menu::visible()) {  // the menu has the controllers
+        wheel::cancel();
+        return false;
+    }
     RdrvrActorState st{};
     const bool have_st = api::actor_state(&st);
     {  // the horse brake: the route decided at the press
@@ -354,6 +368,13 @@ bool pad(xinput::PadState* out) {
             grab_wait[h] = false;
         }
         g_grip_down[h] = g_grip_raw[h] && !g_grip_held_back[h] && !holster::grip_consumed(ph);
+    }
+    {  // [Holsters] Mode=wheel (run 8 item 5): a free grip holds the game's weapon wheel, steered by the hand
+        bool free[2] = {false, false}, taken[2] = {false, false};
+        for (int h = 0; h < 2; ++h) free[swapped ? 1 - h : h] = g_grip_down[h];
+        wheel::poll(now, free, taken);
+        for (int h = 0; h < 2; ++h)
+            if (taken[swapped ? 1 - h : h]) g_grip_down[h] = false;
     }
     // each source's value (0..1: a button is 0 or 1, a trigger analog), then onto its target: a button target is
     // pressed above half, an LT/RT target takes the largest value mapped to it

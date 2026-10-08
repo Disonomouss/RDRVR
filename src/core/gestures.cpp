@@ -26,6 +26,7 @@
 #include "core/menu.h"
 #include "core/pose.h"
 #include "core/reload.h"
+#include "core/whistle.h"
 
 namespace rdrvr::gestures {
 namespace {
@@ -96,14 +97,16 @@ bool velocity(int h, double now, double window_ms, float v[3], float* speed, flo
 // hand and its barrel) are followed in the recentred local frame, as the hands are above (walking, turning and the
 // head-bone anchor are not swing). A point faster than GunMeleeArm arms the swing; while armed, one scan at a time
 // goes to the plugin's tick (RDRVR_NATIVE_GUN_MELEE) with each point's segment since the last scan (world) and its
-// velocity; a hit (or a dry one) ends the swing's scans, and the next swing arms once the points slow below 1 m/s.
+// velocity; a hit (or a dry one) ends the swing's scans, and the next swing arms once the points slow below 0.8 m/s.
+// A hit needs the swing's peak since it armed at GunMeleeSpeed or more and the point moving into the bone at half of it
+// (GunMeleeByPeak; run 8 item 1: people slow down into a virtual contact), else the speed at contact.
 // Not while the menu is open, without a gun, in Dead Eye or the game's reload, riding or driving, drawing or putting
-// away (the gun hand's grip at a holster, the gun at a zone; 0.7 s after the weapon in hand changes, 0.5 s after the
-// holster's grip), working the gun's action (open, a flick wanted, the off hand at a part; 0.4 s after), or in the
+// away (the gun hand's grip at a holster, the gun at a zone with that hand's grip pressed; 0.7 s after the weapon in
+// hand changes, 0.25 s after the holster's grip), working the gun's action (open, a flick wanted, the off hand at a part; 0.4 s after), or in the
 // two-handed grip's take (0.3 s). Out of first person (a cutscene, the cinema: no camera anchor) the swing is forgotten.
 namespace gm {
-constexpr float kRearm = 1.0f;  // m/s: below it the swing is over
-constexpr double kDrawMs = 700.0, kHolsterMs = 500.0, kActionMs = 400.0, kTakeMs = 300.0, kReqMs = 500.0;
+constexpr float kRearm = 0.8f;  // m/s: below it the swing is over (run 8: 1.0, above the slow end of a real swing)
+constexpr double kDrawMs = 700.0, kHolsterMs = 250.0, kActionMs = 400.0, kTakeMs = 300.0, kReqMs = 500.0;
 // the iterator's sphere (cm) about the first strike point: the actors' positions are their roots, at the feet [I], so it
 // reaches them from a strike at head height
 constexpr uint16_t kRadiusCm = 200;
@@ -120,6 +123,14 @@ std::mutex mu;  // the frame end writes; the test channel reads (and adds its sc
 Point pt[2];
 int npts = 0, family = -1, weapon = -1;  // family: 0 a pistol, 1 a long gun by its frame, 2 a long gun by the hand's ray
 bool armed = false, struck = false, counted = false, have_prev = false;
+// the armed swing's peak, its fast part and its scans (the "swing over" line); the last suppression line's time
+float swing_peak = 0.0f, swing_near = -1.0f, swing_near_speed = 0.0f;  // near: the nearest a scan came to a bone (m; -1 none)
+bool over_pending = false;  // a swing over without a hit, its line kept until its last scan has answered (the review's finding)
+float over_peak = 0.0f;
+int over_part = 0, over_scans = 0, over_family = 0;
+int swing_part = 0, swing_scans = 0;
+double suppressed_log_ms = -1e12;
+uint64_t n_swings_missed = 0;
 float prev[2][3] = {};  // where each point was at the last scan: the next segment's start
 uint64_t req = 0;
 double req_ms = 0.0;
@@ -166,7 +177,13 @@ void note(const RdrvrNativeResult& r, bool swing, int gun_h) {
     n_made += (r.value >> 56) & 0xf;
     n_destroyed += (r.value >> 60) & 0xf;
     switch (outcome) {
-        case RDRVR_GUN_MELEE_NONE: ++n_none; break;
+        case RDRVR_GUN_MELEE_NONE:
+            ++n_none;
+            if (swing && r.vec[3] >= 0.0f && (swing_near < 0.0f || r.vec[3] < swing_near)) {
+                swing_near = r.vec[3];
+                swing_near_speed = r.vec[0];
+            }
+            break;
         case RDRVR_GUN_MELEE_GUARD: ++n_guard; break;
         case RDRVR_GUN_MELEE_NO_ITERATOR: ++n_no_iter; break;
         case RDRVR_GUN_MELEE_NO_CORE: ++n_no_core; break;
@@ -214,6 +231,7 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
     }
     if (!on || !bp || !st || !st->actor) {
         armed = struck = counted = have_prev = false;
+        swing_peak = 0.0f;
         npts = 0;
         for (Point& p : pt) p.count = 0, p.ok = false;
         speed_now = 0.0f;
@@ -296,7 +314,7 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
     speed_now = speed;
     if (speed > speed_peak) speed_peak = speed;
     // the exclusion windows (their edges each frame, so the windows run whatever the speed)
-    const bool cons = holster::grip_consumed(gun_h) || holster::gun_at_zone();
+    const bool cons = holster::grip_consumed(gun_h) || (holster::gun_at_zone() && hands::get(gun_h).grip > 0.5f);
     if (holster_was && !cons) holster_ms = now;
     holster_was = cons;
     float part[3];
@@ -317,12 +335,40 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
     else if (cons || now - weapon_ms < kDrawMs || now - holster_ms < kHolsterMs) why = kHolster;
     else if (act || now - action_ms < kActionMs) why = kAction;
     else if ((blend > 0.0f && blend < 1.0f) || now - take_ms < kTakeMs) why = kTake;
-    // the swing: armed past GunMeleeArm, over below 1 m/s; one hit a swing
-    if ((measured || np == 0) && speed < kRearm) armed = struck = counted = false;
+    // the swing: armed past GunMeleeArm, over below 0.8 m/s; one hit a swing
+    if (armed && speed > swing_peak) {
+        swing_peak = speed;
+        swing_part = fast;
+    }
+    if ((measured || np == 0) && speed < kRearm) {
+        if (armed && !struck) {  // a swing over without a hit: its line once its last scan has answered
+            over_pending = true;
+            over_peak = swing_peak;
+            over_part = swing_part;
+            over_scans = swing_scans;
+            over_family = family;
+        }
+        armed = struck = counted = false;
+    }
+    if (over_pending && !req) {  // the swing's numbers, so a missed hit says why (a hit by its last scan: no line)
+        over_pending = false;
+        if (!struck) {
+            ++n_swings_missed;
+            char nr[96] = "no one near";
+            if (swing_near >= 0.0f) std::snprintf(nr, sizeof(nr), "the nearest bone missed by %.2f m at %.1f m/s", swing_near, swing_near_speed);
+            log::info("[gunmelee] swing over: peak %.1f m/s (the %s), %d scan%s, no hit, %s (a hit needs a bone entered %s %.1f m/s)", over_peak,
+                      over_part ? "barrel" : over_family == 0 ? "frame" : "butt", over_scans, over_scans == 1 ? "" : "s", nr,
+                      cfg.by_peak ? "after a peak of" : "at", cfg.speed);
+        }
+    }
     if (why >= 0) {
         if (speed > cfg.arm && !counted) {
             counted = true;
             ++n_suppressed[why];
+            if (now - suppressed_log_ms > 1000.0) {
+                suppressed_log_ms = now;
+                log::info("[gunmelee] a swing at %.1f m/s not armed: %s (weapon %d)", speed, kReasonName[why], w);
+            }
         }
         armed = have_prev = false;
         return;
@@ -330,6 +376,10 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
     if (!armed && !struck && !counted && speed > cfg.arm) {  // (a swing begun inside a window never arms)
         armed = true;
         have_prev = false;
+        swing_peak = speed;
+        swing_part = fast;
+        swing_scans = 0;
+        swing_near = -1.0f;
         ++n_armed;
         log::info("[gunmelee] armed: the %s at %.1f m/s (weapon %d, %s)", fast ? "barrel" : fam == 0 ? "frame" : "butt", speed, w,
                   fam == 0 ? "a pistol" : fam == 1 ? "a long gun by its frame" : "a long gun by the hand's ray");
@@ -354,7 +404,9 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
     a.weapon = w;
     a.flags = static_cast<uint16_t>(np > 1 ? RDRVR_GUN_MELEE_POINT2 : 0u);
     a.radius_cm = kRadiusCm;
-    a.speed = cfg.speed;
+    // by the peak: once the swing has reached the hit speed, the contact may come as it slows (half of it, into the bone)
+    a.speed = cfg.by_peak && swing_peak >= cfg.speed ? 0.5f * cfg.speed : cfg.speed;
+    ++swing_scans;
     uint64_t args[12];
     std::memcpy(args, &a, sizeof(args));
     req = api::queue_op(RDRVR_NATIVE_GUN_MELEE, args, 12, nullptr);
@@ -431,7 +483,7 @@ void frame() {
         // forward (pulling the hand back after a punch is not another)
         const float fwd_speed = v[0] * fwd_l[0] + v[2] * fwd_l[2];
         if (melee && (st.weapon < 0 || st.weapon == kKnife || st.weapon == kTorch) && s > g_swing_speed.load(std::memory_order_relaxed) &&
-            fwd_speed > 0.4f * s && now >= next_ok[h]) {
+            fwd_speed > 0.4f * s && now >= next_ok[h] && !whistle::at_mouth(h)) {  // run 8: a hand to the mouth is no punch
             next_ok[h] = now + 400.0;
             if (st.weapon < 0)
                 controls::inject(0, 255, 0, 120, 255, g_fist_lead_ms.load(std::memory_order_relaxed));  // the fists: the stance first
@@ -612,6 +664,11 @@ std::string gun_melee_command(const std::string& line) {
             gm::speed_peak = 0.0f;
             gm::cost_ns = gm::cost_frames = 0;
         }
+        if (w == "speed") {  // speed <m/s> [peak|contact]: the hit speed and its rule, the session only (run 8 item 1)
+            std::string v, rule;
+            if (in >> v) gun_melee::set_speed(static_cast<float>(std::atof(v.c_str())), false);
+            if (in >> rule) gun_melee::set_by_peak(rule != "contact");
+        }
         if (w == "scan") {
             float r = 5.0f;
             std::string v;
@@ -629,12 +686,12 @@ std::string gun_melee_command(const std::string& line) {
             o += std::snprintf(sup + o, sizeof(sup) - static_cast<size_t>(o), "%s%s %llu", i ? ", " : "", gm::kReasonName[i],
                                static_cast<unsigned long long>(gm::n_suppressed[i]));
         std::snprintf(b, sizeof(b),
-                      "gunmelee %d dry %d | speed %.1f arm %.1f damage %.1f heavy %.1f lethal %d force %.2f stock %.2f | now %.2f m/s peak %.2f, armed %d struck %d, "
-                      "points %d (family %d, weapon %d) | armed %llu requests %llu scans %llu actors %llu iterators made %llu destroyed %llu | none %llu hits %llu "
+                      "gunmelee %d dry %d | speed %.1f (%s) arm %.1f damage %.1f heavy %.1f lethal %d force %.2f stock %.2f | now %.2f m/s peak %.2f, armed %d struck %d, "
+                      "points %d (family %d, weapon %d), swings over without a hit %llu | armed %llu requests %llu scans %llu actors %llu iterators made %llu destroyed %llu | none %llu hits %llu "
                       "dry %llu refused %llu guard %llu no iterator %llu no core %llu timeouts %llu | suppressed: %s | frame-end cost %.1f us/frame over %llu "
                       "frames | last: %s | %s%s%s",
-                      cfg.on ? 1 : 0, cfg.dry ? 1 : 0, cfg.speed, cfg.arm, cfg.damage, cfg.heavy, cfg.lethal ? 1 : 0, cfg.force, cfg.stock, gm::speed_now,
-                      gm::speed_peak, gm::armed ? 1 : 0, gm::struck ? 1 : 0, gm::npts, gm::family, gm::weapon,
+                      cfg.on ? 1 : 0, cfg.dry ? 1 : 0, cfg.speed, cfg.by_peak ? "at the peak" : "at contact", cfg.arm, cfg.damage, cfg.heavy, cfg.lethal ? 1 : 0, cfg.force, cfg.stock, gm::speed_now,
+                      gm::speed_peak, gm::armed ? 1 : 0, gm::struck ? 1 : 0, gm::npts, gm::family, gm::weapon, static_cast<unsigned long long>(gm::n_swings_missed),
                       static_cast<unsigned long long>(gm::n_armed), static_cast<unsigned long long>(gm::n_requests), static_cast<unsigned long long>(gm::n_scans),
                       static_cast<unsigned long long>(gm::n_actors), static_cast<unsigned long long>(gm::n_made), static_cast<unsigned long long>(gm::n_destroyed),
                       static_cast<unsigned long long>(gm::n_none), static_cast<unsigned long long>(gm::n_hits), static_cast<unsigned long long>(gm::n_dry),

@@ -558,11 +558,17 @@ DWORD WINAPI watchdog(void*) {
     double win_start = log::now_ms();
     uint64_t win_presents = state::presents.load();
     int slow_windows = 0;
-    bool slow_reported = false;
+    bool slow_reported = false, late_reported = false;
+    const double started = log::now_ms();
     for (;;) {
         Sleep(500);
         double now = log::now_ms();
         uint64_t presents = state::presents.load();
+        if (!late_reported && presents == 0 && now - started > 30000.0) {  // run 8 item 3: the hooks came after the game's swapchain
+            late_reported = true;
+            log::error("[d3d] LATE: no Present through the hook 30 s after the startup hooks: the game made its device and swapchain "
+                       "before them (a game executable or wrapper that loads the mod late?): no VR this run");
+        }
         double last = state::last_present_ms.load();
         if (now - win_start >= 5000.0) {
             const uint64_t n = presents - win_presents;

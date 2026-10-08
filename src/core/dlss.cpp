@@ -55,7 +55,7 @@ Free_t o_free = nullptr;
 SetOptions_t o_set_options = nullptr;
 thread_local bool t_vp1 = false;  // the playback thread is inside the mod's evaluate
 std::atomic<uint64_t> g_consts_swaps{0}, g_eval_swaps{0}, g_consts_ok{0}, g_eval_ok{0}, g_tags_ok{0}, g_options_vp1{0},
-    g_resets{0}, g_frees{0}, g_mono_runs{0}, g_dup_consts{0};
+    g_resets{0}, g_frees{0}, g_mono_runs{0}, g_dup_consts{0}, g_soft[3]{}, g_soft_run[4]{};
 std::atomic<int> g_last_error{0};
 char g_why[160] = "";
 
@@ -91,6 +91,27 @@ void kill(const char* what, int r) {
     log::error("[dlss] per-eye DLSS off: %s (back to one viewport for both eyes)", g_why);
 }
 
+// A viewport-1 call's result (run 8 item 6). Fatal: every result but these three, e.g. 18 missing resource state, 19
+// invalid integration, 20 missing input, 21/23 not initialised, 22 compute failed, 25 invalid parameter, 28 invalid
+// API, 31-37 the feature missing or broken, 38 invalid state. Counted (one frame's, the next frame's call stands on its
+// own): 26 missing constants (a hitch's frame), 27 duplicated constants (Streamline keeps the newer set), 39 the
+// out-of-VRAM warning; 60 in a row still fall back (a fault that stays). Returns true when the call went through.
+// call: 0 the constants, 1 the tags, 2 the evaluate, 3 the options (each its own run of soft results)
+bool vp1_result(const char* what, int r, int call) {
+    if (r == 0) {
+        g_soft_run[call].store(0, std::memory_order_relaxed);
+        return true;
+    }
+    const int k = r == 26 ? 0 : r == 27 ? 1 : r == 39 ? 2 : -1;
+    if (k < 0) {
+        kill(what, r);
+        return false;
+    }
+    g_soft[k].fetch_add(1, std::memory_order_relaxed);
+    if (g_soft_run[call].fetch_add(1, std::memory_order_relaxed) + 1 >= 60) kill(what, r);
+    return false;
+}
+
 // ---- the mod's callbacks (the playback thread, in the order the first-eye run recorded them)
 void mod_consts1(void* data) {
     auto* p = static_cast<ConstsPayload*>(data);
@@ -115,12 +136,8 @@ void mod_consts1(void* data) {
         std::memcpy(p->consts + kConstsMvecScale, m, sizeof(m));
     }
     const int r = o_set_consts(p->consts, p->token, g_vp1);
-    if (r == 27) {  // sl::Result::eErrorDuplicatedConstants: Streamline keeps the newer set; the evaluate has its constants
-        g_dup_consts.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    if (r != 0) return kill("slSetConstants(viewport 1)", r);
-    g_consts_ok.fetch_add(1, std::memory_order_relaxed);
+    if (r == 27) g_dup_consts.fetch_add(1, std::memory_order_relaxed);  // duplicated: Streamline keeps the newer set
+    if (vp1_result("slSetConstants(viewport 1)", r, 0)) g_consts_ok.fetch_add(1, std::memory_order_relaxed);
 }
 
 void mod_eval1(void* data) {
@@ -191,8 +208,7 @@ int hk_set_consts(const void* consts, const void* token, const void* vp) {
 int hk_set_tag(const void* vp, const void* tags, uint32_t n, void* cmd) {
     if (t_vp1 && reinterpret_cast<uintptr_t>(vp) == g_game_vp_static) {
         const int r = o_set_tag(g_vp1, tags, n, cmd);
-        if (r != 0) kill("slSetTag(viewport 1)", r);
-        else g_tags_ok.fetch_add(1, std::memory_order_relaxed);
+        if (vp1_result("slSetTag(viewport 1)", r, 1)) g_tags_ok.fetch_add(1, std::memory_order_relaxed);
         return r;
     }
     return o_set_tag(vp, tags, n, cmd);
@@ -207,8 +223,7 @@ int hk_evaluate(uint32_t feature, const void* token, const void** inputs, uint32
         const void* in[8];
         for (uint32_t i = 0; i < n; ++i) in[i] = reinterpret_cast<uintptr_t>(inputs[i]) == g_game_vp_static ? g_vp1 : inputs[i];
         const int r = o_evaluate(feature, token, in, n, cmd);
-        if (r != 0) kill("slEvaluateFeature(viewport 1)", r);
-        else g_eval_ok.fetch_add(1, std::memory_order_relaxed);
+        if (vp1_result("slEvaluateFeature(viewport 1)", r, 2)) g_eval_ok.fetch_add(1, std::memory_order_relaxed);
         return r;
     }
     return o_evaluate(feature, token, inputs, n, cmd);
@@ -228,8 +243,7 @@ int hk_set_options(const void* vp, const void* options) {
     const int r = o_set_options(vp, options);
     if (!g_killed.load(std::memory_order_relaxed) && reinterpret_cast<uintptr_t>(vp) != reinterpret_cast<uintptr_t>(g_vp1)) {
         const int r1 = o_set_options(g_vp1, options);
-        if (r1 != 0) kill("slDLSSSetOptions(viewport 1)", r1);
-        else g_options_vp1.fetch_add(1, std::memory_order_relaxed);
+        if (vp1_result("slDLSSSetOptions(viewport 1)", r1, 3)) g_options_vp1.fetch_add(1, std::memory_order_relaxed);
     }
     return r;
 }
@@ -359,13 +373,15 @@ std::string command(const std::string& line) {
     std::string c, w;
     in >> c >> w;
     if (w == "off") kill("the test channel", -1);
-    char b[900];
+    char b[1000];
     std::snprintf(b, sizeof(b),
-                  "dlss per eye: configured %d, ready %d, killed %d%s%s | constants swaps %llu ok %llu (duplicates %llu), evaluate swaps %llu ok %llu, tags ok %llu, "
+                  "dlss per eye: configured %d, ready %d, killed %d%s%s | counted, not fatal: missing constants %llu, duplicated %llu, "
+                  "out of VRAM %llu | constants swaps %llu ok %llu (duplicates %llu), evaluate swaps %llu ok %llu, tags ok %llu, "
                   "options to viewport 1 %llu, resets %llu, mono runs %llu, frees %llu | check: frames %llu, jitter equal %llu differ %llu "
                   "(max %.3f px), tokens equal %llu differ %llu, second eye alone %llu, evaluate tokens off first %llu second %llu",
                   g_cfg.load() ? 1 : 0, g_ready.load() ? 1 : 0, g_killed.load() ? 1 : 0, g_killed.load() ? " (" : "", g_killed.load() ? g_why : "",
-                  static_cast<unsigned long long>(g_consts_swaps.load()), static_cast<unsigned long long>(g_consts_ok.load()),
+                  static_cast<unsigned long long>(g_soft[0].load()), static_cast<unsigned long long>(g_soft[1].load()),
+                  static_cast<unsigned long long>(g_soft[2].load()), static_cast<unsigned long long>(g_consts_swaps.load()), static_cast<unsigned long long>(g_consts_ok.load()),
                   static_cast<unsigned long long>(g_dup_consts.load()), static_cast<unsigned long long>(g_eval_swaps.load()), static_cast<unsigned long long>(g_eval_ok.load()),
                   static_cast<unsigned long long>(g_tags_ok.load()), static_cast<unsigned long long>(g_options_vp1.load()),
                   static_cast<unsigned long long>(g_resets.load()), static_cast<unsigned long long>(g_mono_runs.load()),

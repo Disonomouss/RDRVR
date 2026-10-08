@@ -127,6 +127,12 @@ bool arsenal(Arsenal* out);       // the posted owned weapons (false before the 
 bool show_zones();
 void set_show_zones(bool on);  // also written to the user ini
 void set_show_zones_session(bool on);
+// run 8 item 5b: the hand dots and the weapon points (the foregrip ring, the load point, the action hints), each its
+// own switch ([Holsters] ShowHandDots, ShowWeaponPoints; absent: ShowZones' value). save: the user ini too
+bool show_hand_dots();
+bool show_weapon_points();
+void set_show_hand_dots(bool on, bool save);
+void set_show_weapon_points(bool on, bool save);
 bool markers(Markers* out);    // false when off, out of first person, or older than 100 ms. Any thread.
 // [Holsters] UnarmedAfterHolster: a put-away at a holster also selects unarmed (the fists), as the weapon wheel's
 // Unarmed does (SET_PLAYER_MELEE_MODE_SELECTED): LT is then the fist-fight stance, not a draw of the last gun.

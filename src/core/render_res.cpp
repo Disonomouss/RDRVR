@@ -24,37 +24,46 @@ namespace rdrvr::render_res {
 namespace {
 using anchors::Id;
 
-// The fixed sizes: 16:9 at a headset's eye height (the panel's, or what a runtime asks for at its default), W = H x 16/9
-// rounded to even. The eye-shape mode renders each eye at most this tall, so a height at or above the runtime's
-// recommended one gives the eye its full density (Automatic takes that height from the last session).
-struct Preset {
-    uint32_t h;
-    const char* names;
+// The headsets: each one's eye height (its panel's, per eye), the frame 16:9 at it (W = H x 16/9 rounded to even), at
+// 100%, 150% or 200% of its pixels (the height times the share's square root, as SteamVR's and Virtual Desktop's
+// sliders count). The eye-shape mode renders each eye at most this tall, so 100% gives the eye its panel's density.
+// Automatic takes the height the runtime asked for in the last session.
+struct Headset {
+    const char* key;   // [Render] RenderHeadset
+    const char* name;
+    uint32_t h;        // the eye height (pixels)
 };
-const Preset kPresets[] = {
-    {1600, "Valve Index"},
-    {1920, "Quest 2, Quest 3S, Quest Pro"},
-    {2040, "PlayStation VR2"},
-    {2160, "Pico 4, Reverb G2, Steam Frame"},
-    {2208, "Quest 3"},
-    {2240, "Valve Index at SteamVR's 100%"},
-    {2304, "Virtual Desktop Medium"},
-    {2448, "Vive Pro 2, Vive Focus 3"},
-    {2560, "Bigscreen Beyond"},
-    {2688, "Virtual Desktop High"},
-    {2880, "Pimax Crystal, Virtual Desktop Ultra"},
-    {3264, "Virtual Desktop Godlike"},
+const Headset kHeadsets[] = {
+    {"index", "Valve Index", 1600},
+    {"quest2", "Quest 2", 1920},
+    {"quest3s", "Quest 3S", 1920},
+    {"questpro", "Quest Pro", 1920},
+    {"psvr2", "PlayStation VR2", 2040},
+    {"pico4", "Pico 4", 2160},
+    {"reverbg2", "HP Reverb G2", 2160},
+    {"steamframe", "Steam Frame", 2160},
+    {"quest3", "Quest 3", 2208},
+    {"vivepro2", "Vive Pro 2", 2448},
+    {"focus3", "Vive Focus 3", 2448},
+    {"beyond", "Bigscreen Beyond", 2560},
+    {"crystal", "Pimax Crystal", 2880},
+    {"dreamair", "Pimax Dream Air", 3552},
 };
-constexpr int kPresetCount = static_cast<int>(sizeof(kPresets) / sizeof(kPresets[0]));
-constexpr int kOff = 0, kAuto = 1, kFirstPreset = 2, kChoiceCount = kFirstPreset + kPresetCount;
-constexpr uint32_t kMaxW = 7680, kMaxH = 4320;  // the game's mode label is 12 bytes ("%d x %d"): W <= 9999 keeps it whole
+constexpr int kHeadsetCount = static_cast<int>(sizeof(kHeadsets) / sizeof(kHeadsets[0]));
+// the headset choices: 0 the game's own, 1 Automatic, then the headsets; -1 a custom size (the ini's RenderResolution)
+constexpr int kOff = 0, kAuto = 1, kFirstHeadset = 2, kHeadChoices = kFirstHeadset + kHeadsetCount;
+const int kScalePct[] = {100, 150, 200};
+constexpr int kScaleCount = 3;
+double scale_factor(int s) { return std::sqrt((s >= 0 && s < kScaleCount ? kScalePct[s] : 100) / 100.0); }
+constexpr uint32_t kMaxW = 9998, kMaxH = 5624;  // the game's mode label is 12 bytes ("%d x %d"): W <= 9999 keeps it whole
 constexpr double kBytesPerPixel = 225.0;        // the game's full-size targets (~129 B/px at 3840x2160) and the mod's (~96)
 constexpr double kVramShare = 0.35;             // of the adapter's dedicated memory, at most
 constexpr double kSentinelMs = 120000.0;        // two minutes at the size (or a clean exit) clear a start's sentinel
 
 uint32_t width_of(uint32_t h) { return 2u * static_cast<uint32_t>(std::lround(h * 8.0 / 9.0)); }
 
-char g_label[kChoiceCount][96];
+char g_head_label[kHeadChoices][96];
+char g_scale_label[kScaleCount][96];
 
 // This start (the bootstrap thread writes them before the hooks run; read by the game's threads after)
 std::atomic<bool> g_armed{false};    // the sysParams written, the hooks live
@@ -195,11 +204,16 @@ uint32_t xml_height() {
     return h;
 }
 
-// [Render] RenderResolution: off | auto | <height> (16:9) | <W>x<H>
+std::string lower(std::string v) {
+    for (char& c : v) c = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+    return v;
+}
+
+// [Render] RenderResolution alone (an ini without RenderHeadset): off | auto | <height> (16:9) | <W>x<H>; a headset's
+// height is that headset at 100% (the first listed with it)
 int parse_choice(const std::string& v, uint32_t* cw, uint32_t* ch) {
     *cw = *ch = 0;
-    std::string l = v;
-    for (char& c : l) c = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+    const std::string l = lower(v);
     if (l.empty() || l == "off" || l == "0") return kOff;
     if (l == "auto") return kAuto;
     uint32_t w = 0, h = 0;
@@ -208,15 +222,34 @@ int parse_choice(const std::string& v, uint32_t* cw, uint32_t* ch) {
         h = static_cast<uint32_t>(std::strtoul(l.c_str(), nullptr, 10));
         w = width_of(h);
     }
-    for (int i = 0; i < kPresetCount; ++i)
-        if (kPresets[i].h == h && w == width_of(h)) return kFirstPreset + i;
+    for (int i = 0; i < kHeadsetCount; ++i)
+        if (kHeadsets[i].h == h && w == width_of(h)) return kFirstHeadset + i;
     *cw = w;
     *ch = h;
     return -1;  // a custom size (the ini only)
 }
 
-// The size a choice gives now; false: the game's own (off, Automatic without a record, a size out of range)
-bool size_of(int c, uint32_t cw, uint32_t ch, uint32_t* w, uint32_t* h, char* why, size_t why_len) {
+// [Render] RenderHeadset: off | auto | a headset's key; -2 when absent or not known (RenderResolution decides)
+int parse_headset(const std::string& v) {
+    const std::string l = lower(v);
+    if (l.empty()) return -2;
+    if (l == "off") return kOff;
+    if (l == "auto") return kAuto;
+    for (int i = 0; i < kHeadsetCount; ++i)
+        if (l == kHeadsets[i].key) return kFirstHeadset + i;
+    return -2;
+}
+
+// [Render] RenderScale: 100 | 150 | 200 (anything else: 100)
+int parse_scale(int pct) {
+    for (int s = 0; s < kScaleCount; ++s)
+        if (kScalePct[s] == pct) return s;
+    return 0;
+}
+
+// The size a choice gives now (c: the headset choice, s: the scale); false: the game's own (off, Automatic without a
+// record, a size out of range)
+bool size_of(int c, int s, uint32_t cw, uint32_t ch, uint32_t* w, uint32_t* h, char* why, size_t why_len) {
     if (why && why_len) why[0] = 0;
     uint32_t sw = 0, sh = 0;
     if (c == kOff) {
@@ -229,15 +262,15 @@ bool size_of(int c, uint32_t cw, uint32_t ch, uint32_t* w, uint32_t* h, char* wh
             if (why) std::snprintf(why, why_len, "Automatic: the headset's size is not known yet (start once with the headset)");
             return false;
         }
-        const float s = config::get_float("XR", "EyeScale", 1.0f);
-        uint32_t want = static_cast<uint32_t>(std::ceil(g_rec_h * (s > 0.25f && s < 4.0f ? s : 1.0f)));
+        const float es = config::get_float("XR", "EyeScale", 1.0f);
+        uint32_t want = static_cast<uint32_t>(std::ceil(g_rec_h * (es > 0.25f && es < 4.0f ? es : 1.0f) * scale_factor(s)));
         want = (want + 1) & ~1u;
         static const uint32_t own = xml_height();  // once: the xml before this start's changes
         const uint32_t floor_h = own ? own : static_cast<uint32_t>(GetSystemMetrics(SM_CYSCREEN));
         sh = want > floor_h ? want : floor_h;
         sw = width_of(sh);
-    } else if (c >= kFirstPreset && c < kChoiceCount) {
-        sh = kPresets[c - kFirstPreset].h;
+    } else if (c >= kFirstHeadset && c < kHeadChoices) {
+        sh = 2u * static_cast<uint32_t>(std::lround(kHeadsets[c - kFirstHeadset].h * scale_factor(s) / 2.0));
         sw = width_of(sh);
     } else {
         sw = cw;
@@ -489,11 +522,32 @@ bool arm(bool early) {
     return true;
 }
 
-int g_choice = kOff;
+int g_choice = kOff;  // the headset choice (kOff, kAuto, a headset; -1 custom)
+int g_scale = 0;      // 100%, 150%, 200%
 uint32_t g_custom_w = 0, g_custom_h = 0;
 
+// RenderResolution decides the size (a hand-written height or WxH is kept as written); RenderHeadset and RenderScale
+// say which headset and scale the menu shows for it, and scale Automatic
 void load_choice() {
-    g_choice = parse_choice(config::get_string("Render", "RenderResolution", "off"), &g_custom_w, &g_custom_h);
+    const int c = parse_choice(config::get_string("Render", "RenderResolution", "off"), &g_custom_w, &g_custom_h);
+    const int hs = parse_headset(config::get_string("Render", "RenderHeadset", ""));
+    const int sc = parse_scale(config::get_int("Render", "RenderScale", 100));
+    g_choice = c;
+    g_scale = 0;
+    if (c == kOff) return;
+    if (c == kAuto) {
+        g_scale = sc;
+        return;
+    }
+    // the size the ini asks for: the menu's headset and scale when they give exactly it
+    const uint32_t want_h = c >= kFirstHeadset ? kHeadsets[c - kFirstHeadset].h : g_custom_h;
+    const uint32_t want_w = c >= kFirstHeadset ? width_of(want_h) : g_custom_w;
+    uint32_t w = 0, h = 0;
+    if (hs >= kFirstHeadset && size_of(hs, sc, 0, 0, &w, &h, nullptr, 0) && w == want_w && h == want_h) {
+        g_choice = hs;
+        g_scale = sc;
+        g_custom_w = g_custom_h = 0;
+    }
 }
 
 }  // namespace
@@ -510,7 +564,7 @@ void early_arm() {
                   pending.c_str());
     }
     char why[160];
-    if (!size_of(g_choice, g_custom_w, g_custom_h, &g_w, &g_h, why, sizeof(why))) {
+    if (!size_of(g_choice, g_scale, g_custom_w, g_custom_h, &g_w, &g_h, why, sizeof(why))) {
         std::snprintf(g_why, sizeof(g_why), "%s", why);
         log::info("[renderres] the game's own size: %s", why);
         return;
@@ -562,41 +616,61 @@ void on_exit() {
     if (g_armed.load()) clear_sentinel("a clean exit");
 }
 
-int choice_count() { return kChoiceCount; }
+int headset_count() { return kHeadChoices; }
 
-const char* choice_label(int i) {
-    if (i < 0 || i >= kChoiceCount) return "";
-    if (!g_label[i][0]) {
-        if (i == kOff) std::snprintf(g_label[i], sizeof(g_label[i]), "The game's own (its Graphics menu)");
-        else if (i == kAuto) std::snprintf(g_label[i], sizeof(g_label[i]), "Automatic: what the headset asks for");
+const char* headset_label(int i) {
+    if (i < 0 || i >= kHeadChoices) return "";
+    if (!g_head_label[i][0]) {
+        if (i == kOff) std::snprintf(g_head_label[i], sizeof(g_head_label[i]), "The game's own (its Graphics menu)");
+        else if (i == kAuto) std::snprintf(g_head_label[i], sizeof(g_head_label[i]), "Automatic: what the headset asks for");
         else {
-            const Preset& p = kPresets[i - kFirstPreset];
-            std::snprintf(g_label[i], sizeof(g_label[i]), "%u tall: %s (%u x %u)", p.h, p.names, width_of(p.h), p.h);
+            const Headset& p = kHeadsets[i - kFirstHeadset];
+            std::snprintf(g_head_label[i], sizeof(g_head_label[i]), "%s (eyes %u tall)", p.name, p.h);
         }
     }
-    return g_label[i];
+    return g_head_label[i];
 }
 
-bool choice_size(int i, uint32_t* w, uint32_t* h) { return size_of(i, g_custom_w, g_custom_h, w, h, nullptr, 0); }
+int scale_count() { return kScaleCount; }
+
+const char* scale_label(int c, int s) {
+    if (s < 0 || s >= kScaleCount) return "";
+    uint32_t w = 0, h = 0;
+    if (size_of(c, s, g_custom_w, g_custom_h, &w, &h, nullptr, 0))
+        std::snprintf(g_scale_label[s], sizeof(g_scale_label[s]), "%d%%: %u x %u", kScalePct[s], w, h);
+    else if (c == kAuto)
+        std::snprintf(g_scale_label[s], sizeof(g_scale_label[s]), "%d%% of what the headset asks for", kScalePct[s]);
+    else
+        std::snprintf(g_scale_label[s], sizeof(g_scale_label[s]), "%d%%", kScalePct[s]);
+    return g_scale_label[s];
+}
+
+bool choice_size(int c, int s, uint32_t* w, uint32_t* h) { return size_of(c, s, g_custom_w, g_custom_h, w, h, nullptr, 0); }
 
 int choice() { return g_choice; }
+int scale() { return g_scale; }
 
-void set_choice(int i) {
-    if (i < 0 || i >= kChoiceCount) return;
-    g_choice = i;
-    std::string v = i == kOff ? "off" : i == kAuto ? "auto" : std::to_string(kPresets[i - kFirstPreset].h);
+void set_choice(int c, int s) {
+    if (c < 0 || c >= kHeadChoices || s < 0 || s >= kScaleCount) return;
+    g_choice = c;
+    g_scale = c == kOff ? 0 : s;
+    g_custom_w = g_custom_h = 0;
+    config::set("Render", "RenderHeadset", c == kOff ? "off" : c == kAuto ? "auto" : kHeadsets[c - kFirstHeadset].key);
+    config::set("Render", "RenderScale", std::to_string(kScalePct[g_scale]));
+    uint32_t w = 0, h = 0;  // the size too, as before (what it means without RenderHeadset)
+    const std::string v = c == kOff ? "off" : c == kAuto ? "auto" : size_of(c, g_scale, 0, 0, &w, &h, nullptr, 0) ? std::to_string(h) : "off";
     config::set("Render", "RenderResolution", v);
     state_set("Boot", "Blocked", nullptr);  // the player's own choice retries a blocked size
     if (!g_armed.load() && std::strncmp(g_why, "a start at", 10) == 0)
         std::snprintf(g_why, sizeof(g_why), "blocked this start; chosen again, it is tried at the next start");
 }
 
-bool choice_allowed(int i, char* why, size_t why_len) {
+bool choice_allowed(int i, int s, char* why, size_t why_len) {
     if (why && why_len) why[0] = 0;
     if (i == kOff) return true;
     uint32_t w = 0, h = 0;
     char tmp[160] = "";
-    if (!size_of(i, g_custom_w, g_custom_h, &w, &h, tmp, sizeof(tmp))) {
+    if (!size_of(i, s, g_custom_w, g_custom_h, &w, &h, tmp, sizeof(tmp))) {
         if (why) std::snprintf(why, why_len, "%s", tmp);
         return i == kAuto;  // Automatic can be chosen before its size is known
     }
@@ -629,9 +703,9 @@ std::string command(const std::string&) {
     status_text(st, sizeof(st));
     std::lock_guard lock(g_rec_mutex);
     std::snprintf(b, sizeof(b),
-                  "renderres: choice %d want %ux%u armed %d took %d active %d window %s %dx%d fullscreen %d modes +%u (calls %u, next %u, end %u) saves kept %u "
+                  "renderres: choice %d scale %d%% want %ux%u armed %d took %d active %d window %s %dx%d fullscreen %d modes +%u (calls %u, next %u, end %u) saves kept %u "
                   "sentinel %s vram %llu MB rec %ux%u largest %ux%u runtime %s arm %.1f ms window %.1f ms | %s",
-                  g_choice, g_w, g_h, g_armed.load() ? 1 : 0, g_took.load() ? 1 : 0, active() ? 1 : 0, g_window_kept ? "kept" : "game's",
+                  g_choice, kScalePct[g_scale], g_w, g_h, g_armed.load() ? 1 : 0, g_took.load() ? 1 : 0, active() ? 1 : 0, g_window_kept ? "kept" : "game's",
                   g_player_w, g_player_h, g_fullscreen ? 1 : 0, g_modes_added.load(), g_eds_calls.load(), g_eds_next.load(), g_eds_end.load(),
                   g_saves_kept.load(),
                   g_sentinel_cleared.load() ? "cleared" : g_armed.load() ? "pending" : "-", static_cast<unsigned long long>(vram_mb()), g_rec_w,

@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.5.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.6.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -27,11 +27,16 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   FXAA only): each eye rendered in your headset's own shape and size, with square pixels, instead of the game's 16:9
   frame stretched over it: fewer pixels drawn for the same sharpness. Restart the game after turning it on: the eye
   images take their size at the start.
-- Optional (new in 0.4.0, off by default, tried briefly in a Quest 3; the General tab, "Render resolution", from the
-  next start): the game's frame at your headset's height, apart from your monitor's modes and without DSR. Choose
-  Automatic (16:9 at the height your headset's OpenXR runtime asked for in its last session, never below your own
-  resolution; the game's own size until a first session with that runtime) or a height named for the headsets (and
-  Virtual Desktop quality levels) it fits, 1600 to 3264 tall, for example "2208 tall: Quest 3 (3926 x 2208)". In
+- Optional (new in 0.4.0, off by default, tried briefly in a Quest 3; the General tab, "Render resolution: headset"
+  and "Render resolution: size", from the next start): the game's frame at your headset's height, apart from your
+  monitor's modes and without DSR. Choose your headset, then its size: 100%, 150% or 200% of its pixels (new in 0.6.0,
+  tried in the developer's simulator only; 14 headsets from the Valve Index to the Pimax Dream Air, by their screens'
+  heights; for example a Quest 3 at 3926 x 2208, 4808 x 2704 or 5550 x 3122). Or choose
+  Automatic: the size your OpenXR runtime (SteamVR, Pimax Play, Virtual Desktop...) asks for, for its lenses, at those
+  percentages; it is learned in a first session with that runtime (the game's own size until then), never below your
+  own resolution. Keep the runtime's own resolution setting at its default (SteamVR's 100%): it multiplies with the
+  mod's. A size of your own can be written in `%LOCALAPPDATA%\RDRVR\RDRVR.user.ini`, where the menu saves its choice
+  (`[Render] RenderResolution`, a height or WxH, 16:9; the menu then shows it as Custom). In
   Windowed mode your window keeps its size (the frame is scaled into it). The game's Graphics menu shows the size, and
   `graphicsOptions.xml` keeps your own resolution. With "Eyes in the headset's shape" on, each eye is drawn at the size
   your headset asks for, at most this tall. Larger is sharper and costs more GPU time. A size too large for the
@@ -58,12 +63,25 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - Reloading by hand: take a round at your chest and bring it to the gun (or squeeze the gun at your chest).
 - Every gun's action worked by hand except the magazine pistols' (revolvers flicked open, levers, pumps, bolts,
   breeches, break-actions), with the game's own sounds on your movements; two-handed long guns; dual wielding (a second gun, or a copy of your sidearm);
-  perfect accuracy; the guns shown at their holsters; throwing, punching and the lasso by swinging. All on by default,
-  each can be switched off in the menu. Off by default: pushing and grabbing loose objects.
+  perfect accuracy (your shots only: other people's keep the game's spread); the guns shown at their holsters;
+  throwing, punching and the lasso by swinging. All on by default, each can be switched off in the menu. Off by
+  default: pushing and grabbing loose objects.
+- The holsters, the dots at your hands and the guns' points (the foregrip ring, the loading point, the action hints)
+  each shown or hidden by its own switch (new in 0.6.0, tried in the developer's simulator; the Holsters tab).
+- The foregrip ring held still on the gun (new in 0.6.0, tried in the developer's simulator, not yet in a headset): it
+  followed the game's arm sway, so the off hand could grab the air beside the gun, worst on the Sawed-off (which now
+  has a grip of its own).
 - No executions: the trigger fires at close range instead of starting John's third-person execution.
-- New in 0.3.0, off by default (each in the menu, not yet tried in a headset): a gun-butt melee, the gun in your
+- New in 0.6.0, off by default (each in the menu, tried in the developer's simulator, not yet in a headset): a
+  whistle for your horse, your hand at your mouth and its trigger (the Gestures tab, "Whistle for the horse"; that
+  trigger does nothing else there; the gun hand whistles only with no gun in it); the game's weapon wheel instead of the holsters, a grip held opening it in front
+  of your hand, the hand moved toward a weapon's picture and the grip let go to take it (the Holsters tab, "The weapon
+  wheel").
+- New in 0.3.0, off by default (each in the menu, most not yet tried in a headset): a gun-butt melee, the gun in your
   hand swung into someone landing the game's own melee blow where it meets them (knock-out damage, as a punch does;
-  the Gestures tab, "Gun-butt melee"); shooting from right behind cover (the Hands tab, "Shoot past the arm block");
+  the Gestures tab, "Gun-butt melee"; tried in a headset with 0.5.0, where it hardly ever hit: it needed 3 m/s at the
+  moment of contact. Since 0.6.0 a hit is judged by your swing's fastest moment, from 1.8 m/s (the "Hit speed" under
+  it), the gun still moving into them where it meets them; the new rule tried in the developer's simulator only); shooting from right behind cover (the Hands tab, "Shoot past the arm block");
   jumping, and so vaulting and climbing, with a gun raised (the Controls tab, "Jumping lowers the raised gun"); the
   gun hand kept at each long gun's aiming grip in every pose (the Hands tab, "Long guns held by their aiming grip").
 
@@ -90,7 +108,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.5.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.6.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file.
 3. Start your headset's runtime, then the game.
@@ -113,7 +131,7 @@ To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay i
 
 - **Sharpness:** each eye shows the game's own frame (16:9), or, with "Eyes in the headset's shape" on, a frame in
   the headset's own shape. For a sharper image on a high-resolution headset, choose the "Render resolution" (the General
-  tab) named for your headset, a taller one, or Automatic, if your GPU allows (new in 0.4.0); "Eyes in the headset's
+  tab): your headset or Automatic, at 100%, 150% or 200%, if your GPU allows (new in 0.4.0, the sizes in 0.6.0); "Eyes in the headset's
   shape" (FXAA only) makes it cheaper, and DLSS Quality (usable since 0.5.0; from the next start) renders each eye at
   two thirds of the width and height (about 9 ms of GPU a frame at 3926 x 2208 on an RTX 4070 Ti, against FXAA's 7).
 - **Frame generation** layers (frame interpolation in the OpenXR runtime or a layer) make the guns lag behind your
@@ -129,7 +147,10 @@ To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay i
 - The game's own builds: the mod was made on one build of `RDR.exe`. On another build it looks for the game code and
   data it uses by their bytes (new in 0.3.0, not yet tried on a real other build). If it finds and checks every one,
   it runs; if not, it stands down (the game plays flat). Either way it writes `RDRVR_build_report.txt` in the game
-  folder: if the mod stands down or misbehaves, please attach it, with `RDRVR.log`, to an issue. RedHook, which runs
+  folder: if the mod stands down or misbehaves, please attach it, with `RDRVR.log`, to an issue. A game executable
+  without the Steam version's start-up stage (the same game build otherwise) should no longer start flat (new in 0.6.0,
+  not yet tried on such an executable; the developer forced the path on the Steam version): the mod notices and hooks
+  at once, and `RDRVR.log` says if its hooks came too late. RedHook, which runs
   the gameplay plugin, has to work on that build too.
 
 ## Known issues

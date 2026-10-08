@@ -41,6 +41,8 @@
 #include "core/state.h"
 #include "core/taa.h"
 #include "core/xinput.h"
+#include "core/wheel.h"
+#include "core/whistle.h"
 #include "core/xr.h"
 #include "core/xr_blit.h"
 #include "core/ui_layer.h"
@@ -432,7 +434,7 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "hud") {  // hud wrist|quad (writes the user ini)
         if (t.size() >= 2) xr::set_hud_on_wrist(t[1] == "wrist");
-        char st[300];
+        char st[420];
         xr::hud_status(st, sizeof(st));
         return st;
     }
@@ -464,6 +466,11 @@ std::string execute(const std::vector<std::string>& t) {
         std::string line;
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return gestures::command(line);
+    }
+    if (c == "whistle" || c == "wheel") {  // whistle [on|off] [offset r u f] [radius m] [gunhand on|off] [reset]; wheel [on|off] [angle deg] [flipy on|off] [reset] (the session)
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return c == "whistle" ? whistle::command(line) : wheel::command(line);
     }
     if (c == "gunmelee") {  // gunmelee [on|off] [dry on|off] [reset] [scan [radius]]: the gun-butt melee (GunMelee; the session)
         std::string line;
@@ -684,6 +691,11 @@ std::string execute(const std::vector<std::string>& t) {
         auto f = [&](size_t i) { return std::strtof(t[i].c_str(), nullptr); };
         xinput::press_sticks(f(1), f(2), f(3), f(4), static_cast<uint32_t>(parse_arg(t[5])));
         return "holding";
+    }
+    if (c == "padover" && t.size() >= 5) {  // padover <buttons> <rx> <ry> <ms>: the override (run 8 item 5's probe), the right stick reaching the game
+        xinput::set_override(static_cast<uint16_t>(parse_arg(t[1])), true, std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr),
+                             static_cast<uint32_t>(parse_arg(t[4])));
+        return "overriding";
     }
     if (c == "pad" && t.size() >= 3) {
         xinput::press(static_cast<uint16_t>(parse_arg(t[1])), static_cast<uint32_t>(parse_arg(t[2])));

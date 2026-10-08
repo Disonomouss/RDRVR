@@ -72,6 +72,8 @@ add_library(rdrvr_core SHARED
     src/core/aim.cpp
     src/core/reload.cpp
     src/core/gestures.cpp
+    src/core/whistle.cpp
+    src/core/wheel.cpp
     src/core/gun_melee.cpp
     src/core/dual.cpp
     src/core/actions.cpp

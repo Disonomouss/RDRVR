@@ -48,7 +48,7 @@ bool weapon_ik_offsets(uintptr_t W, float ik[3], float ik_hold[3]);
 // The weapon's MuzzleOffset (its tune, weapon info +0x310) in the gun's axes, when sane (under 1 m). Any thread.
 bool weapon_muzzle_offset(uintptr_t W, float mo[3]);
 bool aiming();
-// [Aim] PerfectAccuracy (run 3 item 3, research\run3\accuracy.md; off by default): the player's shots leave exactly
+// [Aim] PerfectAccuracy (run 3 item 3, research\run3\accuracy.md; on by default since run 8): the player's shots leave exactly
 // along the barrel ray: the game's random bloom skipped, the shot direction aligned to the game's own shoot-from row,
 // the muzzle-blocked flip to the animated barrel undone, and the shooter's velocity left out of the bullet. Game thread,
 // in the spawn's own call (FUN_140302a50). [Aim] ShotgunPattern (on): the pellets keep the game's cone; off, every

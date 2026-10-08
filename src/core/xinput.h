@@ -29,6 +29,9 @@ void set_source(bool on, const PadState& state);
 // to turn).
 void set_pad_turn(bool on, float deg);
 float pad_right_x();
+// Run 8 item 5 (the weapon wheel): the last word on pad 0 for `ms` (0 ends it), after the head turn and the merge:
+// `buttons` or'd, and with `stick` the right stick set to (rx, ry) (-1..1; the turn otherwise gives the game 0)
+void set_override(uint16_t buttons, bool stick, float rx, float ry, uint32_t ms);
 // Headset round 2: true once after both stick clicks (L3 + R3) were held on the real pad for a second.
 bool take_recentre_combo();
 uint64_t polls();           // XInputGetState calls seen

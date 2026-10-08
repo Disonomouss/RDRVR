@@ -24,6 +24,7 @@
 #include "core/menu.h"
 #include "core/pose.h"
 #include "core/reload.h"
+#include "core/whistle.h"
 
 namespace rdrvr::actions {
 namespace {
@@ -1041,7 +1042,7 @@ void frame() {
     const bool block = !deadeye && (g_open || g_needs || (bparts && (blift > 0.05f || bslide > 0.0f)) || (brz && (g_breech_open || bdrawn > 0.05f)) ||
                                     (sparts && sdrawn > 0.05f));
     // the menu's clicks are not pulls (round 10: three refusals counted while the menu was open)
-    const bool trig = gh.trigger > 0.6f && !menu::visible();
+    const bool trig = gh.trigger > 0.6f && !menu::visible() && !whistle::suppressed(gun_h);  // run 8: not the whistle's
     if (block && trig && !g_trig_was) {
         g_held.fetch_add(1, std::memory_order_relaxed);
         controllers::pulse(gun_h, 0.45f, 35);  // felt, and unlike the empty click (round 10: an open full revolver felt dead)

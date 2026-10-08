@@ -26,6 +26,7 @@ struct Config {
     float force;   // GunMeleeForce: the reaction's push, times the strike's unit direction (DamageInfo +0xa0)
     bool dry;      // GunMeleeDryRun: the hit built and logged, the game's never called
     float stock;   // GunMeleeStockLen: a long gun's butt behind its origin along its back axis (m)
+    bool by_peak;  // GunMeleeByPeak (run 8): a hit judged on the swing's peak, the contact at half the speed
 };
 
 void init();                      // reads [Gestures] GunMelee*, logs them
@@ -34,6 +35,9 @@ bool enabled();                   // GunMelee (relaxed): the frame end's one che
 void set_enabled(bool on, bool save);  // save: the user ini too (the menu); "gunmelee on|off" is the session's
 bool dry_run();                   // GunMeleeDryRun
 void set_dry(bool on, bool save);      // save: the user ini too (the menu); "gunmelee dry on|off" is the session's
+// GunMeleeSpeed (the menu's "Hit speed", 1-6 m/s): the arm speed kept below it, the heavy speed above it
+void set_speed(float mps, bool save);
+void set_by_peak(bool on);  // GunMeleeByPeak for the session (the test channel's "gunmelee speed <v> peak|contact")
 // RdrvrApi::gun_melee_hit (API v7): the plugin's script tick only (refused elsewhere). Returns an RdrvrMeleeHitCode.
 int hit(const RdrvrMeleeHit* h);
 // aim.cpp's punch start (the game thread, inside the game's call, the player's melee controller M): the game's own

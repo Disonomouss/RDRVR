@@ -2,6 +2,9 @@
 
 #include <windows.h>
 
+#include <cmath>
+#include <cstdio>
+
 #include "core/actions.h"
 #include "core/anchors.h"
 #include "core/audio.h"
@@ -41,6 +44,8 @@
 #include "core/controls.h"
 #include "core/test_channel.h"
 #include "core/xinput.h"
+#include "core/wheel.h"
+#include "core/whistle.h"
 #include "core/xr.h"
 #include "core/zone_rings.h"
 #include "core/round_draw.h"
@@ -50,8 +55,30 @@ namespace rdrvr::bootstrap {
 namespace {
 
 constexpr DWORD kMtlxWaitMs = 120000;
+bool g_mtlx_at_attach = true;  // MTLX.dll loaded when DllMain ran (on Steam always: MTLX loads dinput8 itself)
 
 bool loaded(const wchar_t* module) { return GetModuleHandleW(module) != nullptr; }
+
+// [Debug] ForceNoMtlx: read with config once MTLX is gone (on the Steam path nothing runs while it is resident)
+
+// The entropy (bits a byte) of the game's code at RVA 0x1000..0x11000: the Steam exe keeps RVA 0x1000..0xFB000
+// encrypted until MTLX has run (8.0 then; about 6.3 as code). -1: not readable.
+double code_entropy() {
+    const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    uint32_t count[256] = {};
+    __try {
+        for (size_t i = 0x1000; i < 0x11000; ++i) ++count[base[i]];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1.0;
+    }
+    double h = 0.0;
+    for (uint32_t c : count)
+        if (c) {
+            const double p = static_cast<double>(c) / 65536.0;
+            h -= p * std::log2(p);
+        }
+    return h;
+}
 
 void log_modules(const char* when) {
     log::info("[boot] %s: MTLX=%d d3d12=%d dxgi=%d sl.interposer=%d RedHook=%d winmm=%d xinput1_4=%d", when,
@@ -61,27 +88,46 @@ void log_modules(const char* when) {
 
 DWORD WINAPI bootstrap_thread(void*) {
     log_modules("bootstrap thread start");
-    // Wait for the MTLX wrapper to finish and unload: the game's real entry point runs only after that,
-    // and nothing may be patched while the wrapper (anti-debug, module enumeration) is resident.
-    bool saw_mtlx = false;
+    // An executable without the MTLX stage (run 8 item 3: MTLX not loaded at DllMain, the game's code already plain):
+    // the game makes its device within about 0.6 s, so the hooks go in at once, not after the 2 s wait below
+    const double entropy = g_mtlx_at_attach ? -1.0 : code_entropy();
+    const bool no_stage = !g_mtlx_at_attach && entropy >= 0.0 && entropy < 7.5;
     ULONGLONG t0 = GetTickCount64();
-    while (GetTickCount64() - t0 < kMtlxWaitMs) {
-        if (loaded(L"MTLX.dll")) {
-            saw_mtlx = true;
-        } else if (saw_mtlx || GetTickCount64() - t0 > 2000) {
-            break;
+    if (no_stage) {
+        log::info("[boot] no MTLX stage (MTLX not loaded at DllMain, the game's code plain: entropy %.2f bits a byte): the hooks at once", entropy);
+    } else {
+        // Wait for the MTLX wrapper to finish and unload: the game's real entry point runs only after that,
+        // and nothing may be patched while the wrapper (anti-debug, module enumeration) is resident.
+        bool saw_mtlx = false;
+        while (GetTickCount64() - t0 < kMtlxWaitMs) {
+            if (loaded(L"MTLX.dll")) {
+                saw_mtlx = true;
+            } else if (saw_mtlx || GetTickCount64() - t0 > 2000) {
+                break;
+            }
+            Sleep(1);
         }
-        Sleep(1);
+        log::info("[boot] MTLX %s after %.0f ms", saw_mtlx ? "unloaded" : "never seen", static_cast<double>(GetTickCount64() - t0));
+        if (!g_mtlx_at_attach)
+            log::warn("[boot] MTLX was not loaded at DllMain but the game's code %s (entropy %.2f): waited as for the Steam exe",
+                      entropy < 0.0 ? "was not readable" : "looked encrypted", entropy);
     }
-    log::info("[boot] MTLX %s after %.0f ms", saw_mtlx ? "unloaded" : "never seen", static_cast<double>(GetTickCount64() - t0));
     log_modules("after MTLX");
 
     config::load();
+    // the test of the no-MTLX branch on the Steam exe: from here on as for an executable without the stage (its only
+    // difference after the wait is the order check below)
+    const bool forced = !no_stage && config::get_bool("Debug", "ForceNoMtlx", false);
+    if (forced)
+        log::info("[boot] [Debug] ForceNoMtlx: the no-MTLX branch taken after the wait (on the Steam exe nothing is patched while MTLX is "
+                  "resident)");
     // [Render] RenderResolution: before the game's device init reads its size (about 300 ms from here at best); on
     // another build after anchors::verify() below
     render_res::early_arm();
     // D3D12 first: the game creates its device soon after its real entry point, and DRED must be armed before.
     d3d::install_startup_hooks();
+    if (no_stage || forced) log::info("[boot] the startup hooks in %.0f ms after the bootstrap began (D3D12Core %s loaded)",
+                                      static_cast<double>(GetTickCount64() - t0), loaded(L"D3D12Core.dll") ? "already" : "not yet");
     xinput::install();
     gpu_timer::init();
     ring_probe::init();
@@ -103,6 +149,8 @@ DWORD WINAPI bootstrap_thread(void*) {
     audio::init();
     gestures::init();
     gun_melee::init();
+    whistle::init();
+    wheel::init();
     dual::init();  // after holster::init: its frame-end listener runs after the holsters'
     actions::init();
     physics::init();
@@ -142,6 +190,7 @@ void on_process_attach() {
     log::open();
     log::info("[boot] RDRVR core loaded (dinput8 proxy), built %s %s", __DATE__, __TIME__);
     log_modules("DllMain");
+    g_mtlx_at_attach = loaded(L"MTLX.dll");
     diag::install_crash_handler();
     build_check::log_self_and_game_async();
     if (HANDLE t = CreateThread(nullptr, 0, bootstrap_thread, nullptr, 0, nullptr)) CloseHandle(t);

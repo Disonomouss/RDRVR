@@ -16,7 +16,7 @@
 namespace rdrvr::gun_melee {
 namespace {
 
-std::atomic<bool> g_on{false}, g_dry{false}, g_lethal{false};
+std::atomic<bool> g_on{false}, g_dry{false}, g_lethal{false}, g_by_peak{true};
 std::atomic<float> g_speed{3.0f}, g_arm{1.5f}, g_damage{10.0f}, g_heavy{6.0f}, g_force{1.0f}, g_stock{0.40f};
 
 // the hit side's counters (the script tick writes, the test channel reads)
@@ -99,23 +99,43 @@ void init() {
     g_dry = config::get_bool("Gestures", "GunMeleeDryRun", false);
     g_lethal = config::get_bool("Gestures", "GunMeleeLethal", false);
     auto clampf = [](float v, float lo, float hi, float def) { return !(v >= lo) ? (std::isfinite(v) ? lo : def) : v > hi ? hi : v; };
-    const float speed = clampf(config::get_float("Gestures", "GunMeleeSpeed", 3.0f), 1.0f, 15.0f, 3.0f);
+    // run 8 item 1: a hit from 1.8 m/s at the swing's peak (was 3.0 at contact: the user's swings armed at 1.5-2.1)
+    const float speed = clampf(config::get_float("Gestures", "GunMeleeSpeed", 1.8f), 1.0f, 15.0f, 1.8f);
     g_speed = speed;
-    g_arm = clampf(config::get_float("Gestures", "GunMeleeArm", 1.5f), 0.5f, speed, 1.5f);
+    g_arm = clampf(config::get_float("Gestures", "GunMeleeArm", 1.2f), 0.9f, speed, 1.2f);
+    g_by_peak = config::get_bool("Gestures", "GunMeleeByPeak", true);
     g_damage = clampf(config::get_float("Gestures", "GunMeleeDamage", 10.0f), 0.1f, 1000.0f, 10.0f);
     g_heavy = clampf(config::get_float("Gestures", "GunMeleeHeavy", 6.0f), speed + 0.1f, 30.0f, 6.0f);
     g_force = clampf(config::get_float("Gestures", "GunMeleeForce", 1.0f), 0.0f, 50.0f, 1.0f);
     g_stock = clampf(config::get_float("Gestures", "GunMeleeStockLen", 0.40f), 0.10f, 1.0f, 0.40f);
-    log::info("[gunmelee] the gun-butt melee %d (dry run %d): a hit from %.1f m/s (scans from %.1f), damage %.1f doubling by %.1f m/s, %s, "
+    log::info("[gunmelee] the gun-butt melee %d (dry run %d): a hit from %.1f m/s %s (scans from %.1f), damage %.1f doubling by %.1f m/s, %s, "
               "force %.2f, the stock %.2f m",
-              g_on.load() ? 1 : 0, g_dry.load() ? 1 : 0, g_speed.load(), g_arm.load(), g_damage.load(), g_heavy.load(),
+              g_on.load() ? 1 : 0, g_dry.load() ? 1 : 0, g_speed.load(), g_by_peak.load() ? "at the swing's peak" : "at contact", g_arm.load(),
+              g_damage.load(), g_heavy.load(),
               g_lethal.load() ? "lethal (health)" : "knock-out points", g_force.load(), g_stock.load());
 }
 
 Config config() {
     return {g_on.load(std::memory_order_relaxed), g_speed.load(std::memory_order_relaxed), g_arm.load(std::memory_order_relaxed),
             g_damage.load(std::memory_order_relaxed), g_heavy.load(std::memory_order_relaxed), g_lethal.load(std::memory_order_relaxed),
-            g_force.load(std::memory_order_relaxed), g_dry.load(std::memory_order_relaxed), g_stock.load(std::memory_order_relaxed)};
+            g_force.load(std::memory_order_relaxed), g_dry.load(std::memory_order_relaxed), g_stock.load(std::memory_order_relaxed),
+            g_by_peak.load(std::memory_order_relaxed)};
+}
+void set_by_peak(bool on) {
+    if (g_by_peak.exchange(on) != on) log::info("[gunmelee] a hit judged %s (the session)", on ? "at the swing's peak" : "at contact");
+}
+void set_speed(float mps, bool save) {
+    mps = mps < 1.0f ? 1.0f : mps > 6.0f ? 6.0f : mps;
+    const float old = g_speed.exchange(mps);
+    if (g_arm.load() > mps) g_arm = mps;
+    if (g_heavy.load() < mps + 0.1f) g_heavy = mps + 0.1f;
+    if (old != mps) log::info("[gunmelee] the hit speed %.2f m/s (%s; scans from %.2f, damage doubled by %.1f)", mps, save ? "saved" : "the session",
+                              g_arm.load(), g_heavy.load());
+    if (save) {
+        char v[16];
+        std::snprintf(v, sizeof(v), "%.2f", mps);
+        config::set("Gestures", "GunMeleeSpeed", v);
+    }
 }
 bool enabled() { return g_on.load(std::memory_order_relaxed); }
 void set_enabled(bool on, bool save) {

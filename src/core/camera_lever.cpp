@@ -771,7 +771,9 @@ void scene_time(uint64_t* us, uint64_t* frames) {
 
 bool head_yaw_deg(float* out) {
     xr::EyeView v[2];
-    if (!xr::eye_views(v)) return false;
+    // a peek: read by frame-end listeners (pose, gestures), not a scene pass; counted as drawn with, it made the pose
+    // check a copy of the submitted views (run 8 item 6b)
+    if (!xr::eye_views_peek(v)) return false;
     float q0[4];
     {
         std::lock_guard lock(g_recentre_mutex);

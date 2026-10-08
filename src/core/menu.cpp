@@ -46,6 +46,8 @@
 #include "core/state.h"
 #include "core/ui_layer.h"
 #include "core/vr_mode.h"
+#include "core/wheel.h"
+#include "core/whistle.h"
 #include "core/xr.h"
 #include "core/round_draw.h"
 #include "core/render_res.h"
@@ -607,37 +609,66 @@ void page_general() {
     sub_end();
     // [Render] RenderResolution: the game's frame at a headset's height, apart from the monitor (from the next start)
     heading("Resolution");
-    {
-        const int cur = render_res::choice();
+    {  // 2026-10-09: the headset first, then its size at 100%, 150% or 200% of its pixels
+        const int cur = render_res::choice(), sc = render_res::scale();
         char why[192];
-        std::string preview = cur >= 0 ? render_res::choice_label(cur) : std::string("Custom (the ini's RenderResolution)");
-        uint32_t w = 0, h = 0;
-        if (cur == 1 && render_res::choice_size(1, &w, &h)) preview += " (" + std::to_string(w) + " x " + std::to_string(h) + ")";
-        ImGui::TextUnformatted("Render resolution");
+        const std::string preview = cur >= 0 ? render_res::headset_label(cur) : std::string("Custom (the ini's RenderResolution)");
+        ImGui::TextUnformatted("Render resolution: headset");
         ImGui::SetNextItemWidth(560);
-        const bool open = ImGui::BeginCombo("##Render resolution", preview.c_str());
-        if (!open) track("Render resolution");
-        help("What the game renders, apart from its window and your monitor's modes, from the next start. Each eye is the game's "
-             "frame (with \"Eyes in the headset's shape\", each eye at most this tall): a height at or above what your headset "
-             "asks for gives it its full sharpness. Larger is dearer on the GPU. Windowed mode keeps your window's size.");
+        const bool open = ImGui::BeginCombo("##Render headset", preview.c_str(), ImGuiComboFlags_HeightLargest);  // all its rows seen
+        if (!open) track("Render resolution: headset");
+        help("The game's frame from the next start: your headset's screen height, at the size below. For the size your runtime "
+             "(SteamVR, Pimax Play, Virtual Desktop...) asks for, choose Automatic. Windowed mode keeps your window's size.");
         if (open) {
-            for (int i = 0; i < render_res::choice_count(); ++i) {
-                const bool ok = render_res::choice_allowed(i, why, sizeof(why));
+            stick_scroll();  // the list, when it is longer than the window (the page under it is not hovered)
+            for (int i = 0; i < render_res::headset_count(); ++i) {
+                // a headset is chosen at the scale already picked, else at 100% when that one does not fit
+                int s = i == 0 ? 0 : (sc >= 0 ? sc : 0);
+                if (i > 0 && !render_res::choice_allowed(i, s, why, sizeof(why))) s = 0;
+                const bool ok = render_res::choice_allowed(i, s, why, sizeof(why));
                 ImGui::PushID(i);
-                if (ImGui::Selectable(render_res::choice_label(i), cur == i, ok ? 0 : ImGuiSelectableFlags_Disabled) && ok)
-                    render_res::set_choice(i);
+                if (ImGui::Selectable(render_res::headset_label(i), cur == i, ok ? 0 : ImGuiSelectableFlags_Disabled) && ok)
+                    render_res::set_choice(i, s);
                 ImGui::PopID();
-                track(render_res::choice_label(i));
+                track(render_res::headset_label(i));
                 help(why[0] ? why : nullptr);
             }
             ImGui::EndCombo();
         }
+        sub_begin(cur > 0);  // the size: not for the game's own or a custom size
+        {
+            const std::string sp = cur > 0 ? render_res::scale_label(cur, sc) : std::string("-");
+            ImGui::TextUnformatted("Render resolution: size");
+            ImGui::SetNextItemWidth(560);
+            const bool sopen = cur > 0 && ImGui::BeginCombo("##Render size", sp.c_str());
+            if (!sopen) track("Render resolution: size");
+            help("The headset's own resolution at 100%, or 150% and 200% of its pixels (each side about 1.22 and 1.41 times): the "
+                 "frame stays 16:9, its height set by the headset's eyes.");
+            if (sopen) {
+                for (int s = 0; s < render_res::scale_count(); ++s) {
+                    const bool ok = render_res::choice_allowed(cur, s, why, sizeof(why));
+                    const std::string lab = render_res::scale_label(cur, s);  // (one static buffer a scale: copied)
+                    ImGui::PushID(100 + s);
+                    if (ImGui::Selectable(lab.c_str(), sc == s, ok ? 0 : ImGuiSelectableFlags_Disabled) && ok) render_res::set_choice(cur, s);
+                    ImGui::PopID();
+                    track(lab.c_str());
+                    help(why[0] ? why : nullptr);
+                }
+                ImGui::EndCombo();
+            }
+        }
+        sub_end();
         char st[256];
         render_res::status_text(st, sizeof(st));
         note((std::string("Now: ") + st).c_str());
-        if (cur >= 0 && render_res::choice_allowed(cur, why, sizeof(why)) && why[0]) note(why);
+        if (cur >= 0 && render_res::choice_allowed(cur, sc, why, sizeof(why)) && why[0]) note(why);
+        // Automatic: the runtime's own size for its lenses (2026-10-09: a Dream Air's 4036x3376 under SteamVR); a note, not
+        // the list's help (the open list covers the help line)
+        if (cur == 1)
+            note("Automatic takes the size your runtime (SteamVR, Pimax Play, Virtual Desktop...) asks for, for its lenses. Its own "
+                 "resolution setting multiplies with the size above: keep it at its default (SteamVR's 100%).");
         uint32_t want_w = 0, want_h = 0, run_w = 0, run_h = 0;
-        const bool want = cur >= 0 && render_res::choice_size(cur, &want_w, &want_h);
+        const bool want = cur >= 0 && render_res::choice_size(cur, sc, &want_w, &want_h);
         const bool run = render_res::active(&run_w, &run_h);
         if (xr::frame_resized()) note("The game's frame changed size while running (its Graphics menu): restart the game for the VR view.");
         else if (want != run || (want && (want_w != run_w || want_h != run_h))) note("Restart the game to apply.");
@@ -973,12 +1004,27 @@ void page_holsters() {
     }
     sub_end();
 
+    heading("Weapons by");  // run 8 item 5: [Holsters] Mode
+    const bool wm = wheel::wheel_mode();
+    static const char* const kModeTip = "The holsters: reach to a holster and grip to draw or put away. The weapon wheel: hold a grip "
+                                        "to open the game's weapon wheel, move the hand toward a weapon and let go to take it into that "
+                                        "hand (the holsters then draw nothing; the chest still gives rounds).";
+    if (radio("The holsters", !wm, kModeTip)) wheel::set_wheel_mode(false, true);
+    ImGui::SameLine();
+    if (radio("The weapon wheel", wm, kModeTip)) wheel::set_wheel_mode(true, true);
+
     heading("Shown");
     bool rings = holster::show_zones();
-    if (check("Show the holsters", &rings,
-              "Rings to place and size the holsters by eye: white, green with a hand in it, amber gripped; blue on a long gun's "
-              "foregrip and, with a round held, where it goes in; a dot at each hand's grab point."))
+    if (check("Show the holsters", &rings, "Rings to place and size the holsters by eye: white, green with a hand in it, amber gripped."))
         holster::set_show_zones(rings);
+    bool hdots = holster::show_hand_dots();  // run 8 item 5b
+    if (check("Show the hand dots", &hdots, "A dot at each hand's grab point: green when it is in a holster or on the foregrip."))
+        holster::set_show_hand_dots(hdots, true);
+    bool wpts = holster::show_weapon_points();
+    if (check("Show the weapon points", &wpts,
+              "Where a gun takes your other hand: the foregrip ring on a long gun, where a held round goes in, and the action's hints "
+              "(the open revolver, the bolt, the lever, the pump)."))
+        holster::set_show_weapon_points(wpts, true);
     bool sg = holster::show_guns();
     if (check("Show the guns at their holsters", &sg,
               "Each holster's gun shown at it while holstered: a sidearm at the hip barrel down, a long gun across the back over "
@@ -1350,6 +1396,13 @@ void page_gestures() {
         gestures::set_tuning(sw, tg, true);
     sub_end();
 
+    heading("The horse whistle");  // run 8 item 4: [Gestures] Whistle
+    bool wh = whistle::enabled();
+    if (check("Whistle for the horse", &wh,
+              "A hand at your mouth and its trigger: John whistles for his horse. The trigger of that hand does nothing else while it is "
+              "at the mouth. The gun hand whistles only with no gun in it."))
+        whistle::set_enabled(wh, true);
+
     heading("The gun-butt melee");  // run 7 item 2: [Gestures] GunMelee, GunMeleeDryRun
     bool gm = gun_melee::enabled();
     if (check("Gun-butt melee", &gm,
@@ -1359,6 +1412,11 @@ void page_gestures() {
     sub_begin(gm);
     bool dr = gun_melee::dry_run();
     if (check("Dry run", &dr, "The hit found and logged (\"[gunmelee] dry hit ...\"), never made.")) gun_melee::set_dry(dr, true);
+    float hs = gun_melee::config().speed;
+    if (nudge1("Hit speed", &hs, 0.25f, 1.0f, 6.0f, "%.2f m/s",
+               "How fast the swing's peak must be for a hit (the gun's butt or barrel; a press 0.25 m/s). The log's \"swing over\" "
+               "line gives each missed swing's peak."))
+        gun_melee::set_speed(hs, true);
     sub_end();
 }
 
@@ -1400,7 +1458,7 @@ void page_controls() {
         bool pa = aim::perfect_accuracy();
         if (check("Perfect accuracy", &pa,
                   "Every shot leaves exactly along the barrel: the game's random spread skipped, a muzzle it thinks is in a wall no "
-                  "longer bends the shot, John's own speed not added."))
+                  "longer bends the shot, John's own speed not added. On by default; off: the game's own spread."))
             aim::set_perfect_accuracy(pa);
         bool sp = aim::shotgun_pattern();
         if (check("Shotgun pellets spread", &sp, "The pellets in the game's cone around the shot's line. Off: every pellet on that one line."))

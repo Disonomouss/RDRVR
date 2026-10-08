@@ -274,6 +274,9 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
     } best;
     uint32_t near_h = 0;
     float near_d = 1e9f, near_p[3] = {};
+    // the nearest a strike segment came to a tested bone's sphere (its surface; run 8 item 1), the speed and the bone
+    float miss_d = 1e9f, miss_s = 0.0f;
+    int miss_b = -1;
     for (int i = 0; i < n; ++i) {
         const uint32_t h = static_cast<uint32_t>(invoke(0x34F0AD96, {objs[i]}));  // GET_ACTOR_FROM_OBJECT
         if (!h || h == a.actor) continue;
@@ -313,6 +316,20 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
             for (int k = 0; k < npts; ++k) {
                 const float* p0 = a.seg[k][0];
                 const float d[3] = {a.seg[k][1][0] - p0[0], a.seg[k][1][1] - p0[1], a.seg[k][1][2] - p0[2]};
+                {  // the segment's nearest point to the bone
+                    const float dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                    float tc = dd > 1e-10f ? ((bpos[b][0] - p0[0]) * d[0] + (bpos[b][1] - p0[1]) * d[1] + (bpos[b][2] - p0[2]) * d[2]) / dd : 0.0f;
+                    tc = tc < 0.0f ? 0.0f : tc > 1.0f ? 1.0f : tc;
+                    const float q[3] = {p0[0] + tc * d[0], p0[1] + tc * d[1], p0[2] + tc * d[2]};
+                    float m = gm_dist(q, bpos[b]) - (kGmBones[b].r + kGmStrikeR);
+                    if (m < 0.0f) m = 0.0f;
+                    if (m < miss_d) {
+                        const float* v = a.vel[k];
+                        miss_d = m;
+                        miss_s = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                        miss_b = b;
+                    }
+                }
                 const float t = gm_enter(p0, d, bpos[b], kGmBones[b].r + kGmStrikeR);
                 if (t < 0.0f || t >= best.t) continue;
                 const float* v = a.vel[k];
@@ -341,7 +358,14 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
         g_api->log(0, line);
         return done(near_h, RDRVR_GUN_MELEE_SCANNED, 0xff);
     }
-    if (!best.h) return done(0, RDRVR_GUN_MELEE_NONE, 0xff);
+    if (!best.h) {
+        if (miss_b >= 0) {  // how near it came (run 8 item 1)
+            res->vec[0] = miss_s;
+            res->vec[1] = static_cast<float>(miss_b);
+            res->vec[3] = miss_d;
+        }
+        return done(0, RDRVR_GUN_MELEE_NONE, 0xff);
+    }
     for (int j = 0; j < 3; ++j) res->vec[j] = best.p[j];
     res->vec[3] = gm_dist(best.p, c);
     if (!g_api->gun_melee_hit) return done(best.h, RDRVR_GUN_MELEE_NO_CORE, 0xff);

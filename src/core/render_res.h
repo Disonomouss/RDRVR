@@ -39,13 +39,17 @@ bool active(uint32_t* w = nullptr, uint32_t* h = nullptr);
 // The process's clean exit (exit_guard): the boot sentinel cleared (as are two minutes at the size).
 void on_exit();
 
-// The menu: the choices (index 0 = the game's own, 1 = Automatic, then the fixed sizes).
-int choice_count();
-const char* choice_label(int i);   // e.g. "2208 tall: Quest 3 (3926 x 2208)"
-bool choice_size(int i, uint32_t* w, uint32_t* h);  // the size it gives now (Automatic: from the last session's record)
-int choice();                      // the saved choice ([Render] RenderResolution)
-void set_choice(int i);            // saved to the user ini; applies from the next start
-bool choice_allowed(int i, char* why, size_t why_len);  // false with the reason (VRAM, the runtime's largest image)
+// The menu (2026-10-09: the headset, then its size): the headset choices (0 = the game's own, 1 = Automatic, then the
+// headsets), each at 100%, 150% or 200% of its pixels (the scale's index 0-2).
+int headset_count();
+const char* headset_label(int i);  // e.g. "Quest 3 (eyes 2208 tall)"
+int scale_count();
+const char* scale_label(int c, int s);  // e.g. "150%: 4808 x 2704" for headset choice c
+bool choice_size(int c, int s, uint32_t* w, uint32_t* h);  // the size it gives now (Automatic: from the last session's record)
+int choice();                      // the headset choice for RenderResolution (as RenderHeadset/RenderScale name it); -1 custom
+int scale();                       // the saved scale ([Render] RenderScale)
+void set_choice(int c, int s);     // saved to the user ini (RenderHeadset, RenderScale, RenderResolution); from the next start
+bool choice_allowed(int c, int s, char* why, size_t why_len);  // false with the reason (VRAM, the runtime's largest image)
 void status_text(char* out, size_t len);  // "running 3926 x 2208 (your window 2560 x 1440)" or why not
 
 // "renderres [status]": the state for tests

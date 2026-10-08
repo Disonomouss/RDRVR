@@ -40,6 +40,12 @@ bool g_source_on = false;
 PadState g_source;
 bool g_source_changed = false;
 std::atomic<bool> g_turn_on{false};
+// run 8 item 5: the last word on pad 0 (after the turn and the merge): buttons or'd and the right stick set, until a tick
+std::atomic<uint16_t> g_ov_buttons{0};
+std::atomic<SHORT> g_ov_rx{0}, g_ov_ry{0};
+std::atomic<bool> g_ov_stick{false};
+std::atomic<ULONGLONG> g_ov_until{0};
+std::atomic<bool> g_ov_was{false};  // the override was on at the last poll: its end gets a fresh packet
 std::atomic<float> g_turn_deg{0.0f}, g_right_x{0.0f};
 // Headset round 2: a recentre on the gamepad, both stick clicks held for 1 s (read before any injection).
 ULONGLONG g_combo_since = 0;  // polling thread
@@ -145,6 +151,22 @@ DWORD WINAPI hk_GetState(DWORD user, XINPUT_STATE* st) {
             g_injected.fetch_add(1);
         }
     }
+    if (user == 0 && st && r == ERROR_SUCCESS && GetTickCount64() < g_ov_until.load(std::memory_order_relaxed)) {
+        const uint16_t ob = g_ov_buttons.load(std::memory_order_relaxed);
+        const WORD before = st->Gamepad.wButtons;
+        st->Gamepad.wButtons |= ob;
+        bool changed = st->Gamepad.wButtons != before;
+        if (g_ov_stick.load(std::memory_order_relaxed)) {
+            const SHORT rx = g_ov_rx.load(std::memory_order_relaxed), ry = g_ov_ry.load(std::memory_order_relaxed);
+            changed = changed || st->Gamepad.sThumbRX != rx || st->Gamepad.sThumbRY != ry;
+            st->Gamepad.sThumbRX = rx;
+            st->Gamepad.sThumbRY = ry;
+        }
+        if (changed) st->dwPacketNumber = ++g_packet;
+        g_ov_was.store(true, std::memory_order_relaxed);
+    } else if (user == 0 && st && r == ERROR_SUCCESS && g_ov_was.exchange(false)) {
+        st->dwPacketNumber = ++g_packet;  // the override's end is a state change (LB and the stick let go)
+    }
     if (user == 0 && st && r == ERROR_SUCCESS) {
         const WORD b = st->Gamepad.wButtons, up = static_cast<WORD>(b & ~g_last_buttons);
         if (up & XINPUT_GAMEPAD_RIGHT_SHOULDER) g_rb_presses.fetch_add(1, std::memory_order_relaxed);
@@ -178,6 +200,15 @@ void set_pad_turn(bool on, float deg) {
 }
 
 float pad_right_x() { return g_right_x.load(std::memory_order_relaxed); }
+
+void set_override(uint16_t buttons, bool stick, float rx, float ry, uint32_t ms) {
+    auto s16 = [](float v) { return static_cast<SHORT>((v < -1.0f ? -1.0f : v > 1.0f ? 1.0f : v) * 32767.0f); };
+    g_ov_buttons.store(buttons, std::memory_order_relaxed);
+    g_ov_rx.store(s16(rx), std::memory_order_relaxed);
+    g_ov_ry.store(s16(ry), std::memory_order_relaxed);
+    g_ov_stick.store(stick, std::memory_order_relaxed);
+    g_ov_until.store(ms ? GetTickCount64() + ms : 0, std::memory_order_relaxed);
+}
 
 bool take_recentre_combo() { return g_recentre_combo.exchange(false); }
 

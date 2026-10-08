@@ -777,6 +777,19 @@ void enable_dred() {
     log::info("[dred] auto-breadcrumbs, breadcrumb context and page-fault reporting forced on");
 }
 
+// The devices made through the hook (run 8 item 3: a swapchain on any other device means the hooks came after the
+// game made it: no device, list or ECL hooks, so no eye images)
+std::mutex g_made_mutex;
+ID3D12Device* g_made[16] = {};
+int g_n_made = 0;
+std::atomic<uint64_t> g_devices_made{0};
+bool made_here(ID3D12Device* d) {
+    std::lock_guard lock(g_made_mutex);
+    for (int i = 0; i < g_n_made; ++i)
+        if (g_made[i] == d) return true;
+    return false;
+}
+
 HRESULT WINAPI hk_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** out) {
     if (out && !state::dred_enabled && config::get_bool("Debug", "Dred", true)) enable_dred();
     HRESULT hr = o_D3D12CreateDevice(adapter, fl, riid, out);
@@ -788,6 +801,11 @@ HRESULT WINAPI hk_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REF
         ID3D12Device* dev = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&dev))) && dev) {
             log::info("[d3d] device %p created", static_cast<void*>(dev));
+            {
+                std::lock_guard lock(g_made_mutex);
+                if (g_n_made < 16) g_made[g_n_made++] = dev;  // the pointer only, for made_here
+            }
+            g_devices_made.fetch_add(1, std::memory_order_relaxed);
             hook_device_methods(dev);
             dev->Release();
         }
@@ -887,6 +905,9 @@ void on_swapchain(IUnknown* device_or_queue, HWND hwnd, IDXGISwapChain* sc) {
         if (SUCCEEDED(q->GetDevice(IID_PPV_ARGS(&dev))) && dev) {
             state::device = dev;
             log::info("[d3d] current device %p (from the swapchain's queue)", static_cast<void*>(dev));
+            if (!made_here(dev))
+                log::error("[d3d] LATE: the swapchain's device %p was made before the startup hooks (no device, list or ECL hooks: no "
+                           "eye images). A game executable or wrapper that loads the mod late?", static_cast<void*>(dev));
         }
         state::present_queue = q;
     }
