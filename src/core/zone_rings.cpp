@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "core/aim.h"
@@ -20,14 +21,15 @@
 #include "core/holster.h"
 #include "core/log.h"
 #include "core/state.h"
+#include "core/xr.h"
 #include "core/xr_blit.h"
 
 namespace rdrvr::zone_rings {
 namespace {
 
-constexpr int kCell = 256, kCells = 8;
+constexpr int kCell = 256, kCells = 10;
 constexpr float kEdge = kCell * 0.5f - 2.0f;  // the outer edge, px from a cell's centre (2 px kept for filtering)
-enum Cell { kRingIdle, kRingIn, kRingHeld, kRingGun, kDotIdle, kDotIn, kReticle, kReticleHot };
+enum Cell { kRingIdle, kRingIn, kRingHeld, kRingGun, kDotIdle, kDotIn, kReticle, kReticleHot, kReticleDot, kReticleDotHot };
 std::vector<uint8_t> g_pixels;  // RGBA8: sRGB-encoded, premultiplied (init)
 std::atomic<bool> g_pixels_ready{false};
 XrSwapchain g_sc = XR_NULL_HANDLE;
@@ -49,10 +51,15 @@ uint8_t to_byte(float v) { return static_cast<uint8_t>(std::lround(255.0f * (v <
 // White idle, green a hand in it, amber gripped there, blue a point on the gun.
 void texel(int cell, float r, float out[4]) {
     static const float kCol[kCells][3] = {{1, 1, 1},       {0.30f, 1, 0.40f}, {1, 0.72f, 0.20f}, {0.35f, 0.85f, 1},
-                                          {1, 1, 1},       {0.30f, 1, 0.40f}, {1, 1, 1},          {1, 0.22f, 0.18f}};
+                                          {1, 1, 1},       {0.30f, 1, 0.40f}, {1, 1, 1},          {1, 0.22f, 0.18f},
+                                          {1, 1, 1},       {1, 0.22f, 0.18f}};
     constexpr float kRimA = 0.6f, kFillA = 0.08f;
     float col, a;
-    if (cell >= kReticle) {  // the reticle: a thin ring and a centre dot, each in a dark rim
+    if (cell >= kReticleDot) {  // the dot reticle ([Hands] ReticleStyle=dot): a dot in a dark rim, bigger than the ring's
+        const float dot = within(r, kEdge * 0.24f), dot_rim = within(r, kEdge * 0.34f) - dot;
+        col = dot;
+        a = dot + dot_rim * kRimA;
+    } else if (cell >= kReticle) {  // the reticle: a thin ring and a centre dot, each in a dark rim
         const float dot = within(r, kEdge * 0.16f), dot_rim = within(r, kEdge * 0.26f) - dot;
         const float ring = within(r, kEdge * 0.80f) - within(r, kEdge * 0.68f);
         const float ring_rim = (within(r, kEdge * 0.88f) - within(r, kEdge * 0.80f)) + (within(r, kEdge * 0.68f) - within(r, kEdge * 0.60f));
@@ -80,7 +87,7 @@ bool ensure(XrSession session) {
     if (g_failed || !g_pixels_ready.load(std::memory_order_acquire)) return false;
     g_failed = true;
     ID3D12Device* dev = state::device.load();
-    ID3D12CommandQueue* q = state::present_queue.load();
+    ID3D12CommandQueue* q = xr::image_queue();  // the atlas: an XR image (filled once, waited for)
     if (!dev || !q) {
         log::error("[rings] no device or queue");
         return false;
@@ -308,13 +315,46 @@ bool reticle_frame(const XrView* views, XrSession session, XrSpace space, XrComp
     q.space = space;
     q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     q.subImage.swapchain = g_sc;
-    const int cell = hot ? kReticleHot : kReticle;
+    const int cell = aim::reticle_dot() ? (hot ? kReticleDotHot : kReticleDot) : (hot ? kReticleHot : kReticle);
     q.subImage.imageRect = {{cell * kCell, 0}, {kCell, kCell}};
     q.pose.orientation = facing(d);
     q.pose.position = {l[0], l[1], l[2]};
     q.size = {s, s};
     g_reticles.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+std::string write_atlas(const std::string& path) {
+    if (!g_pixels_ready.load(std::memory_order_acquire)) return "ERROR the atlas is not made";
+    const int w = kCell * kCells, h = kCell;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) return "ERROR cannot write " + path;
+    BITMAPFILEHEADER fh{};
+    BITMAPINFOHEADER ih{};
+    fh.bfType = 0x4d42;
+    fh.bfOffBits = sizeof(fh) + sizeof(ih);
+    fh.bfSize = fh.bfOffBits + static_cast<DWORD>(w * h * 4);
+    ih.biSize = sizeof(ih);
+    ih.biWidth = w;
+    ih.biHeight = -h;  // top-down
+    ih.biPlanes = 1;
+    ih.biBitCount = 32;
+    std::fwrite(&fh, sizeof(fh), 1, f);
+    std::fwrite(&ih, sizeof(ih), 1, f);
+    std::vector<uint8_t> row(static_cast<size_t>(w) * 4);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {  // RGBA to BGRA
+            const uint8_t* p = &g_pixels[(static_cast<size_t>(y) * w + x) * 4];
+            uint8_t* o = &row[static_cast<size_t>(x) * 4];
+            o[0] = p[2];
+            o[1] = p[1];
+            o[2] = p[0];
+            o[3] = p[3];
+        }
+        std::fwrite(row.data(), 1, row.size(), f);
+    }
+    std::fclose(f);
+    return "wrote " + path + " " + std::to_string(w) + "x" + std::to_string(h) + " (" + std::to_string(kCells) + " cells)";
 }
 
 void status_text(char* out, size_t len) {

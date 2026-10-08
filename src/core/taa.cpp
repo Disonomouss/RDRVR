@@ -81,6 +81,13 @@ std::atomic<bool> g_shared{false};  // positive control: one history and one TAA
 std::atomic<bool> g_mono_pass{true};  // a mono pass with a lever-changed camera gets its own update
 // [Render] DlssPassJitter (on): under DLSS (technique 5) the per-pass jitter and TAA state as for technique 2 (G2)
 std::atomic<bool> g_dlss_jitter{true};
+// [Render] DlssJitterUnits (on): the per-pass update run with the viewport's screen size (vp+0x330/+0x334, which the
+// jitter's NDC shift divides by) set to DLSS's render size (DLSS+0xec/+0xf0): the image then moves by the jitterOffset
+// in render pixels, as DLSS is told, instead of by it in output pixels (the game's own: 0.667 of a render pixel at
+// Quality, 0.333 at Ultra Performance, so the samples never cover the pixel). At DLAA the two sizes agree.
+std::atomic<bool> g_jitter_units{true};
+std::atomic<uint64_t> g_units_applied{0};
+constexpr size_t kDlssObject = 0x530, kDlssRenderW = 0xec, kDlssRenderH = 0xf0, kVpScreenW = 0x330, kVpScreenH = 0x334;
 std::atomic<uint64_t> g_resolves[3], g_resets{0}, g_pass_updates{0}, g_mono_jitters{0}, g_mono_updates{0}, g_rain_restores{0},
     g_rain_skips{0}, g_size_mismatch{0};
 
@@ -150,7 +157,41 @@ void refuse(const char* why) {
 }
 
 // ---- the anti-aliasing slot: TAAResolve into the run's other history target, copied to the scratch target.
+// What makes the game discard the upscaler's history (every technique, every post run): the slot clears the Velocity
+// RT when its latch (FUN_1405ed420: RendererSingleton+0x1fa4, the pair *(0x142ad1c90)+0x2524e/+0x2524f, or the pause
+// menu / scope toggling), +0x3b2 or +0x558 is set, and sets +0x3b2 for the next run's DLSS reset.
+struct Cuts {
+    std::atomic<uint64_t> runs{0}, latch{0}, r3b2{0}, r558{0}, clears{0}, src_1fa4{0}, src_2524{0}, src_toggle{0};
+};
+Cuts g_cuts[3];  // first-eye run, RenderFrame's run of a double frame, mono
+std::atomic<uint64_t> g_cut_runs{0};
+constexpr uintptr_t kCutFlagsObject = 0x2ad1c90;  // RDR.exe+: the pointer to the object holding +0x2524e/+0x2524f
+
+void count_cut(const char* p, uintptr_t latch) {
+    const int slot = dual_pass::post_slot();
+    Cuts& c = g_cuts[slot < 0 || slot > 2 ? 2 : slot];
+    c.runs.fetch_add(1, std::memory_order_relaxed);
+    const bool l = (latch & 0xff) != 0, a = p[kReset] != 0, b = p[0x558] != 0;
+    if (l) {
+        c.latch.fetch_add(1, std::memory_order_relaxed);
+        const char* r = global<char*>(Id::RendererSingleton);
+        const char* o = *reinterpret_cast<char* const*>(anchors::base() + kCutFlagsObject);
+        if (r && r[0x1fa4]) c.src_1fa4.fetch_add(1, std::memory_order_relaxed);
+        else if (o && o[0x2524e] && o[0x2524f]) c.src_2524.fetch_add(1, std::memory_order_relaxed);
+        else c.src_toggle.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (a) c.r3b2.fetch_add(1, std::memory_order_relaxed);
+    if (b) c.r558.fetch_add(1, std::memory_order_relaxed);
+    if (l || a || b) c.clears.fetch_add(1, std::memory_order_relaxed);
+    if (g_cut_runs.fetch_add(1, std::memory_order_relaxed) % 1440 == 1439) {
+        char t[600];
+        cut_text(t, sizeof(t));
+        log::info("[taa] %s", t);
+    }
+}
+
 void* hk_AaSlot(void* pfx, void* a2, void* a3, uintptr_t latch) {
+    if (pfx) count_cut(static_cast<const char*>(pfx), latch);
     void* out = o_AaSlot(pfx, a2, a3, latch);
     char* p = static_cast<char*>(pfx);
     if (g_state != 1 || !p || at<int>(p, kTechApplied) != 2 || !out) return out;
@@ -223,6 +264,7 @@ void hk_TaaUpdate(void* pfx, void* vp, uintptr_t flag) {
 bool install() {
     if (anchors::stand_down()) return false;
     g_dlss_jitter = config::get_bool("Render", "DlssPassJitter", true);
+    g_jitter_units = config::get_bool("Render", "DlssJitterUnits", true);
     g_rain_taa_ret = anchors::addr(Id::RainTaaReturn);
     g_scene_rain_ret = anchors::addr(Id::SceneRainReturn);
     bool ok = hooks::install("RDR anti-aliasing slot (TAA resolve)", reinterpret_cast<void*>(anchors::addr(Id::AaSlot)),
@@ -297,7 +339,24 @@ void after_scene_wait(int pass) {
     std::memcpy(p + kJitter, s.jitter, sizeof(s.jitter));
     std::memcpy(p + kPrevBlock, s.prev, sizeof(s.prev));
     at<int>(p, kJitterIndex) = t_index_base - 1;  // the function advances it first: the tick's sample again
+    int screen[2] = {at<int>(vp, kVpScreenW), at<int>(vp, kVpScreenH)};
+    bool units = false;
+    if (g_jitter_units.load(std::memory_order_relaxed) && at<int>(p, kTechApplied) == 5) {
+        if (char* d = at<char*>(p, kDlssObject)) {
+            const int rw = at<int>(d, kDlssRenderW), rh = at<int>(d, kDlssRenderH);
+            if (rw > 0 && rh > 0 && rw <= screen[0] && rh <= screen[1] && (rw != screen[0] || rh != screen[1])) {
+                at<int>(vp, kVpScreenW) = rw;
+                at<int>(vp, kVpScreenH) = rh;
+                units = true;
+            }
+        }
+    }
     reinterpret_cast<TaaUpdate_t>(anchors::addr(Id::TaaUpdate))(p, vp, 0);
+    if (units) {
+        at<int>(vp, kVpScreenW) = screen[0];
+        at<int>(vp, kVpScreenH) = screen[1];
+        g_units_applied.fetch_add(1, std::memory_order_relaxed);
+    }
     std::memcpy(s.jitter, p + kJitter, sizeof(s.jitter));
     std::memcpy(s.prev, p + kPrevBlock, sizeof(s.prev));
     std::memcpy(p + kJitterDelta, delta, sizeof(delta));
@@ -323,9 +382,30 @@ void set_shared(bool on) {
     log::info("[taa] %s", on ? "one history for both eyes (control)" : "a history per eye");
 }
 
+void set_jitter_units(bool on) {
+    g_jitter_units = on;
+    log::info("[taa] DLSS jitter units: %s", on ? "render pixels (the update run at the render size)" : "the game's own (output pixels)");
+}
+
 void set_mono_pass(bool on) {
     g_mono_pass = on;
     log::info("[taa] mono pass with a changed camera: %s", on ? "own update" : "jitter only (PreRender's update)");
+}
+
+void cut_text(char* out, size_t len) {
+    static const char* const kSlot[3] = {"first eye", "second eye", "mono"};
+    size_t n = static_cast<size_t>(std::snprintf(out, len, "cuts (the history discarded) since start, per post run:"));
+    for (int i = 0; i < 3 && n < len; ++i) {
+        const Cuts& c = g_cuts[i];
+        n += static_cast<size_t>(std::snprintf(out + n, len - n,
+                                               " %s %llu runs: velocity cleared %llu (latch %llu: renderer+0x1fa4 %llu, +0x2524e/f %llu, "
+                                               "toggle %llu; +0x3b2 %llu, +0x558 %llu)%s",
+                                               kSlot[i], static_cast<unsigned long long>(c.runs.load()),
+                                               static_cast<unsigned long long>(c.clears.load()), static_cast<unsigned long long>(c.latch.load()),
+                                               static_cast<unsigned long long>(c.src_1fa4.load()), static_cast<unsigned long long>(c.src_2524.load()),
+                                               static_cast<unsigned long long>(c.src_toggle.load()), static_cast<unsigned long long>(c.r3b2.load()),
+                                               static_cast<unsigned long long>(c.r558.load()), i < 2 ? " |" : ""));
+    }
 }
 
 void status_text(char* out, size_t len) {
@@ -333,7 +413,7 @@ void status_text(char* out, size_t len) {
     std::snprintf(out, len,
                   "taa %s (technique %d) %dx%d%s | resolves first %llu second %llu mono %llu, resets %llu | pass updates %llu, "
                   "mono jitters %llu, mono updates %llu (monopass %s) | rain: scene skips %llu, TAA restores %llu | size mismatches %llu"
-                  " | dlss pass jitter %d",
+                  " | dlss pass jitter %d, jitter units %s (%llu updates)",
                   g_state == 1 ? "made" : g_state < 0 ? "REFUSED" : "not made", p ? at<int>(p, kTechApplied) : -1, g_w, g_h,
                   g_shared.load() ? " SHARED (control)" : "",
                   static_cast<unsigned long long>(g_resolves[0].load()), static_cast<unsigned long long>(g_resolves[1].load()),
@@ -341,7 +421,8 @@ void status_text(char* out, size_t len) {
                   static_cast<unsigned long long>(g_pass_updates.load()), static_cast<unsigned long long>(g_mono_jitters.load()),
                   static_cast<unsigned long long>(g_mono_updates.load()), g_mono_pass.load() ? "on" : "off",
                   static_cast<unsigned long long>(g_rain_skips.load()), static_cast<unsigned long long>(g_rain_restores.load()),
-                  static_cast<unsigned long long>(g_size_mismatch.load()), g_dlss_jitter.load() ? 1 : 0);
+                  static_cast<unsigned long long>(g_size_mismatch.load()), g_dlss_jitter.load() ? 1 : 0,
+                  g_jitter_units.load() ? "render" : "output", static_cast<unsigned long long>(g_units_applied.load()));
 }
 
 }  // namespace rdrvr::taa

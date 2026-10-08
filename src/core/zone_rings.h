@@ -3,6 +3,7 @@
 #include <openxr/openxr.h>
 
 #include <cstddef>
+#include <string>
 
 // The holsters (and the foregrip, the loading point and each hand's test point) drawn as rings in the headset
 // ([Holsters] ShowZones, the menu's Holsters tab), to place and size them by eye. Each marker is one OpenXR quad layer
@@ -17,8 +18,11 @@ void init();  // the bootstrap thread: the atlas pixels
 // holster::markers(), in `space`, facing the centre eye of `views`. Returns how many it filled.
 int frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLayerQuad* out, int max);
 // The reticle ([Hands] Reticle, aim::reticle_target): one quad at the shot's landing point, facing the centre eye, a
-// constant angular size; white, red over an actor. Returns whether it filled `out`.
+// constant angular size ([Hands] ReticleStyle: a ring and a centre dot, or a dot only); white, red over an actor.
+// Returns whether it filled `out`.
 bool reticle_frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLayerQuad* out);
 void status_text(char* out, size_t len);
+// Test aid ("rings atlas <path.bmp>"): the atlas's pixels (sRGB, premultiplied) as a 32-bit BMP.
+std::string write_atlas(const std::string& path);
 
 }  // namespace rdrvr::zone_rings

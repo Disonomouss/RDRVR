@@ -49,6 +49,12 @@ uint32_t g_w = 0, g_h = 0, g_fmt = 0;
 uint64_t g_src_w = 0;  // the armed target's size (the crop's box is inside it)
 uint32_t g_src_h = 0;
 uint64_t g_first_frame = 0;
+int g_source = 0;  // 0 the post output, 1 the scene colour, 2 the Velocity RT
+struct Source {
+    size_t field;
+    const char* name;
+};
+const Source kSource[3] = {{0, nullptr}, {0x10, "FullScreenCopy"}, {0x3f0, "Velocity RT"}};
 ID3D12Fence* g_fence = nullptr;
 uint64_t g_fence_value = 0;
 HANDLE g_fence_event = nullptr;
@@ -119,23 +125,37 @@ void bind_tap(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIP
     if (++g_frame_i >= g_frames) g_phase.store(4, std::memory_order_release);
 }
 
+ID3D12Resource* find_target(char* postfx, size_t field, const char* name) {
+    void* obj = *reinterpret_cast<void**>(postfx + field);
+    char where[64] = "?";
+    const void* found = obj ? d3d::resource_in_object(obj, 0x100, name, where, sizeof(where)) : nullptr;
+    if (!found) found = d3d::unique_resource(name);
+    return static_cast<ID3D12Resource*>(const_cast<void*>(found));
+}
+
 std::string arm(uint64_t frame, int crop_w, int crop_h) {
     char* postfx = *reinterpret_cast<char**>(anchors::addr(anchors::Id::PostFxSingleton));
     if (!postfx) return "ERROR no PostFx object (NOT MEASURED)";
     const char* tname = post_target::name(postfx);
-    void* obj = *reinterpret_cast<void**>(postfx + post_target::field(postfx));
-    char where[64] = "?";
-    const void* found = d3d::resource_in_object(obj, 0x100, tname, where, sizeof(where));
-    if (!found) found = d3d::unique_resource(tname);
-    auto* res = static_cast<ID3D12Resource*>(const_cast<void*>(found));
-    if (!res) return std::string("ERROR no single live resource named \"") + tname + "\" (NOT MEASURED)";
-    g_nrtv = d3d::rtv_handles_of(res, g_rtv, 8);
+    ID3D12Resource* tap = find_target(postfx, post_target::field(postfx), tname);
+    if (!tap) return std::string("ERROR no single live resource named \"") + tname + "\" (NOT MEASURED)";
+    g_nrtv = d3d::rtv_handles_of(tap, g_rtv, 8);
     if (g_nrtv == 0) return std::string("ERROR no render-target view of ") + tname + " seen (NOT MEASURED)";
+    ID3D12Resource* res = tap;  // the binds of the post output tap; the source is copied there
+    if (g_source != 0) {
+        tname = kSource[g_source].name;
+        res = find_target(postfx, kSource[g_source].field, tname);
+        if (!res) return std::string("ERROR no single live resource named \"") + tname + "\" (NOT MEASURED)";
+    }
     D3D12_RESOURCE_DESC d = res->GetDesc();
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.MipLevels != 1 || d.DepthOrArraySize != 1 ||
         d.SampleDesc.Count != 1)
         return std::string("ERROR ") + tname + " is not a single-subresource 2D texture (NOT MEASURED)";
     uint32_t w = static_cast<uint32_t>(crop_w), h = static_cast<uint32_t>(crop_h);
+    if (g_source != 0) {  // the scene colour and the motion vectors are at the render size: the crop within it
+        if (w > d.Width) w = static_cast<uint32_t>(d.Width);
+        if (h > d.Height) h = d.Height;
+    }
     if (w == 0 || h == 0 || w > d.Width || h > d.Height) return "ERROR crop larger than the target";
     g_box.left = static_cast<UINT>((d.Width - w) / 2);
     g_box.top = (d.Height - h) / 2;
@@ -277,9 +297,10 @@ void init() {
     d3d::add_frame_end_listener(on_frame_end);
 }
 
-std::string grab(const std::string& prefix, int frames, int crop_w, int crop_h, unsigned timeout_ms) {
+std::string grab(const std::string& prefix, int frames, int crop_w, int crop_h, unsigned timeout_ms, int source) {
     std::lock_guard lock(g_mutex);
     g_prefix = prefix;
+    g_source = source < 0 || source > 2 ? 0 : source;
     g_frames = frames < 2 ? 2 : frames > kMaxFrames ? kMaxFrames : frames;
     g_crop_w = crop_w;
     g_crop_h = crop_h;

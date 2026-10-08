@@ -22,6 +22,9 @@ bool barrel_aim();
 bool reticle_target(float pos[3], bool* on_actor, float* size_deg);
 bool reticle_on();
 void set_reticle_on(bool on);  // also written to the user ini
+// [Hands] ReticleStyle: ring (a ring and a centre dot, the default) or dot (a dot only)
+bool reticle_dot();
+void set_reticle_dot(bool dot);  // also written to the user ini
 void set_barrel_aim(bool on);
 // [Hands] BlockExecutions (on; round 13): the fire trigger close to an NPC fires, never John's third-person execution,
 // pistol whip or butt strike (the shot request's close-target scan skipped for the player; NPCs keep theirs)

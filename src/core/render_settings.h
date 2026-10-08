@@ -20,6 +20,9 @@ void status_text(char* out, size_t len);
 // 0 Off, 1 FXAA, 2 native TAA (technique 2 with the mod's resolve); false unless the core forces the AA mode.
 bool set_aa(int mode);
 int forced_aa();
+// [Render] DlssFullJitter: DLSS's jitter sequence at 8 x (output / render width)^2 samples (the game leaves DLAA's 8)
+void set_full_jitter(bool on);
+void jitter_text(char* out, size_t len);  // "dlss jitter: ..."
 int dlss_quality();  // the DLSS quality index in effect since boot (0..5)  // the AA mode forced since boot or the last set_aa (-1 none, 0..3)
 
 }  // namespace rdrvr::render_settings

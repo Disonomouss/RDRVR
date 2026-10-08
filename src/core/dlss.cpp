@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +29,8 @@ constexpr size_t kViewportValue = 0x20;
 constexpr size_t kOptionsDirty = 0xe8;     // DLSS +0xe8: options to be sent (FUN_140fd0dc0 sends them, then clears it)
 constexpr size_t kConstsSize = 0x1c8;      // the sl::Constants static 0x142aac640..0x142aac807
 constexpr size_t kConstsReset = 0x1bf;     // its reset (sl::Boolean, a byte)
+constexpr size_t kConstsJitter = 0x160;    // its jitterOffset (float2, render pixels; = the static 0x142aac7a0)
+constexpr size_t kConstsMvecScale = 0x168;  // its mvecScale (float2: 1/render size, the motion vectors in render pixels)
 
 using Append_t = void (*)(void* recorder, void* fn, const void* data, uint32_t size);
 using Callback_t = void (*)(void* data);
@@ -52,9 +55,29 @@ Free_t o_free = nullptr;
 SetOptions_t o_set_options = nullptr;
 thread_local bool t_vp1 = false;  // the playback thread is inside the mod's evaluate
 std::atomic<uint64_t> g_consts_swaps{0}, g_eval_swaps{0}, g_consts_ok{0}, g_eval_ok{0}, g_tags_ok{0}, g_options_vp1{0},
-    g_resets{0}, g_frees{0}, g_mono_runs{0};
+    g_resets{0}, g_frees{0}, g_mono_runs{0}, g_dup_consts{0};
 std::atomic<int> g_last_error{0};
 char g_why[160] = "";
+
+// The constants check (the playback thread, in its order: consts(1), eval(1), consts(0), eval(0) each frame)
+struct Check {
+    float j1[2] = {0, 0};          // the first eye's jitter (the mod's copy, record time)
+    const void* t1 = nullptr;      // its token
+    bool have1 = false;            // a first-eye constants since the last second-eye one
+    const void* tc[2] = {};        // the token each viewport's constants carried (0, 1)
+};
+Check g_chk;
+std::atomic<uint64_t> g_pairs{0}, g_jit_eq{0}, g_jit_ne{0}, g_tok_eq{0}, g_tok_ne{0}, g_vp0_alone{0}, g_eval_tok_ne[2];
+std::atomic<float> g_jit_maxd{0};
+std::atomic<uint64_t> g_jit_changed{0}, g_jit_seen{0};  // the first eye's jitter against the previous frame's (it must vary)
+float g_jit_prev[2] = {0, 0};
+std::atomic<uint64_t> g_reset_seen[2];
+float g_last_j0[2] = {0, 0};  // the game's latest constants' jitter (the playback thread)
+// Test aid ("dlss mvscale <k>", 1 = off): both eyes' mvecScale times k, the upscaler told the motion is k times what it
+// is: the positive control of tools/dlss_align.py (k < 1 must make the output trail its input)
+std::atomic<float> g_mv_scale{1.0f};
+std::atomic<bool> g_have_j0{false};  // DLSS constants with reset set: [0] the game's (second eye, mono), [1] the first eye's
+float g_jit_last_d[2] = {0, 0};  // the last mismatch's (second - first), for the log
 
 struct ConstsPayload {
     alignas(16) uint8_t consts[kConstsSize];
@@ -72,7 +95,30 @@ void kill(const char* what, int r) {
 void mod_consts1(void* data) {
     auto* p = static_cast<ConstsPayload*>(data);
     if (!p || !o_set_consts || g_killed.load(std::memory_order_relaxed)) return;
+    // the frame token as the game's own callback reads it: at playback, after this frame's BeginFrame set it (the
+    // record-time copy was the frame before's when a hitch let the render thread run ahead: duplicated constants)
+    if (const void* live = *reinterpret_cast<const void* const*>(anchors::addr(Id::DlssTokenStatic))) p->token = live;
+    std::memcpy(g_chk.j1, p->consts + kConstsJitter, sizeof(g_chk.j1));
+    if (g_jit_seen.fetch_add(1, std::memory_order_relaxed) && (g_chk.j1[0] != g_jit_prev[0] || g_chk.j1[1] != g_jit_prev[1]))
+        g_jit_changed.fetch_add(1, std::memory_order_relaxed);
+    g_jit_prev[0] = g_chk.j1[0];
+    g_jit_prev[1] = g_chk.j1[1];
+    g_chk.t1 = p->token;
+    g_chk.tc[1] = p->token;
+    if (p->consts[kConstsReset]) g_reset_seen[1].fetch_add(1, std::memory_order_relaxed);
+    g_chk.have1 = true;
+    if (const float k = g_mv_scale.load(std::memory_order_relaxed); k != 1.0f) {
+        float m[2];
+        std::memcpy(m, p->consts + kConstsMvecScale, sizeof(m));
+        m[0] *= k;
+        m[1] *= k;
+        std::memcpy(p->consts + kConstsMvecScale, m, sizeof(m));
+    }
     const int r = o_set_consts(p->consts, p->token, g_vp1);
+    if (r == 27) {  // sl::Result::eErrorDuplicatedConstants: Streamline keeps the newer set; the evaluate has its constants
+        g_dup_consts.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (r != 0) return kill("slSetConstants(viewport 1)", r);
     g_consts_ok.fetch_add(1, std::memory_order_relaxed);
 }
@@ -88,6 +134,59 @@ void mod_eval1(void* data) {
     g_vp1_used = true;
 }
 
+// ---- slSetConstants (the game's own calls: viewport 0, the second eye's run of a double frame and mono)
+int hk_set_consts(const void* consts, const void* token, const void* vp) {
+    if (consts && reinterpret_cast<uintptr_t>(vp) != reinterpret_cast<uintptr_t>(g_vp1)) {
+        g_chk.tc[0] = token;
+        std::memcpy(g_last_j0, static_cast<const char*>(consts) + kConstsJitter, sizeof(g_last_j0));
+        g_have_j0.store(true, std::memory_order_release);
+        if (static_cast<const char*>(consts)[kConstsReset]) g_reset_seen[0].fetch_add(1, std::memory_order_relaxed);
+        if (g_chk.have1) {  // this frame's second eye: its jitter and token against the first eye's
+            g_chk.have1 = false;
+            float j0[2];
+            std::memcpy(j0, static_cast<const char*>(consts) + kConstsJitter, sizeof(j0));
+            g_pairs.fetch_add(1, std::memory_order_relaxed);
+            const float dx = j0[0] - g_chk.j1[0], dy = j0[1] - g_chk.j1[1];
+            if (dx == 0.0f && dy == 0.0f) {
+                g_jit_eq.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_jit_ne.fetch_add(1, std::memory_order_relaxed);
+                const float d = std::sqrt(dx * dx + dy * dy);
+                if (d > g_jit_maxd.load(std::memory_order_relaxed)) g_jit_maxd.store(d, std::memory_order_relaxed);
+                g_jit_last_d[0] = dx;
+                g_jit_last_d[1] = dy;
+            }
+            (token == g_chk.t1 ? g_tok_eq : g_tok_ne).fetch_add(1, std::memory_order_relaxed);
+            const uint64_t n = g_pairs.load(std::memory_order_relaxed);
+            if (n % 600 == 0)
+                log::info("[dlss] constants check, %llu frames: the second eye's jitter = the first's in %llu, differs in %llu (max %.3f px, "
+                          "last %+.3f %+.3f), tokens equal %llu differ %llu | evaluate tokens off their constants': first %llu second %llu | the "
+                          "first eye's jitter changed from the frame before in %llu of %llu (now %+.3f %+.3f) | resets in the constants: first eye %llu, "
+                          "second eye and mono %llu",
+                          static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_jit_eq.load()),
+                          static_cast<unsigned long long>(g_jit_ne.load()), g_jit_maxd.load(), g_jit_last_d[0], g_jit_last_d[1],
+                          static_cast<unsigned long long>(g_tok_eq.load()), static_cast<unsigned long long>(g_tok_ne.load()),
+                          static_cast<unsigned long long>(g_eval_tok_ne[1].load()), static_cast<unsigned long long>(g_eval_tok_ne[0].load()),
+                          static_cast<unsigned long long>(g_jit_changed.load()), static_cast<unsigned long long>(g_jit_seen.load()),
+                          g_chk.j1[0], g_chk.j1[1], static_cast<unsigned long long>(g_reset_seen[1].load()),
+                          static_cast<unsigned long long>(g_reset_seen[0].load()));
+        } else {
+            g_vp0_alone.fetch_add(1, std::memory_order_relaxed);  // mono, or a second eye with no first-eye constants
+        }
+        if (const float k = g_mv_scale.load(std::memory_order_relaxed); k != 1.0f) {  // Streamline copies the constants
+            alignas(16) uint8_t c[kConstsSize];
+            std::memcpy(c, consts, kConstsSize);
+            float m[2];
+            std::memcpy(m, c + kConstsMvecScale, sizeof(m));
+            m[0] *= k;
+            m[1] *= k;
+            std::memcpy(c + kConstsMvecScale, m, sizeof(m));
+            return o_set_consts(c, token, vp);
+        }
+    }
+    return o_set_consts(consts, token, vp);
+}
+
 // ---- the Streamline slots (H3, H5)
 int hk_set_tag(const void* vp, const void* tags, uint32_t n, void* cmd) {
     if (t_vp1 && reinterpret_cast<uintptr_t>(vp) == g_game_vp_static) {
@@ -100,6 +199,10 @@ int hk_set_tag(const void* vp, const void* tags, uint32_t n, void* cmd) {
 }
 
 int hk_evaluate(uint32_t feature, const void* token, const void** inputs, uint32_t n, void* cmd) {
+    if (feature == 0) {
+        const int v = t_vp1 ? 1 : 0;  // this evaluate's token against its viewport's constants
+        if (g_chk.tc[v] && token != g_chk.tc[v]) g_eval_tok_ne[v].fetch_add(1, std::memory_order_relaxed);
+    }
     if (t_vp1 && feature == 0 && inputs && n >= 1 && n <= 8) {
         const void* in[8];
         for (uint32_t i = 0; i < n; ++i) in[i] = reinterpret_cast<uintptr_t>(inputs[i]) == g_game_vp_static ? g_vp1 : inputs[i];
@@ -179,8 +282,9 @@ bool ensure() {
         return false;
     }
     *reinterpret_cast<uint32_t*>(g_vp1 + kViewportValue) = 1;
-    o_set_consts = *reinterpret_cast<SetConsts_t*>(s_consts);  // called by the mod's constants, never swapped
-    bool ok = swap_slot(s_tag, &hk_set_tag, &o_set_tag) && swap_slot(s_eval, &hk_evaluate, &o_evaluate) && swap_slot(s_free, &hk_free, &o_free);
+    // the constants slot too (the check of the game's own calls); the mod's constants call the original
+    bool ok = swap_slot(s_consts, &hk_set_consts, &o_set_consts) && swap_slot(s_tag, &hk_set_tag, &o_set_tag) &&
+              swap_slot(s_eval, &hk_evaluate, &o_evaluate) && swap_slot(s_free, &hk_free, &o_free);
     if (!ok) {
         given_up = true;
         log::error("[dlss] per-eye DLSS refused: an import slot could not be written");
@@ -238,21 +342,38 @@ bool install() {
 
 bool on() { return g_cfg.load() && g_ready.load() && !g_killed.load(); }
 
+void set_mv_scale(float k) {
+    g_mv_scale = k;
+    log::info("[dlss] motion vector scale x %.3f (test)", k);
+}
+
+bool last_jitter(float out[2]) {
+    if (!g_have_j0.load(std::memory_order_acquire)) return false;
+    out[0] = g_last_j0[0];
+    out[1] = g_last_j0[1];
+    return true;
+}
+
 std::string command(const std::string& line) {
     std::istringstream in(line);
     std::string c, w;
     in >> c >> w;
     if (w == "off") kill("the test channel", -1);
-    char b[600];
+    char b[900];
     std::snprintf(b, sizeof(b),
-                  "dlss per eye: configured %d, ready %d, killed %d%s%s | constants swaps %llu ok %llu, evaluate swaps %llu ok %llu, tags ok %llu, "
-                  "options to viewport 1 %llu, resets %llu, mono runs %llu, frees %llu",
+                  "dlss per eye: configured %d, ready %d, killed %d%s%s | constants swaps %llu ok %llu (duplicates %llu), evaluate swaps %llu ok %llu, tags ok %llu, "
+                  "options to viewport 1 %llu, resets %llu, mono runs %llu, frees %llu | check: frames %llu, jitter equal %llu differ %llu "
+                  "(max %.3f px), tokens equal %llu differ %llu, second eye alone %llu, evaluate tokens off first %llu second %llu",
                   g_cfg.load() ? 1 : 0, g_ready.load() ? 1 : 0, g_killed.load() ? 1 : 0, g_killed.load() ? " (" : "", g_killed.load() ? g_why : "",
                   static_cast<unsigned long long>(g_consts_swaps.load()), static_cast<unsigned long long>(g_consts_ok.load()),
-                  static_cast<unsigned long long>(g_eval_swaps.load()), static_cast<unsigned long long>(g_eval_ok.load()),
+                  static_cast<unsigned long long>(g_dup_consts.load()), static_cast<unsigned long long>(g_eval_swaps.load()), static_cast<unsigned long long>(g_eval_ok.load()),
                   static_cast<unsigned long long>(g_tags_ok.load()), static_cast<unsigned long long>(g_options_vp1.load()),
                   static_cast<unsigned long long>(g_resets.load()), static_cast<unsigned long long>(g_mono_runs.load()),
-                  static_cast<unsigned long long>(g_frees.load()));
+                  static_cast<unsigned long long>(g_frees.load()), static_cast<unsigned long long>(g_pairs.load()),
+                  static_cast<unsigned long long>(g_jit_eq.load()), static_cast<unsigned long long>(g_jit_ne.load()), g_jit_maxd.load(),
+                  static_cast<unsigned long long>(g_tok_eq.load()), static_cast<unsigned long long>(g_tok_ne.load()),
+                  static_cast<unsigned long long>(g_vp0_alone.load()), static_cast<unsigned long long>(g_eval_tok_ne[1].load()),
+                  static_cast<unsigned long long>(g_eval_tok_ne[0].load()));
     std::string s = b;
     if (g_killed.load()) s += ")";
     return s;

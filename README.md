@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.4.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.5.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -19,12 +19,15 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - Per-eye fixes so both eyes see the same frame: grass, wind, lights, forest, exposure, rain and particles, god rays,
   wetness and blood, cloud shadows.
 - Culling, tree billboards and distant trees follow your head, and stay upright.
-- FXAA or the game's TAA run per eye; the game's own colour and gamma.
-- Optional (new in 0.3.0, off by default, not yet tried in a headset; the General tab, under the anti-aliasing, with
+- FXAA, the game's TAA or DLSS run per eye (DLSS with its own history per eye, falling back to one shared history
+  if its setup fails, which `RDRVR.log` says; since 0.5.0 it is usable in the headset: its images were handed to the
+  headset a few frames stale, two defects in what the game feeds DLSS are corrected, its jitter's length and units,
+  and a hitch no longer drops the per-eye histories); the game's own colour and gamma.
+- Optional (new in 0.3.0, off by default, tried briefly in a Quest 3; the General tab, under the anti-aliasing, with
   FXAA only): each eye rendered in your headset's own shape and size, with square pixels, instead of the game's 16:9
   frame stretched over it: fewer pixels drawn for the same sharpness. Restart the game after turning it on: the eye
   images take their size at the start.
-- Optional (new in 0.4.0, off by default, not yet tried in a headset; the General tab, "Render resolution", from the
+- Optional (new in 0.4.0, off by default, tried briefly in a Quest 3; the General tab, "Render resolution", from the
   next start): the game's frame at your headset's height, apart from your monitor's modes and without DSR. Choose
   Automatic (16:9 at the height your headset's OpenXR runtime asked for in its last session, never below your own
   resolution; the game's own size until a first session with that runtime) or a height named for the headsets (and
@@ -47,7 +50,8 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 **Guns**
 - Shots leave the barrel of the gun in your hand; the right trigger alone fires; the gun stays drawn until you put it
   away.
-- An optional reticle where the shot will land, from the game's own aim (off by default: the Hands tab).
+- An optional reticle where the shot will land, from the game's own aim (off by default: the Hands tab), a ring or
+  a dot (new in 0.5.0).
 - Holsters you grab: hips, back, left shoulder, belt, lower back, chest (rounds); a weapon chosen per holster; each
   holster movable and resizable. They are fixed to your headset's position, so they stay with you as you step,
   crouch and lean (or to John's body: the Holsters tab).
@@ -86,7 +90,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.4.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.5.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file.
 3. Start your headset's runtime, then the game.
@@ -109,8 +113,9 @@ To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay i
 
 - **Sharpness:** each eye shows the game's own frame (16:9), or, with "Eyes in the headset's shape" on, a frame in
   the headset's own shape. For a sharper image on a high-resolution headset, choose the "Render resolution" (the General
-  tab) named for your headset, a taller one, or Automatic, if your GPU allows (new in 0.4.0, not yet tried in a
-  headset); "Eyes in the headset's shape" (FXAA only) makes it cheaper.
+  tab) named for your headset, a taller one, or Automatic, if your GPU allows (new in 0.4.0); "Eyes in the headset's
+  shape" (FXAA only) makes it cheaper, and DLSS Quality (usable since 0.5.0; from the next start) renders each eye at
+  two thirds of the width and height (about 9 ms of GPU a frame at 3926 x 2208 on an RTX 4070 Ti, against FXAA's 7).
 - **Frame generation** layers (frame interpolation in the OpenXR runtime or a layer) make the guns lag behind your
   hands: the generated frames cannot follow the gun. Prefer a lower refresh rate (72 or 80 Hz) with real frames.
 
@@ -134,8 +139,9 @@ To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay i
 - Standing or walking with a gun raised, the game takes no jump, so no vault or climb: "Jumping lowers the raised gun"
   (the Controls tab, off by default, new in 0.3.0) lowers the gun for the jump. Vaulting over a fence or a low wall
   has not been checked yet.
-- DLSS (in the anti-aliasing choice, from the next start) is experimental and feels laggy in the headset; FXAA is the
-  default (TAA is the alternative).
+- DLSS (in the anti-aliasing choice, from the next start) has been tried in one headset (a Quest 3 over Virtual
+  Desktop) at Quality; FXAA stays the default. With DLSS, Virtual Desktop's latency figure counts the GPU's whole
+  frame now (it did not before), so it reads higher than with FXAA for the same real latency.
 - Rarely, the game freezes or slows to a few frames a second (seen a few times in the developer's simulator tests;
   the cause is not known yet). If it happens, please attach `RDRVR.log` to an issue: it records what the game's
   render threads were doing.

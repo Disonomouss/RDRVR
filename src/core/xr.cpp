@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cwchar>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 #include "core/camera_lever.h"
@@ -73,6 +74,20 @@ struct Perf {
 // (headset round 4: locking g_frame_mutex there again threw std::system_error, a deadlock, and ended the game).
 std::mutex g_perf_mutex;
 Perf g_perf;  // presenting thread (g_perf_mutex)
+
+// The log's "[xr] timing" window ([XR] TimingLog, seconds; 0 off): the presenting thread's, every frame submitted
+struct TimingWin {
+    double start_ms = 0;
+    uint64_t frames = 0, missed = 0, late = 0;
+    double longest = 0, cpu_sum = 0, gpu_sum = 0, wait_sum = 0, wait_max = 0, open_sum = 0, open_max = 0, period_ms = 0;
+    float open[4096];
+    uint32_t nopen = 0;
+    uint64_t pose_m0 = 0, pose_s0 = 0, pose_n0 = 0, latch0 = 0, copies0 = 0, misses0 = 0, late_binds0 = 0;
+    float latch_sum0 = 0;
+};
+TimingWin g_tw;
+double g_open_ms = 0;  // when the open XR frame began (xrBeginFrame returned)
+double g_wait_ms = 0;  // how long its xrWaitFrame blocked
 std::atomic<bool> g_perf_reset{false};
 
 void to_eye_views(const XrView* v, EyeView* e);
@@ -90,6 +105,91 @@ void to_eye_views(const XrView* v, EyeView* e) {
         e[i].position[0] = v[i].pose.position.x;
         e[i].position[1] = v[i].pose.position.y;
         e[i].position[2] = v[i].pose.position.z;
+    }
+}
+
+std::atomic<float> g_ramp_step[3];
+std::atomic<bool> g_ramp_on{false};
+float g_ramp_off[3] = {0, 0, 0};  // under g_frame_mutex
+
+std::atomic<float> g_noise_rot{0.0f}, g_noise_pos{0.0f};  // "xr posnoise": degrees, metres
+uint32_t g_noise_state = 0x9e3779b9u;                        // under g_frame_mutex (xorshift32, a fixed seed)
+
+float noise_unit() {  // uniform in [-1, 1)
+    uint32_t x = g_noise_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_noise_state = x;
+    return static_cast<float>(x) / 2147483648.0f - 1.0f;
+}
+
+XrQuaternionf quat_mul(const XrQuaternionf& a, const XrQuaternionf& b) {
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+XrQuaternionf g_noise_q{0.0f, 0.0f, 0.0f, 1.0f};  // this frame's noise turn (under g_frame_mutex): the late latch keeps it
+
+std::atomic<float> g_rotramp_step{0.0f};  // "xr rotramp": degrees of yaw added every XR frame
+float g_rotramp_acc = 0.0f;               // the turn so far, radians (under g_frame_mutex)
+
+// "xr rotramp": this frame's views turned by the ramp's yaw about the eyes' midpoint (a head turning at a constant
+// rate, the eyes moving with it); the turn joins g_noise_q, which the late latch applies to its views too
+void apply_rot_ramp(XrView* v) {
+    const float step = g_rotramp_step.load(std::memory_order_relaxed);
+    if (step == 0.0f) {
+        g_rotramp_acc = 0.0f;
+        return;
+    }
+    g_rotramp_acc += step * 0.0174532925f;
+    const float a = g_rotramp_acc;
+    const XrQuaternionf q{0.0f, std::sin(0.5f * a), 0.0f, std::cos(0.5f * a)};
+    const float cx = 0.5f * (v[0].pose.position.x + v[1].pose.position.x), cz = 0.5f * (v[0].pose.position.z + v[1].pose.position.z);
+    const float c = std::cos(a), s = std::sin(a);
+    for (int i = 0; i < 2; ++i) {
+        v[i].pose.orientation = quat_mul(q, v[i].pose.orientation);
+        const float dx = v[i].pose.position.x - cx, dz = v[i].pose.position.z - cz;  // yaw about +Y: x' = c x + s z, z' = -s x + c z
+        v[i].pose.position.x = cx + c * dx + s * dz;
+        v[i].pose.position.z = cz - s * dx + c * dz;
+    }
+    g_noise_q = quat_mul(q, g_noise_q);  // the order the views got: the turn after the noise
+}
+
+// "xr posnoise": this frame's views turned and moved by fresh noise (the same for both eyes)
+void apply_pose_noise(XrView* v) {
+    const float rot = g_noise_rot.load(std::memory_order_relaxed), pos = g_noise_pos.load(std::memory_order_relaxed);
+    if (rot == 0.0f && pos == 0.0f) {
+        g_noise_q = {0.0f, 0.0f, 0.0f, 1.0f};
+        apply_rot_ramp(v);
+        return;
+    }
+    const float yaw = rot * noise_unit() * 0.0174532925f, pitch = rot * noise_unit() * 0.0174532925f;
+    const XrQuaternionf qy{0.0f, std::sin(0.5f * yaw), 0.0f, std::cos(0.5f * yaw)}, qp{std::sin(0.5f * pitch), 0.0f, 0.0f, std::cos(0.5f * pitch)};
+    const XrQuaternionf q = quat_mul(qy, qp);
+    g_noise_q = q;
+    const float d[3] = {pos * noise_unit(), pos * noise_unit(), pos * noise_unit()};
+    for (int i = 0; i < 2; ++i) {
+        v[i].pose.orientation = quat_mul(q, v[i].pose.orientation);
+        v[i].pose.position.x += d[0];
+        v[i].pose.position.y += d[1];
+        v[i].pose.position.z += d[2];
+    }
+    apply_rot_ramp(v);
+}
+
+// "xr posramp": this frame's views moved by the ramp's offset (submit_frame_end, after the views are located)
+void apply_pos_ramp(XrView* v) {
+    apply_pose_noise(v);
+    if (!g_ramp_on.load(std::memory_order_relaxed)) {
+        g_ramp_off[0] = g_ramp_off[1] = g_ramp_off[2] = 0;
+        return;
+    }
+    for (int k = 0; k < 3; ++k) g_ramp_off[k] += g_ramp_step[k].load(std::memory_order_relaxed);
+    for (int i = 0; i < 2; ++i) {
+        v[i].pose.position.x += g_ramp_off[0];
+        v[i].pose.position.y += g_ramp_off[1];
+        v[i].pose.position.z += g_ramp_off[2];
     }
 }
 
@@ -210,6 +310,12 @@ std::atomic<bool> g_session_running{false};
 std::mutex g_frame_mutex;                // the presenting thread's frame calls against the session thread's end
 XrInstance g_inst = XR_NULL_HANDLE;
 XrSession g_session = XR_NULL_HANDLE;
+ID3D12CommandQueue* g_session_queue = nullptr;  // the binding's queue (a reference kept, as state's)
+ID3D12Fence* g_to_session = nullptr;            // the present queue's work ordered before the session queue's
+ID3D12Fence* g_from_session = nullptr;          // the session queue's work ordered before the game's next lists
+uint64_t g_to_value = 0, g_from_value = 0;
+std::mutex g_queue_sync_mutex;
+std::atomic<uint64_t> g_queue_syncs{0};
 XrSpace g_space = XR_NULL_HANDLE;
 XrEnvironmentBlendMode g_blend = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 bool g_frame_open = false;               // presenting thread: begun, views located, images acquired
@@ -323,7 +429,7 @@ bool make_quad_swapchain(ID3D12Resource* bb) {
 // into a 3840x2160 quad image) the filtered resample into the image's top-left, the back buffer's aspect kept.
 bool fill_quad() {
     IDXGISwapChain* sc = state::swapchain.load();
-    ID3D12CommandQueue* q = state::present_queue.load();
+    ID3D12CommandQueue* q = image_queue();
     if (!sc || !q) return false;
     IDXGISwapChain3* sc3 = nullptr;
     if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) return false;
@@ -1012,8 +1118,9 @@ void end_open_frame() {
     uint32_t cw = g_w, ch = g_h, rw = 0, rh = 0;
     const bool rect = eye_shape::frame_rect(&cw, &ch, &rw, &rh);
     const uint32_t iw = cw <= g_sw ? cw : g_sw, ih = ch <= g_sh ? ch : g_sh;
+    // the eyes' queue: the session's, after the game's work (the raw copies are in the game's lists: the fence alone)
+    ID3D12CommandQueue* q = g_filled.load() == 3 && !resized ? image_queue() : nullptr;
     if (g_blit && g_filled.load() == 3 && !resized) {
-        ID3D12CommandQueue* q = state::present_queue.load();
         const xr_blit::Frame f{cw, ch, iw, ih, rect ? rw : 0, rect ? rh : 0};
         const bool plain = !rect && g_sw == g_w && g_sh == g_h;
         if (!q || !xr_blit::blit(q, acquired, xr_blit::game_gamma(1.0f), plain ? nullptr : &f)) g_filled = 0;  // not converted: no layer
@@ -1082,6 +1189,7 @@ void end_open_frame() {
         if (cinema) quad_layers[nquad++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_quad);
         else if (full) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_quad);
     }
+    image_written();  // the frame's XR writes are in: the game's next lists wait for them
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_display_time;
     ei.environmentBlendMode = g_blend;
@@ -1090,9 +1198,80 @@ void end_open_frame() {
     if (cinema) g_cinema_frames.fetch_add(1, std::memory_order_relaxed);
     XrResult r = xrEndFrame(g_session, &ei);
     if (XR_FAILED(r)) log::limited("xr.endframe", 8, "[xr] xrEndFrame -> %s", result_name(g_inst, r));
+    if (g_open_ms > 0) {  // the timing window: how long this XR frame was open, and its wait
+        const double open = log::now_ms() - g_open_ms;
+        g_tw.open_sum += open;
+        if (open > g_tw.open_max) g_tw.open_max = open;
+        if (g_tw.nopen < sizeof(g_tw.open) / sizeof(g_tw.open[0])) g_tw.open[g_tw.nopen++] = static_cast<float>(open);
+        g_tw.wait_sum += g_wait_ms;
+        if (g_wait_ms > g_tw.wait_max) g_tw.wait_max = g_wait_ms;
+    }
     ++g_frames;
     (full ? g_submitted : g_empty).fetch_add(1, std::memory_order_relaxed);
     g_frame_open = false;
+}
+
+// The timing window (the presenting thread, after each xrWaitFrame): the display gaps as perf counts them, and every
+// [XR] TimingLog seconds one log line with the window's frames, waits, open times, CPU/GPU, pose check and late latch
+void timing_window(const XrFrameState& fs) {
+    static const double every = config::get_float("XR", "TimingLog", 10.0f);
+    static XrTime prev = 0;
+    if (every <= 0) return;
+    const double now = log::now_ms();
+    if (g_tw.start_ms <= 0) {
+        g_tw = TimingWin{};
+        g_tw.start_ms = now;
+        g_tw.pose_m0 = g_pose_match.load();
+        g_tw.pose_s0 = g_pose_stale.load();
+        g_tw.pose_n0 = g_pose_none.load();
+        g_tw.latch0 = g_latched.load();
+        g_tw.latch_sum0 = g_latch_sum_deg.load();
+        g_tw.copies0 = g_copies.load();
+        g_tw.misses0 = g_misses.load();
+        g_tw.late_binds0 = g_late_eye_binds.load();
+        prev = 0;
+    }
+    if (fs.predictedDisplayPeriod > 0) {
+        const double period = static_cast<double>(fs.predictedDisplayPeriod);
+        g_tw.period_ms = period / 1e6;
+        if (prev) {
+            const double gap = static_cast<double>(fs.predictedDisplayTime - prev) / period;
+            if (gap > 1.5) {
+                g_tw.missed += static_cast<uint64_t>(gap + 0.5) - 1;
+                ++g_tw.late;
+            }
+            if (gap > g_tw.longest) g_tw.longest = gap;
+        }
+        prev = fs.predictedDisplayTime;
+    }
+    ++g_tw.frames;
+    g_tw.cpu_sum += state::cpu_frame_ms.load();
+    g_tw.gpu_sum += state::gpu_frame_ms.load();
+    const double secs = (now - g_tw.start_ms) / 1000.0;
+    if (secs < every) return;
+    float p95 = 0;
+    if (g_tw.nopen) {
+        std::vector<float> v(g_tw.open, g_tw.open + g_tw.nopen);
+        std::nth_element(v.begin(), v.begin() + (v.size() * 95) / 100, v.end());
+        p95 = v[(v.size() * 95) / 100];
+    }
+    const double n = g_tw.frames ? static_cast<double>(g_tw.frames) : 1.0, no = g_tw.nopen ? static_cast<double>(g_tw.nopen) : 1.0;
+    const uint64_t lat = g_latched.load() - g_tw.latch0;
+    log::info("[xr] timing %.1f s: %llu frames (%.2f Hz, display period %.3f ms), missed periods %llu (%.2f%%) in %llu late frames, "
+              "longest gap %.2f periods | xrWaitFrame wait mean %.2f max %.2f ms | frame open mean %.2f p95 %.2f max %.2f ms | "
+              "CPU %.2f GPU %.2f ms | poses this frame %llu, another %llu, none %llu | late latch %llu, mean %.3f deg | eye copies %llu, "
+              "missed %llu, first eye late %llu",
+              secs, static_cast<unsigned long long>(g_tw.frames), g_tw.frames / secs, g_tw.period_ms,
+              static_cast<unsigned long long>(g_tw.missed),
+              100.0 * static_cast<double>(g_tw.missed) / static_cast<double>(g_tw.frames + g_tw.missed ? g_tw.frames + g_tw.missed : 1),
+              static_cast<unsigned long long>(g_tw.late), g_tw.longest, g_tw.wait_sum / no, g_tw.wait_max, g_tw.open_sum / no, p95,
+              g_tw.open_max, g_tw.cpu_sum / n, g_tw.gpu_sum / n,
+              static_cast<unsigned long long>(g_pose_match.load() - g_tw.pose_m0), static_cast<unsigned long long>(g_pose_stale.load() - g_tw.pose_s0),
+              static_cast<unsigned long long>(g_pose_none.load() - g_tw.pose_n0), static_cast<unsigned long long>(lat),
+              lat ? (g_latch_sum_deg.load() - g_tw.latch_sum0) / static_cast<float>(lat) : 0.0f,
+              static_cast<unsigned long long>(g_copies.load() - g_tw.copies0), static_cast<unsigned long long>(g_misses.load() - g_tw.misses0),
+              static_cast<unsigned long long>(g_late_eye_binds.load() - g_tw.late_binds0));
+    g_tw.start_ms = 0;  // the next frame starts a new window
 }
 
 // Presenting thread, at each game frame end (before its Present).
@@ -1106,17 +1285,20 @@ void submit_frame_end() {
     if (g_frame_open) end_open_frame();
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
+    const double w0 = log::now_ms();
     XrResult r = xrWaitFrame(g_session, &wi, &fs);
     if (XR_FAILED(r)) {
         log::limited("xr.waitframe", 8, "[xr] xrWaitFrame -> %s", result_name(g_inst, r));
         return;
     }
+    g_wait_ms = log::now_ms() - w0;
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     r = xrBeginFrame(g_session, &bi);
     if (XR_FAILED(r)) {
         log::limited("xr.beginframe", 8, "[xr] xrBeginFrame -> %s", result_name(g_inst, r));
         return;
     }
+    g_open_ms = log::now_ms();
     g_display_time = fs.predictedDisplayTime;
     g_should_render = fs.shouldRender == XR_TRUE;
     {
@@ -1164,6 +1346,7 @@ void submit_frame_end() {
         g_perf.gpu_sum += state::gpu_frame_ms.load();
     }
     perf_lock.unlock();
+    timing_window(fs);
     XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
     li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     li.displayTime = fs.predictedDisplayTime;
@@ -1173,8 +1356,10 @@ void submit_frame_end() {
     g_frame_views[0] = {XR_TYPE_VIEW};
     g_frame_views[1] = {XR_TYPE_VIEW};
     if (XR_SUCCEEDED(xrLocateViews(g_session, &li, &vs, 2, &nv, g_frame_views)) && nv == 2 &&
-        (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+        (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+        apply_pos_ramp(g_frame_views);
         store_views(g_frame_views, g_frames.load() + 1);
+    }
     controllers::sync(g_space, fs.predictedDisplayTime);
     g_filled = 0;
     g_eyes_acquired = !g_resized.load(std::memory_order_acquire);  // the live-resize guard: no eye images from then on
@@ -1382,6 +1567,16 @@ DWORD WINAPI session_thread(void*) {
     if (XR_FAILED(r)) {
         set_state("no_session");
         return 0;
+    }
+    {
+        std::lock_guard lock(g_queue_sync_mutex);
+        if (g_session_queue != queue) {
+            queue->AddRef();
+            g_session_queue = queue;  // the old reference, if any, kept: the game's queues are never released by the mod
+        }
+        if (!g_to_session && FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_to_session)))) g_to_session = nullptr;
+        if (!g_from_session && FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_from_session)))) g_from_session = nullptr;
+        if (!g_to_session || !g_from_session) log::error("[xr] the queue-order fences could not be made: XR images unordered against a changed present queue");
     }
     set_state("created");
     controllers::create(inst, session);
@@ -1628,6 +1823,30 @@ void submit_status(char* out, size_t len) {
 
 bool submitting() { return g_session_running.load() && g_submit.load(); }
 
+ID3D12CommandQueue* image_queue() {
+    ID3D12CommandQueue* present = state::present_queue.load();
+    ID3D12CommandQueue* session = g_session_queue;
+    if (!session) return present;
+    if (!present || present == session) return session;
+    std::lock_guard lock(g_queue_sync_mutex);
+    if (g_to_session && SUCCEEDED(present->Signal(g_to_session, ++g_to_value))) session->Wait(g_to_session, g_to_value);
+    if (g_queue_syncs.fetch_add(1, std::memory_order_relaxed) == 0)
+        log::info("[xr] the game's present queue %p is not the session's %p (its last swapchain made on a new queue after the session: DLSS): "
+                  "XR images are written on the session's queue behind a fence on the game's",
+                  static_cast<void*>(present), static_cast<void*>(session));
+    return session;
+}
+
+void image_written() {
+    ID3D12CommandQueue* present = state::present_queue.load();
+    ID3D12CommandQueue* session = g_session_queue;
+    if (!session || !present || present == session || !g_from_session) return;
+    std::lock_guard lock(g_queue_sync_mutex);
+    if (SUCCEEDED(session->Signal(g_from_session, ++g_from_value))) present->Wait(g_from_session, g_from_value);
+}
+
+uint64_t queue_syncs() { return g_queue_syncs.load(std::memory_order_relaxed); }
+
 void recentre_layers() { g_relayout = true; }
 
 void perf_reset() { g_perf_reset = true; }
@@ -1669,7 +1888,7 @@ void late_latch() {
     float deg = 0;
     for (int i = 0; i < 2; ++i) {
         const XrQuaternionf& a = g_frame_views[i].pose.orientation;
-        const XrQuaternionf& b = late[i].pose.orientation;
+        const XrQuaternionf b = quat_mul(g_noise_q, late[i].pose.orientation);  // "xr posnoise": the frame's noise kept
         float dot = std::fabs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
         deg = std::fmax(deg, 2.0f * std::acos(std::fmin(1.0f, dot)) * 57.29578f);
         g_frame_views[i].pose.orientation = b;  // rotation only: the positions stay the frame's
@@ -1700,6 +1919,25 @@ void latch_hands() {
     std::lock_guard lock(g_frame_mutex);
     if (!g_frame_open || !g_session_running.load()) return;
     controllers::relocate(g_space, g_display_time);
+}
+
+void set_rot_ramp(float deg_per_frame) {
+    g_rotramp_step = deg_per_frame;
+    log::info("[xr] rotation ramp %.4f deg of yaw a frame%s", deg_per_frame, deg_per_frame == 0.0f ? " (off, the turn taken off)" : "");
+}
+
+void set_pose_noise(float rot_deg, float pos_m) {
+    g_noise_rot = rot_deg;
+    g_noise_pos = pos_m;
+    log::info("[xr] pose noise: +-%.4f deg, +-%.5f m a frame%s", rot_deg, pos_m, rot_deg == 0.0f && pos_m == 0.0f ? " (off)" : "");
+}
+
+void set_pos_ramp(float dx, float dy, float dz) {
+    g_ramp_step[0] = dx;
+    g_ramp_step[1] = dy;
+    g_ramp_step[2] = dz;
+    g_ramp_on = dx != 0.0f || dy != 0.0f || dz != 0.0f;
+    log::info("[xr] position ramp (%.4f, %.4f, %.4f) m a frame%s", dx, dy, dz, g_ramp_on ? "" : " (off, the offset taken off)");
 }
 
 void set_submit(bool on) {

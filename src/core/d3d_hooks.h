@@ -72,10 +72,10 @@ int rtv_handles_of(const void* res, uint64_t* out, int max);  // CPU handles of 
 
 // Called on the recording thread just before each game OMSetRenderTargets, in the game's own list. Four slots:
 // kBindTapGrab (the eye grab), kBindTapXr (the eye images for the OpenXR swapchains), kBindTapLum (lumcheck),
-// kBindTapBurst (the flicker burst).
+// kBindTapBurst (the flicker burst), kBindTapAlign (the upscaler's alignment capture).
 using BindTapFn = void (*)(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
                            const D3D12_CPU_DESCRIPTOR_HANDLE* ds);
-constexpr int kBindTapGrab = 0, kBindTapXr = 1, kBindTapLum = 2, kBindTapBurst = 3;
+constexpr int kBindTapGrab = 0, kBindTapXr = 1, kBindTapLum = 2, kBindTapBurst = 3, kBindTapAlign = 4;
 void set_bind_tap(int slot, BindTapFn fn);
 // One substitution point, after the taps: may replace the first render-target view of the game's bind (only the CPU
 // handle; the caller owns the resource's state). Returns true and sets *out to substitute (ui_layer.h).

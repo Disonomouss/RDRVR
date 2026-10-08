@@ -17,14 +17,14 @@ extern "C" {
 
 typedef enum RdrvrNativeOp {
     RDRVR_NATIVE_RAW = 0,      // call `hash` with args[0..argc) as raw 64-bit pushes; result = 64 bits
-    // v5, [Physics] HandCollision (research\run3\handphysics.md 6.3): one push in one tick. args: [0] the palm's x, y
+    // v5, [Physics] HandCollision: one push in one tick. args: [0] the palm's x, y
     // (two floats), [1] its z, [2] the radius, [3] the gain, [4] the speed cap (floats), [5] the address of the game's
     // current script thread global (LOCATE reads its +0x38 unchecked: skipped while it is null), [6] the name filter
     // (RDRVR_PUSH_PART_*: 0 any p_* prop, then bottle, crate, chair, barrel, bucket, box); vec_in: the hand's
     // velocity (world, m/s). Result: value = the prop's handle | the outcome << 32 (RdrvrPush); vec = the velocity set
     // (RDRVR_PUSH_OK, _FAILED) or the prop's position (the others but NONE and GUARD).
     RDRVR_NATIVE_HAND_PUSH = 1,
-    // v6, [Physics] Grab (research\run3\handphysics.md 6.6), each in one tick, every native generation-checked:
+    // v6, [Physics] Grab, each in one tick, every native generation-checked:
     // GRAB: args [0] the palm's x, y, [1] z, [2] the radius (as HAND_PUSH), [5] the script thread global, [6] the name
     // filter, [7] the player actor. The nearest loose prop is frozen and kept off the player (SET_PHYSINST_FROZEN 1,
     // SET_OBJECT_COLLIDE_WITH_OBJECT(h, the player's object, 0)). Result: value = handle | outcome << 32 (RDRVR_PUSH_OK:
@@ -35,7 +35,7 @@ typedef enum RdrvrNativeOp {
     // GRAB_END: args [0] the handle, [1] the player actor, [2] 0 let go (unfrozen, thrown with vec_in, m/s), 1 its
     // collisions with the player back on (half a second later). value = 1 done, 0 gone.
     RDRVR_NATIVE_GRAB_END = 4,
-    // v7, [Gestures] GunMelee (research\round13\gun-melee.md 5.3): one scan in one tick. args: an RdrvrGunMeleeArgs
+    // v7, [Gestures] GunMelee: one scan in one tick. args: an RdrvrGunMeleeArgs
     // copied over args[0..11]. The object iterator on the ambient layout (type 15, a sphere of radius_cm about seg[0][1])
     // collects up to 10 actors (16 for a scan) and is destroyed before anything else runs; each live, human actor that
     // is not ragdolled, not the player and not held by a cutscene has its head, spine03, spine01 and pelvis tested as
@@ -125,7 +125,7 @@ typedef struct RdrvrNativeResult {
 } RdrvrNativeResult;
 
 // G-B camera anchor (v3): the plugin owns a scripted camera (FreeCameraRDR's sequence,
-// research\camera-takeover-recipe.md) placed each tick at the player actor's position plus `height` along the up axis
+// the camera takeover recipe) placed each tick at the player actor's position plus `height` along the up axis
 // and `forward` along the heading, level, facing `heading_deg`.
 typedef struct RdrvrCameraJob {
     uint32_t enabled;

@@ -103,6 +103,9 @@ void hk_PushGlobals(void* vp, char push_view_inverse) {
 } std::atomic<bool> g_double{false}, g_swap{false};
 std::atomic<float> g_ipd{0.0f};
 std::atomic<float> g_yaw{0.0f};
+std::atomic<float> g_yaw_step{0.0f};  // "cam yawramp": added to g_yaw at each scene frame's start
+float g_move_step[3] = {0, 0, 0};     // "cam moveramp": added to the world offset at each scene frame's start (g_mutex)
+std::atomic<bool> g_move_ramp{false};
 std::atomic<bool> g_xr_head_position{true};
 std::atomic<float> g_xr_separation{1.0f};
 
@@ -287,6 +290,18 @@ void scene_once(void* renderer, void* vp, const float* cam, void* a4, int pass_e
 std::atomic<float> g_scene_near{0}, g_scene_far{0};
 
 void hk_SceneRender(void* renderer, void* vp, const float* cam, void* a4) {
+    if (const float st = g_yaw_step.load(std::memory_order_relaxed); st != 0.0f) {  // the test's ramp, once a frame
+        float y = g_yaw.load(std::memory_order_relaxed) + st;
+        if (y > 180.0f) y -= 360.0f;
+        if (y < -180.0f) y += 360.0f;
+        g_yaw.store(y, std::memory_order_relaxed);
+    }
+    if (g_move_ramp.load(std::memory_order_relaxed)) {  // the test's slide, once a frame
+        std::lock_guard lock(g_mutex);
+        g_offset.mode = Mode::World;
+        for (int k = 0; k < 3; ++k) g_offset.d[k] += g_move_step[k];
+        g_active.store(true, std::memory_order_relaxed);
+    }
     struct Timed {  // once a frame (no clock reads in the draws under it)
         double t0 = log::now_ms();
         ~Timed() {
@@ -641,6 +656,28 @@ void set_tangents(float l, float r, float u, float d) {
 void set_yaw(float deg) {
     g_yaw = deg;
     log::info("[cam] yaw %.2f deg", deg);
+}
+
+void set_move_ramp(float dx, float dy, float dz) {
+    const bool on = dx != 0.0f || dy != 0.0f || dz != 0.0f;
+    {
+        std::lock_guard lock(g_mutex);
+        g_move_step[0] = dx;
+        g_move_step[1] = dy;
+        g_move_step[2] = dz;
+        if (!on) {
+            g_offset.mode = Mode::Off;
+            g_offset.d[0] = g_offset.d[1] = g_offset.d[2] = 0;
+        }
+    }
+    g_move_ramp = on;
+    if (!on) g_active = false;
+    log::info("[cam] move ramp (%.4f, %.4f, %.4f) m a frame%s", dx, dy, dz, on ? "" : " (off, the offset taken off)");
+}
+
+void set_yaw_ramp(float deg_per_frame) {
+    g_yaw_step = deg_per_frame;
+    log::info("[cam] yaw ramp %.3f deg a frame (yaw now %.2f)", deg_per_frame, g_yaw.load());
 }
 
 void set_double(bool on, float ipd, bool swap) {

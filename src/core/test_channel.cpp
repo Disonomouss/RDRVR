@@ -36,6 +36,7 @@
 #include "core/lum_check.h"
 #include "core/pso.h"
 #include "core/render_settings.h"
+#include "core/align_grab.h"
 #include "core/ring_probe.h"
 #include "core/state.h"
 #include "core/taa.h"
@@ -51,6 +52,7 @@
 #include "core/round_draw.h"
 #include "core/held_prop.h"
 #include "core/render_res.h"
+#include "core/zone_rings.h"
 
 namespace rdrvr::test_channel {
 namespace {
@@ -159,6 +161,18 @@ std::string execute(const std::vector<std::string>& t) {
         return std::string("actor ") + std::to_string(handle) + " " +
                run_native(0x99BD9D6Fu, {static_cast<uint64_t>(static_cast<uint32_t>(handle)), 0}, 2);  // GET_POSITION
     }
+    if (c == "cam" && t.size() >= 5 && t[1] == "moveramp") {  // cam moveramp dx dy dz: the slide, metres a frame (0 0 0 stops)
+        camera_lever::set_move_ramp(std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr));
+        char st[400];
+        camera_lever::status_text(st, sizeof(st));
+        return st;
+    }
+    if (c == "cam" && t.size() >= 3 && t[1] == "yawramp") {  // cam yawramp <deg a frame>: the deterministic turn (0 stops)
+        camera_lever::set_yaw_ramp(std::strtof(t[2].c_str(), nullptr));
+        char st[400];
+        camera_lever::status_text(st, sizeof(st));
+        return st;
+    }
     if (c == "cam" && t.size() >= 3 && t[1] == "yaw") {
         camera_lever::set_yaw(std::strtof(t[2].c_str(), nullptr));
         char st[400];
@@ -259,10 +273,47 @@ std::string execute(const std::vector<std::string>& t) {
         render_settings::status_text(st, sizeof(st));
         return st;
     }
+    if (c == "aligngrab" && t.size() >= 3)  // aligngrab <prefix> <frames> [crop_w crop_h]: the upscaler's alignment
+        return align_grab::grab(t[1], std::atoi(t[2].c_str()), t.size() >= 5 ? std::atoi(t[3].c_str()) : 1536,
+                                t.size() >= 5 ? std::atoi(t[4].c_str()) : 864);
+    if (c == "xr" && t.size() >= 3 && t[1] == "rotramp") {  // xr rotramp <deg>: a head turning at deg a frame (0 stops)
+        xr::set_rot_ramp(std::strtof(t[2].c_str(), nullptr));
+        return "xr rotramp " + t[2];
+    }
+    if (c == "xr" && t.size() >= 4 && t[1] == "posnoise") {  // xr posnoise <rot_deg> <pos_m>: white noise a frame (0 0 stops)
+        xr::set_pose_noise(std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr));
+        return "xr posnoise " + t[2] + " " + t[3];
+    }
+    if (c == "cuts") {  // what discarded the upscaler's history (velocity clears, resets), per post run
+        char st[600];
+        taa::cut_text(st, sizeof(st));
+        return st;
+    }
+    if (c == "dlss" && t.size() >= 3 && t[1] == "units") {  // dlss units on|off: the jitter in render pixels or the game's
+        taa::set_jitter_units(t[2] == "on");
+        char st[700];
+        taa::status_text(st, sizeof(st));
+        return st;
+    }
+    if (c == "dlss" && t.size() >= 3 && t[1] == "mvscale") {  // dlss mvscale <k>: the positive control
+        dlss::set_mv_scale(std::strtof(t[2].c_str(), nullptr));
+        return "dlss mvscale " + t[2];
+    }
+    if (c == "dlss" && t.size() >= 2 && t[1] == "phases") {  // dlss phases [on|off]: the jitter sequence's length
+        if (t.size() >= 3) render_settings::set_full_jitter(t[2] == "on");
+        char st[300];
+        render_settings::jitter_text(st, sizeof(st));
+        return st;
+    }
     if (c == "dlss") {  // dlss [off]: per-eye DLSS's state and counters; off = the kill switch
         std::string line;
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return dlss::command(line);
+    }
+    if (c == "taa" && (t.size() == 1 || t[1] == "status")) {  // taa [status]: the TAA/DLSS pass state and counters
+        char st[700];
+        taa::status_text(st, sizeof(st));
+        return st;
     }
     if (c == "taa" && t.size() >= 6 && t[1] == "params") {
         const float v[4] = {std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr),
@@ -282,9 +333,15 @@ std::string execute(const std::vector<std::string>& t) {
         return st;
     }
     if (c == "lumcheck") return lum_check::run(t.size() >= 2 ? std::atoi(t[1].c_str()) : 8);
-    if (c == "grabburst" && t.size() >= 3)  // grabburst <prefix> <frames> [crop_w crop_h]
+    if (c == "grabburst" && t.size() >= 3) {  // grabburst <prefix> <frames> [crop_w crop_h] [post|scene|vel]
+        const int src = t.size() >= 6 ? (t[5] == "scene" ? 1 : t[5] == "vel" ? 2 : 0) : 0;
         return burst_grab::grab(t[1], std::atoi(t[2].c_str()), t.size() >= 5 ? std::atoi(t[3].c_str()) : 640,
-                                t.size() >= 5 ? std::atoi(t[4].c_str()) : 360);
+                                t.size() >= 5 ? std::atoi(t[4].c_str()) : 360, 10000, src);
+    }
+    if (c == "xr" && t.size() >= 5 && t[1] == "posramp") {  // xr posramp dx dy dz: metres an XR frame (0 0 0 stops)
+        xr::set_pos_ramp(std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr));
+        return "xr posramp " + t[2] + " " + t[3] + " " + t[4];
+    }
     if (c == "pose" && t.size() >= 2 && (t[1] == "xr" || t[1] == "off")) {
         // pose xr | pose off: eye cameras from the located XR views (R5); "recentre" takes the current views as origin
         camera_lever::set_xr_pose(t[1] == "xr");
@@ -413,7 +470,12 @@ std::string execute(const std::vector<std::string>& t) {
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return gestures::gun_melee_command(line);
     }
-    if (c == "rings") {  // the holster rings' layers
+    if (c == "rings") {  // the holster rings' layers; rings atlas <path.bmp>: the atlas (the rings, the dots, the reticles)
+        if (t.size() >= 3 && t[1] == "atlas") {
+            std::string path;
+            for (size_t i = 2; i < t.size(); ++i) path += (i > 2 ? " " : "") + t[i];
+            return zone_rings::write_atlas(path);
+        }
         char b[240];
         xr::rings_status(b, sizeof(b));
         return b;

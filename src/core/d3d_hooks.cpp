@@ -300,7 +300,7 @@ const void* rtv_resource(SIZE_T ptr) {
     return it == g_rtv.end() ? nullptr : it->second;
 }
 
-std::atomic<BindTapFn> g_bind_tap[4];
+std::atomic<BindTapFn> g_bind_tap[5];
 std::atomic<RtvSubstFn> g_rtv_subst{nullptr};
 std::atomic<FrameSizeFn> g_frame_size{nullptr};
 std::atomic<bool> g_present_unsynced{false};
@@ -1160,7 +1160,7 @@ void set_present_unsynced(bool on) {
 }
 
 void set_bind_tap(int slot, BindTapFn fn) {
-    if (slot >= 0 && slot < 4) g_bind_tap[slot] = fn;
+    if (slot >= 0 && slot < 5) g_bind_tap[slot] = fn;
 }
 
 void set_frame_size_listener(FrameSizeFn fn) { g_frame_size.store(fn, std::memory_order_release); }

@@ -13,6 +13,8 @@
 
 #include <cstdint>
 
+struct ID3D12CommandQueue;  // d3d12.h: the queue XR images are written on
+
 namespace rdrvr::xr {
 
 struct EyeView {
@@ -37,6 +39,15 @@ const char* runtime_name();
 // its source, and the live-resize guard (frame_resized). 1024 characters hold it.
 void submit_status(char* out, size_t len);
 bool submitting();  // the frame loop runs on the presenting thread with the eye swapchains made
+// The queue XR images are written on. The session is bound to the game's present queue at xrCreateSession; under DLSS
+// the game makes its last swapchain on a new queue after that, and the runtime's "frame ready" fence (signalled inside
+// xrEndFrame on the session's queue) then completed at once on a queue the game no longer used: the runtime read each
+// eye image before the mod wrote it, up to 3 frames old, at the current pose (the headset's "world lags, then catches
+// up", 2026-10-08). Every XR image write: image_queue() (the game's present queue's work ordered before it by a fence),
+// the list submitted on that queue, then image_written() once the frame's writes are in (the game's next lists ordered
+// after them). The game's own back buffer (the monitor) stays on the present queue.
+ID3D12CommandQueue* image_queue();
+void image_written();
 // R5 late latch (DESIGN 3.8, [XR] LateLatch): render thread, just before a double frame's first eye pass: the views
 // are located again for the same predicted display time, and their new orientations (positions kept from the frame's
 // start) become the frame's views, both for the eye cameras and for the projection layer.
@@ -71,5 +82,16 @@ void set_hud_on_wrist(bool on);
 void hud_status(char* out, size_t len);  // "hud [wrist|quad]"
 // Moves the frame loop to the presenting thread (submission) or back to the idle loop, at the next idle-frame boundary.
 void set_submit(bool on);
+// Test aid ("xr posramp dx dy dz"): the located views moved by an offset that grows by (dx, dy, dz) metres every XR
+// frame (the reference space's axes), a head sliding at a constant speed through the real pose path; all zero stops it
+// and takes the offset off.
+void set_pos_ramp(float dx, float dy, float dz);
+// Test aid ("xr posnoise <rot_deg> <pos_m>"): every XR frame the located views get fresh white noise, a yaw and a pitch
+// up to +-rot_deg and a move up to +-pos_m on each axis (the reference space), as real tracking and the runtime's pose
+// prediction give a head held still; 0 0 stops it.
+void set_pose_noise(float rot_deg, float pos_m);
+// Test aid ("xr rotramp <deg>"): the located views turned by a yaw that grows by deg every XR frame, about the eyes'
+// midpoint (a head turning at a constant rate); 0 stops it and takes the turn off.
+void set_rot_ramp(float deg_per_frame);
 
 }  // namespace rdrvr::xr

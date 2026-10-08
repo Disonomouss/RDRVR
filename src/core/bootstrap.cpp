@@ -15,6 +15,7 @@
 #include "core/dual_pass.h"
 #include "core/exit_guard.h"
 #include "core/burst_grab.h"
+#include "core/align_grab.h"
 #include "core/ui_layer.h"
 #include "core/vr_mode.h"
 #include "core/hands.h"
@@ -89,6 +90,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     eye_grab::init();
     lum_check::init();
     burst_grab::init();
+    align_grab::init();
     eye_shape::init();  // before ui_layer::init: its monitor repaint's frame end runs before the UI mirror's
     ui_layer::init();
     vr_mode::init();

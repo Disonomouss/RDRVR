@@ -46,6 +46,7 @@ add_library(rdrvr_core SHARED
     src/core/render_res.cpp
     src/core/lum_check.cpp
     src/core/burst_grab.cpp
+    src/core/align_grab.cpp
     src/core/taa.cpp
     src/core/dlss.cpp
     src/core/exit_guard.cpp

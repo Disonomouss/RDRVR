@@ -33,6 +33,7 @@ std::atomic<bool> g_barrel{true};  // [Hands] BarrelAim
 std::atomic<bool> g_fire{true};    // [Hands] FireInFirstPerson
 std::atomic<bool> g_reticle{false};      // [Hands] Reticle (off by default)
 std::atomic<float> g_reticle_deg{1.2f};  // [Hands] ReticleSize (degrees across)
+std::atomic<bool> g_reticle_dot{false};    // [Hands] ReticleStyle=dot: a dot only
 std::atomic<uint64_t> g_reticle_shown{0}, g_reticle_offline{0};
 std::atomic<bool> g_assist{false}; // [Hands] AimAssist (soft lock and the reticle magnet in first person)
 std::atomic<bool> g_tracer{true};  // [Hands] TracerFromMuzzle
@@ -552,6 +553,7 @@ void init() {
     g_perfect = config::get_bool("Aim", "PerfectAccuracy", false);
     g_pattern = config::get_bool("Aim", "ShotgunPattern", true);
     g_reticle = config::get_bool("Hands", "Reticle", false);
+    g_reticle_dot = config::get_string("Hands", "ReticleStyle", "ring") == "dot";
     {
         const float s = config::get_float("Hands", "ReticleSize", 1.2f);
         g_reticle_deg = !(s >= 0.2f) ? 0.2f : s > 5.0f ? 5.0f : s;
@@ -916,6 +918,12 @@ void set_reticle_on(bool on) {
     config::set("Hands", "Reticle", on ? "1" : "0");
 }
 
+bool reticle_dot() { return g_reticle_dot.load(std::memory_order_relaxed); }
+void set_reticle_dot(bool dot) {
+    if (g_reticle_dot.exchange(dot) != dot) log::info("[aim] the reticle's style: %s", dot ? "a dot" : "a ring and a dot");
+    config::set("Hands", "ReticleStyle", dot ? "dot" : "ring");
+}
+
 bool reticle_target(float pos[3], bool* on_actor, float* size_deg) {
     if (!g_reticle.load(std::memory_order_relaxed) || !g_barrel.load(std::memory_order_relaxed)) return false;
     if (log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed) > 150.0) return false;  // not aiming along the barrel
@@ -1031,15 +1039,17 @@ std::string command(const std::string& line) {
                       g_gun_anim[1], g_gun_anim[2]);
         return f;
     }
-    if (line.find(" reticle") != std::string::npos) {  // aim reticle [on|off]: where it is drawn now, its counters (on/off: the session)
+    if (line.find(" reticle") != std::string::npos) {  // aim reticle [on|off|dot|ring]: where it is drawn now, its counters (the session)
         if (line.find(" reticle on") != std::string::npos) g_reticle = true;
         if (line.find(" reticle off") != std::string::npos) g_reticle = false;
+        if (line.find(" reticle dot") != std::string::npos) g_reticle_dot = true;
+        if (line.find(" reticle ring") != std::string::npos) g_reticle_dot = false;
         float p[3] = {0, 0, 0}, sz = 0;
         bool act = false;
         const bool ok = reticle_target(p, &act, &sz);
         char e[240];
-        std::snprintf(e, sizeof(e), "reticle %d, now %s (%.2f %.2f %.2f)%s, size %.1f deg | shown %llu, off the barrel's line %llu | muzzle (%.2f %.2f %.2f) dir (%.3f %.3f %.3f)",
-                      g_reticle.load() ? 1 : 0, ok ? "at" : "none", p[0], p[1], p[2], act ? " on an actor" : "", sz,
+        std::snprintf(e, sizeof(e), "reticle %d (%s), now %s (%.2f %.2f %.2f)%s, size %.1f deg | shown %llu, off the barrel's line %llu | muzzle (%.2f %.2f %.2f) dir (%.3f %.3f %.3f)",
+                      g_reticle.load() ? 1 : 0, g_reticle_dot.load() ? "dot" : "ring", ok ? "at" : "none", p[0], p[1], p[2], act ? " on an actor" : "", sz,
                       static_cast<unsigned long long>(g_reticle_shown.load()), static_cast<unsigned long long>(g_reticle_offline.load()),
                       g_last_muzzle[0], g_last_muzzle[1], g_last_muzzle[2], g_last_dir[0], g_last_dir[1], g_last_dir[2]);
         return e;

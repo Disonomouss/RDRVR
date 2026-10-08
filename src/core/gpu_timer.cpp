@@ -3,7 +3,9 @@
 // over the frame's submissions, so the gaps where the queue waits on fences, the CPU or vsync are left out; span
 // is the first begin to the last end. At Present the frame's timestamps are resolved into a readback buffer and
 // read a few frames later (never waits on the GPU). Used for the vanilla GPU baseline (Spike S10, DECISIONS D5),
-// so it changes nothing the game renders.
+// so it changes nothing the game renders. Also when the frame's GPU work ended against Present (where the mod hands the
+// frame to the OpenXR runtime), the GPU clock mapped onto the CPU's by the queue's clock calibration: a frame whose
+// eye images are finished late reaches the runtime's compositor late (the DLSS judder study, 2026-10-08).
 
 #include "core/gpu_timer.h"
 
@@ -35,6 +37,7 @@ struct Slot {
     bool pending = false;   // resolved and fenced, result not read yet
     int pending_used = 0;
     uint64_t fence_value = 0;
+    int64_t present_qpc = 0;  // the CPU clock at this frame's Present (the frame-end listener)
 };
 
 std::mutex g_mutex;
@@ -50,6 +53,9 @@ Slot g_slots[kSlots];
 uint64_t g_frame = 0;
 uint64_t g_skipped_behind = 0, g_skipped_overflow = 0;
 std::vector<float> g_busy, g_span;  // last window, for percentiles
+std::vector<float> g_done;          // the frame's GPU work ended, ms after its Present (negative: before)
+uint64_t g_cal_gpu = 0, g_cal_cpu = 0;  // the queue's clock calibration (GPU timestamp, QPC) of this window
+int64_t g_qpc_freq = 0;
 std::vector<uint8_t> g_count;
 double g_window_start_ms = 0;
 
@@ -80,6 +86,12 @@ bool create(ID3D12CommandQueue* q) {
         make_list(s, &s.resolve);
     }
     ok = ok && SUCCEEDED(q->GetTimestampFrequency(&g_freq)) && g_freq;
+    if (ok) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_qpc_freq = f.QuadPart;
+        if (FAILED(q->GetClockCalibration(&g_cal_gpu, &g_cal_cpu))) g_cal_gpu = g_cal_cpu = 0;
+    }
     dev->Release();
     if (ok) log::info("[gputimer] ready on queue %p (timestamp frequency %llu Hz, up to %d submissions per frame)",
                       static_cast<void*>(q), static_cast<unsigned long long>(g_freq), kMaxBrackets);
@@ -106,6 +118,11 @@ void collect(Slot& s, int index) {
     g_busy.push_back(static_cast<float>(busy_ms));
     g_span.push_back(static_cast<float>(span_ms));
     g_count.push_back(static_cast<uint8_t>(s.pending_used));
+    if (g_cal_cpu && g_qpc_freq && s.present_qpc) {  // the last game submission's end on the CPU clock, against Present
+        const double end_qpc = static_cast<double>(g_cal_cpu) +
+                               (static_cast<double>(last) - static_cast<double>(g_cal_gpu)) * static_cast<double>(g_qpc_freq) / static_cast<double>(g_freq);
+        g_done.push_back(static_cast<float>((end_qpc - static_cast<double>(s.present_qpc)) * 1000.0 / static_cast<double>(g_qpc_freq)));
+    }
 }
 
 void report_window() {
@@ -118,15 +135,23 @@ void report_window() {
     double sum = 0;
     for (float f : b) sum += f;
     uint8_t cmin = *std::min_element(g_count.begin(), g_count.end()), cmax = *std::max_element(g_count.begin(), g_count.end());
+    std::vector<float> dn = g_done;
+    std::sort(dn.begin(), dn.end());
+    char done[160] = " | GPU done vs Present: n/a";
+    if (!dn.empty())
+        std::snprintf(done, sizeof(done), " | GPU done vs Present: p5 %+.2f p50 %+.2f p95 %+.2f max %+.2f ms", dn[dn.size() * 5 / 100],
+                      dn[dn.size() / 2], dn[dn.size() * 95 / 100], dn.back());
     log::info("[gputimer] %zu frames over %.1f s: GPU busy mean %.2f ms  p50 %.2f  p95 %.2f  max %.2f | span p50 %.2f p95 %.2f"
-              " | submissions/frame %u..%u | swap %ux%u  cpu %.2f ms | skipped %llu behind %llu overflow",
+              " | submissions/frame %u..%u | swap %ux%u  cpu %.2f ms | skipped %llu behind %llu overflow%s",
               b.size(), (now - g_window_start_ms) / 1000.0, sum / b.size(), b[b.size() / 2], b[b.size() * 95 / 100], b.back(),
               sp[sp.size() / 2], sp[sp.size() * 95 / 100], cmin, cmax, state::swap_width.load(), state::swap_height.load(),
               state::cpu_frame_ms.load(), static_cast<unsigned long long>(g_skipped_behind),
-              static_cast<unsigned long long>(g_skipped_overflow));
+              static_cast<unsigned long long>(g_skipped_overflow), done);
     g_busy.clear();
     g_span.clear();
     g_count.clear();
+    g_done.clear();
+    if (g_queue && FAILED(g_queue->GetClockCalibration(&g_cal_gpu, &g_cal_cpu))) g_cal_gpu = g_cal_cpu = 0;  // no drift across windows
     g_window_start_ms = now;
 }
 
@@ -205,6 +230,9 @@ void on_frame_end(uint64_t) {
         s.fence_value = g_fence_next;
         s.pending = true;
         s.pending_used = s.used;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        s.present_qpc = now.QuadPart;
     }
     s.open = false;
     ++g_frame;

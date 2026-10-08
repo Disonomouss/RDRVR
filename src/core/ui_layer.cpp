@@ -16,6 +16,7 @@
 #include "core/log.h"
 #include "core/post_target.h"
 #include "core/state.h"
+#include "core/xr.h"
 #include "core/xr_blit.h"
 
 namespace rdrvr::ui_layer {
@@ -305,13 +306,13 @@ bool ensure_draw(ID3D12Device* dev) {
 
 // Records one full-screen draw of the UI target into `dst` (in state `dst_state`, returned to it) and submits it.
 // scale: UI pixels a destination pixel (ps_quad_box; else 1).
-bool draw_ui(Draw& d, ID3D12PipelineState* pso, ID3D12Resource* dst, DXGI_FORMAT view_fmt, D3D12_RESOURCE_STATES dst_state, int rtv_slot,
-             float gamma, const float src[2] = nullptr, const int hole[4] = nullptr, const float scale[2] = nullptr) {
+// q: the present queue for the game's back buffer (the mirror), xr::image_queue() for an XR image.
+bool draw_ui(ID3D12CommandQueue* q, Draw& d, ID3D12PipelineState* pso, ID3D12Resource* dst, DXGI_FORMAT view_fmt, D3D12_RESOURCE_STATES dst_state,
+             int rtv_slot, float gamma, const float src[2] = nullptr, const int hole[4] = nullptr, const float scale[2] = nullptr) {
     const float k[12] = {gamma, src ? src[0] : 0.0f, src ? src[1] : 0.0f, 0.0f, hole ? static_cast<float>(hole[0]) : 0.0f,
                          hole ? static_cast<float>(hole[1]) : 0.0f, hole ? static_cast<float>(hole[2]) : 0.0f,
                          hole ? static_cast<float>(hole[3]) : 0.0f, scale ? scale[0] : 1.0f, scale ? scale[1] : 1.0f,
                          static_cast<float>(g_w), static_cast<float>(g_h)};
-    ID3D12CommandQueue* q = state::present_queue.load();
     ID3D12Device* dev = state::device.load();
     if (!q || !dev || !pso) return false;
     int s = d.slot;
@@ -389,7 +390,7 @@ void mirror() {
         g_pso_mirror = make_pso(dev, g_ps_mirror, f, true);
         g_mirror_fmt = f;
     }
-    if (draw_ui(g_draw_mirror, g_pso_mirror, bb, f, D3D12_RESOURCE_STATE_PRESENT, 0, xr_blit::game_gamma(1.0f)))
+    if (draw_ui(state::present_queue.load(), g_draw_mirror, g_pso_mirror, bb, f, D3D12_RESOURCE_STATE_PRESENT, 0, xr_blit::game_gamma(1.0f)))
         g_mirrors.fetch_add(1, std::memory_order_relaxed);
     bb->Release();
 }
@@ -549,7 +550,7 @@ bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4]) {
     if (!dd.Width || !dd.Height || dd.Width > g_w || dd.Height > g_h) return false;
     const bool box = dd.Width != g_w || dd.Height != g_h;
     const float scale[2] = {static_cast<float>(g_w) / static_cast<float>(dd.Width), static_cast<float>(g_h) / static_cast<float>(dd.Height)};
-    bool ok = draw_ui(g_draw_quad, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 1, xr_blit::game_gamma(1.0f),
+    bool ok = draw_ui(xr::image_queue(), g_draw_quad, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 1, xr_blit::game_gamma(1.0f),
                       nullptr, hole, box ? scale : nullptr);
     if (ok) g_quads.fetch_add(1, std::memory_order_relaxed);
     if (ok && box) g_boxed.fetch_add(1, std::memory_order_relaxed);
@@ -566,7 +567,7 @@ bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw
     const bool box = dd.Width != cw || dd.Height != ch;
     const float src[2] = {static_cast<float>(x0), static_cast<float>(y0)};
     const float scale[2] = {static_cast<float>(cw) / static_cast<float>(dd.Width), static_cast<float>(ch) / static_cast<float>(dd.Height)};
-    return draw_ui(g_draw_wrist, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 2, xr_blit::game_gamma(1.0f), src,
+    return draw_ui(xr::image_queue(), g_draw_wrist, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 2, xr_blit::game_gamma(1.0f), src,
                    nullptr, box ? scale : nullptr);
 }
 

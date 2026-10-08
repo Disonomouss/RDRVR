@@ -116,6 +116,12 @@ void set_double(bool on, float ipd, bool swap);
 // R3 truth capture: a yaw (degrees) applied to the scene camera about its own up axis, before any eye offset, in every
 // mode (mono and double). 0 = off.
 void set_yaw(float deg);
+// Test aid ("cam yawramp <deg>"): the yaw lever advanced by `deg` every scene frame, before its passes (0 stops it,
+// the yaw kept); a deterministic camera turn for measuring the eyes' motion, frame by frame.
+void set_yaw_ramp(float deg_per_frame);
+// Test aid ("cam moveramp dx dy dz"): the lever's world offset (metres along the camera's rows, as "cam world")
+// advanced by (dx, dy, dz) every scene frame; all zero stops it and takes the offset off.
+void set_move_ramp(float dx, float dy, float dz);
 
 // The viewport SceneRender is drawing on this thread, while it runs (render thread), or nullptr.
 void* scene_viewport();

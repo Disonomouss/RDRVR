@@ -881,6 +881,13 @@ void page_hands() {
                   "While aiming: a reticle at the game's own target point along the gun's barrel (where the bullet goes), the same "
                   "size near and far, red over a person or an animal."))
             aim::set_reticle_on(rt);
+        sub_begin(rt);  // [Hands] ReticleStyle
+        const bool dot = aim::reticle_dot();
+        const char* const kStyleTip = "The reticle's look: a ring with a dot in its middle, or a dot only (smaller, less in the way).";
+        if (radio("Ring and dot", !dot, kStyleTip)) aim::set_reticle_dot(false);
+        ImGui::SameLine();
+        if (radio("Dot only", dot, kStyleTip)) aim::set_reticle_dot(true);
+        sub_end();
     }
     bool kd = holster::keeps_drawn();
     if (check("Keep the gun drawn", &kd,
@@ -1568,7 +1575,7 @@ bool grab_buffer(ID3D12Device* dev) {
 }
 
 bool render(ID3D12Resource* dst) {
-    ID3D12CommandQueue* q = state::present_queue.load();
+    ID3D12CommandQueue* q = xr::image_queue();  // the menu's quad image: an XR image
     ID3D12Device* dev = state::device.load();
     int s = g_slot;
     if (g_fence->GetCompletedValue() < g_slot_value[s]) {
