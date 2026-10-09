@@ -584,9 +584,11 @@ std::string command(const std::string& line) {
         if (w == "throw") set_throw_by_hand(on);
         if (w == "melee") set_melee_by_swing(on);
         if (w == "lasso") set_lasso_by_hand(on);
+        if (w == "gripthrow") aim::set_grip_throw(on, false);  // [Gestures] ThrowByGrip (the session only)
         if (w == "peak") g_peak_speed[0] = g_peak_speed[1] = 0;  // "peak reset"
         if (w == "strike") aim::set_melee_strike(static_cast<float>(std::atof(v.c_str())));  // the session only
         if (w == "fistlead") g_fist_lead_ms = std::atoi(v.c_str());                            // the session only
+        if (w == "tip" || w == "tipaxis" || w == "tippivot") aim::tip_command(w, v);
     }
     char b[400];
     std::snprintf(b, sizeof(b),
@@ -598,7 +600,7 @@ std::string command(const std::string& line) {
                   g_last_speed[1], g_peak_speed[0], g_peak_speed[1], static_cast<unsigned long long>(g_punches.load()),
                   static_cast<unsigned long long>(g_lasso_throws.load()), static_cast<unsigned long long>(g_yanks.load()),
                   static_cast<unsigned long long>(g_throws.load()), g_last_throw[0], g_last_throw[1], g_last_throw[2], g_last_throw_age);
-    return b;
+    return b + aim::tip_command("", "");
 }
 
 namespace {

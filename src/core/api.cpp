@@ -29,6 +29,8 @@ std::atomic<bool> g_attached{false};
 constexpr uint64_t kWatchBit = 1ull << 63;
 constexpr int kWatches = 8;
 std::atomic<uint32_t> g_watch_hash[kWatches];
+std::atomic<uint64_t> g_watch_arg[kWatches];
+std::atomic<uint32_t> g_watch_argc[kWatches];
 std::atomic<int> g_watch_count{0};
 std::atomic<uint64_t> g_watch_value[kWatches], g_watch_tick[kWatches];
 
@@ -50,6 +52,8 @@ void api_on_script_tick(uint64_t tick, double /*script_ms*/) {
         r.id = kWatchBit | static_cast<uint64_t>(i);
         r.op = RDRVR_NATIVE_RAW;
         r.hash = g_watch_hash[i].load(std::memory_order_relaxed);
+        r.argc = g_watch_argc[i].load(std::memory_order_relaxed);
+        r.args[0] = g_watch_arg[i].load(std::memory_order_relaxed);
         g_requests.push_front(r);
     }
     ReleaseSRWLockExclusive(&g_lock);
@@ -198,12 +202,14 @@ bool actor_state(RdrvrActorState* out) {
     return out->valid != 0;
 }
 
-int watch_native(uint32_t hash) {
+int watch_native(uint32_t hash, uint64_t arg0, uint32_t argc) {
     int i = g_watch_count.load();
     for (int k = 0; k < i; ++k)
-        if (g_watch_hash[k].load() == hash) return k;
+        if (g_watch_hash[k].load() == hash && g_watch_arg[k].load() == arg0 && g_watch_argc[k].load() == argc) return k;
     if (i >= kWatches) return -1;
     g_watch_hash[i] = hash;
+    g_watch_arg[i] = arg0;
+    g_watch_argc[i] = argc > 1 ? 1 : argc;
     g_watch_tick[i] = 0;
     g_watch_count.store(i + 1, std::memory_order_release);
     log::info("[api] watching native 0x%08X every script tick (watch %d)", hash, i);

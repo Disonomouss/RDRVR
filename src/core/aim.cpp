@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -17,6 +18,8 @@
 #include "core/gestures.h"
 #include "core/gun_melee.h"
 #include "core/config.h"
+#include "core/controls.h"
+#include "core/hands.h"
 #include "core/d3d_hooks.h"
 #include "core/dual.h"
 #include "core/hooks.h"
@@ -45,6 +48,15 @@ std::atomic<bool> g_spawn_hooked{false};
 std::atomic<uint64_t> g_flips_seen{0}, g_flips_left{0};
 std::atomic<uint64_t> g_npc_spawns{0}, g_npc_bloomed{0};  // others' shots (left to the game) and those with the game's bloom drawn
 std::atomic<float> g_npc_sigma{0.0f};                      // the last such shot's bloom size
+std::atomic<double> g_npc_log_ms{-1.0e9};                  // others' shots in the log: at most every 30 s
+std::atomic<uint64_t> g_npc_logged{0};                     // the count at the last such line
+void log_npc_shots(const char* when) {
+    const uint64_t n = g_npc_spawns.load(std::memory_order_relaxed), m = g_npc_bloomed.load(std::memory_order_relaxed);
+    g_npc_logged.store(n, std::memory_order_relaxed);
+    log::info("[aim] others' shots%s: %llu, with the game's spread %llu (the last %.3f); perfect accuracy %d (the player's shots only)", when,
+              static_cast<unsigned long long>(n), static_cast<unsigned long long>(m), static_cast<double>(g_npc_sigma.load()),
+              g_perfect.load() ? 1 : 0);
+}
 std::atomic<uint64_t> g_spawns{0}, g_player_spawns{0}, g_bloom_zeroed{0}, g_block_fixes{0}, g_aligned{0}, g_speed_drops{0},
     g_straightened{0};
 // one shot's pellets as hk_launch sees them inside the spawn (the game thread only): the first's numbers, the widest
@@ -396,6 +408,11 @@ void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, 
             if (rd(W + 0x1d0, &b0) && rd(W + 0x1d4, &b1) && rd(W + 0x9b0, &drawn) && !drawn && (b0 > 0.0f || b1 > 0.0f)) {
                 g_npc_bloomed.fetch_add(1, std::memory_order_relaxed);
                 g_npc_sigma.store(b0 > b1 ? b0 : b1, std::memory_order_relaxed);
+            }
+            const double now = log::now_ms();
+            if (now - g_npc_log_ms.load(std::memory_order_relaxed) >= 30000.0) {
+                g_npc_log_ms.store(now, std::memory_order_relaxed);
+                log_npc_shots("");
             }
         }
         o_spawn(W, proj, count, pellets, speed, u6, no_bloom, seed, turret);
@@ -813,8 +830,168 @@ bool is_player_ped(uintptr_t ped) {
     return ped && rd(ped + 0x10, &actor) && actor && rd(actor + 0x118, &fl) && (fl & 3) == 3;
 }
 
+// [Gestures] ThrowByGrip: the throw held from its start (the trigger, the grip held) until the grip is let go
+std::atomic<bool> g_grip_throw{false};
+std::atomic<uintptr_t> g_hold_G{0};
+std::atomic<float> g_hold_phase{0.0f};
+std::atomic<double> g_hold_since{0.0};
+float g_hold_t = -1.0f;  // the clip's time pinned (the game thread)
+std::atomic<uint64_t> g_holds{0}, g_hold_releases{0}, g_hold_timeouts{0};
+constexpr double kHoldMax = 15000.0;  // a held throw let go by itself after this (ms)
+std::atomic<double> g_aim_tail_until{0.0};  // the game's LT held after a held throw's let-go (its release, the launch)
+constexpr double kAimTail = 900.0;
+std::atomic<uint64_t> g_aim_frames{0}, g_arms{0};
+std::atomic<int> g_hold_weapon{-1};  // the eWeapon of the held throw
+// the throwing knife by its tip while its throw is held ([Gestures] KnifeTip, KnifeTipTurn, KnifeTipPivot)
+std::atomic<bool> g_knife_tip{true};
+std::atomic<int> g_tip_force{0};  // the test: 1 always turned, -1 never, 0 by the held throw
+std::atomic<int> g_tip_axis{2};
+float g_tip_pivot[3] = {0.0f, 0.1f, 0.0f};
+std::atomic<double> g_armed_ms{0.0};  // when the trigger armed the throw (the pad's thread)
+std::mutex g_tip_mutex;
+std::atomic<uint64_t> g_tip_frames{0};
+using ThrowPhase_t = float (*)(uintptr_t ped);
+
+float call_phase(uintptr_t fn, uintptr_t ped) {  // the game's own getter (a read only), SEH-guarded
+    __try {
+        return reinterpret_cast<ThrowPhase_t>(fn)(ped);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1.0f;
+    }
+}
+
+bool grip_held() {
+    const hands::Hand hh = hands::get(controls::gun_hand());
+    return hh.grip > 0.5f;
+}
+
+// once a frame on the game thread (the visibility build, after the game's update): a held throw's clip pinned before
+// its release; the grip let go: the release at G's next update. No hook on G's update itself: with one there (a pure
+// pass-through while nothing was held) the hip holster's second draw failed (reg2).
+void throw_hold_tick() {
+    const uintptr_t g = g_hold_G.load(std::memory_order_relaxed);
+    if (g) {
+        uint32_t state = 0;
+        uintptr_t ped = 0, cp = 0, player = 0;
+        const bool live = rd(g + 0x3bc, &state) && state == 13 && rd(g + 8, &ped) && ped && rd(ped + 800, &cp) && cp && rd(cp + 0x10, &player) && player;
+        const bool timeout = log::now_ms() - g_hold_since.load(std::memory_order_relaxed) > kHoldMax;
+        if (!live) {
+            g_hold_G.store(0, std::memory_order_relaxed);  // the throw over (or not the throw): nothing held
+            g_hold_t = -1.0f;
+            g_aim_tail_until.store(log::now_ms() + kAimTail, std::memory_order_relaxed);
+        } else if (!grip_held() || timeout) {
+            wr(g + 0x558, 0.0f);  // the release at this update's check
+            g_hold_G.store(0, std::memory_order_relaxed);
+            g_hold_t = -1.0f;
+            g_aim_tail_until.store(log::now_ms() + kAimTail, std::memory_order_relaxed);
+            (timeout ? g_hold_timeouts : g_hold_releases).fetch_add(1, std::memory_order_relaxed);
+            log::info("[gestures] the held throw let go%s", timeout ? " (held too long)" : " (the grip)");
+        } else {
+            const float ph = call_phase(anchors::addr(anchors::Id::ThrowPhase), ped);
+            if (g_hold_t < 0.0f) {
+                if (ph >= g_hold_phase.load(std::memory_order_relaxed)) rd(player + 0x38, &g_hold_t);  // pinned from here
+            } else {
+                wr(player + 0x38, g_hold_t);
+            }
+        }
+    }
+}
+
+// [Gestures] ThrowByGrip: the gun hand's grip is the throwable's (not the game's button) while one is in that hand
+bool grip_throw_wanted(int ctrl) {
+    if (!g_grip_throw.load(std::memory_order_relaxed) || ctrl != controls::gun_hand() || !pose::anchor_active()) return false;
+    RdrvrActorState st{};
+    return api::actor_state(&st) && gestures::is_thrown(st.weapon);
+}
+bool grip_throw() { return g_grip_throw.load(std::memory_order_relaxed); }
+bool knife_tip(int* axis, float pivot[3]) {
+    const int f = g_tip_force.load(std::memory_order_relaxed);
+    const bool on = f > 0 || (f == 0 && g_knife_tip.load(std::memory_order_relaxed) && g_grip_throw.load(std::memory_order_relaxed) &&
+                              g_hold_G.load(std::memory_order_relaxed) != 0 && g_hold_weapon.load(std::memory_order_relaxed) == 25);
+    if (!on) return false;
+    *axis = g_tip_axis.load(std::memory_order_relaxed);
+    {
+        std::lock_guard lock(g_tip_mutex);
+        for (int k = 0; k < 3; ++k) pivot[k] = g_tip_pivot[k];
+    }
+    g_tip_frames.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+std::string tip_command(const std::string& w, const std::string& v) {
+    if (w == "tip") g_tip_force.store(v == "on" ? 1 : v == "off" ? -1 : 0);
+    if (w == "tipaxis") g_tip_axis.store(std::atoi(v.c_str()) % 3);
+    if (w == "tippivot") {
+        float p[3] = {};
+        if (std::sscanf(v.c_str(), "%f,%f,%f", &p[0], &p[1], &p[2]) == 3) {
+            std::lock_guard lock(g_tip_mutex);
+            for (int k = 0; k < 3; ++k) g_tip_pivot[k] = p[k];
+        }
+    }
+    char b[200];
+    std::lock_guard lock(g_tip_mutex);
+    std::snprintf(b, sizeof(b), " | grip throw %d, arms %llu holds %llu let go %llu timeouts %llu, aim frames %llu | knife tip %d force %d axis %d pivot (%.3f %.3f %.3f) frames %llu",
+                  g_grip_throw.load() ? 1 : 0, static_cast<unsigned long long>(g_arms.load()), static_cast<unsigned long long>(g_holds.load()), static_cast<unsigned long long>(g_hold_releases.load()),
+                  static_cast<unsigned long long>(g_hold_timeouts.load()), static_cast<unsigned long long>(g_aim_frames.load()), g_knife_tip.load() ? 1 : 0,
+                  g_tip_force.load(), g_tip_axis.load(), g_tip_pivot[0], g_tip_pivot[1], g_tip_pivot[2], static_cast<unsigned long long>(g_tip_frames.load()));
+    return b;
+}
+// the pad's thread: the grip holds the throwable unlit; the trigger with the grip held arms it (the game's LT: its aim,
+// which lights dynamite and fire bottles), its RT held back for kRtLead (the throw starts only from the aim) and then a
+// press of kRtPress at least; LT kept through the held throw and its tail
+bool g_armed = false;
+double g_armed_at = 0.0;
+
+constexpr double kRtLead = 120.0, kRtPulse = 100.0, kRtTries = 2000.0;
+void grip_throw_input(float* lt, float* rt) {
+    if (!g_grip_throw.load(std::memory_order_relaxed)) {
+        g_armed = false;
+        return;
+    }
+    const double now = log::now_ms();
+    const bool live = g_hold_G.load(std::memory_order_relaxed) != 0 || now < g_aim_tail_until.load(std::memory_order_relaxed);
+    const bool held = grip_held() && grip_throw_wanted(controls::gun_hand());
+    if (held && !g_armed && *rt > 0.15f) {
+        g_armed = true;
+        g_armed_at = now;
+        g_armed_ms.store(now, std::memory_order_relaxed);
+        g_arms.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!held) g_armed = false;  // let go (a held throw goes on by `live`), or no throwable
+    if (!g_armed && !live) return;
+    *lt = 1.0f;
+    g_aim_frames.fetch_add(1, std::memory_order_relaxed);
+    // RT: held back for the lead, then pressed in pulses until the game's throw starts (its light comes first)
+    if (g_armed && !g_hold_G.load(std::memory_order_relaxed)) {
+        const double t = now - g_armed_at;
+        if (t < kRtLead) *rt = 0.0f;
+        else if (t < kRtLead + kRtTries) *rt = std::fmod(t - kRtLead, 2.0 * kRtPulse) < kRtPulse ? 1.0f : 0.0f;
+    }
+}
+void set_grip_throw(bool on, bool save) {
+    if (g_grip_throw.exchange(on) != on) log::info("[gestures] throw by letting go of the grip: %s", on ? "on" : "off");
+    if (save) config::set("Gestures", "ThrowByGrip", on ? "1" : "0");
+}
+
 uint8_t hk_throw_start(uintptr_t g, void* clip, float release, float rate, float phase_in, float phase_out, float draw_model, uint32_t focus) {
     uintptr_t ped = 0;
+    if (g_grip_throw.load(std::memory_order_relaxed) && pose::anchor_active() && rd(g + 8, &ped) && is_player_ped(ped) && grip_held() &&
+        release > 0.0f && release <= 1.0f) {
+        // held: pinned just before the game's own release and after its model change (the lighting), released by the grip
+        const float hold = std::fmax(std::fmax(0.02f, release * 0.9f), draw_model > 0.0f && draw_model < release ? draw_model + 0.02f : 0.0f);
+        g_hold_phase.store(std::fmin(hold, release - 0.01f), std::memory_order_relaxed);
+        g_hold_since.store(log::now_ms(), std::memory_order_relaxed);
+        g_hold_t = -1.0f;
+        {
+            RdrvrActorState st{};
+            g_hold_weapon.store(api::actor_state(&st) ? st.weapon : -1, std::memory_order_relaxed);
+        }
+        g_hold_G.store(g, std::memory_order_relaxed);
+        g_holds.fetch_add(1, std::memory_order_relaxed);
+        g_throw_start_ms.store(log::now_ms(), std::memory_order_relaxed);
+        log::info("[gestures] the throw held (the grip): release phase %.2f -> out of reach, held at %.2f (the model's change at %.2f), %.0f ms "
+                  "after the trigger", release, g_hold_phase.load(), draw_model, log::now_ms() - g_armed_ms.load());
+        return o_throw_start(g, clip, 5.0f, rate, phase_in, phase_out, draw_model, focus);
+    }
     if (g_quick_throw.load(std::memory_order_relaxed) && pose::anchor_active() && rd(g + 8, &ped) && is_player_ped(ped)) {
         const float r0 = release, k0 = rate;
         if (release > 0.0f && release <= 1.0f) {
@@ -882,6 +1059,14 @@ float melee_strike() { return g_melee_strike.load(); }
 
 bool install() {
     g_quick_throw = config::get_bool("Gestures", "QuickThrow", true);
+    g_grip_throw = config::get_bool("Gestures", "ThrowByGrip", false);
+    g_knife_tip = config::get_bool("Gestures", "KnifeTip", true);
+    g_tip_axis = config::get_int("Gestures", "KnifeTipTurn", 2) % 3;
+    {
+        float p[3] = {};
+        if (std::sscanf(config::get_string("Gestures", "KnifeTipPivot", "0 0.1 0").c_str(), "%f %f %f", &p[0], &p[1], &p[2]) == 3)
+            for (int k = 0; k < 3; ++k) g_tip_pivot[k] = p[k];
+    }
     g_throw_release = config::get_float("Gestures", "ThrowRelease", 0.15f);
     g_throw_rate = config::get_float("Gestures", "ThrowRate", 1.5f);
     g_melee_strike = config::get_float("Gestures", "MeleeStrike", 0.35f);
@@ -1024,6 +1209,9 @@ bool barrel_in_target(float b[3]) {
 }
 
 bool perfect_accuracy() { return g_perfect.load(); }
+void on_exit() {
+    if (g_npc_spawns.load(std::memory_order_relaxed) != g_npc_logged.load(std::memory_order_relaxed)) log_npc_shots(" (at the exit)");
+}
 void set_perfect_accuracy(bool on, bool save) {
     if (g_perfect.exchange(on) != on) log::info("[aim] perfect accuracy: %s", on ? "on" : "off");
     if (save) config::set("Aim", "PerfectAccuracy", on ? "1" : "0");

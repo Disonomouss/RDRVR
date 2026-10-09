@@ -51,7 +51,12 @@ bool frame_rect(uint32_t* cw, uint32_t* ch, uint32_t* rw = nullptr, uint32_t* rh
 struct RunPoke {
     void* rt = nullptr;
     uint16_t w = 0, h = 0;  // its logical size before the run
+    void* up = nullptr;     // under DLSS (EyeShapeDlss): the DLSS output (+0x400), W x H before the run too
 };
+// [XR] EyeShapeDlss (run 9 item 5, off): the shape applied under DLSS now: the scene's render size (rw x rh, the DLSS
+// input sub-rect) and the eye (ew x eh, the DLSS output). The render thread (record time). False otherwise.
+bool dlss_shape(uint32_t* rw, uint32_t* rh, uint32_t* ew, uint32_t* eh);
+void dlss_stop(const char* why);  // per-eye DLSS refused the shape: the kill switch (the uniform state at the next DRS call)
 void begin_run(void* postfx, RunPoke* p);
 void end_run(void* postfx, const RunPoke& p);
 

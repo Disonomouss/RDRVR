@@ -883,6 +883,16 @@ void record_parts(const float* sm, int count, uint64_t frame) {
     std::memcpy(p.m, sm, sizeof(float) * 12 * count);
     if (g_parts_n >= kPartsMax) g_parts_rec = false;
 }
+// [Debug] TwoHandShotLog (run 9 item 3, on): a shot while two-handed arms the recording above by itself (when no test
+// has it), and its end logs the front wrist's move on the drawn gun (parts_post), with the two-handed blend and the
+// front hand's pose at the shot and at the end (the user's "Foregrip hand moves after firing": not reproduced in the
+// simulator, within 2 mm with every grip switch)
+std::atomic<bool> g_shotlog_cfg{true};
+bool g_parts_auto = false;
+bool g_parts_manual = false;  // a test's recording ("skel parts arm") not yet read ("post", "dump"): never overwritten
+float g_parts_auto_blend = 0.0f;
+int g_parts_auto_pose = -1, g_parts_auto_weapon = -1;
+std::atomic<uint64_t> g_shotlogs{0};
 // D = A^-1 B for two set matrices (3x4 rows: the 3x3, then the translation column), A rigid: R_A^T R_B, R_A^T (t_B - t_A)
 void rel_set(const float* A, const float* B, float* D) {
     for (int i = 0; i < 3; ++i) {
@@ -969,6 +979,17 @@ int g_xfer_pin_mode = 0;    // where it was measured: 1 the muzzle (the gun's mi
 // (the aim, the fire) is untouched.
 using ObjSetMatrix_t = uint64_t (*)(uintptr_t obj, const float* m);
 ObjSetMatrix_t o_obj_set_matrix = nullptr;
+// [Body] LassoAtHands (2026-10-09): the lasso's rope drawn at the drawn hands (hk_lasso_draw, hk_rope_points)
+using LassoDraw_t = void (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+LassoDraw_t o_lasso_draw = nullptr;
+using RopePoints_t = void (*)(uintptr_t, uint64_t, uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t);
+RopePoints_t o_rope_points = nullptr;
+std::atomic<bool> g_lasso_cfg{true};
+thread_local int t_lasso_draw = 0;
+std::atomic<uint64_t> g_lasso_draws{0}, g_lasso_moved{0}, g_lasso_points{0};
+std::mutex g_lasso_mutex;
+float g_lasso_dbg[6][3] = {};  // the last draw: its first and last point (the game's), the game's wrists L R, the first and last drawn
+int g_lasso_n = 0, g_lasso_moved_n = 0;
 uintptr_t g_gun_place_ret = 0;
 std::atomic<bool> g_held_at_hand_cfg{true};
 std::atomic<uintptr_t> g_held_wmgr{0};  // the player's weapon manager (actor +0x70), from the last visibility build
@@ -1048,6 +1069,27 @@ bool g_bt_jit_rebase = false;     // "skel lag reset": the jitter measured from 
 // its grip is neither learned again nor switched between the game's aim and hold poses (the snap point slid up to 96 mm
 // along the gun)
 std::atomic<bool> g_same_frame_cfg{true};
+// [Reload] SnapToDrawnGun (run 9 item 3, the user: "Foregrip hand moves after firing, ending up clipped in the gun or
+// holding air"): with FixedGunGrip the drawn gun is the learned aiming hold on the animated wrist, while the front hand's
+// snap and the two-handed turn's barrel took the game's own gun, which the fire clip moves in the game's hand (8-11 mm
+// and 11 degrees at the grip after each Carbine shot in the user's logs: 60-75 mm at the foregrip). On: both from the
+// gun as drawn, and FixedGunGrip's learning paused through the fire clip. Off, or FixedGunGrip off: as before
+std::atomic<bool> g_snap_drawn_cfg{true};
+std::atomic<uint64_t> g_snap_drawn_frames{0};
+bool fixed_grip_on();  // [Hands] FixedGunGrip (defined with it below)
+// [Reload] SnapToDrawnGun: a sample's gun as drawn: its matrix's frame (Gm, gm_o in the set's space) with its placement
+// at the drawn hand (A, ad: held_delta's) undone
+void unplace(const HeldSample& h, const float* off, const float* Gm, const float* gm_o, float* Gu, float* gu_o) {
+    float ut[9], ua[3], d[3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) ut[i * 3 + j] = h.A[j * 3 + i];
+    for (int k = 0; k < 3; ++k)
+        ua[k] = static_cast<float>(h.ad[k] - off[k] + (static_cast<double>(h.A[k * 3]) * off[0] + static_cast<double>(h.A[k * 3 + 1]) * off[1] +
+                                                       static_cast<double>(h.A[k * 3 + 2]) * off[2]));
+    mul3(ut, Gm, Gu);
+    for (int k = 0; k < 3; ++k) d[k] = gm_o[k] - ua[k];
+    for (int k = 0; k < 3; ++k) gu_o[k] = ut[k * 3] * d[0] + ut[k * 3 + 1] * d[1] + ut[k * 3 + 2] * d[2];
+}
 float g_bt_body[3] = {0.0f, 0.174f, -0.985f};  // under g_draw_mutex
 uint64_t g_bt_body_frame = 0;
 bool g_bt_body_ok = false;
@@ -1113,6 +1155,46 @@ std::atomic<int> g_grip_src_pub{-1}, g_grip_pose_pub{-1};  // for grip_source_na
 std::atomic<bool> g_sawed_grip{true};  // [Reload] SawedOffGrip (run 8 item 2)
 std::atomic<bool> g_steady_grip{true};  // [Reload] SteadyRing (run 8 item 2): a learned grip the mean of its first 30 samples, then kept
 int g_grip_n[40][2] = {};               // the samples in each weapon's pose's grip (kGripW weapons)
+// [Weapon.<Gun>] FrontHandPose (2026-10-09): 0 automatic (the game's state picks the hold), 1 the lowered hold, 2 the
+// aiming hold (the default since run 9), each with the fingers the game's hand had in it (relative to its wrist, captured with the hold's learning)
+std::atomic<int> g_front_pose[kGripW] = {};
+struct FingerRel {
+    bool valid = false;
+    bool has[15] = {};
+    float M[15][9] = {};
+    float t[15][3] = {};
+};
+FingerRel g_front_fingers[kGripW][2];
+std::atomic<uint32_t> g_front_seen[kGripW] = {};  // bit 0/1: the lowered/aiming hold learned; bit 2/3: its fingers
+std::atomic<uint64_t> g_front_finger_frames{0};
+// a hand's fingers relative to its wrist in a bone set (12 floats a bone: [R | t] row-major), none for a collapsed hand
+FingerRel finger_rel(const float* s, int nb, int hand) {
+    FingerRel r;
+    const int wb = g_rig.wrist[hand];
+    if (wb < 0 || wb >= nb) return r;
+    const float* w = s + wb * 12;
+    float WR[9], wt[3];
+    for (int i = 0; i < 3; ++i) {
+        for (int k = 0; k < 3; ++k) WR[i * 3 + k] = w[i * 4 + k];
+        wt[i] = w[i * 4 + 3];
+    }
+    if (std::sqrt(WR[0] * WR[0] + WR[3] * WR[3] + WR[6] * WR[6]) < 0.5f) return r;
+    int got = 0;
+    for (int i = 0; i < 15; ++i) {
+        const int fb = g_rig.finger[hand][i];
+        if (fb < 0 || fb >= nb) continue;
+        const float* m = s + fb * 12;
+        for (int a = 0; a < 3; ++a) {  // W^T F, W^T (t_f - t_w)
+            for (int b = 0; b < 3; ++b)
+                r.M[i][a * 3 + b] = WR[0 * 3 + a] * m[0 * 4 + b] + WR[1 * 3 + a] * m[1 * 4 + b] + WR[2 * 3 + a] * m[2 * 4 + b];
+            r.t[i][a] = WR[0 * 3 + a] * (m[3] - wt[0]) + WR[1 * 3 + a] * (m[7] - wt[1]) + WR[2 * 3 + a] * (m[11] - wt[2]);
+        }
+        r.has[i] = true;
+        ++got;
+    }
+    r.valid = got >= 10;
+    return r;
+}
 GripRel g_grip_builtin[2];   // filled at first use (built_in_grips)
 GripRel g_grip_sawed[2];     // the Sawed-off's (run 8 item 2; built_in_grips)
 void built_in_grips() {
@@ -1573,6 +1655,49 @@ void corr_point(const Corr& c, const float* in, float* out) {
 }
 
 // The axis-angle of a rotation matrix.
+// "skel parts post" and TwoHandShotLog: the drawn gun against its first recorded frame (deg/mm over time) and the drawn
+// left wrist in the drawn gun's frame (under g_draw_mutex)
+std::string parts_post() {
+    int first = -1;
+    for (int i = 0; i < g_parts_n; ++i)
+        if (g_parts[i].post_ok) {
+            first = i;
+            break;
+        }
+    if (first < 0) return std::string("parts post: none");
+    float worst_a = 0, worst_t = 0, worst_l = 0;
+    std::string series;
+    char b[200];
+    float l0[3] = {}, ll[3] = {};
+    for (int i = first, k = 0; i < g_parts_n; ++i, ++k) {
+        if (!g_parts[i].post_ok) continue;
+        float D[12], ax[3], an = 0;
+        rel_set(g_parts[first].post, g_parts[i].post, D);
+        const float Rr[9] = {D[0], D[1], D[2], D[4], D[5], D[6], D[8], D[9], D[10]};
+        to_axis_angle(Rr, ax, &an);
+        const float tl = std::sqrt(D[3] * D[3] + D[7] * D[7] + D[11] * D[11]);
+        worst_a = std::fmax(worst_a, an * 57.2958f);
+        worst_t = std::fmax(worst_t, tl * 1000.0f);
+        // the drawn left wrist in the drawn gun's frame: its move from the first frame (mm)
+        float gi[12], L[12];
+        float lm = 0;
+        if (inv34(g_parts[i].post, gi)) {
+            mul34(gi, g_parts[i].left, L);
+            if (i == first) l0[0] = L[3], l0[1] = L[7], l0[2] = L[11];
+            ll[0] = L[3], ll[1] = L[7], ll[2] = L[11];
+            lm = std::sqrt((L[3] - l0[0]) * (L[3] - l0[0]) + (L[7] - l0[1]) * (L[7] - l0[1]) + (L[11] - l0[2]) * (L[11] - l0[2])) * 1000.0f;
+            worst_l = std::fmax(worst_l, lm);
+        }
+        if (k % 6 == 0) {
+            std::snprintf(b, sizeof(b), " %.1f/%.0f/%.0f/%.1f", an * 57.2958f, tl * 1000.0f, lm, g_parts[i].phase);
+            series += b;
+        }
+    }
+    std::snprintf(b, sizeof(b), "parts post: worst %.2f deg %.1f mm, the left wrist on it %.1f mm (at first (%.1f %.1f %.1f) mm in the gun, at last (%.1f %.1f %.1f)) | deg/mm/left mm/clip:",
+                  worst_a, worst_t, worst_l, l0[0] * 1000.0f, l0[1] * 1000.0f, l0[2] * 1000.0f, ll[0] * 1000.0f, ll[1] * 1000.0f, ll[2] * 1000.0f);
+    return b + series;
+}
+
 void to_axis_angle(const float* R, float* axis, float* ang) {
     float c = (R[0] + R[4] + R[8] - 1) * 0.5f;
     c = c < -1 ? -1 : c > 1 ? 1 : c;
@@ -2009,18 +2134,32 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                     }
                     const bool keep = f.two_blend > 0.0f && g_same_frame_cfg.load(std::memory_order_relaxed);  // TwoHandedSteady: held
                     // the pose's hysteresis (run 8 item 2): the learned pose changes only when the other offset is nearer
-                    // by 1 cm; the aim flag's only once it has held 300 ms
+                    // by half the two offsets' distance, at least 1 cm (2026-10-09: 1 cm alone let the game's wrist sway
+                    // carry a lowered long gun's hand across the middle every 0.4 s); either rule's new pose only once
+                    // wanted for 300 ms (take_pose)
                     const bool hyst = g_sawed_grip.load(std::memory_order_relaxed);
                     int learned = da < dh ? 1 : 0;
-                    if (hyst && learned != g_grip_pose && std::fabs(std::sqrt(da) - std::sqrt(dh)) < 0.01f) learned = g_grip_pose;
-                    static int flag_was = -1;
-                    static double flag_since = 0.0;
-                    const int flag = hs->aiming ? 1 : 0;
-                    if (flag != flag_was) {
-                        flag_was = flag;
-                        flag_since = log::now_ms();
-                    }
-                    const int flag_pose = !hyst || log::now_ms() - flag_since >= 300.0 ? flag : g_grip_pose;
+                    float sep = 0.0f;
+                    for (int k = 0; k < 3; ++k) sep += (hs->ik[k] - hs->ik_hold[k]) * (hs->ik[k] - hs->ik_hold[k]);
+                    const float margin = std::fmax(0.01f, 0.5f * std::sqrt(sep));
+                    if (hyst && learned != g_grip_pose && std::fabs(std::sqrt(da) - std::sqrt(dh)) < margin) learned = g_grip_pose;
+                    const int flag_pose = hs->aiming ? 1 : 0;
+                    // a new pose taken once it has been wanted for 300 ms on end, whichever rule wants it (2026-10-09: a long
+                    // gun held lowered about 30 degrees, the game's hand at the learning's 6 cm edge: the learned pose and the
+                    // aim flag's in turn, a flip every frame or two, the ring 35-49 mm each time)
+                    static int pose_cand = -1;
+                    static double pose_since = 0.0, last_learn_ms = -1e9;
+                    auto take_pose = [&](int want) {
+                        if (hyst && want != g_grip_pose) {
+                            if (want != pose_cand) {
+                                pose_cand = want;
+                                pose_since = log::now_ms();
+                            }
+                            if (log::now_ms() - pose_since < 300.0) return;
+                        }
+                        pose_cand = -1;
+                        g_grip_pose = want;
+                    };
                     if (keep) {
                         // the grip and its pose kept while the front hand holds the gun
                     } else if (pair_frames >= 5 && has_ik && std::fmin(da, dh) < 0.06f * 0.06f) {
@@ -2028,8 +2167,10 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                             ++g_two_learns;
                             if (learned != g_grip_pose) ++g_two_flips;
                         }
-                        g_grip_pose = learned;
+                        take_pose(learned);
+                        last_learn_ms = log::now_ms();
                         const int slot_pose = da < dh ? 1 : 0;  // the sample is the nearer pose's, whichever is used
+                        const FingerRel fr_now = finger_rel(s, n, 0);  // the game's left hand's fingers in this hold
                         GripRel scratch;
                         const bool known_w = f.weapon >= 0 && f.weapon < kGripW;
                         GripRel& gr = known_w ? g_grips[f.weapon][slot_pose] : scratch;
@@ -2052,6 +2193,14 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                             gr.valid = true;
                             if (n < 1000) ++n;
                             g_grip_tpl[slot_pose] = gr;
+                            if (known_w) {
+                                uint32_t bits = 1u << slot_pose;
+                                if (fr_now.valid) {
+                                    g_front_fingers[f.weapon][slot_pose] = fr_now;
+                                    bits |= 4u << slot_pose;
+                                }
+                                g_front_seen[f.weapon].fetch_or(bits, std::memory_order_relaxed);
+                            }
                         }
                         g_grip_learns.fetch_add(1, std::memory_order_relaxed);
                     } else if (!has_ik || std::fmin(da, dh) >= 0.06f * 0.06f) {
@@ -2059,30 +2208,37 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                         // no grip learned this frame: the game's aim state picks the pose; a gun with no grip of its own
                         // (it borrows one) keeps the aiming pose (run 8 item 2: the aim flag slid its ring 3-10 cm)
                         const int pose = own || !g_sawed_grip.load(std::memory_order_relaxed) ? flag_pose : 1;
-                        if (f.two_blend > 0.0f && pose != g_grip_pose) ++g_two_flips;
-                        g_grip_pose = pose;
+                        // the aim flag only once nothing was learned for a second: a hand at the 6 cm edge keeps its learned
+                        // pose (2026-10-09: the flag's and the learned pose in turn, the ring 45 mm)
+                        if (!(hyst && log::now_ms() - last_learn_ms < 1000.0)) {
+                            if (f.two_blend > 0.0f && pose != g_grip_pose) ++g_two_flips;
+                            take_pose(pose);
+                        }
                     }
                 }
                 built_in_grips();
                 const GripRel* want = nullptr;
                 int src = 2;
+                // [Weapon.<Gun>] FrontHandPose: the gun's fixed hold, else the game's state's
+                const int fixed_pose = f.weapon >= 0 && f.weapon < kGripW ? g_front_pose[f.weapon].load(std::memory_order_relaxed) : 0;
+                const int pose_use = fixed_pose == 1 ? 0 : fixed_pose == 2 ? 1 : g_grip_pose;
                 if (f.weapon >= 0 && f.weapon < kGripW) {
-                    if (g_grips[f.weapon][g_grip_pose].valid)
-                        want = &g_grips[f.weapon][g_grip_pose], src = 0;
-                    else if (g_grips[f.weapon][1 - g_grip_pose].valid)
-                        want = &g_grips[f.weapon][1 - g_grip_pose], src = 0;
+                    if (g_grips[f.weapon][pose_use].valid)
+                        want = &g_grips[f.weapon][pose_use], src = 0;
+                    else if (g_grips[f.weapon][1 - pose_use].valid)
+                        want = &g_grips[f.weapon][1 - pose_use], src = 0;
                 }
                 // the Sawed-off (15): the game never holds it two-handed, so it learns no grip; the Double-barrel's
                 // as learned in the simulator (the same bones and IK offsets), before the template (the last long
                 // gun's, in that gun's own frame: the ring sat elsewhere each session)
-                if (!want && f.weapon == 15 && g_sawed_grip.load(std::memory_order_relaxed)) want = &g_grip_sawed[g_grip_pose], src = 3;
+                if (!want && f.weapon == 15 && g_sawed_grip.load(std::memory_order_relaxed)) want = &g_grip_sawed[pose_use], src = 3;
                 if (!want && g_fallback_cfg.load(std::memory_order_relaxed)) {
-                    if (g_grip_tpl[g_grip_pose].valid)
-                        want = &g_grip_tpl[g_grip_pose], src = 1;
-                    else if (g_grip_tpl[1 - g_grip_pose].valid)
-                        want = &g_grip_tpl[1 - g_grip_pose], src = 1;
+                    if (g_grip_tpl[pose_use].valid)
+                        want = &g_grip_tpl[pose_use], src = 1;
+                    else if (g_grip_tpl[1 - pose_use].valid)
+                        want = &g_grip_tpl[1 - pose_use], src = 1;
                     else
-                        want = &g_grip_builtin[g_grip_pose], src = 2;
+                        want = &g_grip_builtin[pose_use], src = 2;
                 }
                 // a fallback: the hand kept where it took hold along the barrel (its z in the gun's frame, at the hold's start)
                 static bool z_locked = false;
@@ -2095,6 +2251,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                         } else if (!z_locked) {
                             float Gq[9], gq_o[3], Gdq[9], gdq_o[3], Tq[3], rt[3];
                             frame_of(hs->game, Gq, gq_o);
+                            if (fixed_grip_on() && g_snap_drawn_cfg.load(std::memory_order_relaxed)) unplace(*hs, off, Gm, gm_o, Gq, gq_o);  // the drawn gun's
                             const int rb0 = g_rig.att_wrist[1] >= 0 && g_rig.att_wrist[1] < n ? g_rig.att_wrist[1] : g_rig.wrist[1];
                             const Corr& c0 = mir ? xt : g_corr[rb0];  // the drawn gun
                             mul3(c0.A, Gq, Gdq);
@@ -2119,7 +2276,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                 if (slot == 0) {
                     g_grip_src = want ? src : -1;
                     g_grip_src_pub.store(g_grip_src, std::memory_order_relaxed);
-                    g_grip_pose_pub.store(g_grip_pose, std::memory_order_relaxed);
+                    g_grip_pose_pub.store(pose_use, std::memory_order_relaxed);
                 }
                 if (want && slot == 0 && g_grip_cur_frame != g_body_frame) {
                     g_grip_cur_frame = g_body_frame;
@@ -2159,8 +2316,19 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                     const int rb = g_rig.att_wrist[1] >= 0 && g_rig.att_wrist[1] < n ? g_rig.att_wrist[1] : g_rig.wrist[1];
                     const Corr& cr = mir ? xt : g_corr[rb];
                     float Gd[9], gd_o[3];
-                    mul3(cr.A, Gg, Gd);
-                    corr_point(cr, gg_o, gd_o);
+                    // [Reload] SnapToDrawnGun: with FixedGunGrip, the gun as drawn (the sample's matrix with its placement at
+                    // the drawn hand undone, as held_delta draws it) instead of the game's own
+                    const float* Gs = Gg;
+                    const float* gs_o = gg_o;
+                    float Gu[9], gu_o[3];
+                    if (fixed_grip_on() && g_snap_drawn_cfg.load(std::memory_order_relaxed)) {
+                        unplace(*hs, off, Gm, gm_o, Gu, gu_o);
+                        Gs = Gu;
+                        gs_o = gu_o;
+                        if (slot == 0) g_snap_drawn_frames.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    mul3(cr.A, Gs, Gd);
+                    corr_point(cr, gs_o, gd_o);
                     {  // [Reload] LeverParts: the drawn gun held still in the gun hand's target through John's fire
                        // clip, as its draw is (this frame's: the clip swings it fast)
                         static float G2[12];
@@ -2770,6 +2938,47 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
             }
         }
     }
+    {  // [Weapon.<Gun>] FrontHandPose: a fixed hold's own fingers on the front hand (John's left; not with the gun in his
+       // left, the transplant), blended from the game's by the two-handed hold
+        const bool mir_now = f.mirror && f.xfer && f.gun_j == 0 && f.item_side == 1;
+        const int fp = f.weapon >= 0 && f.weapon < kGripW ? g_front_pose[f.weapon].load(std::memory_order_relaxed) : 0;
+        const FingerRel* fr = fp > 0 ? &g_front_fingers[f.weapon][fp - 1] : nullptr;
+        const float b = f.two_blend > 1.0f ? 1.0f : f.two_blend;
+        const int wb = g_rig.wrist[0];
+        if (fr && fr->valid && f.long_gun && !mir_now && !f.xfer && f.gun_j == 1 && b > 0.0f && wb >= 0 && wb < n) {
+            const FingerRel live = finger_rel(s, n, 0);
+            float* w = s + wb * 12;
+            float WR[9], wt[3];
+            for (int i = 0; i < 3; ++i) {
+                for (int k = 0; k < 3; ++k) WR[i * 3 + k] = w[i * 4 + k];
+                wt[i] = w[i * 4 + 3];
+            }
+            for (int i = 0; live.valid && i < 15; ++i) {
+                const int fb = g_rig.finger[0][i];
+                if (fb < 0 || fb >= n || !fr->has[i] || !live.has[i]) continue;
+                float M[9], t[3];
+                if (b >= 1.0f) {
+                    std::memcpy(M, fr->M[i], sizeof(M));
+                    std::memcpy(t, fr->t[i], sizeof(t));
+                } else {  // from the live finger toward the hold's: its turn and its place by the blend
+                    float lt[9], d[9], ax[3], ang = 0.0f, rp[9];
+                    for (int a = 0; a < 3; ++a)
+                        for (int c = 0; c < 3; ++c) lt[a * 3 + c] = live.M[i][c * 3 + a];
+                    mul3(fr->M[i], lt, d);
+                    to_axis_angle(d, ax, &ang);
+                    axis_angle(ax, ang * b, rp);
+                    mul3(rp, live.M[i], M);
+                    for (int k = 0; k < 3; ++k) t[k] = live.t[i][k] + (fr->t[i][k] - live.t[i][k]) * b;
+                }
+                float* m = s + fb * 12;  // F = W rel
+                for (int a = 0; a < 3; ++a) {
+                    for (int c = 0; c < 3; ++c) m[a * 4 + c] = WR[a * 3 + 0] * M[0 * 3 + c] + WR[a * 3 + 1] * M[1 * 3 + c] + WR[a * 3 + 2] * M[2 * 3 + c];
+                    m[a * 4 + 3] = WR[a * 3 + 0] * t[0] + WR[a * 3 + 1] * t[1] + WR[a * 3 + 2] * t[2] + wt[a];
+                }
+            }
+            if (slot == 0 && live.valid) g_front_finger_frames.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (slot == 0) {  // "skel fingers": each hand's fingers' mean turn from its wrist (degrees), as drawn this frame
         for (int h = 0; h < 2; ++h) {
             const int wb = g_rig.wrist[h];
@@ -2859,6 +3068,11 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         const int bside = hb ? (hb->left ? 0 : 1) : -1, bj = f.gun_j;
         if (hb && bside >= 0 && bj >= 0 && bj < 2 && f.ik[bj]) {
             float gz[3] = {-hb->game[8], -hb->game[9], -hb->game[10]}, dw[3];
+            if (fixed_grip_on() && g_snap_drawn_cfg.load(std::memory_order_relaxed)) {
+                // [Reload] SnapToDrawnGun: the drawn gun's barrel (the sample's, its placement's turn undone)
+                const float mz[3] = {-hb->m[8], -hb->m[9], -hb->m[10]};
+                for (int k = 0; k < 3; ++k) gz[k] = hb->A[k] * mz[0] + hb->A[3 + k] * mz[1] + hb->A[6 + k] * mz[2];
+            }
             norm(gz);
             const Corr& c = item[bside];
             for (int k = 0; k < 3; ++k) dw[k] = c.A[k * 3] * gz[0] + c.A[k * 3 + 1] * gz[1] + c.A[k * 3 + 2] * gz[2];
@@ -2993,6 +3207,48 @@ bool in_box(const float* b, const float* m) {
 
 // The sample (an index into g_frame.held) whose matrix the record matrix `rm` is (the item in hand), else -1: the
 // origin and the first row within 2 mm; of several (a still gun's), the newest.
+// "skel near": the draws near the item in hand (render thread; reads only)
+struct NearDraw {
+    uintptr_t drawable;
+    int kind;  // 1 a matrix set, 2 rigid
+    int count;
+    float dmin;
+    float at[3];
+    uint64_t n;
+    int abone;    // the nearest attachment bone (g_rig.attach's), at its nearest
+    float adist;
+};
+std::atomic<bool> g_near_on{false};
+std::mutex g_near_mutex;
+NearDraw g_near[24];
+int g_nnear = 0;
+void note_near(uintptr_t drawable, int kind, int count, const float* pos, const float* item) {
+    const float dx = pos[0] - item[0], dy = pos[1] - item[1], dz = pos[2] - item[2];
+    const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (d > 0.6f) return;
+    int ab = -1;
+    float ad = 1e9f;
+    const std::vector<float>& ap = g_frame.attach_pos;
+    for (size_t i = 0; i * 3 + 2 < ap.size() && i < g_rig.attach.size(); ++i) {
+        const float ex = pos[0] - ap[i * 3], ey = pos[1] - ap[i * 3 + 1], ez = pos[2] - ap[i * 3 + 2];
+        const float e = std::sqrt(ex * ex + ey * ey + ez * ez);
+        if (e < ad) ad = e, ab = g_rig.attach[i];
+    }
+    std::lock_guard lock(g_near_mutex);
+    for (int i = 0; i < g_nnear; ++i)
+        if (g_near[i].drawable == drawable && g_near[i].kind == kind) {
+            ++g_near[i].n;
+            if (d < g_near[i].dmin) {
+                g_near[i].dmin = d;
+                std::memcpy(g_near[i].at, pos, sizeof(g_near[i].at));
+                g_near[i].abone = ab;
+                g_near[i].adist = ad;
+            }
+            return;
+        }
+    if (g_nnear < 24) g_near[g_nnear++] = {drawable, kind, count, d, {pos[0], pos[1], pos[2]}, 1, ab, ad};
+}
+
 int held_match(const float* rm) {
     int best = -1;
     for (int i = 0; i < kHeldRing; ++i) {
@@ -3253,12 +3509,15 @@ bool place_copy(uintptr_t W, const float* P, int j) {
 // gun's is learned: the built-in (measured in the simulator), else the last learned on any long gun (the template),
 // else the game's own. The muzzle, the barrel ray, the shots, the copy and the second gun follow the placed gun.
 std::atomic<bool> g_fixed_grip{false};
+bool fixed_grip_on() { return g_fixed_grip.load(std::memory_order_relaxed); }
+std::atomic<bool> g_fixed_sidearm{false};  // [Hands] FixedSidearmGrip: the sidearms held by their aiming hold too
 struct GunRel {
     bool valid = false;
     float m[16] = {};  // the gun in the animated wrist's frame (rows: the axes, then the position)
 };
 GunRel g_gun_rel[kGripW];    // learned per eWeapon (game thread; copied out under g_fg_mutex)
 GunRel g_gun_rel_tpl;        // the last learned on any long gun
+GunRel g_gun_rel_tpl_side;   // the last learned on any sidearm (a sidearm never borrows a long gun's)
 std::mutex g_fg_mutex;
 struct FixedGripDiag {
     int weapon = -1, aiming = 0, src = -1, side = -1;  // src: 0 learned, 1 built-in, 2 template, 3 the game's, -1 off
@@ -3339,7 +3598,7 @@ void save_gun_rel(int w, const float* m) {
     config::set("Grips", (std::string("GunHand.") + holster::weapon_token(w)).c_str(), b);
 }
 void load_gun_rels() {
-    for (int w = 8; w <= 20; ++w) {
+    for (int w = 0; w <= 20; ++w) {
         const std::string s = config::get_string("Grips", (std::string("GunHand.") + holster::weapon_token(w)).c_str(), "");
         float v[12];
         if (s.empty() || sscanf_s(s.c_str(), "%f %f %f %f %f %f %f %f %f %f %f %f", v, v + 1, v + 2, v + 3, v + 4, v + 5, v + 6, v + 7, v + 8,
@@ -3380,7 +3639,10 @@ void fixed_grip(int side, float* src) {
     if (!rigid_axes(Wr) || !inv44(Wr, Wi)) return fail(3);
     RdrvrActorState ws{};
     const int w = api::actor_state(&ws) && ws.valid ? ws.weapon : -1;
-    if (!is_long_gun_w(w)) return fail(4);
+    const bool sidearm = w >= 0 && w <= 7;
+    if (!is_long_gun_w(w) && !sidearm) return fail(4);
+    const bool fix_on = sidearm ? g_fixed_sidearm.load(std::memory_order_relaxed) : g_fixed_grip.load(std::memory_order_relaxed);
+    GunRel& tpl = sidearm ? g_gun_rel_tpl_side : g_gun_rel_tpl;
     mul44r(S, Wi, rel);
     const bool aiming = holster::aim_pose() || aim::aiming();  // the gun controller's aim pose (G +0x5d6 & 0x40), or the zoom
     const uint64_t af = aiming ? g_fg_aim_frames.fetch_add(1, std::memory_order_relaxed) + 1 : (g_fg_aim_frames.store(0), 0);
@@ -3401,7 +3663,9 @@ void fixed_grip(int side, float* src) {
         d.att_pos[k] = ab_ok ? Ab[12 + k] : 0.0f;
     }
     GunRel& g = g_gun_rel[w];
-    if (aiming && af > 20 && rigid_axes(rel) && rel[12] * rel[12] + rel[13] * rel[13] + rel[14] * rel[14] < 1.0f) {  // steady aiming: learn (an easing)
+    // steady aiming: learn (an easing); [Reload] SnapToDrawnGun: not through the fire clip (it moves the gun in the hand)
+    if (aiming && af > 20 && rigid_axes(rel) && rel[12] * rel[12] + rel[13] * rel[13] + rel[14] * rel[14] < 1.0f &&
+        !(fix_on && g_snap_drawn_cfg.load(std::memory_order_relaxed) && in_fire_clip())) {
         if (!g.valid) {
             std::memcpy(g.m, rel, sizeof(rel));
             g.valid = true;
@@ -3409,8 +3673,8 @@ void fixed_grip(int side, float* src) {
             for (int i = 0; i < 15; ++i) g.m[i] += 0.1f * (rel[i] - g.m[i]);
             ortho_rows(g.m);
         }
-        g_gun_rel_tpl = g;
-        if (++d.learns == 60 && g_fixed_grip.load(std::memory_order_relaxed) && !g_gun_rel_saved[w].exchange(true)) {
+        tpl = g;
+        if (++d.learns == 60 && fix_on && !g_gun_rel_saved[w].exchange(true)) {
             // a second of aiming, the switch on: saved once a session per gun, written by a work item (no file I/O here)
             GunRelSave* s = new GunRelSave{w, {}};
             std::memcpy(s->m, g.m, sizeof(s->m));
@@ -3429,8 +3693,8 @@ void fixed_grip(int side, float* src) {
         src_kind = 0;
     } else if (builtin_gun_rel(w, ref)) {
         src_kind = 1;
-    } else if (g_gun_rel_tpl.valid) {
-        std::memcpy(ref, g_gun_rel_tpl.m, sizeof(ref));
+    } else if (tpl.valid) {
+        std::memcpy(ref, tpl.m, sizeof(ref));
         src_kind = 2;
     }
     if (src_kind < 3) {
@@ -3446,10 +3710,10 @@ void fixed_grip(int side, float* src) {
         if ((mm > 10.0f || deg > 5.0f) && now - last_log > 5000.0) {  // at most a line every 5 s
             last_log = now;
             log::info("[grip] the %s's hold in the wrist %.1f mm and %.1f deg off its aiming hold (src %d): aiming %d, fixed %d",
-                      holster::weapon_token(w), mm, deg, src_kind, aiming ? 1 : 0, g_fixed_grip.load() ? 1 : 0);
+                      holster::weapon_token(w), mm, deg, src_kind, aiming ? 1 : 0, fix_on ? 1 : 0);
         }
     }
-    d.src = g_fixed_grip.load(std::memory_order_relaxed) ? src_kind : -1;
+    d.src = fix_on ? src_kind : -1;
     if (d.src >= 0 && d.src < 3 && rigid_axes(ref)) {
         ref[3] = ref[7] = ref[11] = 0.0f;
         ref[15] = 1.0f;
@@ -3492,6 +3756,87 @@ void fixed_grip_placed(int side, const float* A, const double* ad, const float* 
 }
 
 // The game thread: the player's held prop placed at the drawn hand (see g_held_at_hand_cfg), and the second gun's.
+// the lasso's draw: its rope's points draws below it are the lasso's
+void hk_lasso_draw(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+    g_lasso_draws.fetch_add(1, std::memory_order_relaxed);
+    ++t_lasso_draw;
+    o_lasso_draw(a, b, c, d, e, f);
+    --t_lasso_draw;
+}
+
+// The rope's points draw (render thread): inside the lasso's draw, a corrected copy of its points
+void hk_rope_points(uintptr_t lod, uint64_t cam, uintptr_t model, uintptr_t pts, uintptr_t ld, uint32_t p6, uint32_t p7) {
+    // only on the render thread (the corrections and the frame are its own)
+    // and only with the lasso in hand (eWeapon 21): the coil at the belt is drawn here too, near the game's hands at the hip
+    if (!t_lasso_draw || !pts || !g_lasso_cfg.load(std::memory_order_relaxed) || !g_corr_world_valid || !g_frame.valid || g_frame.weapon != 21 ||
+        *reinterpret_cast<const DWORD*>(anchors::addr(anchors::Id::RenderThreadId)) != GetCurrentThreadId())
+        return o_rope_points(lod, cam, model, pts, ld, p6, p7);
+    alignas(16) static thread_local float buf[0x810 / 4];
+    int32_t n = 0;
+    if (!raw(pts + 0x800, &n, sizeof(n)) || n <= 0 || n > 128 || !raw(pts, buf, 0x804)) return o_rope_points(lod, cam, model, pts, ld, p6, p7);
+    // the game's wrists (their attachment bones' positions this frame) and their world corrections
+    float wp[2][3];
+    const Corr* wc[2] = {nullptr, nullptr};
+    for (int h = 0; h < 2; ++h) {
+        const int wb = g_rig.att_wrist[h] >= 0 ? g_rig.att_wrist[h] : g_rig.wrist[h];
+        wp[h][0] = wp[h][1] = wp[h][2] = 1e9f;
+        for (size_t i = 0; i < g_rig.attach.size() && i * 3 + 2 < g_frame.attach_pos.size(); ++i)
+            if (g_rig.attach[i] == wb) std::memcpy(wp[h], &g_frame.attach_pos[i * 3], sizeof(wp[h]));
+        if (wb >= 0 && wb < static_cast<int>(g_corr_world.size())) wc[h] = &g_corr_world[wb];
+    }
+    int moved = 0;
+    float first[3], last[3];
+    std::memcpy(first, buf, sizeof(first));
+    std::memcpy(last, buf + (n - 1) * 4, sizeof(last));
+    for (int i = 0; i < n; ++i) {
+        float* p = buf + i * 4;
+        // how much it moves: by the nearer hand's distance (full within 0.5 m: the coil hangs to 0.45 m from its wrist;
+        // none past 1.0 m: a thrown loop keeps the game's place); which hand moves it: each by 1 / d^4 (the nearer
+        // rules; halfway between them, the rope stretched between both)
+        float dist[2] = {1e9f, 1e9f};
+        for (int h = 0; h < 2; ++h) {
+            if (!wc[h]) continue;
+            const float dx = p[0] - wp[h][0], dy = p[1] - wp[h][1], dz = p[2] - wp[h][2];
+            dist[h] = std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        const float dn = std::fmin(dist[0], dist[1]);
+        const float amount = dn <= 0.5f ? 1.0f : dn >= 1.0f ? 0.0f : (1.0f - dn) / 0.5f;
+        if (amount <= 0.0f) continue;
+        float share[2] = {0, 0};
+        {
+            const float i0 = wc[0] ? 1.0f / std::fmax(1e-4f, dist[0] * dist[0] * dist[0] * dist[0]) : 0.0f;
+            const float i1 = wc[1] ? 1.0f / std::fmax(1e-4f, dist[1] * dist[1] * dist[1] * dist[1]) : 0.0f;
+            share[0] = i0 / (i0 + i1);
+            share[1] = i1 / (i0 + i1);
+        }
+        float q[3] = {p[0], p[1], p[2]};
+        for (int h = 0; h < 2; ++h) {
+            if (!wc[h] || share[h] <= 0.0f) continue;
+            const Corr& c = *wc[h];
+            for (int k = 0; k < 3; ++k) {
+                const float t = c.A[k * 3] * p[0] + c.A[k * 3 + 1] * p[1] + c.A[k * 3 + 2] * p[2] + c.a[k];
+                q[k] += amount * share[h] * (t - p[k]);
+            }
+        }
+        std::memcpy(p, q, sizeof(q));
+        ++moved;
+    }
+    g_lasso_points.fetch_add(1, std::memory_order_relaxed);
+    if (moved) g_lasso_moved.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(g_lasso_mutex);
+        std::memcpy(g_lasso_dbg[0], first, sizeof(first));
+        std::memcpy(g_lasso_dbg[1], last, sizeof(last));
+        std::memcpy(g_lasso_dbg[2], wp[0], sizeof(wp[0]));
+        std::memcpy(g_lasso_dbg[3], wp[1], sizeof(wp[1]));
+        std::memcpy(g_lasso_dbg[4], buf, 12);
+        std::memcpy(g_lasso_dbg[5], buf + (n - 1) * 4, 12);
+        g_lasso_n = n;
+        g_lasso_moved_n = moved;
+    }
+    o_rope_points(lod, cam, model, reinterpret_cast<uintptr_t>(buf), ld, p6, p7);
+}
+
 uint64_t hk_obj_set_matrix(uintptr_t obj, const float* m) {
     if (reinterpret_cast<uintptr_t>(_ReturnAddress()) != g_gun_place_ret || !m || !g_held_at_hand_cfg.load(std::memory_order_relaxed) ||
         !g_held_fix_cfg.load(std::memory_order_relaxed))
@@ -3549,6 +3894,20 @@ uint64_t hk_obj_set_matrix(uintptr_t obj, const float* m) {
                                                  static_cast<double>(A[k * 3 + 2]) * src[14] + ad[k]);
     g_place_buf[15] = src[15];
     fixed_grip_placed(lf ? 0 : 1, A, ad, g_place_buf);
+    {  // [Gestures] ThrowByGrip: the readied throwing knife by its tip, turned 180 deg about its local axis through the
+       // pivot c: the other two axes negated, the origin moved by 2 c along them
+        int ax = 0;
+        float c[3];
+        if (aim::knife_tip(&ax, c)) {
+            for (int i = 0; i < 3; ++i) {
+                if (i == ax) continue;
+                for (int k = 0; k < 3; ++k) {
+                    g_place_buf[12 + k] += 2.0f * c[i] * g_place_buf[i * 4 + k];
+                    g_place_buf[i * 4 + k] = -g_place_buf[i * 4 + k];
+                }
+            }
+        }
+    }
     g_placed_seq.fetch_add(1, std::memory_order_acq_rel);  // odd while writing
     g_placed.W = W;
     g_placed.build = g_vis_builds.load(std::memory_order_relaxed);
@@ -3697,6 +4056,7 @@ int own_follow_pose(float* pose) {  // John's hand of the copy (0 left, 1 right)
 struct FollowObj {  // zero-initialised (the arrays stay in .bss)
     bool ok, stale;
     int side;  // John's hand: 0 left, 1 right
+    int w;     // the weapon in hand then (the baseline restarts when it changes)
     float m[12];
 };
 struct FollowSample {
@@ -3711,6 +4071,8 @@ FollowSample g_follow[kFollowMax];
 int g_follow_n = 0;
 std::atomic<bool> g_follow_rec{false};
 std::atomic<int> g_follow_pass{1};
+std::atomic<bool> g_follow_auto{true};  // [Debug] FollowLog: re-armed every 10 s with an item in hand, the report logged
+bool g_follow_manual = false;  // a test's recording ("skel follow arm") not yet read ("skel follow"): never re-armed over (under g_draw_mutex)
 FollowSample* follow_at(uint64_t frame) {
     if (!g_follow_rec.load(std::memory_order_relaxed) || static_cast<int>(t_draw_pass & 7) != g_follow_pass.load(std::memory_order_relaxed))
         return nullptr;
@@ -3732,8 +4094,75 @@ void follow_obj(int which, int side, const float* m) {  // the object's next dra
     FollowObj& o = fs->obj[which][k];
     std::memcpy(o.m, m, sizeof(o.m));
     o.side = side;
+    o.w = g_frame.weapon;
     o.stale = g_corr_frame != g_body_frame;
     o.ok = true;
+}
+// each object in its wrist's frame (X = W^-1 O) against the first such frame of its gun: the move (mm) and turn (deg);
+// the wrist's own speed (mm a frame), to tell a gun a frame late (its error grows with the speed) from an offset. Under
+// g_draw_mutex; each line logged with `tag`
+std::string follow_report(const char* tag) {
+    std::string o;
+    char b[400];
+    for (int which = 0; which < 6; ++which) {
+        const int obj = which / 2, e = which % 2;  // the object, the eye (its k-th draw of the pass)
+        const char* name = obj == 0 ? "gun in hand" : obj == 1 ? "own model" : "copy";
+        float X0[12];
+        bool have0 = false;
+        int n = 0, nfast = 0, nstale = 0, w0 = -2, wl = -1, s0 = -1;
+        float worst_t = 0, worst_a = 0, sum2 = 0, fast_t = 0, slow_t = 0, wsp_max = 0;
+        const float* wprev = nullptr;
+        for (int i = 0; i < g_follow_n; ++i) {
+            const FollowSample& s = g_follow[i];
+            const FollowObj& fo = s.obj[obj][e];
+            const int side = fo.side;
+            const float* O = fo.m;
+            if (!fo.ok || side < 0 || side > 1 || !s.w_ok[e][side]) {
+                wprev = nullptr;
+                continue;
+            }
+            if (fo.stale) ++nstale;
+            float wi[12], X[12];
+            if (!inv34(s.w[e][side], wi)) continue;
+            mul34(wi, O, X);
+            float wsp = -1;
+            if (wprev && side == s0) {  // the same hand's wrist, frame to frame
+                const float dx = s.w[e][side][3] - wprev[3], dy = s.w[e][side][7] - wprev[7], dz = s.w[e][side][11] - wprev[11];
+                wsp = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.0f;
+                wsp_max = std::fmax(wsp_max, wsp);
+            }
+            wprev = s.w[e][side];
+            if (!have0 || fo.w != w0 || side != s0) {  // a new gun or another hand: its own baseline (and no speed across)
+                std::memcpy(X0, X, sizeof(X0));
+                have0 = true;
+                w0 = fo.w;
+                s0 = side;
+            }
+            wl = fo.w;
+            float xi[12], D[12];
+            if (!inv34(X0, xi)) continue;
+            mul34(xi, X, D);
+            const float tl = std::sqrt(D[3] * D[3] + D[7] * D[7] + D[11] * D[11]) * 1000.0f;
+            const float tr = D[0] + D[5] + D[10];
+            const float an = std::acos(std::fmax(-1.0f, std::fmin(1.0f, (tr - 1.0f) * 0.5f))) * 57.2958f;
+            worst_t = std::fmax(worst_t, tl);
+            worst_a = std::fmax(worst_a, an);
+            sum2 += tl * tl;
+            ++n;
+            if (wsp > 20.0f) {  // the hand moving over 20 mm a frame (1.8 m/s at 90 Hz, 0.9 m/s at 45 Hz)
+                fast_t = std::fmax(fast_t, tl);
+                ++nfast;
+            } else if (wsp >= 0.0f && wsp < 5.0f) {
+                slow_t = std::fmax(slow_t, tl);
+            }
+        }
+        if (!n) continue;
+        std::snprintf(b, sizeof(b), "\n  %s (weapon %d), eye %d: %d frames (stale %d), worst %.1f mm %.2f deg, rms %.1f mm | the wrist up to %.0f mm a frame; worst at over 20 mm a frame (%d frames) %.1f mm, under 5 mm a frame %.1f mm",
+                      name, wl, e, n, nstale, worst_t, worst_a, std::sqrt(sum2 / n), wsp_max, nfast, fast_t, slow_t);
+        o += b;
+        log::info("[follow]%s %s", tag, b + 3);  // the reply may be cut: each line in the log too
+    }
+    return o;
 }
 void pose_to34(const float* pose, float* m) {  // the axes X, Y, Z (world vectors), the position -> 3x4 rows
     for (int i = 0; i < 3; ++i) {
@@ -3831,6 +4260,17 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
         if (raw(mset, &count, 1)) {
             float* sm = reinterpret_cast<float*>(mset + 0xd4);
             const size_t n = static_cast<size_t>(count) * 24;  // the current and the previous set, 12 floats a matrix
+            if (g_near_on.load(std::memory_order_relaxed) && g_frame.valid && g_frame.held_any && g_frame.held_new >= 0) {
+                const float* hm = g_frame.held[g_frame.held_new].m;
+                const float* rr = reinterpret_cast<const float*>(rec);
+                {  // "skel near": the set's record and its first matrix
+                    note_near(reinterpret_cast<uintptr_t>(rec[0x10]), 1, count, rr + 12, hm + 12);
+                    if (count >= 1) {
+                        const float p0[3] = {sm[3], sm[7], sm[11]};
+                        note_near(reinterpret_cast<uintptr_t>(rec[0x10]) ^ 1, 1, count, p0, hm + 12);  // (^1: by its first bone)
+                    }
+                }
+            }
             uintptr_t owner = 0;
             if (count > g_rig.max_index && count <= g_rig.count && rec[0x13] &&
                 raw(reinterpret_cast<uintptr_t>(rec[0x13]) + 0x18, &owner, 8) && owner == g_frame.skel) {
@@ -3939,7 +4379,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 // its drawable: its draw moved exactly onto the wanted pose, never hidden, not remembered
                 float hp_pose[12];
                 int hp_slot = -1, hp_john = -1;
-                if (held_prop::diag_on()) held_prop::diag_draw(reinterpret_cast<uintptr_t>(rec[0x10]), rc + 12, t_draw_pass);  // "props diag"
+                if (held_prop::diag_on()) held_prop::diag_draw(reinterpret_cast<uintptr_t>(rec[0x10]), rc + 12, t_draw_pass, rc);  // "props diag"
                 const bool hp = hi < 0 && si < 0 && held_prop::match(reinterpret_cast<uintptr_t>(rec[0x10]), rc + 12, hp_pose, &hp_slot);
                 if (hp && hp_slot == 1) {  // [Hands] OwnModelFollow: the other sidearm at the copy's hand of this frame
                     std::lock_guard lock(g_draw_mutex);
@@ -4079,6 +4519,31 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                             const bool rm_ = (*reinterpret_cast<const uint32_t*>(reinterpret_cast<uintptr_t>(rec) + 0xac) & 0x10000) != 0;
                             g_held_set_count.store(count, std::memory_order_relaxed);
                             g_held_set_rm.store(rm_ ? 1 : 0, std::memory_order_relaxed);
+                            if (g_parts_auto && g_parts_rec.load(std::memory_order_relaxed) && g_parts_frame != ~0ull && g_body_frame > g_parts_frame + 30) {
+                                g_parts_auto = false;  // stalled (the gun put away, another drawn): dropped, not logged with mixed frames
+                                g_parts_rec = false;
+                                g_parts_n = 0;
+                            }
+                            if (g_parts_auto && !g_parts_rec.load(std::memory_order_relaxed)) {  // [Debug] TwoHandShotLog: its end
+                                g_parts_auto = false;
+                                g_shotlogs.fetch_add(1, std::memory_order_relaxed);
+                                const int pz = g_grip_pose_pub.load(std::memory_order_relaxed);  // the hold used (FrontHandPose's or the stance's)
+                                log::info("[two] a shot two-handed (weapon %d; blend %.2f -> %.2f, front pose %d -> %d, fixed grip %d, snap to the drawn gun "
+                                          "%d): %s",
+                                          g_parts_auto_weapon, g_parts_auto_blend, holster::two_hand_blend(), g_parts_auto_pose, pz,
+                                          g_fixed_grip.load() ? 1 : 0, g_snap_drawn_cfg.load() ? 1 : 0, parts_post().c_str());
+                            }
+                            if (g_shotlog_cfg.load(std::memory_order_relaxed) && !g_parts_auto && !g_parts_manual && !g_parts_rec.load(std::memory_order_relaxed) &&
+                                actions::since_shot_ms() < 60.0 && holster::two_hand_blend() > 0.5f) {  // a shot two-handed: recorded
+                                g_parts_n = 0;
+                                g_parts_frame = ~0ull;
+                                g_parts_auto = true;
+                                g_parts_auto_blend = holster::two_hand_blend();
+                                g_parts_auto_pose = g_grip_pose_pub.load(std::memory_order_relaxed);
+                                RdrvrActorState ast{};
+                                g_parts_auto_weapon = api::actor_state(&ast) ? ast.weapon : -1;
+                                g_parts_rec = true;
+                            }
                             if (g_parts_rec.load(std::memory_order_relaxed)) record_parts(sm, count, g_body_frame);
                             float drv[kDrvCount];
                             int gw = -1;
@@ -4285,12 +4750,15 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
         if (dx * dx + dy * dy + dz * dz < 0.05f * 0.05f) note_nearmiss(2, 0, rec[0x10], rc, hm);
     }
     const bool rigid = g_frame.valid && rec && !rec[0x12] && rec[0x10] && g_frame.held_fix;  // the record checked first
+    if (g_near_on.load(std::memory_order_relaxed) && g_frame.valid && rec && !rec[0x12] && rec[0x10] && g_frame.held_any && g_frame.held_new >= 0)
+        note_near(reinterpret_cast<uintptr_t>(rec[0x10]), 2, 0, reinterpret_cast<const float*>(rec) + 12, g_frame.held[g_frame.held_new].m + 12);
     const bool rigid_held = rigid && g_frame.held_any && in_box(g_frame.held_box, reinterpret_cast<const float*>(rec));
     const bool rigid_sec = rigid && g_frame.sec_any && (in_box(g_frame.sec_box, reinterpret_cast<const float*>(rec)) ||
                                                         reinterpret_cast<uintptr_t>(rec[0x10]) == g_sec_drawable.load(std::memory_order_relaxed));
     float hp_pose2[12];  // run 5: a held prop drawn rigid (held_prop): moved exactly onto its wanted pose
     int hp_slot2 = -1;
-    if (rigid && held_prop::diag_on()) held_prop::diag_draw(reinterpret_cast<uintptr_t>(rec[0x10]), reinterpret_cast<const float*>(rec) + 12, t_draw_pass);
+    if (rigid && held_prop::diag_on())
+        held_prop::diag_draw(reinterpret_cast<uintptr_t>(rec[0x10]), reinterpret_cast<const float*>(rec) + 12, t_draw_pass, reinterpret_cast<const float*>(rec));
     const bool rigid_hp = rigid && held_prop::match(reinterpret_cast<uintptr_t>(rec[0x10]), reinterpret_cast<const float*>(rec) + 12, hp_pose2, &hp_slot2);
     if (rigid_hp) {
         float* rc = reinterpret_cast<float*>(rec);
@@ -4530,6 +4998,11 @@ void set_gun_in_gun_hand(bool on) {
     config::set("Hands", "GunInGunHand", on ? "1" : "0");
 }
 bool fixed_gun_grip() { return g_fixed_grip.load(std::memory_order_relaxed); }
+bool fixed_sidearm_grip() { return g_fixed_sidearm.load(std::memory_order_relaxed); }
+void set_fixed_sidearm_grip(bool on, bool save) {
+    if (g_fixed_sidearm.exchange(on) != on) log::info("[body] FixedSidearmGrip: the sidearms held by their aiming hold %d", on ? 1 : 0);
+    if (save) config::set("Hands", "FixedSidearmGrip", on ? "1" : "0");
+}
 void set_fixed_gun_grip(bool on, bool save) {
     if (g_fixed_grip.exchange(on) != on) log::info("[body] FixedGunGrip: the long guns held by their aiming hold %d", on ? 1 : 0);
     if (save) config::set("Hands", "FixedGunGrip", on ? "1" : "0");
@@ -4577,12 +5050,22 @@ bool locks_torso() {
     std::lock_guard lock(g_cfg_mutex);
     return g_cfg_lock_torso;
 }
+int front_pose(int w) { return w >= 0 && w < kGripW ? g_front_pose[w].load() : 0; }
+int front_pose_seen(int w) { return w >= 0 && w < kGripW ? static_cast<int>(g_front_seen[w].load()) : 0; }
+void set_front_pose(int w, int pose, bool save) {
+    if (w < 0 || w >= kGripW || pose < 0 || pose > 2) return;
+    g_front_pose[w].store(pose);
+    static const char* const kName[3] = {"auto", "lowered", "aiming"};
+    log::info("[body] the %s's front hand pose: %s", holster::weapon_label(w), kName[pose]);
+    if (save && *holster::weapon_token(w)) config::set((std::string("Weapon.") + holster::weapon_token(w)).c_str(), "FrontHandPose", kName[pose]);
+}
 void set_locks_torso(bool on) {
     std::lock_guard lock(g_cfg_mutex);
     g_cfg_lock_torso = on;
 }
 
 void on_visibility_build() {  // sampled always (the left-handed transplant needs the side); HeldPropFix gates the use
+    aim::throw_hold_tick();      // [Gestures] ThrowByGrip: a held throw's clip pinned, or let go
     HeldSample h;
     uintptr_t W = 0, wmgr = 0;
     h.valid = aim::held_item_matrix(h.m, &h.left, &W, &wmgr);
@@ -4710,14 +5193,32 @@ bool install() {
         }
         g_held_fix_cfg = config::get_bool("Body", "HeldPropFix", true);
         g_held_at_hand_cfg = config::get_bool("Body", "HeldPropAtHand", true);
+        {  // [Weapon.<Gun>] FrontHandPose: the long guns' front hand (run 9 item 3b: the aiming hold by default, the user's request)
+            static const char* const kPoseName[3] = {"auto", "lowered", "aiming"};
+            std::string poses;
+            for (int w = 8; w <= 20; ++w) {
+                const char* tok = holster::weapon_token(w);
+                if (!*tok) continue;
+                const std::string v = config::get_string((std::string("Weapon.") + tok).c_str(), "FrontHandPose", "aiming");
+                g_front_pose[w] = v == "lowered" ? 1 : v == "auto" ? 0 : 2;
+                poses += std::string(" ") + tok + "=" + kPoseName[g_front_pose[w].load()];
+            }
+            log::info("[body] the front hand's pose per long gun (FrontHandPose):%s", poses.c_str());
+        }
+        g_lasso_cfg = config::get_bool("Body", "LassoAtHands", true);
         g_gun_hand_cfg = config::get_bool("Hands", "GunInGunHand", true);
         g_pin_cfg = config::get_bool("Hands", "TransplantPin", true);
         g_mirror_cfg = config::get_bool("Hands", "TransplantMirror", true);
         g_own_follow = config::get_bool("Hands", "OwnModelFollow", true);
         g_fixed_grip = config::get_bool("Hands", "FixedGunGrip", false);
+        g_fixed_sidearm = config::get_bool("Hands", "FixedSidearmGrip", false);
+        g_follow_auto = config::get_bool("Debug", "FollowLog", true);
         load_gun_rels();
         g_copy_grip_cfg = config::get_bool("Hands", "CopyGrip", true);
         g_same_frame_cfg = config::get_bool("Reload", "TwoHandedSteady", true);
+        g_snap_drawn_cfg = config::get_bool("Reload", "SnapToDrawnGun", true);
+        g_shotlog_cfg = config::get_bool("Debug", "TwoHandShotLog", true);
+        log::info("[body] the front hand's snap from the gun as drawn with FixedGunGrip (SnapToDrawnGun) %d", g_snap_drawn_cfg.load() ? 1 : 0);
         g_twist_cfg = config::get_bool("Hands", "ArmTwist", true);
         g_fallback_cfg = config::get_bool("Reload", "GripFallback", true);
         g_sawed_grip = config::get_bool("Reload", "SawedOffGrip", true);
@@ -4760,6 +5261,12 @@ bool install() {
                          hk_draw_geom, &o_draw_geom);
     ok &= hooks::install("RDR draw recorder (the hidden triangles' filter)", reinterpret_cast<void*>(anchors::addr(anchors::Id::RecorderDraw)),
                          hk_rec_draw, &o_rec_draw);
+    if (g_lasso_cfg.load()) {  // (the anchors verified: as the other hooks here)
+        ok &= hooks::install("RDR the lasso's draw (its rope at the drawn hands)", reinterpret_cast<void*>(anchors::addr(anchors::Id::LassoRopeDraw)),
+                             hk_lasso_draw, &o_lasso_draw);
+        ok &= hooks::install("RDR a rope's points draw (the lasso's corrected)", reinterpret_cast<void*>(anchors::addr(anchors::Id::RopePointsDraw)),
+                             hk_rope_points, &o_rope_points);
+    }
     if (g_held_fix_cfg.load() && g_held_at_hand_cfg.load()) {
         g_gun_place_ret = anchors::addr(anchors::Id::GunPropPlaceRet);
         ok &= hooks::install("RDR object matrix (the held prop at the drawn hand)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ObjectSetMatrix)),
@@ -4928,7 +5435,7 @@ void before_scene(const float* cam) {
         std::memcpy(grip_wp[hh], wp, sizeof(wp));
         for (int k = 0; k < 3; ++k) f.ik_t[hh][k] = wp[k] + rr[k * 3 + 2] * hc.wrist_offset;  // back along the grip's +z
         // the elbow's hint: down, out to the side, a little back (the camera's heading)
-        float hd_ = pose::body_heading_deg() * 0.0174532925f;
+        float hd_ = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's while the ride's view is turned
         float fwd[3] = {-std::sin(hd_), 0, -std::cos(hd_)}, right[3] = {std::cos(hd_), 0, -std::sin(hd_)};
         float out = hh ? 1.0f : -1.0f;
         for (int k = 0; k < 3; ++k) f.ik_pole[hh][k] = (k == 1 ? -1.0f : 0.0f) + 0.6f * out * right[k] - 0.3f * fwd[k];
@@ -5019,7 +5526,7 @@ void before_scene(const float* cam) {
     f.pitch = pitch_deg * 0.0174532925f;
     // the facing lock: the angle about the world's up from the actor's forward (the root's -z) to the camera's
     // (heading h faces (-sin h, -cos h))
-    float h = pose::body_heading_deg() * 0.0174532925f;
+    float h = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's while the ride's view is turned
     float cfx = -std::sin(h), cfz = -std::cos(h);
     {
         float ax = -w[8] * sign, az = -w[10] * sign, al = std::sqrt(ax * ax + az * az);
@@ -5131,6 +5638,15 @@ void before_scene(const float* cam) {
             }
             const uint64_t older = g_held_older.load(), newest = g_held_newest.load(), frames = g_held_frames.load(), missed = g_held_missed.load();
             const uint64_t cp = g_copy_placements.load(), cr = g_copy_refused.load(), cn = g_copy_nomatch.load();
+            if (frames != frames0 && g_follow_auto.load(std::memory_order_relaxed)) {  // [Debug] FollowLog
+                std::lock_guard lock(g_draw_mutex);
+                if (!g_follow_manual) {  // run 9: not over a test's recording (item1_follow read 0 frames: the re-arm reset it)
+                    if (g_follow_n > 30) follow_report(" auto");
+                    g_follow_pass = 1;
+                    g_follow_n = 0;
+                    g_follow_rec = true;
+                }
+            }
             if (frames != frames0 || ob[1] != o0[1] || cp != cp0 || cr != cr0)
                 log::info("[lag] 10 s: held draws by pass 0/1/3 %u/%u/%u, stale %u/%u/%u | the second gun or own model %u/%u/%u, stale %u/%u/%u | "
                           "matched the newest %llu, an older sample %llu | frames in hand %llu, without a draw %llu | the copy: placed %llu, refused "
@@ -5283,6 +5799,11 @@ std::string command(const std::string& line) {
         return std::string("the Sawed-off's own grip (the Double-barrel's), a borrowed grip's pose fixed, the hold short of the muzzle ") +
                (g_sawed_grip.load() ? "on" : "off");
     }
+    if (sub == "two" && line.find(" snapdrawn ") != std::string::npos) {  // skel two snapdrawn on|off: SnapToDrawnGun (the session only)
+        g_snap_drawn_cfg = line.find(" snapdrawn on") != std::string::npos;
+        return std::string("the snap from the gun as drawn with FixedGunGrip ") + (g_snap_drawn_cfg.load() ? "on" : "off") + " (frames " +
+               std::to_string(g_snap_drawn_frames.load()) + ")";
+    }
     if (sub == "two" && line.find(" steady ") != std::string::npos) {  // skel two steady on|off: TwoHandedSteady (the session only)
         g_same_frame_cfg = line.find(" steady on") != std::string::npos;
         return std::string("two-handed steady (the same frame's barrel, the grip kept while held) ") + (g_same_frame_cfg.load() ? "on" : "off");
@@ -5305,6 +5826,15 @@ std::string command(const std::string& line) {
             pose = g_grip_pose;
             miss = g_snap_miss;
         }
+        char b3[260];
+        {
+            const int w = g_frame.weapon;
+            const int fp = w >= 0 && w < kGripW ? g_front_pose[w].load() : 0;
+            const uint32_t seen = w >= 0 && w < kGripW ? g_front_seen[w].load() : 0;
+            std::snprintf(b3, sizeof(b3), " | front hand pose %s (seen: lowered %d fingers %d, aiming %d fingers %d), fixed-pose finger frames %llu, grip now (%.3f %.3f %.3f)",
+                          fp == 1 ? "lowered" : fp == 2 ? "aiming" : "automatic", seen & 1 ? 1 : 0, seen & 4 ? 1 : 0, seen & 2 ? 1 : 0, seen & 8 ? 1 : 0,
+                          static_cast<unsigned long long>(g_front_finger_frames.load()), g_grip_cur.p[0], g_grip_cur.p[1], g_grip_cur.p[2]);
+        }
         char b2[520];
         std::snprintf(b2, sizeof(b2), " || learned for weapon %d: lowered %d (%.3f %.3f %.3f) aiming %d (%.3f %.3f %.3f), pose now %s, grip from %s, "
                       "learns %llu, snaps %llu, the drawn front wrist %.3f m from the snap | grip turn %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f",
@@ -5320,7 +5850,15 @@ std::string command(const std::string& line) {
                       static_cast<unsigned long long>(t.frame), t.aiming ? 1 : 0, t.placed ? 1 : 0, t.wrist_game[0], t.wrist_game[1], t.wrist_game[2],
                       t.palm_game[0], t.palm_game[1], t.palm_game[2], t.wrist_placed[0], t.wrist_placed[1], t.wrist_placed[2], t.palm_placed[0],
                       t.palm_placed[1], t.palm_placed[2], t.ik[0], t.ik[1], t.ik[2], t.ik_hold[0], t.ik_hold[1], t.ik_hold[2]);
-        return std::string(b) + b2;
+        return std::string(b) + b2 + b3;
+    }
+    if (sub == "frontpose") {  // skel frontpose auto|lowered|aiming: the gun in hand's FrontHandPose (the session only)
+        std::string v;
+        in >> v;
+        const int w = g_frame.weapon;
+        if (w < 0 || w >= kGripW) return "frontpose: no gun in hand";
+        set_front_pose(w, v == "lowered" ? 1 : v == "aiming" ? 2 : 0, false);
+        return std::string("frontpose: weapon ") + std::to_string(w) + " " + (front_pose(w) == 1 ? "lowered" : front_pose(w) == 2 ? "aiming" : "automatic");
     }
     if (sub == "lag") {  // skel lag [two|ik] [reset]: the held gun against its bones; two-handed; the wrists and near misses
         std::string x, y;
@@ -5363,6 +5901,40 @@ std::string command(const std::string& line) {
         }
         return b;
     }
+    if (sub == "rope") {  // skel rope [on|off]: [Body] LassoAtHands (the session); the lasso's last rope draw
+        std::string v;
+        in >> v;
+        if (v == "on" || v == "off") g_lasso_cfg = v == "on";
+        std::lock_guard lock(g_lasso_mutex);
+        const float(*d)[3] = g_lasso_dbg;
+        char b[600];
+        std::snprintf(b, sizeof(b), "rope at hands %d: lasso draws %llu, points draws %llu, moved %llu; the last: %d points, %d moved | game first (%.3f %.3f %.3f) "
+                      "last (%.3f %.3f %.3f) | game wrists L (%.3f %.3f %.3f) R (%.3f %.3f %.3f) | drawn first (%.3f %.3f %.3f) last (%.3f %.3f %.3f)",
+                      g_lasso_cfg.load() ? 1 : 0, static_cast<unsigned long long>(g_lasso_draws.load()), static_cast<unsigned long long>(g_lasso_points.load()),
+                      static_cast<unsigned long long>(g_lasso_moved.load()), g_lasso_n, g_lasso_moved_n, d[0][0], d[0][1], d[0][2], d[1][0], d[1][1], d[1][2],
+                      d[2][0], d[2][1], d[2][2], d[3][0], d[3][1], d[3][2], d[4][0], d[4][1], d[4][2], d[5][0], d[5][1], d[5][2]);
+        return b;
+    }
+    if (sub == "near") {  // skel near [on|off|reset]: the drawables drawn within 0.6 m of the item in hand
+        std::string v;
+        in >> v;
+        if (v == "on" || v == "reset") {
+            std::lock_guard lock(g_near_mutex);
+            g_nnear = 0;
+        }
+        if (v == "on" || v == "off") g_near_on = v == "on";
+        std::lock_guard lock(g_near_mutex);
+        std::string o = std::string("near ") + (g_near_on.load() ? "on" : "off") + ", " + std::to_string(g_nnear) + " drawables:";
+        for (int i = 0; i < g_nnear; ++i) {
+            char b[200];
+            std::snprintf(b, sizeof(b), " | %llx %s%s %d at %.3f (%.3f %.3f %.3f) x%llu, attach bone %d at %.3f",
+                          static_cast<unsigned long long>(g_near[i].drawable & 0xffffff), g_near[i].kind == 1 ? "set" : "rigid",
+                          (g_near[i].drawable & 1) && g_near[i].kind == 1 ? "(bone0)" : "", g_near[i].count, g_near[i].dmin, g_near[i].at[0],
+                          g_near[i].at[1], g_near[i].at[2], static_cast<unsigned long long>(g_near[i].n), g_near[i].abone, g_near[i].adist);
+            o += b;
+        }
+        return o;
+    }
     if (sub == "held") {  // skel held [on|off] | skel held athand on|off: the item in hand's draws (the session only)
         std::string v;
         in >> v;
@@ -5372,6 +5944,7 @@ std::string command(const std::string& line) {
             in >> x;
             g_held_at_hand_cfg = x == "on";
         }
+
         HeldSample h[kHeldRing];
         {
             std::lock_guard lock(g_draw_mutex);
@@ -5514,6 +6087,13 @@ std::string command(const std::string& line) {
             g_own_follow = arg == "on";
             return std::string("follow: OwnModelFollow ") + (g_own_follow.load() ? "on" : "off");
         }
+        if (arg == "auto") {  // skel follow auto on|off: [Debug] FollowLog for the session
+            std::string v;
+            in >> v;
+            g_follow_auto = v != "off";
+            if (!g_follow_auto.load()) g_follow_rec = false;
+            return std::string("follow: auto (the 10 s report) ") + (g_follow_auto.load() ? "on" : "off");
+        }
         std::lock_guard lock(g_draw_mutex);
         if (arg == "arm") {
             int pass = 1;
@@ -5521,8 +6101,10 @@ std::string command(const std::string& line) {
             g_follow_pass = pass & 7;
             g_follow_n = 0;
             g_follow_rec = true;
+            g_follow_manual = true;
             return "follow: recording " + std::to_string(kFollowMax) + " frames of pass " + std::to_string(g_follow_pass.load());
         }
+        g_follow_manual = false;  // read: FollowLog's again
         // each object in its wrist's frame (X = W^-1 O) against the first such frame: the move (mm) and turn (deg); the
         // wrist's own speed (mm a frame), to tell a gun a frame late (its error grows with the speed) from an offset
         std::string o;
@@ -5532,74 +6114,22 @@ std::string command(const std::string& line) {
                       static_cast<unsigned long long>(g_own_follow_draws.load()), static_cast<unsigned long long>(g_own_follow_nocp.load()),
                       static_cast<unsigned long long>(g_own_follow_newer.load()));
         o = b;
-        for (int which = 0; which < 6; ++which) {
-            const int obj = which / 2, e = which % 2;  // the object, the eye (its k-th draw of the pass)
-            const char* name = obj == 0 ? "gun in hand" : obj == 1 ? "own model" : "copy";
-            float X0[12];
-            bool have0 = false;
-            int n = 0, nfast = 0, nstale = 0;
-            float worst_t = 0, worst_a = 0, sum2 = 0, fast_t = 0, slow_t = 0, wsp_max = 0;
-            const float* wprev = nullptr;
-            for (int i = 0; i < g_follow_n; ++i) {
-                const FollowSample& s = g_follow[i];
-                const FollowObj& fo = s.obj[obj][e];
-                const int side = fo.side;
-                const float* O = fo.m;
-                if (!fo.ok || side < 0 || side > 1 || !s.w_ok[e][side]) {
-                    wprev = nullptr;
-                    continue;
-                }
-                if (fo.stale) ++nstale;
-                float wi[12], X[12];
-                if (!inv34(s.w[e][side], wi)) continue;
-                mul34(wi, O, X);
-                float wsp = -1;
-                if (wprev) {
-                    const float dx = s.w[e][side][3] - wprev[3], dy = s.w[e][side][7] - wprev[7], dz = s.w[e][side][11] - wprev[11];
-                    wsp = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.0f;
-                    wsp_max = std::fmax(wsp_max, wsp);
-                }
-                wprev = s.w[e][side];
-                if (!have0) {
-                    std::memcpy(X0, X, sizeof(X0));
-                    have0 = true;
-                }
-                float xi[12], D[12];
-                if (!inv34(X0, xi)) continue;
-                mul34(xi, X, D);
-                const float tl = std::sqrt(D[3] * D[3] + D[7] * D[7] + D[11] * D[11]) * 1000.0f;
-                const float tr = D[0] + D[5] + D[10];
-                const float an = std::acos(std::fmax(-1.0f, std::fmin(1.0f, (tr - 1.0f) * 0.5f))) * 57.2958f;
-                worst_t = std::fmax(worst_t, tl);
-                worst_a = std::fmax(worst_a, an);
-                sum2 += tl * tl;
-                ++n;
-                if (wsp > 20.0f) {  // the hand moving over 20 mm a frame (1.8 m/s at 90 Hz)
-                    fast_t = std::fmax(fast_t, tl);
-                    ++nfast;
-                } else if (wsp >= 0.0f && wsp < 5.0f) {
-                    slow_t = std::fmax(slow_t, tl);
-                }
-            }
-            if (!n) continue;
-            std::snprintf(b, sizeof(b), "\n  %s, eye %d: %d frames (stale %d), worst %.1f mm %.2f deg, rms %.1f mm | the wrist up to %.0f mm a frame; worst at over 20 mm a frame (%d frames) %.1f mm, under 5 mm a frame %.1f mm",
-                          name, e, n, nstale, worst_t, worst_a, std::sqrt(sum2 / n), wsp_max, nfast, fast_t, slow_t);
-            o += b;
-            log::info("[follow] %s", b + 3);  // the reply may be cut: each line in the log too
-        }
-        return o;
+        return o + follow_report("");
     }
     if (sub == "parts") {  // skel parts arm: record the held gun's set; skel parts [ref]: each bone against bone ref (default 0)
         std::string arg;
         in >> arg;
         std::lock_guard lock(g_draw_mutex);
         if (arg == "arm") {
+            g_parts_auto = false;  // a test's recording: not TwoHandShotLog's
+            g_parts_manual = true;
             g_parts_n = 0;
             g_parts_frame = ~0ull;
             g_parts_rec = true;
             return "parts: recording the held gun's set (" + std::to_string(kPartsMax) + " frames)";
         }
         if (arg == "dump") {  // skel parts dump <bone> [ref]: each frame's D of that bone against ref, to the log
+            g_parts_manual = false;
             int bo = 2, rf = 0;
             in >> bo >> rf;
             for (int i = 0; i < g_parts_n; ++i) {
@@ -5612,42 +6142,8 @@ std::string command(const std::string& line) {
             return "parts: " + std::to_string(g_parts_n) + " frames logged";
         }
         if (arg == "post") {  // skel parts post: the drawn gun against its first recorded frame (deg/mm over time)
-            int first = -1;
-            for (int i = 0; i < g_parts_n; ++i)
-                if (g_parts[i].post_ok) {
-                    first = i;
-                    break;
-                }
-            if (first < 0) return std::string("parts post: none");
-            float worst_a = 0, worst_t = 0, worst_l = 0;
-            std::string series;
-            char b[96];
-            float l0[3] = {};
-            for (int i = first, k = 0; i < g_parts_n; ++i, ++k) {
-                if (!g_parts[i].post_ok) continue;
-                float D[12], ax[3], an = 0;
-                rel_set(g_parts[first].post, g_parts[i].post, D);
-                const float Rr[9] = {D[0], D[1], D[2], D[4], D[5], D[6], D[8], D[9], D[10]};
-                to_axis_angle(Rr, ax, &an);
-                const float tl = std::sqrt(D[3] * D[3] + D[7] * D[7] + D[11] * D[11]);
-                worst_a = std::fmax(worst_a, an * 57.2958f);
-                worst_t = std::fmax(worst_t, tl * 1000.0f);
-                // the drawn left wrist in the drawn gun's frame: its move from the first frame (mm)
-                float gi[12], L[12];
-                float lm = 0;
-                if (inv34(g_parts[i].post, gi)) {
-                    mul34(gi, g_parts[i].left, L);
-                    if (i == first) l0[0] = L[3], l0[1] = L[7], l0[2] = L[11];
-                    lm = std::sqrt((L[3] - l0[0]) * (L[3] - l0[0]) + (L[7] - l0[1]) * (L[7] - l0[1]) + (L[11] - l0[2]) * (L[11] - l0[2])) * 1000.0f;
-                    worst_l = std::fmax(worst_l, lm);
-                }
-                if (k % 6 == 0) {
-                    std::snprintf(b, sizeof(b), " %.1f/%.0f/%.0f/%.1f", an * 57.2958f, tl * 1000.0f, lm, g_parts[i].phase);
-                    series += b;
-                }
-            }
-            std::snprintf(b, sizeof(b), "parts post: worst %.2f deg %.1f mm, the left wrist on it %.1f mm | deg/mm/left mm/clip:", worst_a, worst_t, worst_l);
-            return b + series;
+            g_parts_manual = false;
+            return parts_post();
         }
         if (arg == "lever") {
             char b[200];
@@ -5741,6 +6237,8 @@ std::string command(const std::string& line) {
     if (sub == "grip") {  // skel grip [on|off|reset]: [Hands] FixedGunGrip (the session); the long gun in the animated wrist's frame
         if (line.find(" grip on") != std::string::npos) g_fixed_grip = true;
         if (line.find(" grip off") != std::string::npos) g_fixed_grip = false;
+        if (line.find(" side on") != std::string::npos) g_fixed_sidearm = true;  // skel grip side on|off: FixedSidearmGrip
+        if (line.find(" side off") != std::string::npos) g_fixed_sidearm = false;
         FixedGripDiag d;
         GunRel g;
         {

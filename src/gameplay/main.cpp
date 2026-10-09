@@ -526,7 +526,7 @@ void camera_tick(uint64_t tick) {
             st.flags = actor_flags(actor);
             st.actor = actor;
             weapon_state(actor, &st);
-            if (job.weapons) weapons_state(actor, tick, &st);
+            if (job.weapons & 1u) weapons_state(actor, tick, &st);
             mount_state(actor, st.flags, &st);
             st.valid = 1;
             g_api->post_actor_state(&st);
@@ -553,7 +553,12 @@ void camera_tick(uint64_t tick) {
     RdrvrActorState st{};
     mount_state(actor, flags, &st);
     float heading = job.heading_from_actor ? actor_heading : job.heading_deg;
-    if (st.mount && job.heading_from_mount) heading = st.mount_heading;
+    // weapons bit 3 (run 9, [Horse] StickTurn): heading_deg is the view's turn over the mount's heading (the last mount's
+    // on the tick the rider got off: the core still riding by the state posted a tick before)
+    static float last_mount_heading = 0.0f;
+    if (st.mount) last_mount_heading = st.mount_heading;
+    if ((job.weapons & 4u) && job.heading_from_mount) heading = (st.mount ? st.mount_heading : last_mount_heading) + job.heading_deg;
+    else if (st.mount && job.heading_from_mount) heading = st.mount_heading;
     float h = heading * 0.0174532925f;
     float cam[3] = {pos[0], pos[1], pos[2]};
     // riding with the saddle anchor: above the mount's own root on its heading, the height low-passed. Otherwise
@@ -601,6 +606,21 @@ void camera_tick(uint64_t tick) {
     float ra = job.orient_mode == 2 ? heading : 0.0f, rb = job.orient_mode == 1 ? heading : job.orient_mode == 3 ? -heading : 0.0f,
           rc = job.orient_mode == 0 ? heading : 0.0f;
     invoke(0x486F4461, {static_cast<uint64_t>(g_cam), vec2(ra, rb), f32(rc), 0});                 // SET_CAMERA_ORIENTATION
+    if (job.weapons & 2u) {  // [Body] KeepAnchorCamera: another camera on the channel (a shop's): ours current again
+        static uint64_t retakes = 0, last_take = 0;
+        const bool active = (invoke(0x02BD5362, {static_cast<uint64_t>(g_cam), 0}) & 0xff) != 0;  // IS_CAMERA_ACTIVE_ON_CHANNEL
+        if (!active) {
+            invoke(0x3EA55678, {static_cast<uint64_t>(g_cam), 0, 0, 0, 0, 0, 0, 0, 0, 0});  // SET_CURRENT_CAMERA_ON_CHANNEL
+            ++retakes;
+            if (!last_take || tick - last_take > 300) {
+                char line[128];
+                std::snprintf(line, sizeof(line), "camera anchor: another camera took the channel: camera %d made current again (%llu times)",
+                              g_cam, static_cast<unsigned long long>(retakes));
+                g_api->log(0, line);
+            }
+            last_take = tick;
+        }
+    }
     st.tick = tick;
     std::memcpy(st.pos, pos, sizeof(st.pos));
     st.heading_deg = actor_heading;
@@ -612,7 +632,7 @@ void camera_tick(uint64_t tick) {
     st.flags = flags;
     st.actor = actor;
     weapon_state(actor, &st);
-    if (job.weapons) weapons_state(actor, tick, &st);
+    if (job.weapons & 1u) weapons_state(actor, tick, &st);
     alignas(16) float head[4] = {};
     static const char kHead[] = "head";  // the camera skeleton mapping's head bone
     if (object && (invoke(0x30516389, {static_cast<uint64_t>(static_cast<uint32_t>(object)), reinterpret_cast<uint64_t>(kHead),

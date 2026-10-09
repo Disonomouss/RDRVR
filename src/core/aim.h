@@ -48,6 +48,20 @@ bool weapon_ik_offsets(uintptr_t W, float ik[3], float ik_hold[3]);
 // The weapon's MuzzleOffset (its tune, weapon info +0x310) in the gun's axes, when sane (under 1 m). Any thread.
 bool weapon_muzzle_offset(uintptr_t W, float mo[3]);
 bool aiming();
+// [Gestures] ThrowByGrip: hold the grip to hold a throwable, the trigger to start it (the light, the knife by its tip),
+// the grip let go to throw it with the swing. grip_throw_wanted(ctrl): that controller's grip is the throwable's (the
+// gun hand with a throwable in it), not the game's button
+bool grip_throw_wanted(int ctrl);
+bool grip_throw();
+void on_exit();  // the process exit: others' shots since the last log line
+// the pad's triggers (the pad's thread): the trigger with the grip holding a throwable arms it (the game's LT, then its
+// RT after a lead), LT kept through the held throw and its tail
+void grip_throw_input(float* lt, float* rt);
+void throw_hold_tick();  // the game thread, once a frame (the visibility build): the held throw pinned, or let go
+// the throwing knife's readied throw held by its tip: its local turn axis (0-2) and pivot (the blade's middle)
+bool knife_tip(int* axis, float pivot[3]);
+std::string tip_command(const std::string& w, const std::string& v);  // gestures tip/tipaxis/tippivot; the readback
+void set_grip_throw(bool on, bool save = true);
 // [Aim] PerfectAccuracy (run 3 item 3, research\run3\accuracy.md; on by default since run 8): the player's shots leave exactly
 // along the barrel ray: the game's random bloom skipped, the shot direction aligned to the game's own shoot-from row,
 // the muzzle-blocked flip to the animated barrel undone, and the shooter's velocity left out of the bullet. Game thread,

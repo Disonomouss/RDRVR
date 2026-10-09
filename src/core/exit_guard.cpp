@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include "core/aim.h"
 #include "core/config.h"
 #include "core/hooks.h"
 #include "core/log.h"
@@ -19,6 +20,7 @@ bool g_terminate = true;  // [Compat] TerminateAtExit
 
 void NTAPI hk_RtlExitUserProcess(LONG status) {
     render_res::on_exit();  // a clean exit: a new render resolution's boot sentinel cleared
+    aim::on_exit();         // others' shots since the last log line
     if (g_terminate) {
         log::info("[exit] process exit (status %#lx): TerminateProcess, so no DLL detach runs (RedHook's crashes)",
                   static_cast<unsigned long>(status));

@@ -39,6 +39,9 @@ bool fire_ready();
 float fire_clip_phase();
 // [Holsters] ShowGuns (off; run 6 item 6a): each gun zone's gun shown at it as a game prop (a hip gun barrel down, a back
 // gun diagonal), hidden while that gun is in a hand; destroyed when off or out of first person.
+// [Holsters] ShowModels: a holster model (the game's prop [Holsters] Model) drawn at each enabled hip holster
+bool show_models();
+void set_show_models(bool on, bool save = true);
 bool show_guns();
 void set_show_guns(bool on, bool save = true);
 // [Holsters] ShowBackGuns (on; round 13 item 14): off, ShowGuns shows the hips' guns only (not the back's, the left shoulder's)
@@ -47,6 +50,18 @@ void set_show_guns(bool on, bool save = true);
 // and cover keep the body's anchor.
 int anchor();
 void set_anchor(int a, bool save = true);
+// [Holsters] TurnWithHead (the headset anchor only): the holsters turned with the headset's yaw since recentre, once it is
+// more than TurnDeadZone degrees (0-90) from where they point; off: they face the body's heading
+// [Holsters] LeanSteady (the headset anchor): the holsters stay when you lean (the neck's move read as a torso pivoting
+// at the hips, TorsoLength); TurnByHands (with TurnWithHead): both hands ahead pull the turn halfway to their direction
+bool lean_steady();
+void set_lean_steady(bool on, bool save = true);
+bool turn_by_hands();
+void set_turn_by_hands(bool on, bool save = true);
+bool turn_with_head();
+void set_turn_with_head(bool on, bool save = true);
+float turn_dead_zone();
+void set_turn_dead_zone(float deg, bool save = true);
 bool show_back_guns();
 void set_show_back_guns(bool on, bool save = true);
 // The gun hand inside a holster zone (the last frame end): no aim stance through a put-away.
@@ -56,7 +71,7 @@ bool gun_at_zone();
 // in the game's world, with the frame camera the points were placed with. Published at each frame end on the
 // presenting thread, before the XR frame end (holster::init registers its listener before xr::init).
 enum MarkerKind : uint8_t { kRing = 0, kDot = 1 };
-enum MarkerState : uint8_t { kIdle = 0, kHandIn = 1, kHeld = 2, kGunIdle = 3 };
+enum MarkerState : uint8_t { kIdle = 0, kHandIn = 1, kHeld = 2, kGunIdle = 3, kNear = 4 };  // kNear: a hand near (ZonesNear)
 constexpr int kMaxMarkers = 14;
 struct Marker {
     float pos[3];
@@ -126,6 +141,17 @@ struct Arsenal {
 bool arsenal(Arsenal* out);       // the posted owned weapons (false before the first read). Any thread.
 bool show_zones();
 void set_show_zones(bool on);  // also written to the user ini
+// [Holsters] ZonesNear (with ShowZones): a holster's ring only while a hand is within ZonesNearDistance (m) of its edge,
+// faint until the hand is in it
+// Placing the holsters by hand (the menu; the session only): every ring shown, no draws or put-aways; a grip in a ring
+// moves that holster with the hand, letting go saves its offset
+bool placing();
+void set_placing(bool on);
+bool zones_near();
+void set_zones_near(bool on, bool save = true);
+// [Holsters] SteadyZones: a hand stays in its holster until 3 cm past its radius; another takes it when 3 cm nearer
+bool steady_zones();
+void set_steady_zones(bool on, bool save = true);
 void set_show_zones_session(bool on);
 // run 8 item 5b: the hand dots and the weapon points (the foregrip ring, the load point, the action hints), each its
 // own switch ([Holsters] ShowHandDots, ShowWeaponPoints; absent: ShowZones' value). save: the user ini too

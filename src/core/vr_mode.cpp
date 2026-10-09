@@ -136,6 +136,7 @@ void force_cutscene(int state) {
 }
 
 bool gameplay_stereo() { return g_auto.load() && g_view == View::Stereo; }
+int state_flags() { return g_flags.load(std::memory_order_relaxed); }
 
 void status_text(char* out, size_t len) {
     int f = g_flags.load();

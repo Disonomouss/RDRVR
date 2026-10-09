@@ -61,6 +61,11 @@ bool trigger_aims();
 void set_trigger_aims(bool on);   // also written to the user ini
 void set_trigger_aims_session(bool on);  // the test channel: not saved
 // [Hands] AimWhenRaised: LT held while the gun hand is raised (the aim stance up, every pull fires at once)
+// [Controls] WristSatchel: with the wrist HUD in view, two short presses of the off hand's Y within SatchelTapMs (run 9)
+// open the satchel (the pad's Back, the game's GENERIC.INVENTORY); a single press reaches the game as Y at the window's
+// end; the hold still opens the mod's menu
+bool wrist_satchel();
+void set_wrist_satchel(bool on, bool save = true);
 bool aim_when_raised();
 void set_aim_when_raised(bool on, bool save = true);
 bool jump_drops_aim();  // [Hands] JumpDropsAim (run 7 item 1f): a jump with a gun in hand lets the aim go first

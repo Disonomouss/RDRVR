@@ -12,6 +12,7 @@
 #include "core/camera_lever.h"
 #include "core/config.h"
 #include "core/dual_pass.h"
+#include "core/eye_shape.h"
 #include "core/hooks.h"
 #include "core/log.h"
 
@@ -343,7 +344,12 @@ void after_scene_wait(int pass) {
     bool units = false;
     if (g_jitter_units.load(std::memory_order_relaxed) && at<int>(p, kTechApplied) == 5) {
         if (char* d = at<char*>(p, kDlssObject)) {
-            const int rw = at<int>(d, kDlssRenderW), rh = at<int>(d, kDlssRenderH);
+            int rw = at<int>(d, kDlssRenderW), rh = at<int>(d, kDlssRenderH);
+            uint32_t srw = 0, srh = 0, sew = 0, seh = 0;
+            if (eye_shape::dlss_shape(&srw, &srh, &sew, &seh)) {  // [XR] EyeShapeDlss: the shaped render size (per axis)
+                rw = static_cast<int>(srw);
+                rh = static_cast<int>(srh);
+            }
             if (rw > 0 && rh > 0 && rw <= screen[0] && rh <= screen[1] && (rw != screen[0] || rh != screen[1])) {
                 at<int>(vp, kVpScreenW) = rw;
                 at<int>(vp, kVpScreenH) = rh;

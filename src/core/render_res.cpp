@@ -75,6 +75,10 @@ bool g_fullscreen = false, g_window_kept = false;
 double g_arm_ms = 0, g_window_ms = 0;
 char g_why[160] = "";                 // why this start runs at the game's own size (the menu, the status)
 char g_wstr[16] = "", g_hstr[16] = "";  // the sysParams' values (strings, read with strtol(s, 0, 0))
+// [Debug] ForceScreenMode (test only, 2026-10-09): the game's -fullscreen or -windowed armed with the size (the device
+// init writes GraphicsOptions' Fullscreen from it); the xml's own Fullscreen kept for its saves (-1: not forced)
+int g_force_fs = -1, g_xml_fs = -1;
+const char kOne[] = "1";
 std::atomic<uint32_t> g_modes_added{0}, g_saves_kept{0};
 std::atomic<uint32_t> g_eds_calls{0}, g_eds_next{0}, g_eds_end{0};  // through the slot; at the list's next-mode call; its end
 std::atomic<bool> g_sentinel_cleared{false};
@@ -185,6 +189,26 @@ uint64_t vram_mb() {
 
 // The game's height from graphicsOptions.xml (Documents\Rockstar Games\Red Dead Redemption), read only: Automatic never
 // goes below the player's own size. 0 when not found.
+// graphicsOptions.xml's <Fullscreen value="true|false"/>: 1, 0, or -1 (not read)
+int xml_fullscreen() {
+    PWSTR docs = nullptr;
+    int fs = -1;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+        wchar_t path[MAX_PATH];
+        std::swprintf(path, MAX_PATH, L"%s\\Rockstar Games\\Red Dead Redemption\\graphicsOptions.xml", docs);
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"rb") == 0 && f) {
+            char buf[8192] = "";
+            const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+            std::fclose(f);
+            buf[n] = 0;
+            if (const char* p = std::strstr(buf, "<Fullscreen value=\"")) fs = std::strncmp(p + 19, "true", 4) == 0 ? 1 : 0;
+        }
+    }
+    CoTaskMemFree(docs);
+    return fs;
+}
+
 uint32_t xml_height() {
     PWSTR docs = nullptr;
     uint32_t h = 0;
@@ -364,7 +388,12 @@ uintptr_t hk_save(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4) {
         res[1] = g_player_h;
         g_saves_kept.fetch_add(1);
     }
+    // [Debug] ForceScreenMode: the xml keeps the player's own Fullscreen, not the forced one
+    uint8_t* fs = at<uint8_t>(Id::GraphicsOptions);
+    const bool fs_swap = g_force_fs >= 0 && g_xml_fs >= 0 && *fs == g_force_fs && g_force_fs != g_xml_fs;
+    if (fs_swap) *fs = static_cast<uint8_t>(g_xml_fs);
     const uintptr_t r = o_save(a1, a2, a3, a4);
+    if (fs_swap && *fs == g_xml_fs) *fs = static_cast<uint8_t>(g_force_fs);
     if (swap && res[0] == g_player_w && res[1] == g_player_h) {
         res[0] = static_cast<int>(g_w);
         res[1] = static_cast<int>(g_h);
@@ -516,6 +545,23 @@ bool arm(bool early) {
     g_armed = true;
     *at<const char*>(Id::SysParamWidth) = g_wstr;
     *at<const char*>(Id::SysParamHeight) = g_hstr;
+    {  // [Debug] ForceScreenMode = fullscreen | windowed (test only: the render resolution in the game's other screen type)
+        const std::string m = lower(config::get_string("Debug", "ForceScreenMode", ""));
+        const bool full = m == "fullscreen", win = m == "windowed";
+        if (full || win) {
+            const Id id = full ? Id::SysParamFullscreen : Id::SysParamWindowed;
+            g_xml_fs = xml_fullscreen();
+            if (g_xml_fs >= 0 && sysparam_ok(id, full ? "fullscreen" : "windowed")) {
+                *at<const char*>(id) = kOne;
+                g_force_fs = full ? 1 : 0;
+                log::info("[renderres] [Debug] ForceScreenMode: the game's -%s armed (the xml's Fullscreen %d kept for its saves)",
+                          full ? "fullscreen" : "windowed", g_xml_fs);
+            } else {
+                log::warn("[renderres] [Debug] ForceScreenMode=%s not armed (the xml's Fullscreen %d, the sysParam %s)", m.c_str(), g_xml_fs,
+                          sysparam_ok(id, full ? "fullscreen" : "windowed") ? "free" : "set already or not found");
+            }
+        }
+    }
     const bool late = device_init_started();
     log::info("[renderres] armed %ux%u at %.1f ms (%s): the game's -width/-height%s", g_w, g_h, g_arm_ms, early ? "before the anchors' check" : "after it",
               late ? "; the device init had started meanwhile (the window create will tell)" : "");

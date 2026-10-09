@@ -96,6 +96,13 @@ float g_raise_pmin = -35.0f, g_raise_pmax = 60.0f, g_raise_reach = 0.25f;  // [H
 std::atomic<float> g_raise_dbg[4] = {};  // the last frame's pitch, reach, ahead, and the conditions (bits) for "holster"
 std::atomic<bool> g_unarmed{true};        // [Holsters] UnarmedAfterHolster
 std::atomic<bool> g_show_zones{false};    // [Holsters] ShowZones: the holster rings (run 8 item 5b: those only)
+std::atomic<bool> g_zones_near{false};    // [Holsters] ZonesNear (2026-10-09): a ring only with a hand near it
+std::atomic<float> g_near_dist{0.25f};    // [Holsters] ZonesNearDistance: how near (m, past the ring's radius)
+std::atomic<bool> g_steady_zones{false};  // [Holsters] SteadyZones (2026-10-09): the zones' edges with hysteresis
+constexpr float kZoneExit = 0.03f, kZoneSticky = 0.03f;  // SteadyZones: past the radius to leave; nearer to change
+std::atomic<bool> g_place{false};  // placing the holsters by hand (the menu; the session only)
+std::atomic<uint64_t> g_placed{0};  // holsters moved by hand and saved
+void save_zone(int i);              // (below) a zone's offset and radius into the user ini
 std::atomic<bool> g_ring_gun_axes{true};
 std::atomic<bool> g_steady_ring{true};  // [Reload] SteadyRing (run 8 item 2): the ring's place on the gun locked after the draw
 std::atomic<uint64_t> g_ring_locks{0};  // [Reload] RingInGunAxes (run 8 item 2): the ring's offset along the drawn gun's axes
@@ -288,9 +295,43 @@ std::atomic<bool> g_show_guns{false};
 std::atomic<bool> g_show_back_guns{true};
 std::atomic<int> g_anchor{1};  // [Holsters] Anchor: 0 body, 1 headset (run 7 item 1d; the default)
 std::atomic<bool> g_anchor_used{false};  // the last update moved the zones with the neck
+// [Holsters] TurnWithHead / TurnDeadZone (2026-10-09, the user's request): with the headset anchor, the holsters turned
+// with the headset's yaw since recentre (about the neutral head), once it is more than the dead zone from where they point
+std::atomic<bool> g_turn_head{false};
+std::atomic<float> g_turn_dead{0.0f}, g_zone_yaw_pub{0.0f};
+// [Holsters] LeanSteady, TorsoLength, TurnByHands (2026-10-09, the holsters' polish)
+std::atomic<bool> g_lean_steady{false}, g_turn_hands{false};
+std::atomic<float> g_torso_len{0.55f}, g_lean_pub{0.0f}, g_hands_yaw_pub{-999.0f};
 float g_anchor_shift[3] = {0, 0, 0};    // that move (world, m); under g_zone_mutex
 float g_anchor_cam[3] = {0, 0, 0};      // the frame camera's position (the neutral head) then; under g_zone_mutex
 const int kShowZones[4] = {0, 1, 5, 6};  // the right hip, the back, the left hip, the left shoulder
+// [Holsters] ShowModels (2026-10-09, the user's request): a holster model at the hips (held_prop kModelSlot + i), the
+// game's own prop by its fragment name ([Holsters] Model), turned by ModelTurn (degrees about the holster's up, right,
+// forward) and moved by ModelOffset (m: right, up, forward; the left hip's right mirrored, its turn about up reversed)
+const int kModelZones[2] = {0, 5};  // the right hip, the left hip
+std::atomic<bool> g_show_models{false};
+char g_model_name[64] = "p_gen_gunbelt01x";
+float g_model_off[3] = {0, 0, 0}, g_model_rot[3] = {90, 90, 0};  // under g_zone_mutex
+float g_model_raw[3] = {0, 0, 0};  // "holster model raw a b c": the native's angles as given (the axes' test)
+bool g_model_raw_on = false;       // under g_zone_mutex
+// The model's pose at a hip (12 floats: X, Y, Z columns, then the position): the holster's frame (X right, Y forward,
+// Z up) turned by the model's turn, at the zone moved by its offset
+void model_pose(int i, const float* at, const float* rgt, const float* up, const float* fwd, const float* off, const float* rot, float* pz) {
+    const float side = i == 0 ? 1.0f : -1.0f;
+    const float ya = side * rot[0] * 0.0174532925f, pa = rot[1] * 0.0174532925f, ra = side * rot[2] * 0.0174532925f;
+    // R = Rz(yaw) * Rx(pitch) * Ry(roll) in the holster's (right, forward, up) basis: its columns, then to the world
+    const float cy = std::cos(ya), sy = std::sin(ya), cp = std::cos(pa), sp = std::sin(pa), cr = std::cos(ra), sr = std::sin(ra);
+    const float Rz[9] = {cy, -sy, 0, sy, cy, 0, 0, 0, 1}, Rx[9] = {1, 0, 0, 0, cp, -sp, 0, sp, cp}, Ry[9] = {cr, 0, sr, 0, 1, 0, -sr, 0, cr};
+    float T[9], M[9];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) T[r * 3 + c] = Rx[r * 3 + 0] * Ry[0 * 3 + c] + Rx[r * 3 + 1] * Ry[1 * 3 + c] + Rx[r * 3 + 2] * Ry[2 * 3 + c];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) M[r * 3 + c] = Rz[r * 3 + 0] * T[0 * 3 + c] + Rz[r * 3 + 1] * T[1 * 3 + c] + Rz[r * 3 + 2] * T[2 * 3 + c];
+    const float* B[3] = {rgt, fwd, up};  // the holster's basis vectors (world)
+    for (int c = 0; c < 3; ++c)
+        for (int k = 0; k < 3; ++k) pz[c * 3 + k] = B[0][k] * M[0 * 3 + c] + B[1][k] * M[1 * 3 + c] + B[2][k] * M[2 * 3 + c];
+    for (int k = 0; k < 3; ++k) pz[9 + k] = at[k] + rgt[k] * off[0] * side + up[k] * off[1] + fwd[k] * off[2];
+}
 // the shown guns' error: the drawn position against the wanted one of the frame after (the walk's lag), the worst (m)
 struct ShowDiag {
     int weapon[4] = {-1, -1, -1, -1};
@@ -376,6 +417,8 @@ std::mutex g_hdiag_mutex;
 
 const uint32_t kWeaponEquipped = 0x42C0FAAA;   // GET_WEAPON_EQUIPPED(actor, slot): the slot's eWeapon, -1 none
 const uint32_t kPutWeaponInHand = 0x8F4B473D;  // ACTOR_PUT_WEAPON_IN_HAND(actor, eWeapon, animated)
+const uint32_t kSetNextWeapon = 0xBFD6D55F;     // ACTOR_SET_NEXT_WEAPON(actor, eWeapon): its slot's object becomes it (not drawn)
+std::atomic<uint64_t> g_sec_switches{0}, g_sec_refused{0};
 const uint32_t kPutItemAway = 0x13A63AA7;      // ACTOR_PUT_ITEM_AWAY(actor)
 // SET_PLAYER_MELEE_MODE_SELECTED: the handler (0x140ad7470) takes only its first argument, the flag (the natives DB's
 // "player, mode" order is not the handler's): P +0x3bc bit 5, the weapon wheel's Unarmed (FUN_1403f92e0). Any later
@@ -431,6 +474,7 @@ void holster_frame() {
         held_prop::want(0, nullptr, nullptr);  // out of first person: the shell goes
         held_prop::want(1, nullptr, nullptr);  // and the copy's own model
         for (int i = 0; i < 4; ++i) held_prop::want(held_prop::kHolsterSlot + i, nullptr, nullptr);  // and the holsters' guns
+        for (int i = 0; i < 2; ++i) held_prop::want(held_prop::kModelSlot + i, nullptr, nullptr);    // and their models
         held_prop::frame(0);
         std::lock_guard lock(g_hdiag_mutex);
         g_hdiag.valid = false;
@@ -443,8 +487,10 @@ void holster_frame() {
         std::memcpy(zones, g_zones, sizeof(zones));
     }
     const bool lefty = controls::left_handed();
-    const float hd = pose::body_heading_deg() * 0.0174532925f;
+    const float hd = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's, not the ride's turned view
     const float fwd[3] = {-std::sin(hd), 0.0f, -std::cos(hd)}, right[3] = {std::cos(hd), 0.0f, -std::sin(hd)}, up[3] = {0, 1, 0};
+    // the holsters' own frame: the body's, or turned with the headset ([Holsters] TurnWithHead, below)
+    float hr[3] = {right[0], right[1], right[2]}, hf[3] = {fwd[0], fwd[1], fwd[2]};
     float zp[kZones][3], bases[kZones][3];
     bool zok[kZones];
     for (int z = 0; z < kZones; ++z) {
@@ -501,19 +547,82 @@ void holster_frame() {
                               rel[0][0], -rel[0][1], rel[0][2]);
                 }
             }
+            {  // [Holsters] TurnWithHead: the frame turned by the headset's yaw since recentre, past the dead zone
+                static float zyaw = 0.0f;
+                static uint32_t yaw_gen = ~0u;
+                if (gen != yaw_gen || was_anchor != 1) {  // a recentre, or the anchor taken again: facing the body
+                    yaw_gen = gen;
+                    zyaw = 0.0f;
+                }
+                float hy = 0.0f;
+                if (!g_turn_head.load(std::memory_order_relaxed)) {
+                    zyaw = 0.0f;
+                } else if (camera_lever::head_yaw_deg(&hy)) {  // (no head pose this frame: kept where they point)
+                    // [Holsters] TurnByHands: both hands well ahead of the neck: the target halfway to their direction
+                    float hands_yaw = -999.0f;
+                    float nk[3];
+                    if (g_turn_hands.load(std::memory_order_relaxed) && bp.hand_ok[0] && bp.hand_ok[1] && camera_lever::neck_offset(nk)) {
+                        const float nl[3] = {nk[0], nk[1] - 0.10f, nk[2] + 0.08f};  // the neck point (the head's model)
+                        float nw[3];
+                        for (int k = 0; k < 3; ++k) nw[k] = cp[k] + bp.cam[k] * nl[0] + bp.cam[4 + k] * nl[1] + bp.cam[8 + k] * nl[2];
+                        // the aiming pose, wherever it points: both hands 0.30 m or more out from the neck, within 0.35 m of
+                        // each other (a look aside while aiming is the case; not against the head's or the holsters' facing)
+                        bool ahead = true;
+                        float mx = 0, mz = 0;
+                        for (int j = 0; j < 2; ++j) {
+                            const float vx = bp.hand[j][0] - nw[0], vz = bp.hand[j][2] - nw[2];
+                            ahead = ahead && std::sqrt(vx * vx + vz * vz) > 0.30f;
+                            mx += 0.5f * vx, mz += 0.5f * vz;
+                        }
+                        const float sx = bp.hand[0][0] - bp.hand[1][0], sz = bp.hand[0][2] - bp.hand[1][2];
+                        ahead = ahead && std::sqrt(sx * sx + sz * sz) < 0.35f;
+                        if (ahead) {
+                            hands_yaw = std::remainder(std::atan2(-mx, -mz) * 57.29578f - hd * 57.29578f, 360.0f);
+                            hy += 0.5f * std::remainder(hands_yaw - hy, 360.0f);
+                        }
+                    }
+                    g_hands_yaw_pub.store(hands_yaw, std::memory_order_relaxed);
+                    float d = std::remainder(hy - zyaw, 360.0f);
+                    const float dz = g_turn_dead.load(std::memory_order_relaxed);
+                    if (d > dz) zyaw += d - dz;
+                    else if (d < -dz) zyaw += d + dz;
+                    zyaw = std::remainder(zyaw, 360.0f);
+                }
+                g_zone_yaw_pub.store(zyaw, std::memory_order_relaxed);
+                const float a = hd + zyaw * 0.0174532925f;
+                hf[0] = -std::sin(a), hf[2] = -std::cos(a);
+                hr[0] = std::cos(a), hr[2] = -std::sin(a);
+            }
             if (rel_ok) {
                 for (int z = 0; z < kZones; ++z) {
                     for (int k = 0; k < 3; ++k)
-                        zp[z][k] = cp[k] + right[k] * (rel[z][0] + zones[z].off[0]) + up[k] * (rel[z][1] + zones[z].off[1]) +
-                                   fwd[k] * (rel[z][2] + zones[z].off[2]);
+                        zp[z][k] = cp[k] + hr[k] * (rel[z][0] + zones[z].off[0]) + up[k] * (rel[z][1] + zones[z].off[1]) +
+                                   hf[k] * (rel[z][2] + zones[z].off[2]);
                     if (lefty) {  // mirrored across the camera's middle (the body's, as the body mode's)
-                        const float d = (zp[z][0] - cp[0]) * right[0] + (zp[z][2] - cp[2]) * right[2];
-                        for (int k = 0; k < 3; ++k) zp[z][k] -= 2.0f * d * right[k];
+                        const float d = (zp[z][0] - cp[0]) * hr[0] + (zp[z][2] - cp[2]) * hr[2];
+                        for (int k = 0; k < 3; ++k) zp[z][k] -= 2.0f * d * hr[k];
                     }
                 }
             }
             const bool follow = body::follows_head();
-            const float n[3] = {follow ? 0.0f : no[0], no[1], follow ? 0.0f : no[2]};
+            float nn[3] = {no[0], no[1], no[2]};
+            float lean = 0.0f;
+            if (g_lean_steady.load(std::memory_order_relaxed)) {
+                // [Holsters] LeanSteady: the torso pivoting at the hips: its drop gives the lean's most forward reach
+                // (L sin a with L (1 - cos a) = the drop), the forward move up to that is the lean, the rest a step
+                const float L = g_torso_len.load(std::memory_order_relaxed);
+                const float drop = std::fmax(0.0f, -nn[1]), dh = std::sqrt(nn[0] * nn[0] + nn[2] * nn[2]);
+                const float c = 1.0f - std::fmin(drop, L) / L;
+                lean = std::fmin(dh, L * std::sqrt(std::fmax(0.0f, 1.0f - c * c)));
+                if (dh > 1e-4f) {
+                    nn[0] *= (dh - lean) / dh;
+                    nn[2] *= (dh - lean) / dh;
+                }
+                const float sa = std::fmin(1.0f, lean / L);
+                nn[1] += L * (1.0f - std::sqrt(1.0f - sa * sa));  // the drop the lean explains is not a crouch
+            }
+            g_lean_pub.store(lean, std::memory_order_relaxed);
+            const float n[3] = {follow ? 0.0f : nn[0], nn[1], follow ? 0.0f : nn[2]};
             for (int k = 0; k < 3; ++k) sh[k] = bp.cam[k] * n[0] + bp.cam[4 + k] * n[1] + bp.cam[8 + k] * n[2];
             for (int z = 0; z < kZones; ++z)
                 for (int k = 0; k < 3; ++k) zp[z][k] += sh[k];
@@ -536,6 +645,26 @@ void holster_frame() {
         uintptr_t item = 0;
         return s >= 0 && s < 8 && wmgr && rd(wmgr + 0xa8 + static_cast<uintptr_t>(s) * 0x70, &item) && item;
     };
+    auto slot_gun = [&](int s) -> int {  // the eWeapon of a slot's object (-1: none)
+        uintptr_t item = 0, W = 0, info = 0;
+        int16_t wt = -1;
+        if (s >= 0 && s < 8 && wmgr && rd(wmgr + 0xa8 + static_cast<uintptr_t>(s) * 0x70, &item) && item && rd(item + 0xa0, &W) && W &&
+            rd(W + 0x28, &info) && info)
+            rd(info + 8, &wt);
+        return wt;
+    };
+    auto slot_loaded = [&](int s) {  // the slot's gun model streamed in (W +0x2c0 = 2, as dual's resolve wants)
+        uintptr_t item = 0, W = 0;
+        int32_t prop = 0;
+        return s >= 0 && s < 8 && wmgr && rd(wmgr + 0xa8 + static_cast<uintptr_t>(s) * 0x70, &item) && item && rd(item + 0xa0, &W) && W &&
+               rd(W + 0x2c0, &prop) && prop == 2;
+    };
+    // a second gun waiting for its slot to hold the holster's gun (ACTOR_SET_NEXT_WEAPON queued), per controller
+    struct SecWait {
+        int slot = -1, weapon = -1, zone = -1;
+        double since = 0.0;
+    };
+    static SecWait sec_wait[2];
     const bool choosing = g_weapon_choice.load(std::memory_order_relaxed) && st.owned_tick != 0;
     auto owns = [&](int w) { return choosing && w >= 0 && w < kWeapons && (st.owned >> w & 1); };
     // what each slot last held in hand (so a twin can draw another gun than its partner's)
@@ -637,6 +766,32 @@ void holster_frame() {
         }
     };
     const bool gun = reload::is_gun(st.weapon) && in_hand, long_gun = gun && reload::is_long_gun(st.weapon);
+    {  // the user, 2026-10-09: "a revolver facing backwards in my holster and then also coming out backwards when I grab it"
+       // (the right hip, the right hand, the Cattleman and another revolver; not seen in the simulator): once a draw, 0.4 s
+       // in, the drawn sidearm's barrel in the gun hand's frame (forward about (0 0.17 -0.98)), BACKWARDS when it points back
+        static int diag_w = -1;
+        static double diag_ms = 0.0;
+        static bool diag_done = false;
+        if (gun && st.weapon >= 0 && st.weapon <= 7) {
+            if (st.weapon != diag_w) {
+                diag_w = st.weapon;
+                diag_ms = now_ms;
+                diag_done = false;
+            }
+            float b[3];
+            if (!diag_done && now_ms - diag_ms > 400.0 && aim::barrel_in_target(b)) {
+                diag_done = true;
+                const bool back = b[2] > 0.0f;
+                log::write(back ? log::Level::Warn : log::Level::Info,
+                           "[holster] the %s in hand (from the %s, the %s hand): its barrel in the hand's frame (%.2f %.2f %.2f)%s | the hips' choices %s, %s",
+                           kWeaponLabel[st.weapon], drawn_from >= 0 ? zones[drawn_from].key : "?", gun_h ? "right" : "left", b[0], b[1], b[2],
+                           back ? " BACKWARDS" : "", zones[0].weapon >= 0 ? kWeaponToken[zones[0].weapon] : "auto",
+                           zones[5].weapon >= 0 ? kWeaponToken[zones[5].weapon] : "auto");
+            }
+        } else {
+            diag_w = -1;
+        }
+    }
     // the empty gun clicks: the gun hand's trigger pulled with nothing loaded (with or without spare rounds), not while
     // the menu has the controllers. [Reload] EmptyClick: a click sound from the gun hand's side, the buzz, both or none
     {
@@ -734,13 +889,18 @@ void holster_frame() {
     for (int h = 0; h < 2; ++h) {  // h: the controller; jh: John's hand on it (body.cpp's mapping)
         const int jh = bp.ctrl[0] == h ? 0 : 1;
         if (bp.hand_ok[jh]) {
+            // [Holsters] SteadyZones: the zone the hand was in is kept until it is kZoneExit past its radius, and wins
+            // over another by kZoneSticky (the left hip's holsters overlap)
+            const bool steady = g_steady_zones.load(std::memory_order_relaxed);
             float best = 1e9f;
             for (int z = 0; z < kZones; ++z) {
                 if (!zok[z]) continue;
                 const float dx = gb[jh][0] - zp[z][0], dy = gb[jh][1] - zp[z][1], dz = gb[jh][2] - zp[z][2];
                 const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (d < zones[z].radius && d < best) {
-                    best = d;
+                const bool was = steady && z == zone_in[h];
+                const float score = was ? d - kZoneSticky : d;
+                if (d < zones[z].radius + (was ? kZoneExit : 0.0f) && score < best) {
+                    best = score;
                     in_z[h] = z;
                 }
             }
@@ -752,6 +912,24 @@ void holster_frame() {
             }
             zone_in[h] = in_z[h];
         }
+        if (sec_wait[h].slot >= 0) {  // the slot holds the holster's gun, its model in: the second gun now (3 s at most)
+            SecWait& sw = sec_wait[h];
+            const double waited = log::now_ms() - sw.since;
+            const bool ready = slot_gun(sw.slot) == sw.weapon && slot_loaded(sw.slot);
+            if (ready || waited > 3000.0 || ds.on || !gun) {
+                if (ready && !ds.on && gun) {
+                    dual::begin(h, jh, sw.slot, zones[sw.zone].key);
+                    controllers::pulse(h, 0.5f, 30);
+                    if (waited > 30.0) log::info("[wield] the %s ready in slot %d after %.0f ms", kWeaponLabel[sw.weapon], sw.slot, waited);
+                } else if (!ready) {
+                    controllers::pulse(h, 0.15f, 10);
+                    log::info("[wield] the %s not ready in slot %d after %.0f ms (it holds the %s, model %s): no second gun", kWeaponLabel[sw.weapon],
+                              sw.slot, waited, slot_gun(sw.slot) >= 0 && slot_gun(sw.slot) < kWeapons ? kWeaponLabel[slot_gun(sw.slot)] : "?",
+                              slot_loaded(sw.slot) ? "in" : "not in");
+                }
+                sw.slot = -1;
+            }
+        }
         if (ds.on && h == ds.ctrl) {
             if (sec_zone[h] == -2) sec_zone[h] = in_z[h];
             if (in_z[h] < 0 || in_z[h] != sec_zone[h]) sec_armed[h] = true;
@@ -761,6 +939,44 @@ void holster_frame() {
         }
         const bool down = grip_down[h], pressed = down && !was_down[h], released = !down && was_down[h];
         was_down[h] = down;
+        {  // placing the holsters by hand: a grip in a ring takes that holster, the hand's move moves it, letting go keeps it
+            static int place_z[2] = {-1, -1};
+            if (!g_place.load(std::memory_order_relaxed)) {
+                place_z[h] = -1;
+            } else {
+                if (pressed && in_z[h] >= 0) {
+                    place_z[h] = in_z[h];
+                    controllers::pulse(h, 0.5f, 30);
+                    log::info("[holster] placing the %s by hand (the %s hand)", zones[in_z[h]].key, h ? "right" : "left");
+                }
+                const int pz = place_z[h];
+                if (pz >= 0 && down && bp.hand_ok[jh]) {
+                    // this frame's zone at zp with its offset; the hand at gb: the offset moved by the difference, in the
+                    // holster's frame (right, up, forward; mirrored when left-handed)
+                    const float d[3] = {gb[jh][0] - zp[pz][0], gb[jh][1] - zp[pz][1], gb[jh][2] - zp[pz][2]};
+                    float loc[3] = {d[0] * hr[0] + d[2] * hr[2], d[1], d[0] * hf[0] + d[2] * hf[2]};
+                    if (lefty) loc[0] = -loc[0];
+                    std::lock_guard lock(g_zone_mutex);
+                    for (int k = 0; k < 3; ++k) g_zones[pz].off[k] = std::fmin(0.8f, std::fmax(-0.8f, g_zones[pz].off[k] + loc[k]));
+                }
+                if (pz >= 0 && !down) {
+                    save_zone(pz);
+                    g_placed.fetch_add(1, std::memory_order_relaxed);
+                    controllers::pulse(h, 0.3f, 20);
+                    float o[3];
+                    {
+                        std::lock_guard lock(g_zone_mutex);
+                        std::memcpy(o, g_zones[pz].off, sizeof(o));
+                    }
+                    log::info("[holster] the %s placed by hand: offset (%.3f %.3f %.3f)", zones[pz].key, o[0], o[1], o[2]);
+                    place_z[h] = -1;
+                }
+                g_consumed[h] = place_z[h] >= 0;
+                press_zone[h] = place_z[h];
+                pending[h] = false;
+                continue;  // no draws, put-aways or rounds while placing
+            }
+        }
         if (pressed && in_z[h] == kAmmoZone) {
             // a round from the chest for the gun in the other hand (the game's count: the gun not full, spare rounds)
             g_consumed[h] = true;
@@ -875,11 +1091,37 @@ void holster_frame() {
             g_consumed[h] = true;
             press_zone[h] = in_z[h];
             pending[h] = false;
-            int sslot = -1;
-            for (int s : z.slots)
-                if (sslot < 0 && (s == 1 || (s >= 4 && s <= 6)) && s != cur && slot_filled(s)) sslot = s;
-            dual::begin(h, jh, sslot, z.key);
-            controllers::pulse(h, 0.5f, 30);
+            // the gun this holster draws (its choice, its own last, its twin's other), in its slot; else the first filled slot
+            const int dw = draw_weapon(in_z[h]);
+            const int ws = dw >= 0 && dw < kWeapons ? st.equip_slot[dw] : -1;
+            bool listed = false;
+            for (int s : z.slots) listed = listed || (s >= 0 && s == ws);
+            if (dw >= 0 && listed && ws == cur) {  // the game keeps one gun a slot: the gun in hand's
+                g_sec_refused.fetch_add(1, std::memory_order_relaxed);
+                controllers::pulse(h, 0.15f, 10);
+                log::info("[wield] %s hand at the %s: the %s shares the slot of the %s in hand (%d): no second gun", h ? "right" : "left", z.key,
+                          kWeaponLabel[dw], st.weapon >= 0 && st.weapon < kWeapons ? kWeaponLabel[st.weapon] : "?", cur);
+            } else if (dw >= 0 && listed && slot_filled(ws) && !(slot_gun(ws) == dw && slot_loaded(ws))) {
+                if (slot_gun(ws) != dw) {  // the game's last gun of that slot is another: switched to this holster's
+                    const uint64_t args[2] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(dw)};
+                    api::queue_native(kSetNextWeapon, args, 2, 0, nullptr);
+                    g_sec_switches.fetch_add(1, std::memory_order_relaxed);
+                    log::info("[wield] %s hand at the %s: slot %d switched to the %s (it held the %s)", h ? "right" : "left", z.key, ws,
+                              kWeaponLabel[dw], slot_gun(ws) >= 0 && slot_gun(ws) < kWeapons ? kWeaponLabel[slot_gun(ws)] : "?");
+                }
+                sec_wait[h] = SecWait{ws, dw, in_z[h], log::now_ms()};
+                zone_last[in_z[h]] = dw;
+            } else if (dw >= 0 && listed && slot_filled(ws)) {  // the slot already holds it, loaded: at once
+                zone_last[in_z[h]] = dw;
+                dual::begin(h, jh, ws, z.key);
+                controllers::pulse(h, 0.5f, 30);
+            } else {
+                int sslot = -1;
+                for (int s : z.slots)
+                    if (sslot < 0 && (s == 1 || (s >= 4 && s <= 6)) && s != cur && slot_filled(s)) sslot = s;
+                dual::begin(h, jh, sslot, z.key);
+                controllers::pulse(h, 0.5f, 30);
+            }
         } else if (pressed && in_z[h] >= 0) {
             const Zone& z = zones[in_z[h]];
             g_consumed[h] = true;
@@ -1087,7 +1329,7 @@ void holster_frame() {
             const bool room = gun && reload::hand_reload() && st.clip + 0.5f <= st.clip_max && st.spare >= 1.0f && actions::can_load(st.weapon) &&
                               !(st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) && zok[kAmmoZone];
             const float can = std::fmin(std::fmin(st.spare, st.clip_max - st.clip), 6.0f);
-            round_draw::set_row(room ? audio::click_family(st.weapon) : 0, room ? static_cast<int>(can + 0.01f) : 0, zp[kAmmoZone], right, up, fwd);
+            round_draw::set_row(room ? audio::click_family(st.weapon) : 0, room ? static_cast<int>(can + 0.01f) : 0, zp[kAmmoZone], hr, up, hf);
         }
         // [Reload] RoundInHand = 2: the game's own shotgun shell in the hand (held_prop; its draw moved onto the pose)
         float pz[12];
@@ -1143,7 +1385,7 @@ void holster_frame() {
             const char* frag = gw >= 0 ? gun_fragment(gw) : nullptr;
             float gp[12];
             if (frag) {
-                show_pose(zi, zp[zi], right, up, fwd, bp.root, gp);
+                show_pose(zi, zp[zi], hr, up, hf, bp.root, gp);
                 float dp[3], rel[3];
                 double dms = 0;
                 uint64_t gated = 0;
@@ -1162,6 +1404,32 @@ void holster_frame() {
             }
             sd.weapon[i] = frag ? gw : -1;
             held_prop::want(held_prop::kHolsterSlot + i, frag, frag ? gp : nullptr, anc);
+        }
+        {  // [Holsters] ShowModels: the holster models at the hips (each enabled hip's, drawn or not)
+            float mo[3], mr[3], raw[3];
+            bool raw_on;
+            {
+                std::lock_guard lock(g_zone_mutex);
+                std::memcpy(mo, g_model_off, sizeof(mo));
+                std::memcpy(mr, g_model_rot, sizeof(mr));
+                std::memcpy(raw, g_model_raw, sizeof(raw));
+                raw_on = g_model_raw_on;
+            }
+            const bool models = g_show_models.load(std::memory_order_relaxed);
+            for (int i = 0; i < 2; ++i) {
+                const int zi = kModelZones[i];
+                float mp[12];
+                const bool want = models && zok[zi] && g_model_name[0];
+                const float zero[3] = {0, 0, 0};
+                if (want) model_pose(lefty ? 1 - i : i, zp[zi], hr, up, hf, mo, zero, mp);  // its place (the turn is the object's)
+                held_prop::want(held_prop::kModelSlot + i, want ? g_model_name : nullptr, want ? mp : nullptr, anc);
+                // its turn: SET_OBJECT_ORIENTATION's three angles (the model's tilt, its heading, its roll) from ModelTurn,
+                // the heading plus the holsters' own (their frame's forward), the left hip's heading offset and roll reversed
+                const float side = (lefty ? 1 - i : i) == 0 ? 1.0f : -1.0f;
+                const float heading = std::atan2(-hf[0], -hf[2]) * 57.29578f;
+                const float ang[3] = {mr[0], heading + side * mr[1], side * mr[2]};
+                held_prop::want_angles(held_prop::kModelSlot + i, raw_on ? raw : ang);
+            }
         }
         ++sd.frames;
         {
@@ -1185,7 +1453,8 @@ void holster_frame() {
     g_markers_valid = false;
     float hint_pos[3] = {};
     const int ahint = gun ? actions::hint(hint_pos) : 0;  // [Reload] ActionHints
-    const bool zones_shown = g_show_zones.load(std::memory_order_relaxed);
+    const bool placing = g_place.load(std::memory_order_relaxed);
+    const bool zones_shown = g_show_zones.load(std::memory_order_relaxed) || placing;
     const bool dots_shown = g_show_dots.load(std::memory_order_relaxed), points_shown = g_show_points.load(std::memory_order_relaxed);
     if ((zones_shown || dots_shown || points_shown) && bp.cam_ok) {
         Markers& mk = g_markers;
@@ -1200,6 +1469,8 @@ void holster_frame() {
             m.state = s;
             m.id = static_cast<int8_t>(id);
         };
+        const bool near_only = g_zones_near.load(std::memory_order_relaxed) && !placing;
+        const float near_d = g_near_dist.load(std::memory_order_relaxed);
         for (int z = 0; z < kZones && zones_shown; ++z) {  // the zones first (the dots are dropped first when layers run short)
             if (!zok[z]) continue;
             MarkerState ms = kIdle;
@@ -1208,6 +1479,16 @@ void holster_frame() {
                     ms = kHeld;
                 else if (in_z[h] == z && ms == kIdle)
                     ms = kHandIn;
+            }
+            if (near_only && ms == kIdle) {  // [Holsters] ZonesNear: shown faint while a hand is near, else not at all
+                bool close_by = false;
+                for (int jh = 0; jh < 2; ++jh) {
+                    if (!bp.hand_ok[jh]) continue;
+                    const float dx = gb[jh][0] - zp[z][0], dy = gb[jh][1] - zp[z][1], dz = gb[jh][2] - zp[z][2];
+                    close_by = close_by || std::sqrt(dx * dx + dy * dy + dz * dz) < zones[z].radius + near_d;
+                }
+                if (!close_by) continue;
+                ms = kNear;
             }
             add(zp[z], zones[z].radius, kRing, ms, z);
         }
@@ -1430,6 +1711,9 @@ void init() {
     g_raise_pmax = config::get_float("Hands", "RaisedPitchMax", 60.0f);
     g_raise_reach = config::get_float("Hands", "RaisedReach", 0.25f);
     g_show_zones = config::get_bool("Holsters", "ShowZones", false);
+    g_zones_near = config::get_bool("Holsters", "ZonesNear", false);
+    g_near_dist = std::fmin(1.0f, std::fmax(0.05f, config::get_float("Holsters", "ZonesNearDistance", 0.25f)));
+    g_steady_zones = config::get_bool("Holsters", "SteadyZones", false);
     g_show_dots = config::get_bool("Holsters", "ShowHandDots", g_show_zones.load());
     g_ring_gun_axes = config::get_bool("Reload", "RingInGunAxes", true);
     g_steady_ring = config::get_bool("Reload", "SteadyRing", true);
@@ -1477,6 +1761,22 @@ void init() {
         g_show_guns = config::get_bool("Holsters", "ShowGuns", false);
         g_show_back_guns = config::get_bool("Holsters", "ShowBackGuns", true);
         g_anchor = config::get_string("Holsters", "Anchor", "headset") == "body" ? 0 : 1;
+        g_turn_head = config::get_bool("Holsters", "TurnWithHead", false);
+        g_turn_hands = config::get_bool("Holsters", "TurnByHands", false);
+        g_lean_steady = config::get_bool("Holsters", "LeanSteady", false);
+        g_torso_len = std::fmin(0.9f, std::fmax(0.3f, config::get_float("Holsters", "TorsoLength", 0.55f)));
+        g_show_models = config::get_bool("Holsters", "ShowModels", false);
+        {
+            const std::string mn = config::get_string("Holsters", "Model", "p_gen_gunbelt01x");
+            std::snprintf(g_model_name, sizeof(g_model_name), "%s", mn.c_str());
+            float o[3] = {0, 0, 0}, r[3] = {0, 0, 0};
+            sscanf_s(config::get_string("Holsters", "ModelOffset", "0 0 0").c_str(), "%f %f %f", &o[0], &o[1], &o[2]);
+            sscanf_s(config::get_string("Holsters", "ModelTurn", "90 90 0").c_str(), "%f %f %f", &r[0], &r[1], &r[2]);
+            std::lock_guard lock(g_zone_mutex);
+            std::memcpy(g_model_off, o, sizeof(o));
+            std::memcpy(g_model_rot, r, sizeof(r));
+        }
+        g_turn_dead = std::fmin(90.0f, std::fmax(0.0f, config::get_float("Holsters", "TurnDeadZone", 0.0f)));
         log::info("[holster] the loading point moved (%.3f %.3f %.3f) m, radius %.2f m; a round goes in on touch %d", lo[0], lo[1], lo[2], g_load_radius,
                   g_insert_touch ? 1 : 0);
         log::info("[holster] foregrip: the game's grip moved (%.3f %.3f %.3f) m, radius %.2f m; the front hand snaps on %d", off[0], off[1],
@@ -1744,6 +2044,20 @@ bool arsenal(Arsenal* out) {
     std::memcpy(out->equip_slot, st.equip_slot, sizeof(out->equip_slot));
     return true;
 }
+bool placing() { return g_place.load(std::memory_order_relaxed); }
+void set_placing(bool on) {
+    if (g_place.exchange(on) != on) log::info("[holster] placing the holsters by hand: %s", on ? "on" : "off");
+}
+bool zones_near() { return g_zones_near.load(std::memory_order_relaxed); }
+void set_zones_near(bool on, bool save) {
+    if (g_zones_near.exchange(on) != on) log::info("[holster] the rings only near a hand: %s", on ? "on" : "off");
+    if (save) config::set("Holsters", "ZonesNear", on ? "1" : "0");
+}
+bool steady_zones() { return g_steady_zones.load(std::memory_order_relaxed); }
+void set_steady_zones(bool on, bool save) {
+    if (g_steady_zones.exchange(on) != on) log::info("[holster] the holsters' edges steadied: %s", on ? "on" : "off");
+    if (save) config::set("Holsters", "SteadyZones", on ? "1" : "0");
+}
 bool show_zones() { return g_show_zones.load(); }
 void set_show_zones(bool on) {
     set_show_zones_session(on);
@@ -1777,12 +2091,42 @@ bool aim_pose() { return g_aim_pose.load(std::memory_order_relaxed); }
 bool gun_raised() { return g_raised.load(std::memory_order_relaxed); }
 bool fire_ready() { return g_fire_ready.load(std::memory_order_relaxed); }
 float fire_clip_phase() { return g_fire_phase.load(std::memory_order_relaxed); }
+bool show_models() { return g_show_models.load(std::memory_order_relaxed); }
+void set_show_models(bool on, bool save) {
+    if (g_show_models.exchange(on) != on) log::info("[holster] the holster models (%s) at the hips: %s", g_model_name, on ? "on" : "off");
+    if (save) config::set("Holsters", "ShowModels", on ? "1" : "0");
+}
 bool show_guns() { return g_show_guns.load(std::memory_order_relaxed); }
 void set_show_guns(bool on, bool save) {
     if (g_show_guns.exchange(on) != on) log::info("[holster] the guns shown at the holsters: %s", on ? "on" : "off");
     if (save) config::set("Holsters", "ShowGuns", on ? "1" : "0");
 }
 int anchor() { return g_anchor.load(std::memory_order_relaxed); }
+bool lean_steady() { return g_lean_steady.load(std::memory_order_relaxed); }
+void set_lean_steady(bool on, bool save) {
+    if (g_lean_steady.exchange(on) != on) log::info("[holster] the holsters steady when you lean: %s", on ? "on" : "off");
+    if (save) config::set("Holsters", "LeanSteady", on ? "1" : "0");
+}
+bool turn_by_hands() { return g_turn_hands.load(std::memory_order_relaxed); }
+void set_turn_by_hands(bool on, bool save) {
+    if (g_turn_hands.exchange(on) != on) log::info("[holster] the holsters' turn by the head and the hands: %s", on ? "on" : "off");
+    if (save) config::set("Holsters", "TurnByHands", on ? "1" : "0");
+}
+bool turn_with_head() { return g_turn_head.load(std::memory_order_relaxed); }
+void set_turn_with_head(bool on, bool save) {
+    if (g_turn_head.exchange(on) != on) log::info("[holster] the holsters turn with the headset: %s", on ? "on" : "off");
+    if (save) config::set("Holsters", "TurnWithHead", on ? "1" : "0");
+}
+float turn_dead_zone() { return g_turn_dead.load(std::memory_order_relaxed); }
+void set_turn_dead_zone(float deg, bool save) {
+    deg = std::fmin(90.0f, std::fmax(0.0f, deg));
+    g_turn_dead = deg;
+    if (save) {
+        char v[16];
+        std::snprintf(v, sizeof(v), "%.0f", deg);
+        config::set("Holsters", "TurnDeadZone", v);
+    }
+}
 void set_anchor(int a, bool save) {
     a = a == 1 ? 1 : 0;
     if (g_anchor.exchange(a) != a) log::info("[holster] the holsters anchored to the %s", a ? "headset (the neck's offset)" : "body");
@@ -1846,6 +2190,23 @@ std::string command(const std::string& line) {
             if (_stricmp(key.c_str(), g_zones[z].key) == 0) set_zone_weapon(z, weapon_from_token(tok), true);
         v = "weapons";
     }
+    if (v == "slots") {  // holster slots: the weapon manager's slots, each one's gun (the game's object of that slot)
+        const uintptr_t actor = player_actor();
+        uintptr_t wmgr = 0, hand = 0;
+        int32_t cur = -1;
+        if (!actor || !rd(actor + 0x70, &wmgr) || !wmgr) return "slots: no weapon manager";
+        rd(wmgr + 0x80, &hand);
+        rd(wmgr + 0x448, &cur);
+        std::string r = "slots: current " + std::to_string(cur) + ":";
+        for (int s = 0; s < 8; ++s) {
+            uintptr_t item = 0, W = 0, info = 0;
+            int16_t wt = -1;
+            if (rd(wmgr + 0xa8 + static_cast<uintptr_t>(s) * 0x70, &item) && item && rd(item + 0xa0, &W) && W && rd(W + 0x28, &info) && info)
+                rd(info + 8, &wt);
+            r += " " + std::to_string(s) + "=" + (wt >= 0 && wt < kWeapons ? kWeaponToken[wt] : item ? "?" : "-") + (item && item == hand ? "(in hand)" : "");
+        }
+        return r;
+    }
     if (v == "weapons") {  // holster weapons: the owned weapons with their slots, each holster's choice
         Arsenal a{};
         const bool ok = arsenal(&a);
@@ -1859,7 +2220,8 @@ std::string command(const std::string& line) {
                 r += std::string(" ") + g_zones[z].key + "=" + (w >= 0 ? kWeaponToken[w] : "auto");
                 if (w >= 0 && ok && !(a.owned >> w & 1)) r += "(not owned)";
             }
-        r += " | choice draws " + std::to_string(g_choice_draws.load());
+        r += " | choice draws " + std::to_string(g_choice_draws.load()) + ", second-gun slot switches " + std::to_string(g_sec_switches.load()) +
+             ", refused " + std::to_string(g_sec_refused.load());
         return r;
     }
     if (v == "load") {  // holster load [set <right> <up> <forward> [radius] | touch on|off] (the session only): the loading point
@@ -1896,6 +2258,19 @@ std::string command(const std::string& line) {
         std::string x;
         in >> x;
         if (x == "body" || x == "headset") set_anchor(x == "headset" ? 1 : 0, false);
+        if (x == "lean" || x == "hands") {  // holster anchor lean|hands on|off: LeanSteady, TurnByHands (the session only)
+            std::string y;
+            in >> y;
+            if (x == "lean") set_lean_steady(y == "on", false);
+            else set_turn_by_hands(y == "on", false);
+        }
+        if (x == "turn") {  // holster anchor turn on|off [dead zone]: the session only
+            std::string y;
+            float dz = -1.0f;
+            in >> y >> dz;
+            if (y == "on" || y == "off") set_turn_with_head(y == "on", false);
+            if (dz >= 0.0f) set_turn_dead_zone(dz, false);
+        }
         float sh[3], cp[3];
         {
             std::lock_guard lock(g_zone_mutex);
@@ -1904,10 +2279,14 @@ std::string command(const std::string& line) {
         }
         float no[3] = {0, 0, 0};
         const bool nk = camera_lever::neck_offset(no);
-        char b[240];
-        std::snprintf(b, sizeof(b), "anchor %s, used %d, shift (%.3f %.3f %.3f) | neck since recentre%s (%.3f %.3f %.3f) | camera (%.3f %.3f %.3f)",
+        float hy = 0.0f;
+        const bool hk = camera_lever::head_yaw_deg(&hy);
+        char b[420];
+        std::snprintf(b, sizeof(b), "anchor %s, used %d, shift (%.3f %.3f %.3f) | neck since recentre%s (%.3f %.3f %.3f) | camera (%.3f %.3f %.3f) | "
+                      "turn %d, dead zone %.0f, the holsters' yaw %.1f, the head's%s %.1f deg | lean steady %d (the lean %.3f m), by hands %d (%.1f)",
                       g_anchor.load() ? "headset" : "body", g_anchor_used.load() ? 1 : 0, sh[0], sh[1], sh[2], nk ? "" : " (none)", no[0],
-                      no[1], no[2], cp[0], cp[1], cp[2]);
+                      no[1], no[2], cp[0], cp[1], cp[2], g_turn_head.load() ? 1 : 0, g_turn_dead.load(), g_zone_yaw_pub.load(), hk ? "" : " (none)", hy,
+                      g_lean_steady.load() ? 1 : 0, g_lean_pub.load(), g_turn_hands.load() ? 1 : 0, g_hands_yaw_pub.load());
         return b;
     }
     if (v == "guns") {  // holster guns [on|off|reset|back on|off]: [Holsters] ShowGuns (ShowBackGuns) for the session; each shown gun, its drawn error
@@ -2038,20 +2417,29 @@ std::string command(const std::string& line) {
         std::string x;
         in >> x;
         if (x == "on" || x == "off") set_show_zones_session(x == "on");
+        if (x == "near" || x == "steady" || x == "place") {  // holster rings near|steady|place on|off (the session)
+            std::string y;
+            in >> y;
+            if (x == "near") set_zones_near(y == "on", false);
+            else if (x == "steady") set_steady_zones(y == "on", false);
+            else set_placing(y == "on");
+        }
         if (x == "dots" || x == "points") {  // holster rings dots|points on|off: the hand dots, the weapon points (the session)
             std::string y;
             in >> y;
             if (x == "dots") set_show_hand_dots(y == "on", false);
             else set_show_weapon_points(y == "on", false);
         }
-        const std::string only = x == "on" || x == "off" || x == "dots" || x == "points" ? std::string() : x;
+        const std::string only =
+            x == "on" || x == "off" || x == "dots" || x == "points" || x == "near" || x == "steady" || x == "place" ? std::string() : x;
         Markers mk;
         char sw[96];
-        std::snprintf(sw, sizeof(sw), "(holsters %d, hand dots %d, weapon points %d) ", g_show_zones.load() ? 1 : 0, g_show_dots.load() ? 1 : 0,
-                      g_show_points.load() ? 1 : 0);
+        std::snprintf(sw, sizeof(sw), "(holsters %d, hand dots %d, weapon points %d, near %d, steady %d, placing %d, placed %llu) ",
+                      g_show_zones.load() ? 1 : 0, g_show_dots.load() ? 1 : 0, g_show_points.load() ? 1 : 0, g_zones_near.load() ? 1 : 0,
+                      g_steady_zones.load() ? 1 : 0, g_place.load() ? 1 : 0, static_cast<unsigned long long>(g_placed.load()));
         if (!markers(&mk)) return std::string("rings ") + sw + (g_show_zones.load() || g_show_dots.load() || g_show_points.load() ? "on, no markers yet" : "off");
         std::string r = std::string("rings ") + sw + "on, " + std::to_string(mk.n) + " markers:";
-        static const char* const kState[4] = {"idle", "hand in", "held", "gun"};
+        static const char* const kState[5] = {"idle", "hand in", "held", "gun", "near"};
         for (int i = 0; i < mk.n; ++i) {
             const Marker& m = mk.m[i];
             float l[3] = {}, w2[3] = {};
@@ -2063,7 +2451,7 @@ std::string command(const std::string& line) {
                            : m.id == kZones + 3 ? "RightHand" : "ActionHint";
             if (!only.empty() && only != nm) continue;
             char b[200];
-            std::snprintf(b, sizeof(b), " | %s %s r %.2f world (%.3f %.3f %.3f) local (%.3f %.3f %.3f) back %.5f", nm, kState[m.state & 3], m.radius,
+            std::snprintf(b, sizeof(b), " | %s %s r %.2f world (%.3f %.3f %.3f) local (%.3f %.3f %.3f) back %.5f", nm, kState[m.state < 5 ? m.state : 0], m.radius,
                           m.pos[0], m.pos[1], m.pos[2], l[0], l[1], l[2], err);
             r += b;
         }
@@ -2089,6 +2477,34 @@ std::string command(const std::string& line) {
         for (int h = 0; h < 2 && k < static_cast<int>(sizeof(b)) - 60; ++h)
             k += std::snprintf(b + k, sizeof(b) - k, " | %s hand (%.3f %.3f %.3f) in %d%s", h ? "right" : "left", d.hand[h][0], d.hand[h][1],
                                d.hand[h][2], d.in_zone[h], g_consumed[h].load() ? " grip held" : "");
+        return b;
+    }
+    if (v == "model") {  // holster model [on|off] [offset x y z turn yaw pitch roll]: the session only; the models' state
+        std::string x;
+        in >> x;
+        if (x == "on" || x == "off") set_show_models(x == "on", false);
+        float o[3], r[3];
+        if (x == "pose" && (in >> o[0] >> o[1] >> o[2] >> r[0] >> r[1] >> r[2])) {  // the offset and ModelTurn (the raw test off)
+            std::lock_guard lock(g_zone_mutex);
+            std::memcpy(g_model_off, o, sizeof(o));
+            std::memcpy(g_model_rot, r, sizeof(r));
+            g_model_raw_on = false;
+        }
+        if (x == "raw" && (in >> r[0] >> r[1] >> r[2])) {  // the native's three angles as given (the axes' test)
+            std::lock_guard lock(g_zone_mutex);
+            std::memcpy(g_model_raw, r, sizeof(r));
+            g_model_raw_on = true;
+        }
+        float mo[3], mr[3];
+        {
+            std::lock_guard lock(g_zone_mutex);
+            std::memcpy(mo, g_model_off, sizeof(mo));
+            std::memcpy(mr, g_model_rot, sizeof(mr));
+        }
+        char b[240];
+        std::snprintf(b, sizeof(b), "models %d (%s), offset (%.3f %.3f %.3f) turn (%.0f %.0f %.0f), shown right %d left %d", g_show_models.load() ? 1 : 0,
+                      g_model_name, mo[0], mo[1], mo[2], mr[0], mr[1], mr[2], held_prop::shown(held_prop::kModelSlot) ? 1 : 0,
+                      held_prop::shown(held_prop::kModelSlot + 1) ? 1 : 0);
         return b;
     }
     if (v == "instant") {  // the draw's mode for this session (not saved)

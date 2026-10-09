@@ -14,6 +14,7 @@
 namespace rdrvr::pose {
 
 void init();  // frame-end listener
+void set_keep_camera(bool on);  // [Body] KeepAnchorCamera for the session ("pose keepcam on|off")
 void set_anchor(bool on);    // the switch ([Body] CameraAnchor, the menu, "pose anchor on|off")
 bool anchor_active();        // the camera anchor is placing the view this frame (first person)
 bool anchor_enabled();
@@ -22,6 +23,14 @@ bool anchor_enabled();
 // head) and its height smoothing (seconds). The setters write the user ini (set_saddle when `save`).
 bool steer_by_head();
 void set_steer_by_head(bool on);
+// [Horse] StickTurn (run 9 item 4, on): with stick steering the right stick turns the view on horseback (TurnMode's
+// snap or smooth), an offset over the horse's heading; mounting and recentre set it to 0 ("pose rideturn on|off")
+bool stick_turn_riding();
+void set_stick_turn_riding(bool on, bool save = true);
+float ride_turn_deg();  // the offset now (0 on foot or steering by the head)
+// John's body's heading: the body heading less the ride's turn (the horse's while riding with the view turned): the
+// holsters' frame, the facing lock, the elbow hints
+float torso_heading_deg();
 bool saddle_anchor();
 // [Horse] SaddleClimb (run 6 item 8, on): with the saddle anchor, the plugin feeds the horse's own vertical speed into
 // the height's filter (it fell behind climbs) and keeps the view above the rider's root + 0.5 m

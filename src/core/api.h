@@ -27,7 +27,7 @@ bool plugin_attached();
 bool in_script_tick();
 // A native with no arguments called on every script tick (state queries such as IS_GAME_PAUSED), its latest result
 // kept: up to 8. Returns the watch index, or -1 when full.
-int watch_native(uint32_t hash);
+int watch_native(uint32_t hash, uint64_t arg0 = 0, uint32_t argc = 0);  // argc 0 or 1 (arg0: e.g. a static string's address)
 // The latest result of watch `index` and the script tick it ran on; false before the first result.
 bool watched(int index, uint64_t* value, uint64_t* tick);
 // G-B (v3): the camera job the plugin reads every tick, and the actor state it posts back.

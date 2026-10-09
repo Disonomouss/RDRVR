@@ -27,9 +27,9 @@
 namespace rdrvr::zone_rings {
 namespace {
 
-constexpr int kCell = 256, kCells = 10;
+constexpr int kCell = 256, kCells = 11;
 constexpr float kEdge = kCell * 0.5f - 2.0f;  // the outer edge, px from a cell's centre (2 px kept for filtering)
-enum Cell { kRingIdle, kRingIn, kRingHeld, kRingGun, kDotIdle, kDotIn, kReticle, kReticleHot, kReticleDot, kReticleDotHot };
+enum Cell { kRingIdle, kRingIn, kRingHeld, kRingGun, kDotIdle, kDotIn, kReticle, kReticleHot, kReticleDot, kReticleDotHot, kRingNear };
 std::vector<uint8_t> g_pixels;  // RGBA8: sRGB-encoded, premultiplied (init)
 std::atomic<bool> g_pixels_ready{false};
 XrSwapchain g_sc = XR_NULL_HANDLE;
@@ -52,10 +52,15 @@ uint8_t to_byte(float v) { return static_cast<uint8_t>(std::lround(255.0f * (v <
 void texel(int cell, float r, float out[4]) {
     static const float kCol[kCells][3] = {{1, 1, 1},       {0.30f, 1, 0.40f}, {1, 0.72f, 0.20f}, {0.35f, 0.85f, 1},
                                           {1, 1, 1},       {0.30f, 1, 0.40f}, {1, 1, 1},          {1, 0.22f, 0.18f},
-                                          {1, 1, 1},       {1, 0.22f, 0.18f}};
+                                          {1, 1, 1},       {1, 0.22f, 0.18f}, {1, 1, 1}};
     constexpr float kRimA = 0.6f, kFillA = 0.08f;
     float col, a;
-    if (cell >= kReticleDot) {  // the dot reticle ([Hands] ReticleStyle=dot): a dot in a dark rim, bigger than the ring's
+    if (cell == kRingNear) {  // [Holsters] ZonesNear: a hand near: a thinner, fainter ring, no fill
+        const float e = within(r, kEdge), b1 = within(r, kEdge - 2), b0 = within(r, kEdge - 8), f1 = within(r, kEdge - 10);
+        const float band = b1 - b0, rims = (e - b1) + (b0 - f1);
+        col = band * 0.55f;
+        a = band * 0.55f + rims * kRimA * 0.5f;
+    } else if (cell >= kReticleDot) {  // the dot reticle ([Hands] ReticleStyle=dot): a dot in a dark rim, bigger than the ring's
         const float dot = within(r, kEdge * 0.24f), dot_rim = within(r, kEdge * 0.34f) - dot;
         col = dot;
         a = dot + dot_rim * kRimA;
@@ -273,6 +278,7 @@ int frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLa
                          : m.state == holster::kHandIn ? kRingIn
                          : m.state == holster::kHeld   ? kRingHeld
                          : m.state == holster::kGunIdle ? kRingGun
+                         : m.state == holster::kNear    ? kRingNear
                                                         : kRingIdle;
         const float s = 2.0f * m.radius * (kCell * 0.5f) / kEdge;  // the drawn outer edge at the radius
         XrCompositionLayerQuad& q = out[n++];

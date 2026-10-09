@@ -11,6 +11,7 @@
 
 #include "core/anchors.h"
 #include "core/camera_lever.h"
+#include "core/eye_shape.h"
 #include "core/config.h"
 #include "core/d3d_hooks.h"
 #include "core/dlss.h"
@@ -139,15 +140,18 @@ void bind_tap(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIP
     if (++g_frame_i >= g_frames) g_phase.store(4, std::memory_order_release);
 }
 
-std::string arm_src(ID3D12Device* dev, Src& s, ID3D12Resource* res, uint32_t w, uint32_t h, const char* name) {
+// the crop centred in the resource, or in its top-left rect_w x rect_h (run 9: the eye shape's eye or render rect)
+std::string arm_src(ID3D12Device* dev, Src& s, ID3D12Resource* res, uint32_t w, uint32_t h, const char* name, uint32_t rect_w = 0, uint32_t rect_h = 0) {
     const D3D12_RESOURCE_DESC d = res->GetDesc();
+    const uint64_t RW = rect_w && rect_w <= d.Width ? rect_w : d.Width;
+    const uint32_t RH = rect_h && rect_h <= d.Height ? rect_h : d.Height;
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.MipLevels != 1 || d.DepthOrArraySize != 1 || d.SampleDesc.Count != 1)
         return std::string("ERROR ") + name + " is not a single-subresource 2D texture (NOT MEASURED)";
-    if (w > d.Width) w = static_cast<uint32_t>(d.Width);
-    if (h > d.Height) h = d.Height;
+    if (w > RW) w = static_cast<uint32_t>(RW);
+    if (h > RH) h = RH;
     if (w == 0 || h == 0) return std::string("ERROR ") + name + ": empty crop";
-    s.box.left = static_cast<UINT>((d.Width - w) / 2);
-    s.box.top = (d.Height - h) / 2;
+    s.box.left = static_cast<UINT>((RW - w) / 2);
+    s.box.top = (RH - h) / 2;
     s.box.right = s.box.left + w;
     s.box.bottom = s.box.top + h;
     s.box.front = 0;
@@ -199,11 +203,17 @@ std::string arm(uint64_t frame) {
     const D3D12_RESOURCE_DESC dp = res[0]->GetDesc(), ds = res[1]->GetDesc();
     // the input's crop covers the post crop's field: scaled by the render / output size
     const uint32_t pw = static_cast<uint32_t>(g_crop_w), ph = static_cast<uint32_t>(g_crop_h);
-    const uint32_t sw = static_cast<uint32_t>(static_cast<double>(pw) * static_cast<double>(ds.Width) / static_cast<double>(dp.Width) + 0.5);
-    const uint32_t sh = static_cast<uint32_t>(static_cast<double>(ph) * ds.Height / dp.Height + 0.5);
-    std::string err = arm_src(dev, g_src[0], res[0], pw, ph, "the post output");
-    if (err.empty()) err = arm_src(dev, g_src[1], res[1], sw, sh, kName[1]);
-    if (err.empty()) err = arm_src(dev, g_src[2], res[2], sw, sh, kName[2]);
+    double rx = static_cast<double>(ds.Width) / static_cast<double>(dp.Width), ry = static_cast<double>(ds.Height) / static_cast<double>(dp.Height);
+    uint32_t ecw = 0, ech = 0, erw = 0, erh = 0;
+    if (eye_shape::frame_rect(&ecw, &ech, &erw, &erh) && ecw && ech && erw && erh) {  // run 9: the eye shape: the render size over the eye's
+        rx = static_cast<double>(erw) / ecw;
+        ry = static_cast<double>(erh) / ech;
+    }
+    const uint32_t sw = static_cast<uint32_t>(static_cast<double>(pw) * rx + 0.5);
+    const uint32_t sh = static_cast<uint32_t>(static_cast<double>(ph) * ry + 0.5);
+    std::string err = arm_src(dev, g_src[0], res[0], pw, ph, "the post output", ecw, ech);
+    if (err.empty()) err = arm_src(dev, g_src[1], res[1], sw, sh, kName[1], erw, erh);
+    if (err.empty()) err = arm_src(dev, g_src[2], res[2], sw, sh, kName[2], erw, erh);
     if (err.empty() && !g_fence) dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
     if (!g_fence_event) g_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     dev->Release();

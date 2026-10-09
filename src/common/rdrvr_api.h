@@ -149,7 +149,11 @@ typedef struct RdrvrCameraJob {
     float saddle_forward;
     float saddle_tau;
     uint32_t heading_from_mount;
-    uint32_t weapons;             // v4: 1 to post the player's owned weapons (the holsters' weapon choice)
+    uint32_t weapons;             // v4: bit 1 to post the player's owned weapons (the holsters' weapon choice); bit 2
+                                  // (2026-10-09, [Body] KeepAnchorCamera): the anchor's camera made current again whenever
+                                  // another camera takes its channel (a shop's script); bit 3 (run 9, [Horse]
+                                  // StickTurn): with heading_from_mount, heading_deg is an offset added to the mount's
+                                  // heading (the view turned by the right stick); a plugin without it faces the mount
 } RdrvrCameraJob;
 
 typedef struct RdrvrActorState {

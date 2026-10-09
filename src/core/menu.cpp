@@ -566,6 +566,14 @@ void page_general() {
               "The radar, its meters and the ammo counter on the back of the left hand (the right one when left-handed), shown "
               "while you look at it (the palm flat, face down, like a watch); the prompts stay on the floating quad."))
         xr::set_hud_on_wrist(wrist);
+    sub_begin(wrist);  // 2026-10-09, the user's choice: [Controls] WristSatchel
+    bool ws = controls::wrist_satchel();
+    if (check("A double tap of Y at the wrist opens the satchel", &ws,
+              "With the wrist HUD in view, two quick presses of the off hand's Y (its upper button) open John's satchel (his items: "
+              "consumables, kit, provisions); B closes it. A single press is still Y for the game, a third of a second late. Off, "
+              "every press is Y at once. Held, Y opens this menu either way."))
+        controls::set_wrist_satchel(ws);
+    sub_end();
     heading("Anti-aliasing");
     // DLSS is chosen for the next start: switching to or from it while the game runs would re-create its swapchain
     const char* aa[] = {"Off", "FXAA", "Native TAA", "DLSS (from the next start)"};
@@ -806,6 +814,13 @@ void page_comfort() {
     ImGui::SameLine();
     if (radio("Steer with the head", steer == 1, "As on foot: the left stick goes where you look.")) steer = 1;
     if ((steer == 1) != pose::steer_by_head()) pose::set_steer_by_head(steer == 1);
+    sub_begin(steer == 0);
+    bool rturn = pose::stick_turn_riding();
+    if (check("The right stick turns the view while riding", &rturn,
+              "As on foot (snap or smooth, above): the view turns while the left stick still steers the horse. Mounting faces "
+              "the horse again, and so does a recentre. Steering with the head, the right stick always turns the view."))
+        pose::set_stick_turn_riding(rturn);
+    sub_end();
     bool saddle = pose::saddle_anchor();
     float stau = pose::saddle_smoothing();
     if (check("View from the saddle", &saddle,
@@ -941,6 +956,12 @@ void page_hands() {
               "A long gun is held differently lowered or carried (the wrist higher on it); each gun's aiming hold is learned while "
               "the game aims (saved per gun) and used in every pose. Off: the game's own hold of each moment."))
         body::set_fixed_gun_grip(fg, true);
+    bool fs = body::fixed_sidearm_grip();  // 2026-10-09: [Hands] FixedSidearmGrip
+    if (check("Sidearms held by their aiming grip", &fs,
+              "A revolver or pistol kept in your hand the way the game holds it aimed (learned per gun while you aim, saved), so it "
+              "moves with your hand at once. Off: the game's own hold of each moment, which can trail your hand (a lag) when the "
+              "game runs slowly."))
+        body::set_fixed_sidearm_grip(fs, true);
 
     heading("Dual wield");
     bool dw = dual::enabled();
@@ -1001,8 +1022,45 @@ void page_holsters() {
         if (radio("John's body", an == 0, kAnchorTip)) holster::set_anchor(0);
         ImGui::SameLine();
         if (radio("Your headset", an == 1, kAnchorTip)) holster::set_anchor(1);
+        sub_begin(an == 1);  // 2026-10-09, the user's request: [Holsters] TurnWithHead, TurnDeadZone
+        bool tw = holster::turn_with_head();
+        if (check("Turn with the headset", &tw,
+                  "The holsters turn as you turn your head (left and right only), around you; off, they face the way John faces "
+                  "(the stick's turns and a recentre turn them)."))
+            holster::set_turn_with_head(tw);
+        sub_begin(tw);
+        bool th = holster::turn_by_hands();
+        if (check("Turn by your head and hands", &th,
+                  "While both hands are out in front of you (aiming), the holsters turn halfway to where your hands point: looking "
+                  "aside then swings them less."))
+            holster::set_turn_by_hands(th);
+        float dz = holster::turn_dead_zone();
+        if (nudge1("Turn dead zone", &dz, 5.0f, 0.0f, 90.0f, "%.0f deg",
+                   "How far you can look aside before the holsters turn after your head: 0 turns them with every look; 30 to 45 "
+                   "keeps them still while you glance aside and follows when you turn."))
+            holster::set_turn_dead_zone(dz);
+        sub_end();
+        bool ls = holster::lean_steady();
+        if (check("Steady when you lean", &ls,
+                  "Leaning forward or bending over moves your head but not your hips: the holsters stay at your hips (a crouch "
+                  "still lowers them, a step still moves them)."))
+            holster::set_lean_steady(ls);
+        sub_end();
     }
     sub_end();
+
+    {  // 2026-10-09: the holsters' polish (ideas 1 and 4)
+        bool pl = holster::placing();
+        if (check("Place the holsters by hand", &pl,
+                  "Close the menu, grip a holster's ring and move your hand: the holster follows; let go to leave it there (saved). "
+                  "Every ring shows and nothing is drawn while this is on: open the menu and untick it when done."))
+            holster::set_placing(pl);
+        bool sz = holster::steady_zones();
+        if (check("Steady holster edges", &sz,
+                  "A hand stays in a holster until it is clearly out (3 cm past its ring), and a nearby holster takes over only "
+                  "when clearly nearer: no buzz at a ring's edge, no flip between the left hip's holsters."))
+            holster::set_steady_zones(sz);
+    }
 
     heading("Weapons by");  // run 8 item 5: [Holsters] Mode
     const bool wm = wheel::wheel_mode();
@@ -1017,6 +1075,11 @@ void page_holsters() {
     bool rings = holster::show_zones();
     if (check("Show the holsters", &rings, "Rings to place and size the holsters by eye: white, green with a hand in it, amber gripped."))
         holster::set_show_zones(rings);
+    sub_begin(rings);  // 2026-10-09: [Holsters] ZonesNear
+    bool znear = holster::zones_near();
+    if (check("Only near a hand", &znear, "Each holster's ring shown only while a hand comes near it (faint), green with the hand in it."))
+        holster::set_zones_near(znear);
+    sub_end();
     bool hdots = holster::show_hand_dots();  // run 8 item 5b
     if (check("Show the hand dots", &hdots, "A dot at each hand's grab point: green when it is in a holster or on the foregrip."))
         holster::set_show_hand_dots(hdots, true);
@@ -1094,6 +1157,19 @@ void page_gun() {
         std::snprintf(lb, sizeof(lb), "Use every gun's##%s: every gun's", kTrack[what]);
         if (reset_button(lb, own, "This gun's own setting cleared: it uses every gun's (the Reloading tab) again."))
             holster::clear_gun_adjust(w, what);
+    }
+    if (w >= 8 && w <= 20) {  // [Weapon.<Gun>] FrontHandPose: the long guns' front hand
+        heading("The front hand's pose");
+        const int fp = body::front_pose(w), seen = body::front_pose_seen(w);
+        note("John's front hand takes one of the game's own holds of this gun: lowered or aiming (the aiming hold unless you "
+             "choose another). Automatic switches with the game's stance; a fixed one keeps that hold (and its fingers) whatever "
+             "the stance.");
+        if (radio("Automatic##front pose", fp == 0, "The hold the game uses for its stance: lowered or aiming.")) body::set_front_pose(w, 0);
+        char lb[96];
+        std::snprintf(lb, sizeof(lb), "The lowered hold%s##front pose", seen & 1 ? "" : " (not seen yet: hold the gun lowered once)");
+        if (radio(lb, fp == 1, "The game's hold with the gun lowered, and its fingers, always.")) body::set_front_pose(w, 1);
+        std::snprintf(lb, sizeof(lb), "The aiming hold%s##front pose", seen & 2 ? "" : " (not seen yet: aim with it once)");
+        if (radio(lb, fp == 2, "The game's hold with the gun aimed, and its fingers, always.")) body::set_front_pose(w, 2);
     }
 }
 
@@ -1380,6 +1456,12 @@ void page_gestures() {
     sub_begin(th);
     if (nudge1("Throw strength", &tg, 0.1f, 0.5f, 4.0f, "%.1fx", "The throw's speed, times your hand's (a press 0.1)."))
         gestures::set_tuning(sw, tg, true);
+    bool gt = aim::grip_throw();
+    if (check("Throw by letting go of the grip", &gt,
+              "Hold the grip of your gun hand to hold the throwable, pull the trigger to ready it (dynamite and fire bottles are "
+              "lit, a throwing knife is held by its tip), then swing and let go of the grip to throw. A lit one held too long goes "
+              "off in your hand, as in the game. The grip is not the game's button while a throwable is in that hand."))
+        aim::set_grip_throw(gt);
     sub_end();
     bool me = gestures::melee_by_swing();
     if (check("Melee by swing", &me,
@@ -1484,7 +1566,7 @@ void page_controls() {
     if (reset_button("Reset to the game's scheme", true, "Every VR button back on the game button of its own name."))
         controls::reset_mapping();
     note("The menu: hold the menu button (without one: both B buttons), hold Y with the wrist HUD in view, or F7. A tap of the menu "
-         "button pauses; held with the right stick it is the D-pad, with A the map. The right stick scrolls the menu's page.");
+         "button pauses; held with the right stick it is the D-pad, with A the satchel (John's items). The right stick scrolls the menu's page.");
 }
 
 void page_screen() {

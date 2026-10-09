@@ -23,6 +23,9 @@ std::string command(const std::string& line);  // "dlss": the state and counters
 // The jitter (render pixels) of the latest DLSS constants the game's own call set (viewport 0: the second eye's run of
 // a double frame, or mono), read on the playback thread; false before any.
 bool last_jitter(float out[2]);
-void set_mv_scale(float k);  // test aid ("dlss mvscale <k>"): both eyes' mvecScale times k (1 = as the game sets it)
+void set_mv_scale(float k);
+// [XR] EyeShapeDlss: the eye shape applied or ended under DLSS (the render thread, the DRS controller): the options are
+// sent again (the eye's output size, or the game's) at the next post run, before its evaluate
+void shape_changed();  // test aid ("dlss mvscale <k>"): both eyes' mvecScale times k (1 = as the game sets it)
 
 }  // namespace rdrvr::dlss

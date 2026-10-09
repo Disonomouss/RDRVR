@@ -23,6 +23,7 @@ namespace rdrvr::pose {
 namespace {
 
 std::atomic<bool> g_anchor{false}, g_recentre{false};
+std::atomic<bool> g_keep_cam{true};  // [Body] KeepAnchorCamera: the anchor's camera kept current (a shop's took it)
 // presenting thread
 bool g_active = false, g_have_heading = false, g_snapped = false;
 std::atomic<bool> g_active_shared{false};
@@ -48,6 +49,15 @@ float g_last_head_yaw = 0;
 // offset from it averaged over about a second, the height smoothed by the plugin)
 std::atomic<bool> g_steer_head{false}, g_saddle{true};
 std::atomic<bool> g_saddle_climb{true};  // [Horse] SaddleClimb (run 6 item 8): the plugin's climb feed-forward and floor
+// [Horse] StickTurn (run 9 item 4, the user: "Turn view with joystick on horse, currently stuck facing forward"): with
+// stick steering the right stick turns the view as on foot (snap or smooth), an offset over the mount's heading that the
+// plugin adds to the mount's own (the job's `weapons` bit 3: heading_deg is that offset). Mounting starts it at 0 (the
+// view faces the horse), recentre clears it; the left stick still steers the horse relative to itself
+std::atomic<bool> g_ride_turn{true};
+float g_ride_off = 0.0f;
+std::atomic<float> g_ride_off_shared{0.0f};
+bool g_ride_snapped = false;
+uint64_t g_ride_turns = 0;
 // run 6 item 8, "pose trace on|off|reset|dump <file>": one row per script tick while riding (the presenting thread
 // appends; the command thread dumps a CSV): the mount's position and heading, the camera, the rider's head and root
 // (the seat), the 1 s averages of the head over the root
@@ -98,7 +108,7 @@ void on_frame_end(uint64_t) {
     job.orient_mode = static_cast<uint32_t>(g_orient_mode);
     job.no_idles = g_no_idles ? 1 : 0;
     job.hide_reticle = g_hide_reticle ? 1 : 0;
-    job.weapons = holster::weapon_choice() ? 1 : 0;
+    job.weapons = (holster::weapon_choice() ? 1u : 0u) | (g_keep_cam.load(std::memory_order_relaxed) ? 2u : 0u);
     if (want) {
         RdrvrActorState st{};
         if (!g_have_scale && g_auto_height && api::actor_state(&st) && st.head_valid) {
@@ -121,10 +131,11 @@ void on_frame_end(uint64_t) {
             }
         }
         if (g_recentre.exchange(false)) {
-            log::info("[pose] recentre: body heading %.1f -> %.1f deg (the head's yaw %.1f)", g_heading, g_heading + g_last_head_yaw,
-                      g_last_head_yaw);
+            log::info("[pose] recentre: body heading %.1f -> %.1f deg (the head's yaw %.1f; the ride's turn %.1f cleared)", g_heading,
+                      g_heading + g_last_head_yaw, g_last_head_yaw, g_ride_off);
             g_heading += g_last_head_yaw;
             g_last_head_yaw = 0;
+            g_ride_off = 0.0f;
         }
         // turning on the right stick (positive heading turns left): the controllers' or the gamepad's, the larger
         double now = log::now_ms();
@@ -136,6 +147,8 @@ void on_frame_end(uint64_t) {
         if (riding != g_was_riding) {
             g_was_riding = riding;
             g_saddle_valid = false;
+            g_ride_off = 0.0f;  // [Horse] StickTurn: the view faces the horse at the mount (the dismount keeps the turned heading)
+            g_ride_snapped = true;  // a stick still held from a turn on foot: no snap until it comes back
             log::info("[pose] %s (steering by the %s, saddle anchor %s)", riding ? "riding" : "on foot", g_steer_head.load() ? "head" : "stick",
                       g_saddle.load() ? "on" : "off");
         }
@@ -184,14 +197,34 @@ void on_frame_end(uint64_t) {
             job.saddle_forward = g_saddle_f + g_forward;
             job.saddle_tau = g_saddle_tau.load(std::memory_order_relaxed);
         }
-        if (stick_steer) {
-            // the view faces the horse and the stick steers it; the right stick does not turn the view
-            job.heading_from_mount = 1;
-            g_heading = st.mount_heading;
-        }
         float sx = xinput::pad_right_x();
         if (controllers && std::fabs(pad.rx / 32767.0f) > std::fabs(sx)) sx = pad.rx / 32767.0f;
-        if (stick_steer) sx = 0.0f;
+        if (stick_steer) {
+            // the view faces the horse and the left stick steers it; the right stick turns the view by an offset over
+            // the mount's heading ([Horse] StickTurn), or not at all
+            job.heading_from_mount = 1;
+            if (g_ride_turn.load(std::memory_order_relaxed)) {
+                if (g_snap) {
+                    if (std::fabs(sx) > 0.7f && !g_ride_snapped) {
+                        g_ride_off += sx > 0 ? -g_snap_angle : g_snap_angle;
+                        g_ride_snapped = true;
+                        ++g_ride_turns;
+                    } else if (std::fabs(sx) < 0.3f) {
+                        g_ride_snapped = false;
+                    }
+                } else if (std::fabs(sx) > 0.15f) {
+                    g_ride_off -= sx * g_turn_speed * dt;
+                    ++g_ride_turns;
+                }
+                g_ride_off = std::fmod(g_ride_off + 540.0f, 360.0f) - 180.0f;
+            } else {
+                g_ride_off = 0.0f;
+            }
+            if (g_ride_off != 0.0f) job.weapons |= 4u;  // heading_deg below is the offset over the mount's heading (else absolute, as before)
+            g_heading = st.mount_heading + g_ride_off;
+            sx = 0.0f;
+        }
+        g_ride_off_shared.store(stick_steer ? g_ride_off : 0.0f, std::memory_order_relaxed);
         if (g_snap) {
             if (std::fabs(sx) > 0.7f && !g_snapped) {
                 g_heading += sx > 0 ? -g_snap_angle : g_snap_angle;
@@ -205,7 +238,7 @@ void on_frame_end(uint64_t) {
             ++g_turns;
         }
         g_heading = std::fmod(g_heading + 540.0f, 360.0f) - 180.0f;
-        job.heading_deg = g_heading;
+        job.heading_deg = (job.weapons & 4u) ? g_ride_off : g_heading;
         g_heading_shared = g_heading;
         if (g_height_follow && g_have_scale && api::actor_state(&st) && st.head_valid) {
             float up = g_up_axis == 1 ? st.head_pos[1] - st.pos[1] : st.head_pos[2] - st.pos[2];
@@ -242,6 +275,7 @@ void on_frame_end(uint64_t) {
 
 void init() {
     g_anchor = config::get_bool("Body", "CameraAnchor", false);
+    g_keep_cam = config::get_bool("Body", "KeepAnchorCamera", true);
     g_height = config::get_float("Body", "EyeHeight", 0.0f);  // 0 = measured from the head bone
     g_auto_height = g_height <= 0;
     if (g_auto_height) g_height = 1.60f;  // until measured
@@ -260,8 +294,9 @@ void init() {
     g_saddle = config::get_bool("Horse", "SaddleAnchor", true);
     g_saddle_tau = config::get_float("Horse", "SaddleSmoothing", 0.15f);
     g_saddle_climb = config::get_bool("Horse", "SaddleClimb", true);
-    log::info("[pose] horse: steering by the %s, saddle anchor %d (smoothing %.2f s)", g_steer_head.load() ? "head" : "stick",
-              g_saddle.load() ? 1 : 0, g_saddle_tau.load());
+    g_ride_turn = config::get_bool("Horse", "StickTurn", true);
+    log::info("[pose] horse: steering by the %s, saddle anchor %d (smoothing %.2f s), the right stick turns the view %d", g_steer_head.load() ? "head" : "stick",
+              g_saddle.load() ? 1 : 0, g_saddle_tau.load(), g_ride_turn.load() ? 1 : 0);
     d3d::add_frame_end_listener(on_frame_end);
 }
 
@@ -282,6 +317,13 @@ void set_orient_mode(int m) {
     log::info("[pose] scripted camera orientation mode %d", m);
 }
 
+bool stick_turn_riding() { return g_ride_turn.load(); }
+void set_stick_turn_riding(bool on, bool save) {
+    if (g_ride_turn.exchange(on) != on) log::info("[pose] the right stick turns the view on horseback (StickTurn) %d", on ? 1 : 0);
+    if (save) config::set("Horse", "StickTurn", on ? "1" : "0");
+}
+float ride_turn_deg() { return g_ride_off_shared.load(std::memory_order_relaxed); }
+float torso_heading_deg() { return g_heading_shared.load(std::memory_order_relaxed) - g_ride_off_shared.load(std::memory_order_relaxed); }
 bool steer_by_head() { return g_steer_head.load(); }
 void set_steer_by_head(bool on) {
     if (g_steer_head.exchange(on) != on) log::info("[pose] horse steering by the %s", on ? "head" : "stick");
@@ -343,6 +385,9 @@ void set_eye_lift(float m) {
     g_lift = m < -0.3f ? -0.3f : m > 0.4f ? 0.4f : m;
 }
 
+void set_keep_camera(bool on) {
+    if (g_keep_cam.exchange(on) != on) log::info("[pose] the anchor's camera kept current (KeepAnchorCamera) %d", on ? 1 : 0);
+}
 void set_anchor(bool on) {
     g_anchor = on;
     log::info("[pose] camera anchor switch %s", on ? "on" : "off");
@@ -354,13 +399,14 @@ void status_text(char* out, size_t len) {
     std::snprintf(out, len,
                   "anchor %s (%s), heading %.1f deg, head yaw %.1f, eye height %.3f%s, turns %llu, walk frames %llu | actor %s (%.2f %.2f %.2f) "
                   "heading %.1f, camera %d at (%.2f %.2f %.2f), tick %llu | mount %d (%.2f %.2f %.2f) heading %.1f, saddle %s h %.2f f %.2f, "
-                  "steer %s, ride frames %llu, jitter %.4f m/tick (camera height %.4f) over %llu",
+                  "steer %s, ride turn %d %.1f deg (turns %llu), ride frames %llu, jitter %.4f m/tick (camera height %.4f) over %llu",
                   g_anchor.load() ? "on" : "off", g_active ? "active" : "idle", g_heading, g_last_head_yaw, g_height,
                   g_have_scale ? " (head bone)" : g_auto_height ? " (not yet measured)" : " (ini)",
                   static_cast<unsigned long long>(g_turns), static_cast<unsigned long long>(g_walk_frames), have ? "" : "none",
                   st.pos[0], st.pos[1], st.pos[2], st.heading_deg, st.camera, st.camera_pos[0], st.camera_pos[1], st.camera_pos[2],
                   static_cast<unsigned long long>(st.tick), st.mount, st.mount_pos[0], st.mount_pos[1], st.mount_pos[2], st.mount_heading,
-                  g_saddle.load() ? "on" : "off", g_saddle_h, g_saddle_f, g_steer_head.load() ? "head" : "stick",
+                  g_saddle.load() ? "on" : "off", g_saddle_h, g_saddle_f, g_steer_head.load() ? "head" : "stick", g_ride_turn.load() ? 1 : 0,
+                  g_ride_off_shared.load(), static_cast<unsigned long long>(g_ride_turns),
                   static_cast<unsigned long long>(g_ride_frames), g_jit_n ? std::sqrt(g_jit_sum / static_cast<double>(g_jit_n)) : 0.0,
                   g_jit_n ? std::sqrt(g_jit_abs / static_cast<double>(g_jit_n)) : 0.0,
                   static_cast<unsigned long long>(g_jit_n));

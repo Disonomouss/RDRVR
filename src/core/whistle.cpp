@@ -60,7 +60,7 @@ bool mouth(float out[3]) {
 }  // namespace
 
 void init() {
-    g_on = config::get_bool("Gestures", "Whistle", false);
+    g_on = config::get_bool("Gestures", "Whistle", true);  // run 9: on by default (the user's request)
     g_gun_hand = config::get_bool("Gestures", "WhistleGunHand", false);
     float o[3] = {0.0f, -0.08f, 0.08f};
     {

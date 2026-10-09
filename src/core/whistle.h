@@ -1,5 +1,5 @@
 #pragma once
-// Run 8 item 4: the horse whistle by gesture ([Gestures] Whistle, off). A hand at the mouth (a head-local point,
+// Run 8 item 4: the horse whistle by gesture ([Gestures] Whistle, on since run 9). A hand at the mouth (a head-local point,
 // [Gestures] WhistleOffset right/up/forward of the eyes' midpoint, within WhistleRadius) and its trigger pressed there:
 // the game's whistle (GENERIC.WHISTLE: the pad's D-pad up, FUN_14000c0b0's action table) sent once, a haptic tick, a
 // log line. While the hand is at the mouth, and until its trigger is let go after a whistle, that controller's trigger

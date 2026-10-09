@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -18,12 +19,14 @@ constexpr uint32_t kPropLoaded = 0xD7F80035;      // STREAMING_IS_PROP_LOADED(id
 constexpr uint32_t kCreateLayout = 0x6CA53214;    // CREATE_LAYOUT(name) -> layout
 constexpr uint32_t kCreateProp = 0xE351587D;      // CREATE_PROP_IN_LAYOUT(layout, name, fragment, xy, z, rxy, rz, frozen)
 constexpr uint32_t kSetPosition = 0xC5D796F8;     // SET_OBJECT_POSITION(object, xy, z)
+constexpr uint32_t kSetOrientation = 0xC8A4EE74;  // SET_OBJECT_ORIENTATION(object, xy, z): Euler degrees
 constexpr uint32_t kCollideWorld = 0x601FC9F4;    // SET_OBJECT_COLLIDE_WITH_WORLD(object, 0)
 constexpr uint32_t kCollideMovables = 0x05D69EA6; // SET_OBJECT_COLLIDE_WITH_MOVABLES(object, 0)
 constexpr uint32_t kIsValid = 0xD7E7187B;         // IS_OBJECT_VALID(object)
 constexpr uint32_t kDestroy = 0x21144994;         // DESTROY_OBJECT(object)
 const char kLayoutName[] = "rdrvr_held_props";
-const char* const kObjName[kSlots] = {"rdrvr_round", "rdrvr_second_gun", "rdrvr_holster_0", "rdrvr_holster_1", "rdrvr_holster_2", "rdrvr_holster_3"};
+const char* const kObjName[kSlots] = {"rdrvr_round",     "rdrvr_second_gun", "rdrvr_holster_0", "rdrvr_holster_1",
+                                      "rdrvr_holster_2", "rdrvr_holster_3",  "rdrvr_model_0",   "rdrvr_model_1"};
 
 uint64_t fbits(float f) {
     uint32_t u;
@@ -38,6 +41,8 @@ struct Slot {
     // wanted (any thread, under g_mutex)
     const char* want = nullptr;
     float pose[12] = {};
+    bool angled = false;  // want_angles: the object turned with each move
+    float angles[3] = {};
     // the game thread's
     State st = kNone;
     const char* frag = nullptr;  // what is being loaded or held
@@ -87,6 +92,9 @@ struct DiagSlot {
     uint64_t other[4] = {};  // draws of any other model there
     uintptr_t other_d = 0;   // the last other one's drawable
     float other_dist = 0.0f;
+    uintptr_t near_d = 0;    // the nearest other one's drawable (2026-10-09: a model whose draws are never learned)
+    float near_dist = 1e9f;
+    float near_m[12] = {};   // its record's axes (rows 0-2 of the 4x4) and position
 };
 DiagSlot g_diag_slot[kSlots];  // under g_mutex
 constexpr int kMoves = 64;
@@ -160,6 +168,13 @@ void want(int s, const char* fragment, const float* pose, const float* anchor) {
     update_any();
 }
 
+void want_angles(int s, const float* deg) {
+    if (s < 0 || s >= kSlots) return;
+    std::lock_guard lock(g_mutex);
+    g_slot[s].angled = deg != nullptr;
+    if (deg) std::memcpy(g_slot[s].angles, deg, sizeof(g_slot[s].angles));
+}
+
 void note_root(const float* root) {
     std::lock_guard lock(g_mutex);
     std::memcpy(g_root_now, root, sizeof(g_root_now));
@@ -190,11 +205,14 @@ void frame(uint32_t actor) {
     for (int i = 0; i < kSlots; ++i) {
         Slot& s = g_slot[i];
         const char* want;
-        float pose[12];
+        float pose[12], ang[3];
+        bool angled;
         {
             std::lock_guard lock(g_mutex);
             want = s.want;
             std::memcpy(pose, s.pose, sizeof(pose));
+            angled = s.angled;
+            std::memcpy(ang, s.angles, sizeof(ang));
         }
         if (s.pending && !api::wait_native(s.pending, &r, 0)) {
             if (now - s.since > 5000.0) {  // no answer: given up, the object (if any) left to the destroy path
@@ -332,6 +350,7 @@ void frame(uint32_t actor) {
                 }
                 if (g_nmoves < kMoves - 3 * kSlots) {  // kept at the drawn hand: the game draws (and culls) it there (room left for creations)
                     later(q(kSetPosition, {s.obj, v2(pose[9], pose[10]), fbits(pose[11])}));
+                    if (angled) later(q(kSetOrientation, {s.obj, v2(ang[0], ang[1]), fbits(ang[2])}));
                     std::lock_guard lock(g_mutex);
                     push_put(s, pose + 9);
                     s.put_ok = true;
@@ -399,7 +418,7 @@ bool match(uintptr_t drawable, const float* pos, float* pose, int* slot) {
 
 bool diag_on() { return g_diag.load(std::memory_order_relaxed); }
 
-void diag_draw(uintptr_t drawable, const float* pos, uint64_t pass) {
+void diag_draw(uintptr_t drawable, const float* pos, uint64_t pass, const float* m) {
     if (!g_any.load(std::memory_order_relaxed)) return;
     const int p = pass < 3 ? static_cast<int>(pass) : 3;
     std::lock_guard lock(g_mutex);
@@ -415,12 +434,32 @@ void diag_draw(uintptr_t drawable, const float* pos, uint64_t pass) {
             ++d.other[p];
             d.other_d = drawable;
             d.other_dist = std::sqrt(d2);
+            if (d.other_dist < d.near_dist) {
+                d.near_dist = d.other_dist;
+                d.near_d = drawable;
+                if (m) {
+                    for (int r = 0; r < 3; ++r)
+                        for (int c = 0; c < 3; ++c) d.near_m[r * 3 + c] = m[r * 4 + c];
+                    for (int k = 0; k < 3; ++k) d.near_m[9 + k] = pos[k];
+                }
+            }
         }
     }
 }
 
 std::string diag_command(const std::string& arg) {
     if (arg == "on" || arg == "off") g_diag = arg == "on";
+    if (arg.rfind("near", 0) == 0) {  // props diag near<slot>: that slot's nearest other draw's record axes and position
+        const int i = std::atoi(arg.c_str() + 4);
+        if (i < 0 || i >= kSlots) return "no slot";
+        std::lock_guard lock(g_mutex);
+        const DiagSlot& d = g_diag_slot[i];
+        char b[300];
+        std::snprintf(b, sizeof(b), "slot %d nearest %llx at %.3f: x (%.3f %.3f %.3f) y (%.3f %.3f %.3f) z (%.3f %.3f %.3f) at (%.3f %.3f %.3f)", i,
+                      static_cast<unsigned long long>(d.near_d & 0xffffff), d.near_dist, d.near_m[0], d.near_m[1], d.near_m[2], d.near_m[3],
+                      d.near_m[4], d.near_m[5], d.near_m[6], d.near_m[7], d.near_m[8], d.near_m[9], d.near_m[10], d.near_m[11]);
+        return b;
+    }
     std::lock_guard lock(g_mutex);
     if (arg == "on" || arg == "reset")
         for (DiagSlot& d : g_diag_slot) d = DiagSlot{};
@@ -429,11 +468,12 @@ std::string diag_command(const std::string& arg) {
     for (int i = 0; i < kSlots; ++i) {
         if (!g_slot[i].want) continue;
         const DiagSlot& d = g_diag_slot[i];
-        std::snprintf(b, sizeof(b), " | slot %d own %llu/%llu/%llu/%llu other %llu/%llu/%llu/%llu (%llx at %.2f)", i,
+        std::snprintf(b, sizeof(b), " | slot %d own %llu/%llu/%llu/%llu other %llu/%llu/%llu/%llu (%llx at %.2f, nearest %llx at %.3f)", i,
                       static_cast<unsigned long long>(d.own[0]), static_cast<unsigned long long>(d.own[1]), static_cast<unsigned long long>(d.own[2]),
                       static_cast<unsigned long long>(d.own[3]), static_cast<unsigned long long>(d.other[0]), static_cast<unsigned long long>(d.other[1]),
                       static_cast<unsigned long long>(d.other[2]), static_cast<unsigned long long>(d.other[3]),
-                      static_cast<unsigned long long>(d.other_d & 0xffffff), d.other_dist);
+                      static_cast<unsigned long long>(d.other_d & 0xffffff), d.other_dist, static_cast<unsigned long long>(d.near_d & 0xffffff),
+                      d.near_dist);
         o += b;
     }
     return o;

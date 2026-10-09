@@ -52,7 +52,9 @@ bool gun_in_gun_hand();
 void set_gun_in_gun_hand(bool on);  // also written to the user ini
 // [Hands] FixedGunGrip (off; run 7 item 1c): each long gun held in the drawn hand by its aiming hold in every pose
 bool fixed_gun_grip();
-void set_fixed_gun_grip(bool on, bool save);  // save: also written to the user ini (the menu; "skel grip on|off" is the session's)
+void set_fixed_gun_grip(bool on, bool save);
+bool fixed_sidearm_grip();  // [Hands] FixedSidearmGrip: the sidearms held by their aiming hold too
+void set_fixed_sidearm_grip(bool on, bool save);  // save: also written to the user ini (the menu; "skel grip on|off" is the session's)
 int transplant_fingers();
 void set_transplant_fingers(int mode);  // also written to the user ini
 // The visibility build (camera_lever.cpp's hook, the update thread, just before the game builds its draw records):
@@ -102,6 +104,12 @@ void set_hidden_geometry(int mode);  // also written to the user ini
 const char* grip_source_name();  // the foregrip's grip now: "the weapon's", "<gun>'s (borrowed)", "the template", "built-in"
 bool auto_shows();           // [Body] AutoShow: forearms and hands while crouching, in cover, riding or driving
 void set_auto_shows(bool on);
+// [Weapon.<Gun>] FrontHandPose: a long gun's front hand: 0 automatic (the game's state), 1 the lowered hold, 2 the
+// aiming hold (each with its own fingers); front_pose_seen: bit 0/1 the lowered/aiming hold learned this session, bit
+// 2/3 its fingers
+int front_pose(int w);
+int front_pose_seen(int w);
+void set_front_pose(int w, int pose, bool save = true);
 bool locks_torso();          // [Body] LockTorso: the upper body kept over the hips horizontally (running leans)
 void set_locks_torso(bool on);
 HandCfg hand_cfg();

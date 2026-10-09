@@ -17,6 +17,7 @@
 #include "core/camera_lever.h"
 #include "core/config.h"
 #include "core/d3d_hooks.h"
+#include "core/dlss.h"
 #include "core/hooks.h"
 #include "core/log.h"
 #include "core/render_settings.h"
@@ -34,6 +35,11 @@ std::atomic<bool> g_on{false};      // [XR] EyeShape now ("eyeshape on|off")
 std::atomic<bool> g_ini_on{false};  // as read at boot
 std::atomic<float> g_scale{1.0f};   // [XR] EyeScale
 std::atomic<bool> g_hooked{false};  // both hooks installed
+// [XR] EyeShapeDlss (run 9 item 5, off): the eye shape under DLSS too (technique 5, with per-eye DLSS engaged)
+std::atomic<bool> g_dlss_cfg{false};
+// a technique the shape applies under: FXAA, or DLSS with EyeShapeDlss and per-eye DLSS on
+bool tech_ok(int tech) { return tech == 1 || (tech == 5 && g_dlss_cfg.load(std::memory_order_relaxed) && dlss::on()); }
+std::atomic<uint64_t> g_dlss_runs{0};
 std::atomic<uint32_t> g_rec_w{0}, g_rec_h{0}, g_max_w{0}, g_max_h{0};
 std::atomic<uint32_t> g_W{0}, g_H{0};    // the post output's allocation this session (0: no session yet)
 std::atomic<uint32_t> g_sw{0}, g_sh{0};  // the eye swapchains
@@ -245,15 +251,22 @@ bool shape(char* r, int W, int H) {
         return false;
     }
     int rw = static_cast<int>(std::lround(s * static_cast<float>(ew))), rh = static_cast<int>(std::lround(s * static_cast<float>(eh)));
-    if (rw < 16) rw = 16;
-    if (rh < 16) rh = 16;
     char* postfx = global<char*>(Id::PostFxSingleton);
     int tech = -1;
     if (!postfx || !rdp(postfx, 0x868, &tech)) {
         kill("no PostFx object");
         return false;
     }
-    if (tech != 1) return false;  // not FXAA this frame: the uniform state stays (no kill: it comes back with FXAA)
+    if (!tech_ok(tech)) return false;  // not FXAA (or DLSS with EyeShapeDlss) this frame: the uniform state stays (no kill)
+    if (tech == 5 && s < 0.999f) {  // under DLSS a pixel short of the scale: never above the NGX feature's render size for the eye's output
+        rw = static_cast<int>(std::floor(s * static_cast<float>(ew))) - 1;
+        rh = static_cast<int>(std::floor(s * static_cast<float>(eh))) - 1;
+    } else if (tech == 5) {  // DLAA: the render size is the output's
+        rw = static_cast<int>(ew);
+        rh = static_cast<int>(eh);
+    }
+    if (rw < 16) rw = 16;
+    if (rh < 16) rh = 16;
     void* pf_rt[4] = {};
     const size_t pf_off[4] = {0x10, 0x880, 0x3f0, 0x3f8};
     for (int i = 0; i < 4; ++i)
@@ -299,6 +312,14 @@ bool shape(char* r, int W, int H) {
         kill("ExtraSceneTarget %p is not an RT", extra);
         return false;
     }
+    // [XR] EyeShapeDlss: the DLSS output (PostFx +0x400, "FSR Linear Ouput", the tonemap's source) at the eye size, its
+    // resource re-created by the game's own SetSize (the tonemap samples the whole resource: UV 0..1)
+    void* up = nullptr;
+    int up_type = 0;
+    if (tech == 5 && (!rdp(postfx, 0x400, &up) || !rt_ok(up) || !rdp(up, 0x30, &up_type) || up_type != 3)) {
+        kill("the DLSS output (PostFx +0x400, %p, type %d) is not a render target", up, up_type);
+        return false;
+    }
     // the calls, in FUN_1405c26a0's order (its render size first)
     *reinterpret_cast<int*>(r + 0x554) = rw;
     *reinterpret_cast<int*>(r + 0x558) = rh;
@@ -310,6 +331,17 @@ bool shape(char* r, int W, int H) {
     rt_call(sc[1], rw, rh, W, H);
     if (grass) reinterpret_cast<GrassSize_t>(anchors::addr(Id::GrassSetSize))(grass, rw, rh, W, H);
     if (extra) rt_call(extra, rw, rh, W, H);
+    if (up) {  // after PostFxSetSizes (which set it W x H); the game's own resize sets it back (o_DrsSub at the unapply)
+        rt_call(up, static_cast<int>(ew), static_cast<int>(eh), W, H);
+        uint32_t uw = 0, uh = 0, tw = 0, th = 0;
+        void* tex = nullptr;
+        if (!rt_size(up, &uw, &uh) || uw != ew || uh != eh || !rdp(up, 0x68, &tex) || !tex || !rdp(tex, 0x50, &tw) || !rdp(tex, 0x54, &th) || tw != ew ||
+            th != eh) {
+            kill("the DLSS output is %ux%u (its texture %ux%u) after its SetSize, not %ux%u", uw, uh, tw, th, ew, eh);
+            o_DrsSub(r, W, H);  // the game's uniform state back now (every target the calls above sized)
+            return false;
+        }
+    }
     g_aw = ew;
     g_ah = eh;
     g_arw = static_cast<uint32_t>(rw);
@@ -321,6 +353,7 @@ void hk_DrsSub(void* renderer, int w, int h) {
     o_DrsSub(renderer, w, h);  // the game's uniform state at (s W, s H)
     const int want = t_want;
     if (want != 1) {
+        if (g_applied.load() && g_dlss_cfg.load(std::memory_order_relaxed)) dlss::shape_changed();  // the game's output size again
         if (g_applied.exchange(false)) {
             g_uniforms.fetch_add(1, std::memory_order_relaxed);
             if (want < 0) g_game_resizes.fetch_add(1, std::memory_order_relaxed);
@@ -330,11 +363,13 @@ void hk_DrsSub(void* renderer, int w, int h) {
     }
     const uint32_t aw = g_aw.load(), ah = g_ah.load(), arw = g_arw.load(), arh = g_arh.load();
     if (!renderer || !shape(static_cast<char*>(renderer), w, h)) {
+        if (g_applied.load() && g_dlss_cfg.load(std::memory_order_relaxed)) dlss::shape_changed();
         if (g_applied.exchange(false)) g_uniforms.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     g_applies.fetch_add(1, std::memory_order_relaxed);
     const bool was = g_applied.exchange(true);
+    if (g_dlss_cfg.load(std::memory_order_relaxed) && (!was || aw != g_aw.load() || ah != g_ah.load())) dlss::shape_changed();
     if (!was || aw != g_aw.load() || ah != g_ah.load() || arw != g_arw.load() || arh != g_arh.load())
         log::limited("eye.applied", 64, "[eye] applied: the eyes %ux%u, rendered at %ux%u, in the game's %dx%d", g_aw.load(), g_ah.load(),
                      g_arw.load(), g_arh.load(), w, h);
@@ -351,7 +386,7 @@ int decide(char* r) {
     char* postfx = global<char*>(Id::PostFxSingleton);
     int tech = -1;
     if (!r || !postfx || !rdp(postfx, 0x868, &tech)) return kNoGame;
-    if (tech != 1) return kTechnique;
+    if (!tech_ok(tech)) return kTechnique;
     const int sw = global<int>(Id::ScreenWidth), sh = global<int>(Id::ScreenHeight);
     if (sw != static_cast<int>(W) || sh != static_cast<int>(H)) {
         kill("the game's size changed: %dx%d, this session's %ux%u", sw, sh, W, H);
@@ -432,8 +467,15 @@ std::string rt_list(bool long_names) {
         uint32_t w = 0, h = 0;
         const bool ok = rt_size(slots[i].rt, &w, &h);
         if (ok && rdp(slots[i].rt, 0x60, &np) && np) copy_name(np, name, long_names ? sizeof(name) : 20);
-        char b[96];
-        if (ok)
+        char b[128];
+        // run 9 item 5 (step 0): the RT's texture object (+0x68) and its size (+0x50/+0x54), which the DLSS tags' extents
+        // take; the long form only
+        void* tex = nullptr;
+        uint32_t tw = 0, th = 0;
+        const bool tok = long_names && ok && rdp(slots[i].rt, 0x68, &tex) && tex && rdp(tex, 0x50, &tw) && rdp(tex, 0x54, &th);
+        if (ok && tok)
+            std::snprintf(b, sizeof(b), "%s%s %s %ux%u (tex %p %ux%u)", i ? ", " : "", slots[i].what, name, w, h, tex, tw, th);
+        else if (ok)
             std::snprintf(b, sizeof(b), "%s%s %s %ux%u", i ? ", " : "", slots[i].what, name, w, h);
         else
             std::snprintf(b, sizeof(b), "%s%s %s", i ? ", " : "", slots[i].what, slots[i].rt ? "NOT AN RT" : "null");
@@ -446,6 +488,8 @@ std::string rt_list(bool long_names) {
 
 void init() {
     g_on = g_ini_on = config::get_bool("XR", "EyeShape", false);
+    g_dlss_cfg = config::get_bool("XR", "EyeShapeDlss", false);
+    log::info("[eye] [XR] EyeShapeDlss %d (the eye shape under DLSS too)", g_dlss_cfg.load() ? 1 : 0);
     float s = config::get_float("XR", "EyeScale", 1.0f);
     if (!(s >= 0.25f && s <= 2.0f)) s = 1.0f;
     g_scale = s;
@@ -472,7 +516,9 @@ void set_recommended(uint32_t rec_w, uint32_t rec_h, uint32_t max_w, uint32_t ma
     g_max_h = max_h;
 }
 
-bool configured() { return g_on.load() && g_hooked.load() && render_settings::forced_aa() == 1; }
+bool configured() {
+    return g_on.load() && g_hooked.load() && (render_settings::forced_aa() == 1 || (render_settings::forced_aa() == 3 && g_dlss_cfg.load()));
+}
 
 void stop(const char* why) {
     if (g_on.load() || g_applied.load()) kill("%s", why);
@@ -517,9 +563,9 @@ void plan_session(uint32_t w, uint32_t h, uint32_t fw, uint32_t fh, const float 
         log::error("[eye] EyeShape refused: the DRS hooks are not installed");
         return;
     }
-    if (render_settings::forced_aa() != 1) {
-        log::error("[eye] EyeShape refused: [Render] ForceAntiAliasing is %d, not 1 (FXAA): the eye swapchains are the game's %ux%u frame",
-                   render_settings::forced_aa(), w, h);
+    if (render_settings::forced_aa() != 1 && !(render_settings::forced_aa() == 3 && g_dlss_cfg.load())) {
+        log::error("[eye] EyeShape refused: [Render] ForceAntiAliasing is %d, not 1 (FXAA)%s: the eye swapchains are the game's %ux%u frame",
+                   render_settings::forced_aa(), render_settings::forced_aa() == 3 ? " (DLSS needs [XR] EyeShapeDlss=1)" : "", w, h);
         return;
     }
     uint32_t ew = 0, eh = 0;
@@ -530,6 +576,21 @@ void plan_session(uint32_t w, uint32_t h, uint32_t fw, uint32_t fh, const float 
     g_sh = eh;
     *sw = ew;
     *sh = eh;
+}
+
+bool dlss_shape(uint32_t* rw, uint32_t* rh, uint32_t* ew, uint32_t* eh) {
+    if (!g_dlss_cfg.load(std::memory_order_relaxed) || !g_applied.load(std::memory_order_relaxed)) return false;
+    char* postfx = global<char*>(Id::PostFxSingleton);
+    int tech = -1;
+    if (!postfx || !rdp(postfx, 0x868, &tech) || tech != 5) return false;
+    *rw = g_arw.load(std::memory_order_relaxed);
+    *rh = g_arh.load(std::memory_order_relaxed);
+    *ew = g_aw.load(std::memory_order_relaxed);
+    *eh = g_ah.load(std::memory_order_relaxed);
+    return *rw && *rh && *ew && *eh;
+}
+void dlss_stop(const char* why) {
+    if (g_applied.load() && g_dlss_cfg.load()) kill("%s", why);
 }
 
 bool frame_rect(uint32_t* cw, uint32_t* ch, uint32_t* rw, uint32_t* rh) {
@@ -551,13 +612,22 @@ void begin_run(void* postfx, RunPoke* p) {
     int tech = -1;
     void* rt = nullptr;
     uint16_t wh[2] = {};
-    bool ok = postfx && rdp(postfx, 0x868, &tech) && tech == 1;  // not FXAA: this run is the game's (no kill)
-    if (ok && (!rdp(postfx, 0x898, &rt) || !rt_ok(rt))) {
-        kill("the post output (PostFx +0x898, %p) is not an RT", rt);
+    bool ok = postfx && rdp(postfx, 0x868, &tech) && tech_ok(tech);  // not FXAA (or DLSS with EyeShapeDlss): the game's run (no kill)
+    // the post output: the Post FXAA Target under FXAA; under DLSS the tonemap writes FXAATarget (+0x880 = +0x890)
+    const size_t out_off = tech == 5 ? 0x880 : 0x898;
+    if (ok && (!rdp(postfx, out_off, &rt) || !rt_ok(rt))) {
+        kill("the post output (PostFx +%#zx, %p) is not an RT", out_off, rt);
         ok = false;
     }
     if (ok && (!rdp(rt, 0xb0, &wh) || wh[0] != W || wh[1] != H)) {
         kill("the post output's logical size is %ux%u, not %ux%u", wh[0], wh[1], W, H);
+        ok = false;
+    }
+    // under DLSS the upscaler's output (+0x400) is at the eye size already (shape(): its own SetSize)
+    void* up = nullptr;
+    uint16_t upwh[2] = {};
+    if (ok && tech == 5 && (!rdp(postfx, 0x400, &up) || !rt_ok(up) || !rdp(up, 0xb0, &upwh) || upwh[0] != ew || upwh[1] != eh)) {
+        kill("the DLSS output (PostFx +0x400, %p) is %ux%u, not the eye's %ux%u", up, upwh[0], upwh[1], ew, eh);
         ok = false;
     }
     if (ok && (!ew || !eh || ew > W || eh > H || !write_size(rt, static_cast<uint16_t>(ew), static_cast<uint16_t>(eh)))) {
@@ -572,6 +642,8 @@ void begin_run(void* postfx, RunPoke* p) {
     p->rt = rt;
     p->w = wh[0];
     p->h = wh[1];
+    p->up = nullptr;  // (no per-run poke of the DLSS output)
+    if (tech == 5) g_dlss_runs.fetch_add(1, std::memory_order_relaxed);
     uint16_t in[2] = {};
     if (rdp(rt, 0xb0, &in)) {
         g_in_w.store(in[0], std::memory_order_relaxed);
@@ -585,6 +657,11 @@ void begin_run(void* postfx, RunPoke* p) {
 
 void end_run(void* postfx, const RunPoke& p) {
     if (!p.rt) return;
+    if (p.up) {  // the DLSS output back to W x H (its logical size before the run: checked W x H there)
+        uint16_t u[2] = {};
+        if (!write_size(p.up, p.w, p.h) || !rdp(p.up, 0xb0, &u) || u[0] != p.w || u[1] != p.h)
+            kill("the DLSS output's size was not put back to %ux%u (reads %ux%u)", p.w, p.h, u[0], u[1]);
+    }
     uint16_t out[2] = {};
     if (!write_size(p.rt, p.w, p.h) || !rdp(p.rt, 0xb0, &out) || out[0] != p.w || out[1] != p.h) {
         g_ui_mismatch.fetch_add(1, std::memory_order_relaxed);
@@ -593,8 +670,15 @@ void end_run(void* postfx, const RunPoke& p) {
     }
     g_out_w.store(out[0], std::memory_order_relaxed);
     g_out_h.store(out[1], std::memory_order_relaxed);
-    // the UI pass binds PostFx +0x890 (the chain's output pointer: the Post FXAA Target under FXAA): W x H after the run
+    // the UI pass binds PostFx +0x890 (the chain's output pointer: the Post FXAA Target under FXAA, FXAATarget under DLSS,
+    // where it must be the poked RT itself): W x H after the run
     void* ui = nullptr;
+    int tech = -1;
+    if (rdp(postfx, 0x868, &tech) && tech == 5 && rdp(postfx, 0x890, &ui) && ui != p.rt) {
+        g_ui_mismatch.fetch_add(1, std::memory_order_relaxed);
+        log::limited("eye.ui5", 4, "[eye] under DLSS the UI pass's target %p is not the post output %p", ui, p.rt);
+    }
+    ui = nullptr;
     uint32_t uw = 0, uh = 0;
     if (rdp(postfx, 0x890, &ui) && ui && ui != p.rt && rt_size(ui, &uw, &uh) && (uw != p.w || uh != p.h)) {
         g_ui_mismatch.fetch_add(1, std::memory_order_relaxed);
@@ -627,7 +711,7 @@ void status_text(char* out, size_t len) {
                   "eyeshape %s, scale %.2f, configured %d, hooks %d | game %ux%u, rec %ux%u, aspect %.3f, eye %ux%u, swapchains %ux%u | "
                   "wanted %d (%s), applied %d, eyes %ux%u render %ux%u, last run %d | killed %s | renderer %dx%d s %.3f tech %d | "
                   "screen %dx%d rt %dx%d | post output now %ux%u, in run %ux%u, after %ux%u | runs %llu/%llu, applies %llu, uniform %llu, "
-                  "resizes %llu, ui mismatch %llu, repaints %llu/%llu",
+                  "resizes %llu, ui mismatch %llu, repaints %llu/%llu | under DLSS (EyeShapeDlss %d): runs %llu",
                   g_on.load() ? "on" : "off", g_scale.load(), configured() ? 1 : 0, g_hooked.load() ? 1 : 0, g_W.load(), g_H.load(), g_rec_w.load(),
                   g_rec_h.load(), g_aspect.load(), g_ew.load(), g_eh.load(), g_sw.load(), g_sh.load(), why == kWanted ? 1 : 0, kWhyName[why],
                   g_applied.load() ? 1 : 0, g_aw.load(), g_ah.load(), g_arw.load(), g_arh.load(), g_run_shaped.load() ? 1 : 0, killed, rw, rh, s, tech,
@@ -636,7 +720,7 @@ void status_text(char* out, size_t len) {
                   static_cast<unsigned long long>(g_runs_plain.load()), static_cast<unsigned long long>(g_applies.load()),
                   static_cast<unsigned long long>(g_uniforms.load()), static_cast<unsigned long long>(g_game_resizes.load()),
                   static_cast<unsigned long long>(g_ui_mismatch.load()), static_cast<unsigned long long>(g_repaints.load()),
-                  static_cast<unsigned long long>(g_repaint_fails.load()));
+                  static_cast<unsigned long long>(g_repaint_fails.load()), g_dlss_cfg.load() ? 1 : 0, static_cast<unsigned long long>(g_dlss_runs.load()));
 }
 
 std::string command(const std::string& line) {

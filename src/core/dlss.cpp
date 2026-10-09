@@ -13,6 +13,7 @@
 #include "core/anchors.h"
 #include "core/config.h"
 #include "core/dual_pass.h"
+#include "core/eye_shape.h"
 #include "core/hooks.h"
 #include "core/log.h"
 
@@ -41,6 +42,7 @@ using Free_t = int (*)(uint32_t feature, const void* vp);
 using SetOptions_t = int (*)(const void* vp, const void* options);
 
 Append_t o_append = nullptr;
+bool t_shape_recorded = false;  // the render thread: the last run's marker was a shaped one (an off marker follows once)
 std::atomic<bool> g_cfg{false};      // [Render] DlssPerEye
 std::atomic<bool> g_ready{false};    // the slots swapped and viewport 1 made
 std::atomic<bool> g_killed{false};
@@ -84,8 +86,34 @@ struct ConstsPayload {
     const void* token;
 };
 
+// [XR] EyeShapeDlss (run 9 item 5): each run's shape as recorded (the render thread), set on the playback thread by a
+// marker callback appended before that run's constants: the constants' mvecScale and the tags' output extent follow it
+struct ShapePayload {
+    uint32_t on, rw, rh, ew, eh;
+};
+ShapePayload t_shape{};  // the playback thread's current run (only the playback thread reads and writes it)
+constexpr size_t kOptsOutW = 0x24, kOptsOutH = 0x28;  // sl::DLSSOptions outputWidth/Height (research\run9\eyeshape-dlss.md)
+std::atomic<bool> g_opt_shaped{false};                 // the options last sent carried the eye's output size
+std::atomic<uint32_t> g_opt_w{0}, g_opt_h{0};
+std::atomic<uint64_t> g_shape_marks{0}, g_shape_consts{0}, g_shape_tags{0}, g_shape_opts{0}, g_shape_refused{0}, g_shape_size_skips{0};
+std::atomic<int> g_shape_mv{1};  // the test aid "dlss shapemv game|eye": 1 = 1/(rw, rh) (the shaped render size), 0 = the game's
+void mod_shape_mark(void* data) {
+    if (const auto* p = static_cast<const ShapePayload*>(data)) t_shape = *p;
+    if (g_killed.load(std::memory_order_relaxed)) t_shape.on = 0;  // per-eye DLSS off: the game's own constants and tags
+    g_shape_marks.fetch_add(1, std::memory_order_relaxed);
+}
+// the constants' mvecScale for the shaped run: 1 / the shaped render size
+void shape_consts(uint8_t* c) {
+    if (!t_shape.on || g_killed.load(std::memory_order_relaxed) || !g_shape_mv.load(std::memory_order_relaxed) || !t_shape.rw || !t_shape.rh) return;
+    const float m[2] = {1.0f / static_cast<float>(t_shape.rw), 1.0f / static_cast<float>(t_shape.rh)};
+    std::memcpy(c + kConstsMvecScale, m, sizeof(m));
+    g_shape_consts.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::atomic<bool> g_opt_pending{false};  // [XR] EyeShapeDlss: the options to be sent again (set by any thread, acted on by the render thread)
 void kill(const char* what, int r) {
     if (g_killed.exchange(true)) return;
+    g_opt_pending = true;  // the options sent again at the next run (the shape's output size, then the game's W x H)
     g_last_error = r;
     std::snprintf(g_why, sizeof(g_why), "%s returned %d", what, r);
     log::error("[dlss] per-eye DLSS off: %s (back to one viewport for both eyes)", g_why);
@@ -128,6 +156,7 @@ void mod_consts1(void* data) {
     g_chk.tc[1] = p->token;
     if (p->consts[kConstsReset]) g_reset_seen[1].fetch_add(1, std::memory_order_relaxed);
     g_chk.have1 = true;
+    shape_consts(p->consts);  // [XR] EyeShapeDlss
     if (const float k = g_mv_scale.load(std::memory_order_relaxed); k != 1.0f) {
         float m[2];
         std::memcpy(m, p->consts + kConstsMvecScale, sizeof(m));
@@ -190,6 +219,19 @@ int hk_set_consts(const void* consts, const void* token, const void* vp) {
         } else {
             g_vp0_alone.fetch_add(1, std::memory_order_relaxed);  // mono, or a second eye with no first-eye constants
         }
+        if (t_shape.on && !g_killed.load(std::memory_order_relaxed) && g_shape_mv.load(std::memory_order_relaxed)) {  // [XR] EyeShapeDlss: the shaped run's mvecScale (a copy)
+            alignas(16) uint8_t c[kConstsSize];
+            std::memcpy(c, consts, kConstsSize);
+            shape_consts(c);
+            if (const float k = g_mv_scale.load(std::memory_order_relaxed); k != 1.0f) {
+                float m[2];
+                std::memcpy(m, c + kConstsMvecScale, sizeof(m));
+                m[0] *= k;
+                m[1] *= k;
+                std::memcpy(c + kConstsMvecScale, m, sizeof(m));
+            }
+            return o_set_consts(c, token, vp);
+        }
         if (const float k = g_mv_scale.load(std::memory_order_relaxed); k != 1.0f) {  // Streamline copies the constants
             alignas(16) uint8_t c[kConstsSize];
             std::memcpy(c, consts, kConstsSize);
@@ -204,8 +246,85 @@ int hk_set_consts(const void* consts, const void* token, const void* vp) {
     return o_set_consts(consts, token, vp);
 }
 
+// run 9 item 5 (step 0, read-only): the tags as the game passes them, once per viewport: each 0x40-byte sl::ResourceTag
+// (the type +0x28, the lifecycle +0x2c, the extent {top, left, width, height} +0x30) and its sl::Resource (+0x20: the
+// type +0x20, the native pointer +0x28, the width/height +0x44/+0x48, the format +0x4c), every read guarded
+bool raw_copy(const void* p, void* out, size_t n) {
+    __try {
+        std::memcpy(out, p, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+std::atomic<bool> g_tags_logged[2][2] = {};  // [viewport][the eye shape's run: the tags as the shape passes them]
+void log_tags(int v, const void* tags, uint32_t n, int shaped) {
+    if (!tags || n == 0 || n > 8 || g_tags_logged[v][shaped].exchange(true)) return;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint8_t t[0x40];
+        if (!raw_copy(static_cast<const uint8_t*>(tags) + i * 0x40, t, sizeof(t))) {
+            log::info("[dlss] tags (viewport %d%s) %u: unreadable", v, shaped ? ", the eye shape" : "", i);
+            return;
+        }
+        const void* res = *reinterpret_cast<const void* const*>(t + 0x20);
+        uint32_t type = 0, life = 0, ext[4] = {};
+        std::memcpy(&type, t + 0x28, 4);
+        std::memcpy(&life, t + 0x2c, 4);
+        std::memcpy(ext, t + 0x30, sizeof(ext));
+        uint8_t r[0x50] = {};
+        const bool rok = res && raw_copy(res, r, sizeof(r));
+        uint32_t rtype = 0, rw = 0, rh = 0, rfmt = 0;
+        const void* native = nullptr;
+        if (rok) {
+            std::memcpy(&rtype, r + 0x20, 4);
+            std::memcpy(&native, r + 0x28, 8);
+            std::memcpy(&rw, r + 0x44, 4);
+            std::memcpy(&rh, r + 0x48, 4);
+            std::memcpy(&rfmt, r + 0x4c, 4);
+        }
+        log::info("[dlss] tags (viewport %d%s) %u of %u: type %u lifecycle %u extent {top %u left %u width %u height %u} | resource %p%s: type %u "
+                  "native %p %ux%u format %u",
+                  v, shaped ? ", the eye shape" : "", i, n, type, life, ext[0], ext[1], ext[2], ext[3], res, rok ? "" : " (unreadable)", rtype, native, rw, rh, rfmt);
+    }
+}
+
 // ---- the Streamline slots (H3, H5)
 int hk_set_tag(const void* vp, const void* tags, uint32_t n, void* cmd) {
+    // [XR] EyeShapeDlss: the shaped run's tags, a copy: the output's (type 4) extent at the eye, checked first (the
+    // layout as step 0 read it: type +0x28, lifecycle +0x2c, extent +0x30; the input extents follow their textures)
+    alignas(16) uint8_t shaped[5 * 0x40];
+    if (t_shape.on && !g_killed.load(std::memory_order_relaxed) && tags && n == 5 && raw_copy(tags, shaped, sizeof(shaped))) {
+        bool ok = true, sizes = true;
+        int out = -1;
+        for (uint32_t i = 0; i < 5 && ok; ++i) {
+            uint8_t* t = shaped + i * 0x40;
+            uint32_t type = 0, life = 0, ext[4] = {};
+            std::memcpy(&type, t + 0x28, 4);
+            std::memcpy(&life, t + 0x2c, 4);
+            std::memcpy(ext, t + 0x30, sizeof(ext));
+            ok = (type == 0 || type == 1 || type == 3 || type == 4 || type == 29) && life == 1 && ext[0] == 0 && ext[1] == 0;
+            if (type == 4) {
+                ok = ok && out < 0;
+                sizes = sizes && t_shape.ew <= ext[2] && t_shape.eh <= ext[3];
+                out = static_cast<int>(i);
+            } else {
+                sizes = sizes && ext[2] <= t_shape.rw + 1 && ext[3] <= t_shape.rh + 1;  // the inputs at the shaped render size
+            }
+        }
+        if (ok && out >= 0 && !sizes) {  // the eye size changed between the record and this playback: the game's tags, this once
+            g_shape_size_skips.fetch_add(1, std::memory_order_relaxed);
+        } else if (ok && out >= 0) {
+            uint32_t e[4] = {0, 0, t_shape.ew, t_shape.eh};
+            std::memcpy(shaped + out * 0x40 + 0x30, e, sizeof(e));
+            tags = shaped;
+            g_shape_tags.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_shape_refused.fetch_add(1, std::memory_order_relaxed);
+            log::limited("dlss.shape", 4, "[dlss] the eye shape's tags refused (a field not as expected): the game's tags passed");
+            eye_shape::dlss_stop("the DLSS tags were not as expected for the eye shape");
+        }
+    }
+    log_tags(t_vp1 ? 1 : 0, tags, n, tags == shaped ? 1 : 0);  // run 9 item 5: as passed (the shape's copy when shaped)
     if (t_vp1 && reinterpret_cast<uintptr_t>(vp) == g_game_vp_static) {
         const int r = o_set_tag(g_vp1, tags, n, cmd);
         if (vp1_result("slSetTag(viewport 1)", r, 1)) g_tags_ok.fetch_add(1, std::memory_order_relaxed);
@@ -240,15 +359,48 @@ int hk_free(uint32_t feature, const void* vp) {
 
 // ---- slDLSSSetOptions (H4: the render thread, synchronous)
 int hk_set_options(const void* vp, const void* options) {
+    // [XR] EyeShapeDlss: with the shape applied, the output size is the eye's for both viewports (the game's options
+    // object written for the calls and put back: the render thread, synchronous)
+    uint32_t rw = 0, rh = 0, ew = 0, eh = 0, ow = 0, oh = 0;
+    char* o = static_cast<char*>(const_cast<void*>(options));
+    const bool want = o && eye_shape::dlss_shape(&rw, &rh, &ew, &eh);
+    const bool shape = want && raw_copy(o + kOptsOutW, &ow, 4) && raw_copy(o + kOptsOutH, &oh, 4) && ew <= ow && eh <= oh;
+    if (want && !shape) eye_shape::dlss_stop("the DLSS options' output size could not take the eye's");
+    if (shape) {
+        std::memcpy(o + kOptsOutW, &ew, 4);
+        std::memcpy(o + kOptsOutH, &eh, 4);
+        g_shape_opts.fetch_add(1, std::memory_order_relaxed);
+    }
     const int r = o_set_options(vp, options);
     if (!g_killed.load(std::memory_order_relaxed) && reinterpret_cast<uintptr_t>(vp) != reinterpret_cast<uintptr_t>(g_vp1)) {
         const int r1 = o_set_options(g_vp1, options);
         if (vp1_result("slDLSSSetOptions(viewport 1)", r1, 3)) g_options_vp1.fetch_add(1, std::memory_order_relaxed);
     }
+    uint32_t sw = ow, sh = oh;
+    if (shape) {
+        std::memcpy(o + kOptsOutW, &ow, 4);
+        std::memcpy(o + kOptsOutH, &oh, 4);
+        sw = ew;
+        sh = eh;
+    } else if (o) {
+        raw_copy(o + kOptsOutW, &sw, 4);
+        raw_copy(o + kOptsOutH, &sh, 4);
+    }
+    g_opt_shaped = shape;
+    g_opt_w = sw;
+    g_opt_h = sh;
+    log::limited("dlss.opts", 200, "[dlss] options sent (viewport %s): the output %ux%u%s, result %d",
+                 reinterpret_cast<uintptr_t>(vp) == reinterpret_cast<uintptr_t>(g_vp1) ? "1" : "0", sw, sh, shape ? " (the eye shape)" : "", r);
     return r;
 }
 
 // a slot's value points into this module's image
+// DLSS +0xe8: the options sent again at the next post run's AA slot (before its evaluate)
+void request_options() {
+    char* pfx = *reinterpret_cast<char**>(anchors::addr(Id::PostFxSingleton));
+    if (char* d = pfx ? *reinterpret_cast<char**>(pfx + kDlssObject) : nullptr) d[kOptionsDirty] = 1;
+}
+
 bool in_module(const void* p, HMODULE m) {
     MEMORY_BASIC_INFORMATION mbi{};
     return p && m && VirtualQuery(p, &mbi, sizeof(mbi)) && mbi.AllocationBase == m;
@@ -315,12 +467,29 @@ bool ensure() {
 // ---- H2: the deferred append (the render thread; every deferred callback passes: two compares, then the original)
 void hk_append(void* recorder, void* fn, const void* data, uint32_t size) {
     const uintptr_t f = reinterpret_cast<uintptr_t>(fn);
+    if (f == g_cb_consts && !data && !size && g_ready.load(std::memory_order_relaxed) && g_opt_pending.exchange(false)) request_options();
     if ((f != g_cb_consts && f != g_cb_eval) || data || size || g_killed.load(std::memory_order_relaxed))
         return o_append(recorder, fn, data, size);
     const int slot = dual_pass::post_slot();  // 0 the first-eye run, 1 RenderFrame's run of a double frame, 2 mono
     if (slot == 2 && f == g_cb_consts) {
         g_need_reset = true;  // a mono frame: viewport 1 sees a gap
         g_mono_runs.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (f == g_cb_consts && g_ready.load(std::memory_order_relaxed)) {
+        // [XR] EyeShapeDlss: this run's shape for the playback thread (every run: the shape's off runs clear it). When the
+        // shape is applied but the options last sent were not the eye's (a toggle), they are sent again first (the AA
+        // slot sends them before this run's evaluate when DLSS +0xe8 is set)
+        ShapePayload sp{};
+        uint32_t rw = 0, rh = 0, ew = 0, eh = 0;
+        const bool shaped = eye_shape::dlss_shape(&rw, &rh, &ew, &eh);
+        if (shaped) sp = {1, rw, rh, ew, eh};
+        const bool want_opts = shaped != g_opt_shaped.load(std::memory_order_relaxed) || (shaped && (g_opt_w.load() != ew || g_opt_h.load() != eh));
+        if (want_opts) {
+            char* pfx = *reinterpret_cast<char**>(anchors::addr(Id::PostFxSingleton));
+            if (char* d = pfx ? *reinterpret_cast<char**>(pfx + kDlssObject) : nullptr) d[kOptionsDirty] = 1;
+        }
+        if (shaped || t_shape_recorded) o_append(recorder, reinterpret_cast<void*>(&mod_shape_mark), &sp, sizeof(sp));
+        t_shape_recorded = shaped;
     }
     if (slot != 0 || !ensure()) return o_append(recorder, fn, data, size);
     if (f == g_cb_consts) {
@@ -356,6 +525,10 @@ bool install() {
 
 bool on() { return g_cfg.load() && g_ready.load() && !g_killed.load(); }
 
+void shape_changed() {
+    if (g_ready.load()) request_options();  // killed too: viewport 0 must get the game's output size back
+}
+
 void set_mv_scale(float k) {
     g_mv_scale = k;
     log::info("[dlss] motion vector scale x %.3f (test)", k);
@@ -373,6 +546,11 @@ std::string command(const std::string& line) {
     std::string c, w;
     in >> c >> w;
     if (w == "off") kill("the test channel", -1);
+    if (w == "shapemv") {  // dlss shapemv game|eye: the shaped run's mvecScale (the test aid)
+        std::string v;
+        in >> v;
+        g_shape_mv = v == "game" ? 0 : 1;
+    }
     char b[1000];
     std::snprintf(b, sizeof(b),
                   "dlss per eye: configured %d, ready %d, killed %d%s%s | counted, not fatal: missing constants %llu, duplicated %llu, "
@@ -392,7 +570,14 @@ std::string command(const std::string& line) {
                   static_cast<unsigned long long>(g_eval_tok_ne[0].load()));
     std::string s = b;
     if (g_killed.load()) s += ")";
-    return s;
+    char e[260];
+    std::snprintf(e, sizeof(e),
+                  " | the eye shape (EyeShapeDlss): marks %llu, constants %llu (mvecScale %s), tags %llu, refused %llu, size skips %llu, options shaped %llu (the last %ux%u%s)",
+                  static_cast<unsigned long long>(g_shape_marks.load()), static_cast<unsigned long long>(g_shape_consts.load()),
+                  g_shape_mv.load() ? "the shaped size" : "the game's", static_cast<unsigned long long>(g_shape_tags.load()),
+                  static_cast<unsigned long long>(g_shape_refused.load()), static_cast<unsigned long long>(g_shape_size_skips.load()), static_cast<unsigned long long>(g_shape_opts.load()), g_opt_w.load(),
+                  g_opt_h.load(), g_opt_shaped.load() ? ", the eye's" : "");
+    return s + e;
 }
 
 }  // namespace rdrvr::dlss

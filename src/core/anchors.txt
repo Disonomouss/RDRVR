@@ -188,6 +188,8 @@ SetShaderGlobal          func   0x1490a0   # (id, src, count, type): copies into
 ShaderGlobalTable        global 0x2b01e40  # 16 bytes per global id: the cbuffer, then the int byte offset at +8
 WindParamsId             global 0x2c0347c  # the WindParams global's id (FUN_1405b3640); gWindParams = (time, wind x 0.03, 5, 6) each frame (FUN_1406b1480)
 # --- the gun in hand culled at the game's hand (round 7: "the gun turns invisible now and then")
+LassoRopeDraw            func   0x369370   # the lasso's draw (its handler table 0x141c936a8): the rope's textures (DAT_142ac4818/4820), then FUN_1409e2b90 (the rope's LOD, then the points' draw)
+RopePointsDraw           func   0x9e26e0   # (lod, camera, model, points, lod data, ..): the rope's points (16 bytes each, the count at +0x800) copied into the draw's constants
 ObjectSetMatrix          func   0x2191c0   # (object, matrix): the object's vtable +0xb8 (its matrix), then FUN_1402eaa00; every object
 GunPropPlaceRet          site   0x2ff10d 7 # its return address in FUN_1402fe6d0: the held item's prop placed at W +0x80 (rdx)
 # --- dual wield (run 3 item 5, research\run3\dualwield.md): a second gun from another equip slot in the free hand
@@ -196,6 +198,7 @@ ScriptThreadCurrent      global 0x2c3f3b8  # the running script thread (null out
 ScriptRefPool            global 0x2ac4550  # the scripts' object-reference node pool (1024 nodes): its free count at +0x20; each prop LOCATE returns pins one for the session
 GunItemVtbl              global 0x1c9c720  # the gun items' vtable (FUN_140358a40's): slot 6 (+0x30) the trigger FUN_1403b4660(item) -> 1 fired, 0 refused (empty, the trigger not released, the fire interval)
 # --- the forearms mode's sliver, round 8 (float rounding of the collapsed points at the world's coordinates)
+ThrowPhase               func   0xcf0150   # (ped) -> the throw clip's phase: the clip player's time (+0x38 of [[ped +0x320] +0x10]) / its length
 ThrowStart               func   0xd152d0   # (G, clip, release phase, rate, phase in, phase out, draw-model phase, focus) -> 1: AimDoThrowTrack's start (G +0x558 the release phase, +0x55c the rate; state 13)
 MeleeTrackStart          func   0xd54900   # MeleeAnimationTrack's start (self): an attack (def +0x18 == 0) sets M = [[ped +0xaa8] +0x80] +0x11c / +0x120, the strike's start and end phases
 RecorderDraw             func   0xecd690   # (recorder, topology, index count): records draw packet 0x2c, replayed by RenderThread as DrawIndexedInstanced(count, 1, 0, 0, 0); the recorder's vtable +0x190 (research\run3\deferred_draw.md)
@@ -217,6 +220,8 @@ ScreenHeightRT           global 0x22722d0  # its render-thread copy
 # --- [Render] RenderResolution (the render resolution study, 2026-10-08; render_res.h)
 SysParamWidth            global 0x22bdc48  # the sysParam "width"'s value (a string), read only by the device init FUN_14012e420 (0x14012e511, strtol) over the xml's size
 SysParamHeight           global 0x22bdc80  # the sysParam "height"'s value (read at 0x14012e533)
+SysParamWindowed         global 0x22ca2b0  # the sysParam "windowed"'s value ("[grcore] Force windowed mode"): non-null makes the device init (0x14012e56e) write GraphicsOptions +0 Fullscreen 0
+SysParamFullscreen       global 0x22ca2e8  # the sysParam "fullscreen"'s value ("[grcore] Force fullscreen mode", 0x14012e579): Fullscreen 1 (after windowed's)
 GraphicsOptions          global 0x22ca340  # rage__GraphicsOptions (graphicsOptions.xml): +0 Fullscreen (u8), +1 Monitor, +4 ResolutionX, +8 ResolutionY
 WindowSizeW              global 0x225b088  # the client width FUN_140ec38b0 creates the window at (FUN_140ebfa60 sets it from the boot size, 0x14012e642)
 WindowSizeH              global 0x225b08c  # its height

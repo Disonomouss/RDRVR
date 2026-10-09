@@ -15,6 +15,7 @@
 #include "core/api.h"
 #include "core/body.h"
 #include "core/actions.h"
+#include "core/aim.h"
 #include "core/config.h"
 #include "core/dual.h"
 #include "core/hands.h"
@@ -26,6 +27,7 @@
 #include "core/reload.h"
 #include "core/wheel.h"
 #include "core/whistle.h"
+#include "core/vr_mode.h"
 #include "core/xr.h"
 
 namespace rdrvr::controls {
@@ -97,6 +99,16 @@ double g_jump_until = 0, g_jump_since = 0, g_jump_pulse_until = 0;
 bool g_jump_prev = false, g_jump_pending = false;
 std::atomic<uint64_t> g_jump_presses{0}, g_jump_waits{0};
 std::atomic<float> g_jump_wait_ms{0.0f};
+// [Gestures] Whistle (run 9 item 1, the user: "Add ability to whistle with off hand when weapon equipped in the
+// other"): the game takes no whistle from its aim stance (the simulator: the Schofield and the Winchester raised, LT held
+// by AimWhenRaised: the press sent, IS_ACTOR_WHISTLING 0, the horse stayed at 20 m; lowered, it came). A whistle pressed
+// while LT is held: LT let go for kWhistleDropMs from the press, the whistle held back until the aim pose is down (at most
+// kWhistleWaitMs), then pressed for kWhistlePulseMs
+constexpr double kWhistleDropMs = 900.0, kWhistleWaitMs = 300.0, kWhistlePulseMs = 200.0;
+double g_wh_drop_until = 0, g_wh_since = 0, g_wh_pulse_until = 0;
+bool g_wh_prev = false, g_wh_pending = false;
+std::atomic<uint64_t> g_wh_drops{0};
+std::atomic<float> g_wh_wait_ms{0.0f};
 std::atomic<uint64_t> g_sprint_frames{0};
 std::atomic<bool> g_draw_any{true};     // [Hands] DrawToGrabbingHand
 std::atomic<int> g_draw_hand{-1};       // the controller that drew the gun in hand (-1: the layout's)
@@ -133,6 +145,36 @@ double g_menu_since = 0, g_start_until = 0;
 std::atomic<bool> g_wrist_menu{true};
 bool g_wy_held = false, g_wy_fired = false;
 double g_wy_since = 0, g_wy_tap_until = 0;
+// [Controls] MenuControls (2026-10-09): while a game menu is open (the satchel, the pause menu, the shop) RT presses RB
+// and LT presses LB (their tabs), the left stick is the D-pad's steps (the game's own stick scrolled two to three items a
+// flick and the whole list in a second)
+std::atomic<bool> g_menu_ctl{true};
+int g_w_shop = -1;  // UI_ISFOCUSED("ShopMenu"), every script tick (the shop does not stop the scripts)
+const char kShopLayer[] = "ShopMenu";
+std::atomic<uint64_t> g_menu_tabs{0}, g_menu_steps{0}, g_menu_frames{0};
+bool g_menu_rt = false, g_menu_lt = false;  // the triggers' state (the pad's thread)
+double g_menu_tab_until = 0.0;
+uint16_t g_menu_tab_button = 0;
+int g_menu_dir = -1;  // the stick's step direction held: 0 up, 1 down, 2 left, 3 right
+double g_menu_dir_since = 0.0, g_menu_next_step = 0.0, g_menu_step_until = 0.0;
+constexpr double kStepPulse = 70.0, kStepFirstRepeat = 450.0, kStepRepeat = 180.0;
+bool game_menu_now() {
+    const int f = vr_mode::state_flags();
+    if ((f & (2 | 4)) && !(f & 1)) return true;  // paused or the scripts stopped, the scene still drawn (not a load)
+    uint64_t v = 0;
+    return g_w_shop >= 0 && api::watched(g_w_shop, &v, nullptr) && (v & 0xff) == 1;
+}
+// [Controls] WristSatchel (2026-10-09, the user's choice): that short press is the pad's Back (the satchel), not Y
+std::atomic<bool> g_wrist_satchel{false};
+std::atomic<uint64_t> g_satchels{0}, g_wy_single{0}, g_y_frames{0};
+double g_back_until = 0;
+// run 9 item 2 (the user: "too easy to accidentally trigger with one press"): two taps within SatchelTapMs open the
+// satchel. The first tap is held back for that window (from its release): a second press inside it makes the pair (no Y
+// at all); none, and the game gets its Y at the window's end (a single Y SatchelTapMs late)
+float g_satchel_tap_ms = 350.0f;
+bool g_wy_pending = false, g_wy_second = false;
+double g_wy_pending_at = 0;
+std::atomic<float> g_wy_single_delay{0.0f};  // the last single tap's Y, from its release (ms)
 double g_combo_since = 0;
 bool g_combo_fired = false;
 uint64_t g_seen_updates[2] = {0, 0};
@@ -172,6 +214,13 @@ void init() {
     g_menu_hold_ms = config::get_float("Controls", "MenuHoldMs", 600.0f);
     g_menu_chord_on = config::get_bool("Controls", "MenuChord", true);
     g_wrist_menu = config::get_bool("Controls", "WristMenu", true);
+    g_wrist_satchel = config::get_bool("Controls", "WristSatchel", false);
+    g_satchel_tap_ms = config::get_float("Controls", "SatchelTapMs", 350.0f);
+    g_satchel_tap_ms = !(g_satchel_tap_ms >= 150.0f) ? 150.0f : g_satchel_tap_ms > 800.0f ? 800.0f : g_satchel_tap_ms;
+    log::info("[controls] the satchel by a double tap of Y at the wrist HUD (WristSatchel) %d, within %.0f ms (a single tap: Y that late)",
+              g_wrist_satchel.load() ? 1 : 0, g_satchel_tap_ms);
+    g_menu_ctl = config::get_bool("Controls", "MenuControls", true);
+    g_w_shop = api::watch_native(0x6F2509E8u, reinterpret_cast<uint64_t>(kShopLayer), 1);  // UI_ISFOCUSED
     g_left_handed = config::get_bool("Controls", "LeftHanded", false);
     g_click_brake = config::get_bool("Horse", "StickClickBrake", true);
     g_trigger_aims = config::get_bool("Hands", "TriggerAims", true);
@@ -276,17 +325,21 @@ bool pad(xinput::PadState* out) {
     }
     g_menu_was = menu_down;
     if (now < g_start_until) p.buttons |= XINPUT_GAMEPAD_START;
-    if (whistle_btn) p.buttons |= XINPUT_GAMEPAD_DPAD_UP;  // the game's GENERIC.WHISTLE
+    // the game's GENERIC.WHISTLE (D-pad up): pressed below, after the aim stance's check
     // the wrist menu: with the wrist HUD in view (the palm flat, looked at), the off hand's Y held MenuHoldMs toggles
     // the menu. Y is the mod's from its press while the HUD shows (the hold keeps it if the HUD goes); a shorter press
     // reaches the game as a tap at the release
     {
         const bool y = (l.buttons & hands::kB) != 0;
-        if (y && (g_wy_held || (g_wrist_menu.load(std::memory_order_relaxed) && xr::wrist_hud_shown()))) {
+        const bool sat = g_wrist_satchel.load(std::memory_order_relaxed);
+        // a press while the first tap waits is the pair's second, the HUD in view or not
+        if (y && (g_wy_held || g_wy_pending || (g_wrist_menu.load(std::memory_order_relaxed) && xr::wrist_hud_shown()))) {
             if (!g_wy_held) {
                 g_wy_held = true;
                 g_wy_fired = false;
                 g_wy_since = now;
+                g_wy_second = g_wy_pending;
+                g_wy_pending = false;  // the first tap's Y is never sent
             }
             if (!g_wy_fired && now - g_wy_since >= g_menu_hold_ms) {
                 g_wy_fired = true;
@@ -296,10 +349,29 @@ bool pad(xinput::PadState* out) {
             }
             l.buttons &= ~static_cast<uint32_t>(hands::kB);
         } else if (g_wy_held) {
-            if (!g_wy_fired) g_wy_tap_until = now + 120;  // a tap: Y for the game
+            if (!g_wy_fired) {
+                if (!sat) {
+                    g_wy_tap_until = now + 120;  // a tap: Y for the game
+                } else if (g_wy_second) {  // [Controls] WristSatchel: the second tap opens the satchel
+                    g_back_until = now + 120;
+                    g_satchels.fetch_add(1, std::memory_order_relaxed);
+                    log::info("[controls] Y tapped twice with the wrist HUD in view: the satchel (Back)");
+                } else {
+                    g_wy_pending = true;  // the first: held back for the window
+                    g_wy_pending_at = now;
+                }
+            }
             g_wy_held = false;
+            g_wy_second = false;
+        }
+        if (g_wy_pending && (now - g_wy_pending_at >= g_satchel_tap_ms || !sat)) {  // no second tap: the game's Y now
+            g_wy_pending = false;
+            g_wy_tap_until = now + 120;
+            g_wy_single.fetch_add(1, std::memory_order_relaxed);
+            g_wy_single_delay.store(static_cast<float>(now - g_wy_pending_at), std::memory_order_relaxed);
         }
         if (now < g_wy_tap_until) l.buttons |= hands::kB;
+        if (now < g_back_until) p.buttons |= XINPUT_GAMEPAD_BACK;  // the game's GENERIC.INVENTORY
     }
     // both stick clicks held a second: recentre
     if ((l.buttons & hands::kStick) && (r.buttons & hands::kStick)) {
@@ -343,7 +415,7 @@ bool pad(xinput::PadState* out) {
         const bool was = g_grip_raw[h];
         if (grips[h] > g_grip_on) g_grip_raw[h] = true;
         else if (grips[h] < g_grip_off) g_grip_raw[h] = false;
-        if (g_grip_raw[h] && !was && (holster::grip_wanted(ph) || actions::grip_wanted(ph))) g_grip_held_back[h] = true;
+        if (g_grip_raw[h] && !was && (holster::grip_wanted(ph) || actions::grip_wanted(ph) || aim::grip_throw_wanted(ph))) g_grip_held_back[h] = true;
         // [Physics] Grab: an empty hand's press held back until the grab is known (kept if a prop is held, the game's
         // if none was there, or after 200 ms)
         static bool grab_wait[2] = {false, false};
@@ -397,6 +469,24 @@ bool pad(xinput::PadState* out) {
         else if (t > kNone && t < kTargets && value[s] > 0.5f) p.buttons |= kTargetButton[t];
     }
     if (actions::fire_blocked()) rt = 0.0f;  // [Reload] ManualActions: the gun's action not worked (open, or not cycled)
+    const bool menu_mode = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now();
+    if (menu_mode) {  // [Controls] MenuControls: the triggers are the tabs (RB, LB), a press of 120 ms on each pull
+        g_menu_frames.fetch_add(1, std::memory_order_relaxed);
+        const bool rt_on = rt > (g_menu_rt ? 0.35f : 0.6f), lt_on = lt > (g_menu_lt ? 0.35f : 0.6f);
+        if ((rt_on && !g_menu_rt) || (lt_on && !g_menu_lt)) {
+            g_menu_tab_button = rt_on && !g_menu_rt ? XINPUT_GAMEPAD_RIGHT_SHOULDER : XINPUT_GAMEPAD_LEFT_SHOULDER;
+            g_menu_tab_until = now + 120.0;
+            g_menu_tabs.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_menu_rt = rt_on;
+        g_menu_lt = lt_on;
+        if (now < g_menu_tab_until) p.buttons |= g_menu_tab_button;
+        lt = rt = 0.0f;
+    } else {
+        g_menu_rt = g_menu_lt = false;
+        g_menu_dir = -1;
+    }
+    aim::grip_throw_input(&lt, &rt);  // [Gestures] ThrowByGrip: the trigger with the grip holding a throwable readies it
     {  // the right trigger alone fires: LT held for it
         const bool gun = have_st && reload::is_gun(st.weapon);
         const bool de = have_st && (st.weapon_flags & RDRVR_WEAPON_DEADEYE);
@@ -438,8 +528,28 @@ bool pad(xinput::PadState* out) {
             if (now < g_jump_pulse_until) p.buttons |= XINPUT_GAMEPAD_X;
         }
         const bool jump = !riding && g_jump_drops.load(std::memory_order_relaxed) && now < g_jump_until;
+        {  // [Gestures] Whistle from the aim stance: LT let go first (above: kWhistleDropMs)
+            const bool press = whistle_btn && !g_wh_prev;
+            g_wh_prev = whistle_btn;
+            if (press && gun && (g_aim_inj || lt >= 0.3f)) {
+                g_wh_drop_until = now + kWhistleDropMs;
+                g_wh_pending = true;
+                g_wh_since = now;
+                g_wh_drops.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (g_wh_pending && (!holster::aim_pose() || now - g_wh_since >= kWhistleWaitMs)) {
+                g_wh_pending = false;
+                g_wh_pulse_until = now + kWhistlePulseMs;
+                g_wh_wait_ms.store(static_cast<float>(now - g_wh_since), std::memory_order_relaxed);
+                log::info("[whistle] from the aim stance: LT let go, the whistle sent after %.0f ms", now - g_wh_since);
+            }
+            if ((whistle_btn && !g_wh_pending) || now < g_wh_pulse_until) p.buttons |= XINPUT_GAMEPAD_DPAD_UP;
+        }
+        if (!g_wh_pending && now >= g_wh_pulse_until && rt > 0.15f && g_wh_drop_until > now) g_wh_drop_until = now;  // a pull: the aim back
+        const bool whist = now < g_wh_drop_until;
+        if (whist) lt = rt = 0.0f;  // the real LT too, and no pull fires meanwhile (RT alone would shoot from the hip)
         const bool raised = base && g_aim_raised.load(std::memory_order_relaxed) && (g_aims_riding.load(std::memory_order_relaxed) || !riding) &&
-                            holster::gun_raised() && !sprint && !jump;
+                            holster::gun_raised() && !sprint && !jump && !whist;
         if (sprint && base && holster::gun_raised()) g_sprint_frames.fetch_add(1, std::memory_order_relaxed);
         if (raised) g_raised_frames.fetch_add(1, std::memory_order_relaxed);
         auto stop = [&] {
@@ -447,8 +557,8 @@ bool pad(xinput::PadState* out) {
             g_rt_pending = false;
             g_rt_pulse_until = 0;
         };
-        if (lt < 0.3f && (allow || two || raised || (g_aim_inj && de))) {  // the real LT is not held
-            const bool pulled = rt > 0.15f;
+        if (!menu_mode && lt < 0.3f && (allow || two || raised || (g_aim_inj && de))) {  // the real LT is not held
+            const bool pulled = rt > 0.15f && !whist;
             if (two || raised || (allow && pulled)) {
                 if (!g_aim_inj) {
                     g_aim_inj = true;
@@ -457,7 +567,7 @@ bool pad(xinput::PadState* out) {
                 }
                 g_aim_until = now + g_aim_tail_ms;  // two-handed or raised: the tail runs from when it ends
             }
-            if (!pulled && (holster::gun_at_zone() || sprint || jump) && g_aim_until > now) g_aim_until = now;  // into a holster, sprinting, jumping: no tail
+            if (!pulled && (holster::gun_at_zone() || sprint || jump || whist) && g_aim_until > now) g_aim_until = now;  // into a holster, sprinting, jumping, whistling: no tail
             // held while pulled, two-handed, the tail, and never let go in Dead Eye (that fires the marks)
             if (g_aim_inj && (two || raised || pulled || now < g_aim_until || de)) {
                 lt = 1.0f;
@@ -494,6 +604,27 @@ bool pad(xinput::PadState* out) {
     p.rt = trig(rt);
     p.lx = axis(l.stick[0]);
     p.ly = axis(l.stick[1]);
+    if (menu_mode) {  // [Controls] MenuControls: the left stick as the D-pad's steps, its axes held back
+        const float sx = l.stick[0], sy = l.stick[1];
+        const float ax = std::fabs(sx), ay = std::fabs(sy);
+        int dir = -1;
+        const float on = g_menu_dir >= 0 ? 0.35f : 0.55f;  // let go below 0.35 once held
+        if (ay >= ax && ay > on) dir = sy > 0.0f ? 0 : 1;
+        else if (ax > ay && ax > on) dir = sx > 0.0f ? 3 : 2;
+        if (dir != g_menu_dir) {
+            g_menu_dir = dir;
+            g_menu_dir_since = now;
+            g_menu_next_step = now;  // a new push: a step at once
+        }
+        if (dir >= 0 && now >= g_menu_next_step) {
+            g_menu_step_until = now + kStepPulse;
+            g_menu_next_step = now + (now - g_menu_dir_since < 1.0 ? kStepFirstRepeat : kStepRepeat);
+            g_menu_steps.fetch_add(1, std::memory_order_relaxed);
+        }
+        static const uint16_t kPadDir[4] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
+        if (dir >= 0 && now < g_menu_step_until) p.buttons |= kPadDir[dir];
+        p.lx = p.ly = 0;
+    }
     p.rx = axis(rx);
     p.ry = axis(ry);
     {
@@ -507,6 +638,7 @@ bool pad(xinput::PadState* out) {
         }
     }
     g_frames_in_use.fetch_add(1, std::memory_order_relaxed);
+    if (p.buttons & XINPUT_GAMEPAD_Y) g_y_frames.fetch_add(1, std::memory_order_relaxed);  // run 9: the Ys the game got (the tests)
     g_last = p;
     *out = p;
     return true;
@@ -564,6 +696,11 @@ void set_trigger_aims(bool on) {
     config::set("Hands", "TriggerAims", on ? "1" : "0");
 }
 void set_trigger_aims_session(bool on) { g_trigger_aims = on; }
+bool wrist_satchel() { return g_wrist_satchel.load(); }
+void set_wrist_satchel(bool on, bool save) {
+    if (g_wrist_satchel.exchange(on) != on) log::info("[controls] a double tap of Y at the wrist HUD: %s", on ? "the satchel" : "Y twice");
+    if (save) config::set("Controls", "WristSatchel", on ? "1" : "0");
+}
 bool aim_when_raised() { return g_aim_raised.load(); }
 void set_aim_when_raised(bool on, bool save) {
     g_aim_raised = on;
@@ -621,18 +758,25 @@ void status_text(char* out, size_t len) {
     xinput::PadState p = g_last;
     std::snprintf(out, len,
                   "controls: %s, frames %llu, last pad buttons %#06x LT %u RT %u L (%d %d) R (%d %d), starts %llu, menu toggles %llu, "
+                  "wrist satchel %d (opened %llu, window %.0f ms, single taps %llu: Y after %.0f ms; Y to the game %llu frames), game menu controls %d (in a menu %d: frames %llu, tab presses %llu, stick steps %llu), "
                   "left-handed %d, chord %d, click brake %d (route %d, brakes %llu), trigger aims %d (injects %llu, RT held back %llu frames, "
                   "aim pose %d, fire-ready %d, raised %d (frames %llu), LT tail frames %llu, let go for a sprint %llu frames) | jump drops aim %d: "
-                  "presses %llu, sent %llu (the last after %.0f ms)",
+                  "presses %llu, sent %llu (the last after %.0f ms) | the whistle from the aim stance %llu (the last sent after %.0f ms)",
                   g_was_in_use ? "in use" : "idle", static_cast<unsigned long long>(g_frames_in_use.load()), p.buttons, p.lt, p.rt, p.lx,
                   p.ly, p.rx, p.ry, static_cast<unsigned long long>(g_starts.load()), static_cast<unsigned long long>(g_toggles.load()),
+                  g_wrist_satchel.load() ? 1 : 0, static_cast<unsigned long long>(g_satchels.load()), g_satchel_tap_ms,
+                  static_cast<unsigned long long>(g_wy_single.load()), g_wy_single_delay.load(), static_cast<unsigned long long>(g_y_frames.load()),
+                  g_menu_ctl.load() ? 1 : 0,
+                  game_menu_now() ? 1 : 0, static_cast<unsigned long long>(g_menu_frames.load()), static_cast<unsigned long long>(g_menu_tabs.load()),
+                  static_cast<unsigned long long>(g_menu_steps.load()),
                   g_left_handed.load() ? 1 : 0, g_menu_chord_on ? 1 : 0, g_click_brake.load() ? 1 : 0, g_click_route,
                   static_cast<unsigned long long>(g_brakes.load()), g_trigger_aims.load() ? 1 : 0,
                   static_cast<unsigned long long>(g_aim_injects.load()), static_cast<unsigned long long>(g_rt_held.load()),
                   holster::aim_pose() ? 1 : 0, holster::fire_ready() ? 1 : 0, holster::gun_raised() ? 1 : 0,
                   static_cast<unsigned long long>(g_raised_frames.load()), static_cast<unsigned long long>(g_aim_tail_frames.load()),
                   static_cast<unsigned long long>(g_sprint_frames.load()), g_jump_drops.load() ? 1 : 0,
-                  static_cast<unsigned long long>(g_jump_presses.load()), static_cast<unsigned long long>(g_jump_waits.load()), g_jump_wait_ms.load());
+                  static_cast<unsigned long long>(g_jump_presses.load()), static_cast<unsigned long long>(g_jump_waits.load()), g_jump_wait_ms.load(),
+                  static_cast<unsigned long long>(g_wh_drops.load()), g_wh_wait_ms.load());
 }
 
 }  // namespace rdrvr::controls

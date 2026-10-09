@@ -410,10 +410,12 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 3 && t[1] == "trace") return pose::trace_command(t[2], t.size() >= 4 ? t[3] : "");  // pose trace on|off|reset|dump <file>
         if (t.size() >= 3 && t[1] == "horse") pose::set_steer_by_head(t[2] == "head");
         if (t.size() >= 3 && t[1] == "jitter") pose::reset_ride_jitter();
+        if (t.size() >= 3 && t[1] == "keepcam") pose::set_keep_camera(t[2] == "on");
+        if (t.size() >= 3 && t[1] == "rideturn") pose::set_stick_turn_riding(t[2] == "on", false);  // run 9 item 4: the session only
         if (t.size() >= 3 && t[1] == "turn")  // pose turn snap|smooth [speed] [snap angle]
             pose::set_turning(t[2] == "snap", t.size() >= 4 ? std::strtof(t[3].c_str(), nullptr) : pose::turn_speed(),
                               t.size() >= 5 ? std::strtof(t[4].c_str(), nullptr) : pose::snap_angle());
-        char st[600];
+        char st[700];
         pose::status_text(st, sizeof(st));
         return st;
     }
@@ -508,6 +510,7 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 3 && t[1] == "lefthanded") controls::set_left_handed(t[2] == "on");
         if (t.size() >= 3 && t[1] == "triggeraims") controls::set_trigger_aims_session(t[2] == "on");  // the session only
         if (t.size() >= 3 && t[1] == "raised") controls::set_aim_when_raised(t[2] == "on", false);  // the session only
+        if (t.size() >= 3 && t[1] == "wristsatchel") controls::set_wrist_satchel(t[2] == "on", false);  // the session only
         if (t.size() >= 3 && t[1] == "drawhand") controls::set_draw_to_grabbing_hand(t[2] == "on", false);  // the session only
         if (t.size() >= 3 && t[1] == "clickbrake") controls::set_click_brake_session(t[2] == "on");
         if (t.size() >= 3 && t[1] == "sprint") controls::set_sprint_drops_aim(t[2] == "on", false);  // this session only
@@ -516,7 +519,7 @@ std::string execute(const std::vector<std::string>& t) {
         std::string r = "map:";
         for (int s = 0; s < controls::kSources; ++s)
             r += std::string(" ") + controls::source_key(s) + "=" + controls::target_name(controls::mapping(s));
-        char b[900];
+        char b[1400];
         controls::status_text(b, sizeof(b));
         return r + " || " + b;
     }
