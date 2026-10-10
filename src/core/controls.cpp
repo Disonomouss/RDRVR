@@ -16,6 +16,7 @@
 #include "core/body.h"
 #include "core/actions.h"
 #include "core/aim.h"
+#include "core/anchors.h"
 #include "core/config.h"
 #include "core/dual.h"
 #include "core/hands.h"
@@ -160,6 +161,16 @@ uint16_t g_menu_tab_button = 0;
 int g_menu_dir = -1;  // the stick's step direction held: 0 up, 1 down, 2 left, 3 right
 double g_menu_dir_since = 0.0, g_menu_next_step = 0.0, g_menu_step_until = 0.0;
 constexpr double kStepPulse = 70.0, kStepFirstRepeat = 450.0, kStepRepeat = 180.0;
+// The map screen (2026-10-11, the user: "the map is no longer usable. Does not respond to controls"): it pans by the
+// left stick's analog axes only and zooms by LT/RT (the game's action table: @MAP.SCROLL_* on the stick's directions,
+// no D-pad; @UI.ZOOM_OUT/IN on LT/RT), so MenuControls leaves it the raw stick and triggers. Its byte (anchor MapOpen)
+// is 1 from rdrMapLayer's OnActivate to OnDeactivate: memory, since no native answers while the pause menu stops the
+// scripts (tests/sim/r13_mapprobe.py: 0 in gameplay, the pause list, the satchel; 1 on the map).
+std::atomic<uint64_t> g_map_frames{0};
+bool map_open() {
+    if (anchors::stand_down() || !anchors::present(anchors::Id::MapOpen)) return false;
+    return *reinterpret_cast<const volatile uint8_t*>(anchors::addr(anchors::Id::MapOpen)) != 0;  // RDR.exe's .data
+}
 bool game_menu_now() {
     const int f = vr_mode::state_flags();
     if ((f & (2 | 4)) && !(f & 1)) return true;  // paused or the scripts stopped, the scene still drawn (not a load)
@@ -471,7 +482,9 @@ bool pad(xinput::PadState* out) {
         else if (t > kNone && t < kTargets && value[s] > 0.5f) p.buttons |= kTargetButton[t];
     }
     if (actions::fire_blocked()) rt = 0.0f;  // [Reload] ManualActions: the gun's action not worked (open, or not cycled)
-    const bool menu_mode = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now();
+    const bool on_map = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now() && map_open();  // only in a paused menu
+    if (on_map) g_map_frames.fetch_add(1, std::memory_order_relaxed);
+    const bool menu_mode = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now() && !on_map;
     if (menu_mode) {  // [Controls] MenuControls: the triggers are the tabs (RB, LB), a press of 120 ms on each pull
         g_menu_frames.fetch_add(1, std::memory_order_relaxed);
         const bool rt_on = rt > (g_menu_rt ? 0.35f : 0.6f), lt_on = lt > (g_menu_lt ? 0.35f : 0.6f);
@@ -485,10 +498,12 @@ bool pad(xinput::PadState* out) {
         if (now < g_menu_tab_until) p.buttons |= g_menu_tab_button;
         lt = rt = 0.0f;
     } else {
-        g_menu_rt = g_menu_lt = false;
-        g_menu_dir = -1;
+        // on the map its own zoom: a trigger still held when it closes is no new pull (a tab) on the list
+        g_menu_rt = on_map && rt > 0.35f;
+        g_menu_lt = on_map && lt > 0.35f;
+        if (!on_map) g_menu_dir = -1;
     }
-    aim::grip_throw_input(&lt, &rt);  // [Gestures] ThrowByGrip: the trigger with the grip holding a throwable readies it
+    if (!on_map) aim::grip_throw_input(&lt, &rt);  // [Gestures] ThrowByGrip: the trigger with the grip holding a throwable readies it (not the map's zoom)
     {  // the right trigger alone fires: LT held for it
         const bool gun = have_st && reload::is_gun(st.weapon);
         const bool de = have_st && (st.weapon_flags & RDRVR_WEAPON_DEADEYE);
@@ -626,6 +641,12 @@ bool pad(xinput::PadState* out) {
         static const uint16_t kPadDir[4] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
         if (dir >= 0 && now < g_menu_step_until) p.buttons |= kPadDir[dir];
         p.lx = p.ly = 0;
+    } else if (on_map) {  // the stick still pushed when the map closes: no step on the list until it is let go
+        const float ax = std::fabs(l.stick[0]), ay = std::fabs(l.stick[1]);
+        const int dir = ay >= ax && ay > 0.35f ? (l.stick[1] > 0.0f ? 0 : 1) : ax > ay && ax > 0.35f ? (l.stick[0] > 0.0f ? 3 : 2) : -1;
+        g_menu_dir = dir;
+        g_menu_dir_since = now;
+        g_menu_next_step = dir >= 0 ? 1e300 : now;
     }
     p.rx = axis(rx);
     p.ry = axis(ry);
@@ -698,6 +719,11 @@ void set_trigger_aims(bool on) {
     config::set("Hands", "TriggerAims", on ? "1" : "0");
 }
 void set_trigger_aims_session(bool on) { g_trigger_aims = on; }
+bool menu_controls() { return g_menu_ctl.load(); }
+void set_menu_controls(bool on, bool save) {
+    if (g_menu_ctl.exchange(on) != on) log::info("[controls] the game menus' controls (MenuControls) %s", on ? "on" : "off");
+    if (save) config::set("Controls", "MenuControls", on ? "1" : "0");
+}
 bool wrist_satchel() { return g_wrist_satchel.load(); }
 void set_wrist_satchel(bool on, bool save) {
     if (g_wrist_satchel.exchange(on) != on) log::info("[controls] a double tap of Y at the wrist HUD: %s", on ? "the satchel" : "Y twice");
@@ -777,7 +803,7 @@ void status_text(char* out, size_t len) {
                   "wrist satchel %d (opened %llu, window %.0f ms, single taps %llu: Y after %.0f ms; Y to the game %llu frames), game menu controls %d (in a menu %d: frames %llu, tab presses %llu, stick steps %llu), "
                   "left-handed %d, chord %d, click brake %d (route %d, brakes %llu), trigger aims %d (injects %llu, RT held back %llu frames, "
                   "aim pose %d, fire-ready %d, raised %d (frames %llu), LT tail frames %llu, let go for a sprint %llu frames) | jump drops aim %d: "
-                  "presses %llu, sent %llu (the last after %.0f ms) | the whistle from the aim stance %llu (the last sent after %.0f ms)",
+                  "presses %llu, sent %llu (the last after %.0f ms) | the whistle from the aim stance %llu (the last sent after %.0f ms) | the map open %d (frames %llu, its stick and triggers the game's)",
                   g_was_in_use ? "in use" : "idle", static_cast<unsigned long long>(g_frames_in_use.load()), p.buttons, p.lt, p.rt, p.lx,
                   p.ly, p.rx, p.ry, static_cast<unsigned long long>(g_starts.load()), static_cast<unsigned long long>(g_toggles.load()),
                   g_wrist_satchel.load() ? 1 : 0, static_cast<unsigned long long>(g_satchels.load()), g_satchel_tap_ms,
@@ -792,7 +818,8 @@ void status_text(char* out, size_t len) {
                   static_cast<unsigned long long>(g_raised_frames.load()), static_cast<unsigned long long>(g_aim_tail_frames.load()),
                   static_cast<unsigned long long>(g_sprint_frames.load()), g_jump_drops.load() ? 1 : 0,
                   static_cast<unsigned long long>(g_jump_presses.load()), static_cast<unsigned long long>(g_jump_waits.load()), g_jump_wait_ms.load(),
-                  static_cast<unsigned long long>(g_wh_drops.load()), g_wh_wait_ms.load());
+                  static_cast<unsigned long long>(g_wh_drops.load()), g_wh_wait_ms.load(), map_open() ? 1 : 0,
+                  static_cast<unsigned long long>(g_map_frames.load()));
 }
 
 }  // namespace rdrvr::controls

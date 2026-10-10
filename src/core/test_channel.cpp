@@ -664,6 +664,56 @@ std::string execute(const std::vector<std::string>& t) {
         }
         return out;
     }
+    if (c == "menuctl" && t.size() >= 2) {  // menuctl on|off: [Controls] MenuControls for the session (test only)
+        controls::set_menu_controls(t[1] == "on", false);
+        return std::string("menu controls ") + (controls::menu_controls() ? "on" : "off");
+    }
+    if (c == "peekx" && t.size() >= 3) {
+        // each read also SEH-guarded: a heap object in the chain may be freed between the check and the read
+        struct G {
+            static bool read(uintptr_t a, void* out, size_t n) {
+                __try {
+                    std::memcpy(out, reinterpret_cast<const void*>(a), n);
+                    return true;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    return false;
+                }
+            }
+        };
+        // peekx <rva> <offsets> [n]: n (<= 256) bytes in hex at a pointer chain from RDR.exe+rva. <offsets> is "-" (the
+        // global itself) or a comma list: each hop reads a pointer at the address so far, then adds the offset (so
+        // "0" is the global's pointee, "0,38" a field of it followed). Every read is checked committed and readable.
+        auto readable = [](uintptr_t a, size_t n) {
+            MEMORY_BASIC_INFORMATION mi{};
+            return a && VirtualQuery(reinterpret_cast<void*>(a), &mi, sizeof(mi)) && mi.State == MEM_COMMIT &&
+                   (mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) &&
+                   !(mi.Protect & PAGE_GUARD) && a + n <= reinterpret_cast<uintptr_t>(mi.BaseAddress) + mi.RegionSize;
+        };
+        uintptr_t a = anchors::base() + static_cast<uintptr_t>(std::strtoull(t[1].c_str(), nullptr, 16));
+        if (t[2] != "-") {
+            size_t pos = 0;
+            while (pos <= t[2].size()) {
+                const size_t comma = t[2].find(',', pos);
+                const std::string tok = t[2].substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                uintptr_t next = 0;
+                if (!readable(a, 8) || !G::read(a, &next, 8)) return "ERROR pointer not readable at hop " + tok;
+                a = next + static_cast<uintptr_t>(std::strtoull(tok.c_str(), nullptr, 16));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
+        int n = t.size() >= 4 ? std::atoi(t[3].c_str()) : 64;
+        if (n < 1 || n > 256) n = 64;
+        unsigned char bytes[256];
+        if (!readable(a, static_cast<size_t>(n)) || !G::read(a, bytes, static_cast<size_t>(n))) return "ERROR target not readable";
+        std::string out;
+        char b[8];
+        for (int i = 0; i < n; ++i) {
+            std::snprintf(b, sizeof(b), "%s%02x", i ? " " : "", bytes[i]);
+            out += b;
+        }
+        return out;
+    }
     if (c == "peekpp" && t.size() >= 4) {
         // peekpp <rva> <off1> <off2> [n]: n floats at (*(*(RDR.exe+rva) + off1)) + off2, each pointer checked readable
         auto readable = [](uintptr_t a, size_t n) {
@@ -730,7 +780,10 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "affinity" && t.size() >= 2) return diag::set_affinity(t[1].c_str());  // same|split|off (test only)
     if (c == "stacks") {  // stacks <render|playback> [n]: a thread's stack by function and scene phase ("[stack]" lines)
-        return diag::sample_stacks(t.size() >= 2 ? t[1].c_str() : "render", t.size() >= 3 ? std::atoi(t[2].c_str()) : 2000);
+        std::string split;  // stacks render n split <walk> <sites,> <entity> <draws,>
+        if (t.size() >= 8 && t[3] == "split") split = t[4] + " " + t[5] + " " + t[6] + " " + t[7];
+        return diag::sample_stacks(t.size() >= 2 ? t[1].c_str() : "render", t.size() >= 3 ? std::atoi(t[2].c_str()) : 2000,
+                                   split.empty() ? nullptr : split.c_str());
     }
     if (c == "sample") {  // where the busy threads are: "[sample]" lines (RIP histograms; no unwind)
         return diag::sample_threads(t.size() >= 2 ? std::atoi(t[1].c_str()) : 20);

@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.1 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.2 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -135,7 +135,9 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   the holsters turn with your view as you do (before, they kept facing the horse); recentring faces them back.
 - The game's own menus by the controllers (new in 0.7.0, on by default, tried in the developer's simulator only, not
   yet in a headset; `[Controls] MenuControls` in `RDRVR.ini`, no menu row): in the satchel and shops the triggers
-  change tabs; in the satchel, the pause menu and shops the left stick moves one item a push.
+  change tabs; in the satchel, the pause menu and shops the left stick moves one item a push. Fixed in 0.8.2: the pause
+  menu's map keeps the game's own controls (the left stick moves the map, LT and RT zoom); since 0.7.0 it did not
+  respond to them (tried in the developer's simulator).
 - Shops in first person (new in 0.7.0, on by default; tried at a shop in the developer's simulator, not yet in a
   headset; `[Body] KeepAnchorCamera` in `RDRVR.ini`, no menu row): talking to a shopkeeper no longer takes the view to
   third person. Other scripted cameras outside cutscenes are kept first person too; this is not yet tried in
@@ -163,7 +165,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.1.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.2.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -456,11 +458,12 @@ Live performance and view-mode readouts (frame rate, missed frames, CPU and GPU 
 - The game's own builds: the mod was made on one build of `RDR.exe`. On another build it looks for the game code and
   data it uses by their bytes (new in 0.3.0, not yet tried on a real other build). If it finds and checks every one,
   it runs; if not, it stands down (the game plays flat). Either way it writes `RDRVR_build_report.txt` in the game
-  folder: if the mod stands down or misbehaves, please attach it, with `RDRVR.log`, to an issue. Since 0.8.1 one of them is optional: in a player's build
+  folder: if the mod stands down or misbehaves, please attach it, with `RDRVR.log`, to an issue. Since 0.8.1 two of them are optional. One: in a player's build
   the mod found every one but the playback thread's dispatch (used only by the batched hand-off, see Performance), and
   it stood down there. Such a build should now run with the batched hand-off off (`RDRVR.log` and the report say so;
   tried by forcing it on the developer's build, not yet on that player's), and the report shows the bytes near a
-  missing one so a later release can find it. A game executable
+  missing one so a later release can find it. The other (0.8.2) tells the map screen apart: a build without it keeps
+  the game-menu controls on the map, as before 0.8.2. A game executable
   without the Steam version's start-up stage (the same game build otherwise) should no longer start flat (new in 0.6.0,
   not yet tried on such an executable; the developer forced the path on the Steam version): the mod notices and hooks
   at once, and `RDRVR.log` says if its hooks came too late. RedHook, which runs

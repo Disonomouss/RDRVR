@@ -66,6 +66,7 @@ UiWaitGate               global 0x2b66818  # RenderFrame waits on renderer+0x38 
 PauseGate                global 0x2b73e18  # RenderFrame's inline pause-menu block runs only while this qword is 0 ...
 PauseMenuState           global 0x2c45768  # ... and *(this)+0x34 is set
 PauseTint                global 0x2c8aca8  # the block's tint alpha
+MapOpen                  global 0x2ac50bb  # byte: the map screen open (1 from rdrMapLayer's OnActivate FUN_140621690 -> FUN_1405fba90 to OnDeactivate FUN_140621aa0 -> FUN_1405fc480; 0 in gameplay, the pause list, the satchel: tests/sim/r13_mapprobe.py)
 PostRun                  func   0x86bff0   # PostFx vt+0x30 (postfx, 0): the whole chain (exposure hold wraps it)
 PostTail                 func   0x678710   # (PostFx), right after RenderFrame's post chain: last eye's capture point
 # --- R4a one exposure writer (R4 study, ENGINE-NOTES item 7)

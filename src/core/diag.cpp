@@ -750,8 +750,9 @@ void rebase(CONTEXT& c, uintptr_t lo, size_t len, intptr_t delta) {
         if (*r >= lo && *r < lo + len) *r = static_cast<DWORD64>(static_cast<intptr_t>(*r) + delta);
 }
 
-// The function begins on the copied stack, innermost first (0 for a leaf frame with no unwind entry)
-int unwind_copy_raw(CONTEXT ctx, const uint8_t* copy, uintptr_t lo, size_t len, uintptr_t* out, int max) {
+// The function begins on the copied stack, innermost first (0 for a leaf frame with no unwind entry); with `at`, each
+// frame's address inside its function too (the caller frames': the return address of the call they are in)
+int unwind_copy_raw(CONTEXT ctx, const uint8_t* copy, uintptr_t lo, size_t len, uintptr_t* out, uintptr_t* at, int max) {
     const intptr_t delta = reinterpret_cast<intptr_t>(copy) - static_cast<intptr_t>(lo);
     const uintptr_t clo = reinterpret_cast<uintptr_t>(copy), chi = clo + len;
     rebase(ctx, lo, len, delta);
@@ -760,6 +761,7 @@ int unwind_copy_raw(CONTEXT ctx, const uint8_t* copy, uintptr_t lo, size_t len, 
         DWORD64 image_base = 0;
         PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
         out[n] = fn ? primary_begin(static_cast<uintptr_t>(image_base), fn) : 0;
+        if (at) at[n] = static_cast<uintptr_t>(ctx.Rip);
         if (!fn) {
             if (n > 0 || ctx.Rsp < clo || ctx.Rsp + 8 > chi) {  // a leaf only at the top
                 ++n;
@@ -780,9 +782,9 @@ int unwind_copy_raw(CONTEXT ctx, const uint8_t* copy, uintptr_t lo, size_t len, 
     }
     return n;
 }
-int unwind_copy(const CONTEXT& ctx, const uint8_t* copy, uintptr_t lo, size_t len, uintptr_t* out, int max) {
+int unwind_copy(const CONTEXT& ctx, const uint8_t* copy, uintptr_t lo, size_t len, uintptr_t* out, uintptr_t* at, int max) {
     __try {
-        return unwind_copy_raw(ctx, copy, lo, len, out, max);
+        return unwind_copy_raw(ctx, copy, lo, len, out, at, max);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
@@ -792,6 +794,14 @@ struct StackJob {
     DWORD tid;
     int n;
     char name[64];
+    // "split" (Stage A's ceiling, research\sps\stageA-phases.md): the samples under a walk function, by the call site
+    // it is in (its frame's return address), and within each: under an entity function, and under that, under any of
+    // the draw functions. Absolute addresses (the command gives RDR.exe RVAs); 0 = no split.
+    uintptr_t walk = 0, entity = 0;
+    uintptr_t sites[4] = {};
+    int nsites = 0;
+    uintptr_t emit[8] = {};
+    int nemit = 0;
 };
 
 void bump(std::vector<std::pair<uintptr_t, int>>& v, uintptr_t a) {
@@ -835,6 +845,9 @@ DWORD WINAPI stacks_worker(void* p) {
     std::vector<std::vector<std::pair<uintptr_t, int>>> incl(frame_probe::kPhaseCount), excl(frame_probe::kPhaseCount),
         rips(frame_probe::kPhaseCount);  // the exact instruction (where in a function the time goes: a lock's stall)
     int count[frame_probe::kPhaseCount] = {}, failed = 0, total = 0;
+    // split: [phase][site (nsites = another place in the walk)]: under the site, under the entity function, under a
+    // draw function inside it
+    int sp_site[frame_probe::kPhaseCount][5] = {}, sp_ent[frame_probe::kPhaseCount][5] = {}, sp_emit[frame_probe::kPhaseCount][5] = {};
     const double t0 = log::now_ms();
     for (int s = 0; s < job.n; ++s) {
         Sleep(1 + (s % 3));  // 1-3 ms apart (and the system timer's granularity): not in step with the frame
@@ -855,8 +868,8 @@ DWORD WINAPI stacks_worker(void* p) {
             ++failed;
             continue;
         }
-        uintptr_t frames[kMaxFrames];
-        const int nf = unwind_copy(ctx, copy.data(), static_cast<uintptr_t>(ctx.Rsp), len, frames, kMaxFrames);
+        uintptr_t frames[kMaxFrames], at[kMaxFrames];
+        const int nf = unwind_copy(ctx, copy.data(), static_cast<uintptr_t>(ctx.Rsp), len, frames, at, kMaxFrames);
         if (nf <= 0) {
             ++failed;
             continue;
@@ -870,6 +883,27 @@ DWORD WINAPI stacks_worker(void* p) {
             bool dup = false;
             for (int j = 0; j < i && !dup; ++j) dup = frames[j] == frames[i];
             if (!dup) bump(incl[ph], frames[i]);
+        }
+        if (job.walk) {  // the innermost walk frame: the site it is in; inside it, the entity frame, inside that a draw
+            int w = -1;
+            for (int i = 1; i < nf && w < 0; ++i)
+                if (frames[i] == job.walk) w = i;
+            if (w > 0) {
+                int site = job.nsites;
+                for (int k = 0; k < job.nsites; ++k)
+                    if (at[w] == job.sites[k]) site = k;
+                ++sp_site[ph][site];
+                int e = -1;
+                for (int i = 0; i < w && e < 0; ++i)
+                    if (frames[i] == job.entity) e = i;
+                if (e >= 0) {
+                    ++sp_ent[ph][site];
+                    bool d = false;
+                    for (int i = 0; i < e && !d; ++i)
+                        for (int k = 0; k < job.nemit && !d; ++k) d = frames[i] == job.emit[k];
+                    if (d) ++sp_emit[ph][site];
+                }
+            }
         }
     }
     CloseHandle(h);
@@ -895,6 +929,20 @@ DWORD WINAPI stacks_worker(void* p) {
             }
         }
     }
+    if (job.walk)
+        for (int ph = 0; ph < frame_probe::kPhaseCount; ++ph) {
+            if (!count[ph]) continue;
+            char line[1200];
+            int used = std::snprintf(line, sizeof(line), "[stack] split %s, %s (%d samples):", job.name, kPhase[ph], count[ph]);
+            for (int k = 0; k <= job.nsites && used < static_cast<int>(sizeof(line)) - 200; ++k) {
+                char where[64] = "elsewhere in the walk";
+                if (k < job.nsites) module_rva(job.sites[k], where, sizeof(where));
+                used += std::snprintf(line + used, sizeof(line) - used, " site %s %d (%.1f%%), the entity %d (%.1f%%), its draws %d (%.1f%%);", where,
+                                      sp_site[ph][k], 100.0 * sp_site[ph][k] / count[ph], sp_ent[ph][k], 100.0 * sp_ent[ph][k] / count[ph],
+                                      sp_emit[ph][k], 100.0 * sp_emit[ph][k] / count[ph]);
+            }
+            log::info("%s", line);
+        }
     log::info("[stack] %s: done", job.name);
     g_stacks_busy = false;
     return 0;
@@ -959,7 +1007,7 @@ std::string set_affinity(const char* mode) {
     return out;
 }
 
-std::string sample_stacks(const char* which, int n) {
+std::string sample_stacks(const char* which, int n, const char* split) {
     n = n < 10 ? 10 : n > 20000 ? 20000 : n;
     const char* want = std::strcmp(which, "playback") == 0 ? "RenderThread" : "[RDR2] Render Thread";
     DWORD tid = 0;
@@ -983,8 +1031,34 @@ std::string sample_stacks(const char* which, int n) {
     CloseHandle(snap);
     if (!tid) return std::string("ERROR no thread named ") + want;
     if (g_stacks_busy.exchange(true)) return "ERROR a stack sampling is already running";
-    auto* job = new StackJob{tid, n, ""};
+    auto* job = new StackJob{};
+    job->tid = tid;
+    job->n = n;
     std::snprintf(job->name, sizeof(job->name), "%s", want);
+    if (split && *split) {  // "<walk> <site,site,..> <entity> <draw,draw,..>": RDR.exe RVAs in hex
+        const uintptr_t b = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        char buf[400];
+        std::snprintf(buf, sizeof(buf), "%s", split);
+        char* tok[4] = {};
+        int nt = 0;
+        char* ctx = nullptr;
+        for (char* t = strtok_s(buf, " ", &ctx); t && nt < 4; t = strtok_s(nullptr, " ", &ctx)) tok[nt++] = t;
+        if (nt < 4) {
+            delete job;
+            g_stacks_busy = false;
+            return "ERROR stacks <which> <n> split <walk> <sites,> <entity> <draws,>";
+        }
+        auto list = [&](char* s, uintptr_t* out, int cap) {
+            int k = 0;
+            char* c2 = nullptr;
+            for (char* t = strtok_s(s, ",", &c2); t && k < cap; t = strtok_s(nullptr, ",", &c2)) out[k++] = b + std::strtoull(t, nullptr, 16);
+            return k;
+        };
+        job->walk = b + std::strtoull(tok[0], nullptr, 16);
+        job->nsites = list(tok[1], job->sites, 4);
+        job->entity = b + std::strtoull(tok[2], nullptr, 16);
+        job->nemit = list(tok[3], job->emit, 8);
+    }
     HANDLE t = CreateThread(nullptr, 0, stacks_worker, job, 0, nullptr);
     if (!t) {
         delete job;

@@ -33,7 +33,8 @@ std::string sample_threads(int n);
 // "stacks <render|playback> [n]" (the single-pass study): n samples, 1-3 ms apart, of the render (recording) or the
 // playback thread's whole stack, unwound after the thread runs on, counted per function (inclusive and self) and per
 // scene phase (frame_probe::phase). Runs on its own thread; "[stack]" lines in the log, the last "... done".
-std::string sample_stacks(const char* which, int n);
+// split: "<walk> <sites,> <entity> <draws,>" (RDR.exe RVAs in hex): where under a walk function's call sites the time goes
+std::string sample_stacks(const char* which, int n, const char* split = nullptr);
 // "affinity same|split|off" (the single-pass study): the render and playback threads pinned to one P-core's two
 // logical processors (2, 3), to two P-cores (2, 4), or back to their masks. Test only.
 std::string set_affinity(const char* mode);

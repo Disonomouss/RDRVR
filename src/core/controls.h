@@ -66,6 +66,8 @@ void set_trigger_aims_session(bool on);  // the test channel: not saved
 // end; the hold still opens the mod's menu
 bool wrist_satchel();
 void set_wrist_satchel(bool on, bool save = true);
+bool menu_controls();  // [Controls] MenuControls: in a game menu the triggers are its tabs and the stick its steps
+void set_menu_controls(bool on, bool save = true);
 bool aim_when_raised();
 void set_aim_when_raised(bool on, bool save = true);
 bool jump_drops_aim();  // [Hands] JumpDropsAim (run 7 item 1f): a jump with a gun in hand lets the aim go first

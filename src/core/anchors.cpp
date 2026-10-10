@@ -165,6 +165,7 @@ struct Optional {
 };
 constexpr Optional kOptional[] = {
     {"ReplayDispatch", "the batched hand-off to the playback thread ([Render] PlaybackBatch) is off on this build"},
+    {"MapOpen", "the map screen is not told from the menu lists: [Controls] MenuControls takes its stick and triggers too"},
 };
 const char* optional_what(const char* name) {
     for (const Optional& o : kOptional)
@@ -342,16 +343,28 @@ bool scan_build(long long* reloc) {
     const char* cur = nullptr;
     long long shift = 0;
     int agree = 0, seen = 0, total = 0;
+    const char* opt_name[4] = {};
+    long long opt_shift[4] = {};
+    int nopt = 0;
     auto flush = [&]() {
         if (!cur) return;
+        const char* opt = optional_what(cur);  // an optional global left unplaced: absent below, the build still runs
         if (!seen) {
-            ++g_none;
-            out("DATA %s: no reference found (%d tried)", cur, total);
+            if (!opt) ++g_none;
+            out("DATA %s: no reference found (%d tried)%s", cur, total, opt ? " (optional)" : "");
             return;
         }
         if (agree != seen) {
-            ++g_conflict;
-            out("DATA %s: the references disagree (%d of %d found, %d agree with %+lld)", cur, seen, total, agree, shift);
+            if (!opt) ++g_conflict;
+            out("DATA %s: the references disagree (%d of %d found, %d agree with %+lld)%s", cur, seen, total, agree, shift,
+                opt ? " (optional)" : "");
+            return;
+        }
+        if (opt) {  // placed below only if it has the shift every required global has (else absent, the build still runs)
+            if (nopt < 4) {
+                opt_name[nopt] = cur;
+                opt_shift[nopt++] = shift;
+            }
             return;
         }
         if (shift == 0) {
@@ -392,6 +405,16 @@ bool scan_build(long long* reloc) {
         if (s == shift) ++agree;
     }
     flush();
+    for (int k = 0; k < nopt; ++k) {
+        const int e = entry_index(opt_name[k]);
+        if (d_uniform && d_shift != kNone && opt_shift[k] == d_shift) {
+            if (e >= 0) reloc[e] = opt_shift[k];
+            if (opt_shift[k] == 0) ++g_same;
+            else ++g_moved;
+        } else {
+            out("DATA %s: its references give %+lld, not the globals' shift (optional: not placed)", opt_name[k], opt_shift[k]);
+        }
+    }
     constexpr int kNoRefs = static_cast<int>(sizeof(kNoRef) / sizeof(kNoRef[0]));
     for (const char* n : kNoRef) {
         const int e = entry_index(n);
