@@ -46,6 +46,22 @@ PostChangeLatch          global 0x2c43a72
 PostPrevViewStatic       global 0x5a494ca0 # function-static previous view matrix (0x40 bytes), written per post run
 SunFlag                  global 0x2ad1ca4
 FrameUiWaitReturn        site   0x5c8ef6 7 # return address of RenderFrame's wait on renderer+0x38 (main thread's UI data)
+# --- the single-pass probe's wait sites (research\sps\current.md 3.7; Ghidra 2026-10-10: each the return of a SemWait 0xebd8c0 call)
+FrameLockWaitReturnA     site   0x5c8b8c 7 # return address of RenderFrame's first wait on renderer+0x40 (before the scene)
+FrameLockWaitReturnB     site   0x5c96f5 7 # return address of its second wait on renderer+0x40 (after EndFrame, before the +0x18 release)
+FrameDataWaitReturn      site   0x5c8e77 7 # return address of RenderFrame's wait on renderer+0x80 (before the viewport copies)
+MainFrameWaitReturn      site   0x1f35b9 7 # return address of PreRender's wait on renderer+0x18 (the main thread waits for the render thread's frame)
+PlaybackWaitReturn       site   0xecfb0b 2 # return address of the playback loop's wait on recorder+0x108 (idle until a chunk is recorded)
+# --- the single-pass study step 2, the shared shadow passes (research\sps\measure.md; Ghidra 2026-10-10)
+CascadeRender            func   0x88df50   # (cascades, ?, light dir, ?, flag): clears the 3200^2 cascade map, fits each cascade to sm_Current (0x88ce10: a sphere about the current viewport's frustum slice, texel-snapped), draws it (vt+8); results kept in the cascade objects
+CascadeRenderReturn      site   0x5cb78c 3 # its call in FUN_1405cb640 (SceneRender's sun cascades; the other caller, FUN_1409e7f80, is another shadow object's)
+FacesRender              func   0x88a940   # (faces): the point lights' cube shadow faces, each drawn only if it meets sm_Current's six cull planes
+FacesRenderReturn        site   0x5cba63 7 # its call in FUN_1405cb810 (SceneRender's light faces)
+SpotRender               func   0x192e70   # (spot, ?, params): the spot light shadows; sm_Current's camera taken as the reference
+SpotRenderReturn         site   0x5cb5e9 7 # its call in FUN_1405cb400 (SceneRender's spot shadows)
+ReplayHead               site   0xecdd61 6 # ReplayChunk's loop head (mov eax,[rbp+10h]; nop; test eax,eax): replaced by [Render] PlaybackBatch
+ReplayDispatch           site   0xecdd8a 5 # its dispatch (dec eax; cmp eax,4Fh): entered with eax = the opcode, rdi = the packet
+PresentWrapper           func   0xf8b380   # the swap chain object's Present (vt+0x18; the object at D3dDeviceSingleton +0x48): the game's frame limiter (+0x9c the period in s, 0 none) yields until it has passed, then IDXGISwapChain::Present (+0xb8)
 UiWaitGate               global 0x2b66818  # RenderFrame waits on renderer+0x38 only while this qword is 0
 PauseGate                global 0x2b73e18  # RenderFrame's inline pause-menu block runs only while this qword is 0 ...
 PauseMenuState           global 0x2c45768  # ... and *(this)+0x34 is set

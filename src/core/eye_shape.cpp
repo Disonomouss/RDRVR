@@ -37,6 +37,7 @@ std::atomic<float> g_scale{1.0f};   // [XR] EyeScale
 std::atomic<bool> g_hooked{false};  // both hooks installed
 // [XR] EyeShapeDlss (run 9 item 5, off): the eye shape under DLSS too (technique 5, with per-eye DLSS engaged)
 std::atomic<bool> g_dlss_cfg{false};
+std::atomic<bool> g_dlss_saved{false};  // the next start's (the menu row): EyeShape and EyeShapeDlss both on
 // a technique the shape applies under: FXAA, or DLSS with EyeShapeDlss and per-eye DLSS on
 bool tech_ok(int tech) { return tech == 1 || (tech == 5 && g_dlss_cfg.load(std::memory_order_relaxed) && dlss::on()); }
 std::atomic<uint64_t> g_dlss_runs{0};
@@ -489,6 +490,7 @@ std::string rt_list(bool long_names) {
 void init() {
     g_on = g_ini_on = config::get_bool("XR", "EyeShape", false);
     g_dlss_cfg = config::get_bool("XR", "EyeShapeDlss", false);
+    g_dlss_saved = g_dlss_cfg.load() && g_on.load();
     log::info("[eye] [XR] EyeShapeDlss %d (the eye shape under DLSS too)", g_dlss_cfg.load() ? 1 : 0);
     float s = config::get_float("XR", "EyeScale", 1.0f);
     if (!(s >= 0.25f && s <= 2.0f)) s = 1.0f;
@@ -526,6 +528,15 @@ void stop(const char* why) {
 
 bool enabled() { return g_on.load(); }
 
+bool dlss_saved() { return g_dlss_saved.load(); }
+bool dlss_running() { return g_on.load() && g_dlss_cfg.load() && render_settings::forced_aa() == 3; }
+void set_dlss_next_start(bool on) {
+    g_dlss_saved = on;
+    config::set("XR", "EyeShapeDlss", on ? "1" : "0");
+    if (on) config::set("XR", "EyeShape", "1");  // it needs the eye shape itself (off: EyeShape stays, FXAA's row has it)
+    log::info("[eye] EyeShapeDlss %d from the next start (saved to the user ini)", on ? 1 : 0);
+}
+
 bool set_enabled(bool on, bool save) {
     if (on && !g_hooked.load()) return false;
     if (on) {
@@ -538,6 +549,7 @@ bool set_enabled(bool on, bool save) {
     }
     g_on = on;
     if (save) config::set("XR", "EyeShape", on ? "1" : "0");
+    if (save && !on) g_dlss_saved = false;  // the DLSS row needs EyeShape too (its saved tick follows)
     log::info("[eye] EyeShape %s (%s)", on ? "on" : "off", save ? "saved to the user ini" : "the session; the ini is not written");
     return true;
 }

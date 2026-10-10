@@ -13,6 +13,7 @@
 #include "core/anchors.h"
 #include "core/diag.h"
 #include "core/dual_pass.h"
+#include "core/frame_probe.h"
 #include "core/taa.h"
 #include "core/hooks.h"
 #include "core/body.h"
@@ -203,6 +204,11 @@ bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false) {
 }
 alignas(16) char g_saved_vp[0x470 + 0x10];  // render thread only
 alignas(16) char g_cover_vp[kViewportSize + 0x10];
+alignas(16) char g_union_vp[kViewportSize + 0x10];  // render thread only: shadow_union_vp
+bool g_union_ok = false;
+// The union's margin: each eye sits 3 cm or so off the centre, so its frustum edge leaves the centre's by up to
+// atan(0.032/z) at depth z, against tangents near 1.4 at the edge: 3 degrees covers it from about 0.25 m on.
+constexpr float kUnionMarginDeg = 3.0f;
 
 float& f32(void* vp, size_t off) { return *reinterpret_cast<float*>(static_cast<char*>(vp) + off); }
 
@@ -282,6 +288,7 @@ void log_state(void* vp, const float* cam) {
 }
 
 void scene_once(void* renderer, void* vp, const float* cam, void* a4, int pass_eye);
+bool build_union_vp(void* vp, const float* cam_in);
 
 // A double frame (R3, D13): the original runs twice on the same viewport, its 0x470 bytes saved before the first pass
 // and restored before the second, so every pointer the frame holds stays vanilla. dual_pass keeps the per-frame state
@@ -309,6 +316,11 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam, void* a4) {
             g_scene_timed.fetch_add(1, std::memory_order_relaxed);
         }
     } timed;
+    const bool probe = frame_probe::on();  // the single-pass probe: once a pass (frame_probe.h)
+    if (probe) {
+        frame_probe::render_frame_start(timed.t0);
+        frame_probe::set_phase(frame_probe::kBefore);
+    }
     if (vp) {
         g_scene_near = f32(vp, 0x340);
         g_scene_far = f32(vp, 0x344);
@@ -325,17 +337,59 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam, void* a4) {
         if (g_xr_pose.load(std::memory_order_relaxed)) xr::late_latch();
         int first = g_swap.load(std::memory_order_relaxed) ? 1 : 0;
         std::memcpy(g_saved_vp, vp, kViewportSize);
+        g_union_ok = dual_pass::shadows_wanted() && g_xr_pose.load(std::memory_order_relaxed) && build_union_vp(vp, cam);
         dual_pass::begin_frame(renderer);
+        const double t1 = probe ? log::now_ms() : 0;
+        if (probe) frame_probe::set_phase(frame_probe::kPhasePass1);
         scene_once(renderer, vp, cam, a4, first);
+        const double t2 = probe ? log::now_ms() : 0;
+        if (probe) frame_probe::set_phase(frame_probe::kBetween);
         dual_pass::between_passes(renderer, first);
+        const double t3 = probe ? log::now_ms() : 0;
+        if (probe) frame_probe::set_phase(frame_probe::kPhasePass2);
         std::memcpy(vp, g_saved_vp, kViewportSize);
         scene_once(renderer, vp, cam, a4, 1 - first);
         dual_pass::end_frame(1 - first);
         g_double_frames.fetch_add(1, std::memory_order_relaxed);
+        if (probe) {
+            frame_probe::set_phase(frame_probe::kOutside);
+            frame_probe::add(frame_probe::kPre, t1 - timed.t0);
+            frame_probe::add(frame_probe::kPass1, t2 - t1);
+            frame_probe::add(frame_probe::kMid, t3 - t2);
+            frame_probe::add(frame_probe::kPass2, log::now_ms() - t3);
+        }
         return;
     }
     dual_pass::mono_frame();
+    g_union_ok = false;
+    const double t1 = probe ? log::now_ms() : 0;
+    if (probe) frame_probe::set_phase(frame_probe::kPhaseMono);
     scene_once(renderer, vp, cam, a4, -1);
+    if (probe) {
+        frame_probe::set_phase(frame_probe::kOutside);
+        frame_probe::add(frame_probe::kPre, t1 - timed.t0);
+        frame_probe::add(frame_probe::kMono, log::now_ms() - t1);
+    }
+}
+
+// The shadow passes' union viewport (shadow_union_vp): the frame's viewport with the centre eye's camera and the union
+// of both eyes' tangents plus the margin, through the engine's SetCamera and Perspective (the head cover's way).
+bool build_union_vp(void* vp, const float* cam_in) {
+    xr::EyeView v[2];
+    if (!vp || !cam_in || !xr::eye_views_peek(v)) return false;
+    alignas(16) float c[16], centre[16];
+    std::memcpy(c, cam_in, sizeof(c));
+    const float yaw = g_yaw.load(std::memory_order_relaxed);
+    if (yaw != 0) yaw_rows(c, yaw);  // the passes draw the yawed camera (the truth capture's presets)
+    if (!xr_eye_camera(c, 2, centre, true)) return false;
+    const float m = kUnionMarginDeg / 57.29577951f;
+    const float l = std::tan(std::fmin(v[0].fov[0], v[1].fov[0]) - m), r = std::tan(std::fmax(v[0].fov[1], v[1].fov[1]) + m);
+    const float u = std::tan(std::fmax(v[0].fov[2], v[1].fov[2]) + m), d = std::tan(std::fmin(v[0].fov[3], v[1].fov[3]) - m);
+    if (!(r > l && u > d)) return false;
+    std::memcpy(g_union_vp, vp, kViewportSize);
+    o_SetCamera(g_union_vp, centre);
+    apply_tangents(g_union_vp, l, r, u, d);
+    return true;
 }
 
 // One scene pass. pass_eye: -1 mono, 0 left, 1 right (double mode).
@@ -948,6 +1002,7 @@ void status_text(char* out, size_t len) {
 }
 
 void* scene_viewport() { return t_scene_vp; }
+void* shadow_union_vp() { return g_union_ok ? g_union_vp : nullptr; }
 void scene_clip(float* near_m, float* far_m) {
     *near_m = g_scene_near.load();
     *far_m = g_scene_far.load();

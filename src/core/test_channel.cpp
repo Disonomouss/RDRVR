@@ -19,6 +19,8 @@
 #include "core/d3d_hooks.h"
 #include "core/diag.h"
 #include "core/dual_pass.h"
+#include "core/frame_probe.h"
+#include "core/playback.h"
 #include "core/eye_grab.h"
 #include "core/eye_shape.h"
 #include "core/frame_grab.h"
@@ -256,7 +258,7 @@ std::string execute(const std::vector<std::string>& t) {
         // split <name> on|off, the names in dual_pass.h
         if (!dual_pass::set_split(t[1].c_str(), t[2] == "on"))
             return "ERROR unknown split (grass gust lights forest post masks exposure rain pfxmap godrays damage clouds "
-                   "sunvis hold)";
+                   "sunvis hold shadows shadowunion)";
         char st[512];
         dual_pass::status_text(st, sizeof(st));
         return st;
@@ -561,11 +563,25 @@ std::string execute(const std::vector<std::string>& t) {
         dual_pass::lens_drops_status(st, sizeof(st));
         return st;
     }
+    if (c == "shadows") {  // the shared shadow passes' state (dual_pass.h)
+        char st[400];
+        dual_pass::shadow_status(st, sizeof(st));
+        return st;
+    }
+    if (c == "framelimit") {  // framelimit [off|on]: the game's own frame limiter, in memory (frame_probe.h)
+        char st[200];
+        frame_probe::game_frame_limit(t.size() >= 2 ? t[1].c_str() : "", st, sizeof(st));
+        return st;
+    }
+    if (c == "probe" && t.size() >= 2) {  // probe on|off: the single-pass probe's timers (frame_probe.h)
+        return frame_probe::set_on(t[1] == "on") ? "probe " + t[1] : "ERROR the probe is not installed ([XR] TimingProbe=0)";
+    }
     if (c == "perf") {
         if (t.size() >= 2 && t[1] == "reset") xr::perf_reset();
-        char st[400];
+        char st[400], pr[768];
         xr::perf_status(st, sizeof(st));
-        return st;
+        xr::perf_probe(pr, sizeof(pr));
+        return std::string(st) + " || " + pr;
     }
     if (c == "mode") {
         // mode | mode auto on|off | mode cutscene screen|3d
@@ -705,6 +721,17 @@ std::string execute(const std::vector<std::string>& t) {
         return "pressed";
     }
     if (c == "forceremove") return diag::force_device_removal() ? "removing a WARP test device" : "ERROR could not start the removal test";
+    if (c == "playbatch" && t.size() >= 2)  // playbatch <K>: [Render] PlaybackBatch at run time (0 = one packet a claim)
+        return playback::set_batch(std::atoi(t[1].c_str())) ? "playback batch " + t[1] : "ERROR not installed ([Render] PlaybackBatch=-1)";
+    if (c == "playback") {
+        char st[256];
+        playback::status(st, sizeof(st));
+        return st;
+    }
+    if (c == "affinity" && t.size() >= 2) return diag::set_affinity(t[1].c_str());  // same|split|off (test only)
+    if (c == "stacks") {  // stacks <render|playback> [n]: a thread's stack by function and scene phase ("[stack]" lines)
+        return diag::sample_stacks(t.size() >= 2 ? t[1].c_str() : "render", t.size() >= 3 ? std::atoi(t[2].c_str()) : 2000);
+    }
     if (c == "sample") {  // where the busy threads are: "[sample]" lines (RIP histograms; no unwind)
         return diag::sample_threads(t.size() >= 2 ? std::atoi(t[1].c_str()) : 20);
     }

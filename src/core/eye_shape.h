@@ -65,6 +65,12 @@ void end_run(void* postfx, const RunPoke& p);
 // swapchains need it on at the session's start). Refused (false) when the DRS hooks are not installed.
 bool enabled();
 bool set_enabled(bool on, bool save);
+// [XR] EyeShapeDlss for the menu (2026-10-10, the user's request after round 15 check 31): the eye shape under DLSS is
+// sized at the session's start, so the row only saves the next start's choice (EyeShapeDlss, and EyeShape when on).
+// dlss_saved: both on in the settings; dlss_running: this session runs it (DLSS, the shape on, EyeShapeDlss at start)
+bool dlss_saved();
+bool dlss_running();
+void set_dlss_next_start(bool on);
 
 // eyeshape [on|off|scale <x>|status]: the session only (the ini is not written)
 std::string command(const std::string& line);

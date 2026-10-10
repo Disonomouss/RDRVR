@@ -31,6 +31,8 @@
 #include "core/taa.h"
 #include "core/frame_grab.h"
 #include "core/game_hooks.h"
+#include "core/frame_probe.h"
+#include "core/playback.h"
 #include "core/gpu_timer.h"
 #include "core/log.h"
 #include "core/render_settings.h"
@@ -170,6 +172,8 @@ DWORD WINAPI bootstrap_thread(void*) {
         game_hooks::install();
         camera_lever::install();
         dual_pass::install();
+        frame_probe::install();  // after dual_pass: its wait sites
+        playback::install();
         eye_shape::install();
         body::install();
         holster::install();

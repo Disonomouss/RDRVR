@@ -13,6 +13,7 @@
 
 #include "core/anchors.h"
 #include "core/config.h"
+#include "core/frame_probe.h"
 #include "core/hooks.h"
 #include "core/pso.h"
 #include "core/log.h"
@@ -850,15 +851,26 @@ void after_present(HRESULT hr) {
     if (FAILED(hr)) log::limited("d3d.present.fail", 16, "[d3d] Present failed %#lx", static_cast<unsigned long>(hr));
 }
 
+// The single-pass probe (frame_probe.h): the frame end's and Present's times on the playback thread
+void probe_present(double t0, double t1) {
+    frame_probe::add(frame_probe::kFrameEnd, t1 - t0);
+    frame_probe::add(frame_probe::kPresent, log::now_ms() - t1);
+    frame_probe::playback_frame(t_draws);
+}
+
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT flags) {
     if (t_in_present || (flags & DXGI_PRESENT_TEST)) return o_Present(sc, sync, flags);
     ++t_in_present;
+    const bool probe = frame_probe::on();
+    const double t0 = probe ? log::now_ms() : 0;
     on_frame_end();
     if (sync && g_present_unsynced.load(std::memory_order_relaxed)) {
         sync = 0;
         g_unsynced_presents.fetch_add(1, std::memory_order_relaxed);
     }
+    const double t1 = probe ? log::now_ms() : 0;
     HRESULT hr = o_Present(sc, sync, flags);
+    if (probe) probe_present(t0, t1);
     after_present(hr);
     --t_in_present;
     return hr;
@@ -867,12 +879,16 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT flags) 
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
     if (t_in_present || (flags & DXGI_PRESENT_TEST)) return o_Present1(sc, sync, flags, p);
     ++t_in_present;
+    const bool probe = frame_probe::on();
+    const double t0 = probe ? log::now_ms() : 0;
     on_frame_end();
     if (sync && g_present_unsynced.load(std::memory_order_relaxed)) {
         sync = 0;
         g_unsynced_presents.fetch_add(1, std::memory_order_relaxed);
     }
+    const double t1 = probe ? log::now_ms() : 0;
     HRESULT hr = o_Present1(sc, sync, flags, p);
+    if (probe) probe_present(t0, t1);
     after_present(hr);
     --t_in_present;
     return hr;

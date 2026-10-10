@@ -13,6 +13,7 @@
 
 #include "core/anchors.h"
 #include "core/config.h"
+#include "core/frame_probe.h"
 #include "core/log.h"
 #include "core/state.h"
 
@@ -721,5 +722,280 @@ bool force_device_removal() {
 }
 
 const char* removal_test_status() { return g_test_status; }
+
+// ---- "stacks <render|playback> [n]" (the single-pass study, research\sps\measure.md): where one thread's time goes,
+// by function, per scene phase. Each sample suspends the thread only to copy its registers and stack (no allocation,
+// no lock: a suspended thread may hold the heap's or the loader's), then the copy is unwound with the modules' unwind
+// tables after the thread runs again. The stack registers are rebased into the copy before each unwind step.
+namespace {
+constexpr size_t kStackCopy = 128 * 1024;
+constexpr int kMaxFrames = 64;
+std::atomic<bool> g_stacks_busy{false};
+
+// The primary function of a (possibly chained) unwind entry
+uintptr_t primary_begin(uintptr_t image_base, const RUNTIME_FUNCTION* fn) {
+    for (int k = 0; k < 8 && fn; ++k) {
+        const uint8_t* ui = reinterpret_cast<const uint8_t*>(image_base + fn->UnwindData);
+        const uint8_t flags = ui[0] >> 3, codes = ui[2];
+        if (!(flags & UNW_FLAG_CHAININFO)) break;
+        fn = reinterpret_cast<const RUNTIME_FUNCTION*>(ui + 4 + ((codes + 1) & ~1) * 2);
+    }
+    return fn ? image_base + fn->BeginAddress : 0;
+}
+
+void rebase(CONTEXT& c, uintptr_t lo, size_t len, intptr_t delta) {
+    DWORD64* regs[] = {&c.Rax, &c.Rcx, &c.Rdx, &c.Rbx, &c.Rsp, &c.Rbp, &c.Rsi, &c.Rdi,
+                       &c.R8,  &c.R9,  &c.R10, &c.R11, &c.R12, &c.R13, &c.R14, &c.R15};
+    for (DWORD64* r : regs)
+        if (*r >= lo && *r < lo + len) *r = static_cast<DWORD64>(static_cast<intptr_t>(*r) + delta);
+}
+
+// The function begins on the copied stack, innermost first (0 for a leaf frame with no unwind entry)
+int unwind_copy_raw(CONTEXT ctx, const uint8_t* copy, uintptr_t lo, size_t len, uintptr_t* out, int max) {
+    const intptr_t delta = reinterpret_cast<intptr_t>(copy) - static_cast<intptr_t>(lo);
+    const uintptr_t clo = reinterpret_cast<uintptr_t>(copy), chi = clo + len;
+    rebase(ctx, lo, len, delta);
+    int n = 0;
+    for (; n < max; ++n) {
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        out[n] = fn ? primary_begin(static_cast<uintptr_t>(image_base), fn) : 0;
+        if (!fn) {
+            if (n > 0 || ctx.Rsp < clo || ctx.Rsp + 8 > chi) {  // a leaf only at the top
+                ++n;
+                break;
+            }
+            ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+            ctx.Rsp += 8;
+        } else {
+            void* handler_data = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+            rebase(ctx, lo, len, delta);
+        }
+        if (!ctx.Rip || ctx.Rsp < clo || ctx.Rsp >= chi) {
+            ++n;
+            break;
+        }
+    }
+    return n;
+}
+int unwind_copy(const CONTEXT& ctx, const uint8_t* copy, uintptr_t lo, size_t len, uintptr_t* out, int max) {
+    __try {
+        return unwind_copy_raw(ctx, copy, lo, len, out, max);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+struct StackJob {
+    DWORD tid;
+    int n;
+    char name[64];
+};
+
+void bump(std::vector<std::pair<uintptr_t, int>>& v, uintptr_t a) {
+    for (auto& e : v)
+        if (e.first == a) {
+            ++e.second;
+            return;
+        }
+    v.emplace_back(a, 1);
+}
+
+DWORD WINAPI stacks_worker(void* p) {
+    StackJob job = *static_cast<StackJob*>(p);
+    delete static_cast<StackJob*>(p);
+    static const char* const kPhase[frame_probe::kPhaseCount] = {"outside the scene", "before pass 1", "pass 1",
+                                                                  "between the passes", "pass 2", "a mono pass"};
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, job.tid);
+    // the thread's stack top (its TEB's NT_TIB StackBase), the copy's end
+    uintptr_t stack_base = 0;
+    if (h) {
+        using Query = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+        static const auto qi =
+            reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+        struct {
+            LONG status;
+            void* teb;
+            uintptr_t pid, tid, affinity;
+            LONG prio, base;
+        } tbi{};
+        ULONG got = 0;
+        if (qi && qi(h, 0, &tbi, sizeof(tbi), &got) >= 0 && tbi.teb)
+            sraw(reinterpret_cast<uintptr_t>(tbi.teb) + 8, &stack_base, 8);
+    }
+    if (!h || !stack_base) {
+        log::warn("[stack] %s: the thread or its stack not found", job.name);
+        if (h) CloseHandle(h);
+        g_stacks_busy = false;
+        return 0;
+    }
+    std::vector<uint8_t> copy(kStackCopy);
+    std::vector<std::vector<std::pair<uintptr_t, int>>> incl(frame_probe::kPhaseCount), excl(frame_probe::kPhaseCount),
+        rips(frame_probe::kPhaseCount);  // the exact instruction (where in a function the time goes: a lock's stall)
+    int count[frame_probe::kPhaseCount] = {}, failed = 0, total = 0;
+    const double t0 = log::now_ms();
+    for (int s = 0; s < job.n; ++s) {
+        Sleep(1 + (s % 3));  // 1-3 ms apart (and the system timer's granularity): not in step with the frame
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (SuspendThread(h) == static_cast<DWORD>(-1)) continue;
+        // while it is suspended: its registers, the phase and a copy of its stack, nothing else
+        const bool got = GetThreadContext(h, &ctx) != 0;
+        const int ph = frame_probe::phase();
+        size_t len = 0;
+        if (got && ctx.Rsp < stack_base) {
+            len = static_cast<size_t>(stack_base - ctx.Rsp);
+            if (len > kStackCopy) len = kStackCopy;
+            if (!sraw(static_cast<uintptr_t>(ctx.Rsp), copy.data(), len)) len = 0;
+        }
+        ResumeThread(h);
+        if (!got || !len || ph < 0 || ph >= frame_probe::kPhaseCount) {
+            ++failed;
+            continue;
+        }
+        uintptr_t frames[kMaxFrames];
+        const int nf = unwind_copy(ctx, copy.data(), static_cast<uintptr_t>(ctx.Rsp), len, frames, kMaxFrames);
+        if (nf <= 0) {
+            ++failed;
+            continue;
+        }
+        ++total;
+        ++count[ph];
+        bump(excl[ph], frames[0] ? frames[0] : static_cast<uintptr_t>(ctx.Rip));
+        bump(rips[ph], static_cast<uintptr_t>(ctx.Rip));
+        for (int i = 0; i < nf; ++i) {  // each function once per sample
+            if (!frames[i]) continue;
+            bool dup = false;
+            for (int j = 0; j < i && !dup; ++j) dup = frames[j] == frames[i];
+            if (!dup) bump(incl[ph], frames[i]);
+        }
+    }
+    CloseHandle(h);
+    const double secs = (log::now_ms() - t0) / 1000.0;
+    log::info("[stack] %s: %d samples over %.1f s (%d not unwound)", job.name, total, secs, failed);
+    for (int ph = 0; ph < frame_probe::kPhaseCount; ++ph) {
+        if (!count[ph]) continue;
+        for (int self = 0; self < 3; ++self) {
+            auto& v = self == 2 ? rips[ph] : self ? excl[ph] : incl[ph];
+            std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            const size_t shown = self == 2 ? 36 : self ? 24 : 60;
+            for (size_t i0 = 0; i0 < v.size() && i0 < shown; i0 += 12) {
+                char line[1600];
+                int used = std::snprintf(line, sizeof(line), "[stack] %s, %s (%d samples, %.1f%%) %s %zu-%zu:", job.name,
+                                         kPhase[ph], count[ph], 100.0 * count[ph] / (total ? total : 1),
+                                         self == 2 ? "rip" : self ? "self" : "inclusive", i0 + 1, (std::min)(v.size(), (std::min)(i0 + 12, shown)));
+                for (size_t i = i0; i < v.size() && i < i0 + 12 && i < shown && used < static_cast<int>(sizeof(line)) - 120; ++i) {
+                    char where[128];
+                    module_rva(v[i].first, where, sizeof(where));
+                    used += std::snprintf(line + used, sizeof(line) - used, " %s %.1f%%;", where, 100.0 * v[i].second / count[ph]);
+                }
+                log::info("%s", line);
+            }
+        }
+    }
+    log::info("[stack] %s: done", job.name);
+    g_stacks_busy = false;
+    return 0;
+}
+}  // namespace
+
+// ---- "affinity same|split|off" (the single-pass study, research\sps\measure.md): every packet the render thread
+// records ends with a locked increment of the chunk's count (+0x10), and the playback thread's replay decrements it per
+// packet (ReplayChunk 0xecdd7d), beside the chunk's used size the recorder's reserve rewrites (+0x20): the line moves
+// between the two threads' cores on every packet. Pinned to one P-core's two logical processors it stays in that core's
+// L1/L2; "split" pins them to two P-cores (the line through L3), "off" puts back the masks they had.
+namespace {
+DWORD thread_by_name(const char* want) {
+    DWORD tid = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te{sizeof(te)};
+    const DWORD pid = GetCurrentProcessId();
+    for (BOOL ok = Thread32First(snap, &te); ok && !tid; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        PWSTR desc = nullptr;
+        char name[64] = "";
+        if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc) {
+            WideCharToMultiByte(CP_UTF8, 0, desc, -1, name, sizeof(name), nullptr, nullptr);
+            LocalFree(desc);
+        }
+        CloseHandle(h);
+        if (std::strcmp(name, want) == 0) tid = te.th32ThreadID;
+    }
+    CloseHandle(snap);
+    return tid;
+}
+DWORD_PTR g_saved_mask[2] = {0, 0};  // the render and playback threads' masks before the first pin
+}  // namespace
+
+std::string set_affinity(const char* mode) {
+    const char* const names[2] = {"[RDR2] Render Thread", "RenderThread"};
+    const DWORD_PTR same[2] = {DWORD_PTR(1) << 2, DWORD_PTR(1) << 3}, split[2] = {DWORD_PTR(1) << 2, DWORD_PTR(1) << 4};
+    const bool off = std::strcmp(mode, "off") == 0, is_same = std::strcmp(mode, "same") == 0;
+    if (!off && !is_same && std::strcmp(mode, "split") != 0) return "ERROR affinity same|split|off";
+    DWORD_PTR proc = 0, sys = 0;
+    GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
+    std::string out = std::string("affinity ") + mode + ":";
+    for (int i = 0; i < 2; ++i) {
+        const DWORD tid = thread_by_name(names[i]);
+        HANDLE h = tid ? OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, tid) : nullptr;
+        if (!h) return std::string("ERROR no thread ") + names[i];
+        DWORD_PTR want = off ? (g_saved_mask[i] ? g_saved_mask[i] : proc) : (is_same ? same[i] : split[i]);
+        if (!off && !(want & proc)) want = proc;  // not a processor this process may use: left alone
+        const DWORD_PTR was = SetThreadAffinityMask(h, want);
+        if (!off && !g_saved_mask[i]) g_saved_mask[i] = was;
+        if (off) g_saved_mask[i] = 0;
+        CloseHandle(h);
+        char b[128];
+        std::snprintf(b, sizeof(b), " %s %#llx (was %#llx)", names[i], static_cast<unsigned long long>(want),
+                      static_cast<unsigned long long>(was));
+        out += b;
+    }
+    log::info("[affinity] %s", out.c_str());
+    return out;
+}
+
+std::string sample_stacks(const char* which, int n) {
+    n = n < 10 ? 10 : n > 20000 ? 20000 : n;
+    const char* want = std::strcmp(which, "playback") == 0 ? "RenderThread" : "[RDR2] Render Thread";
+    DWORD tid = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return "ERROR no thread snapshot";
+    THREADENTRY32 te{sizeof(te)};
+    const DWORD pid = GetCurrentProcessId();
+    for (BOOL ok = Thread32First(snap, &te); ok && !tid; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        PWSTR desc = nullptr;
+        char name[64] = "";
+        if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc) {
+            WideCharToMultiByte(CP_UTF8, 0, desc, -1, name, sizeof(name), nullptr, nullptr);
+            LocalFree(desc);
+        }
+        CloseHandle(h);
+        if (std::strcmp(name, want) == 0) tid = te.th32ThreadID;
+    }
+    CloseHandle(snap);
+    if (!tid) return std::string("ERROR no thread named ") + want;
+    if (g_stacks_busy.exchange(true)) return "ERROR a stack sampling is already running";
+    auto* job = new StackJob{tid, n, ""};
+    std::snprintf(job->name, sizeof(job->name), "%s", want);
+    HANDLE t = CreateThread(nullptr, 0, stacks_worker, job, 0, nullptr);
+    if (!t) {
+        delete job;
+        g_stacks_busy = false;
+        return "ERROR no worker thread";
+    }
+    SetThreadDescription(t, L"RDRVR stack sampler");
+    CloseHandle(t);
+    char out[200];
+    std::snprintf(out, sizeof(out), "sampling %s's stack %d times: [stack] lines follow, the last \"... done\"", want, n);
+    return out;
+}
 
 }  // namespace rdrvr::diag

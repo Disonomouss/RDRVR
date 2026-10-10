@@ -2,12 +2,34 @@
 # Files it would replace are backed up first (RDRVR_backup\<time>), and RDRVR_Uninstall.cmd puts them back.
 # Nothing of the game's own is changed, and the player's settings (%LOCALAPPDATA%\RDRVR\RDRVR.user.ini) are never touched.
 #   install.ps1 [-GameDir <folder>] [-Quiet]
+# Everything it prints also goes to %TEMP%\RDRVR_install.log. Install.cmd passes -FromCmd and pauses itself, so its
+# window stays open whatever happens (2026-10-10: a player's window closed at once on red text, unreadable).
 param(
     [string] $GameDir,
     [switch] $Quiet,
-    [switch] $Elevated
+    [switch] $Elevated,
+    [switch] $FromCmd
 )
 $ErrorActionPreference = 'Stop'
+$LogPath = Join-Path $env:TEMP 'RDRVR_install.log'
+try { Start-Transcript -LiteralPath $LogPath -Append | Out-Null } catch {}
+
+function Say([string] $s) { Write-Host $s }
+function Done([int] $code) {
+    try { Stop-Transcript | Out-Null } catch {}
+    if (-not $Quiet -and -not $FromCmd) { Write-Host ''; Read-Host 'Press Enter to close' | Out-Null }
+    exit $code
+}
+# Any error not handled below: shown with its line, the window kept open, nothing more changed
+trap {
+    Write-Host ''
+    Write-Host 'The installer stopped on an error:' -ForegroundColor Red
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    if ($_.InvocationInfo -and $_.InvocationInfo.Line) { Write-Host "  (line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim()))" }
+    Write-Host 'If a file is in use, close the game and its crash reporter (or wait a minute) and run the installer again.'
+    Write-Host "Otherwise send this text, or the log $LogPath, to RDRVR's author."
+    Done 1
+}
 $Payload = Join-Path $PSScriptRoot 'payload'
 if (-not (Test-Path -LiteralPath $Payload)) { $Payload = $PSScriptRoot }  # the .exe extracts everything flat
 $Version = (Get-Content -LiteralPath (Join-Path $Payload 'RDRVR_version.txt') -TotalCount 1).Trim()
@@ -16,11 +38,6 @@ $Files = @(Get-Content -LiteralPath (Join-Path $Payload 'RDRVR_files.txt') | For
 # A test build's simulator pointer: it would send the eyes to the simulator instead of the headset (removed, not kept)
 $Leftovers = @('RDRVR_xr_runtime.txt')
 
-function Say([string] $s) { Write-Host $s }
-function Done([int] $code) {
-    if (-not $Quiet) { Write-Host ''; Read-Host 'Press Enter to close' | Out-Null }
-    exit $code
-}
 function Sha([string] $p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLowerInvariant() }
 
 function Find-Game {
@@ -84,17 +101,43 @@ if (-not (Test-Path -LiteralPath (Join-Path $GameDir 'RedHook.dll')) -or -not (T
 # Only this folder's game counts (a process whose path cannot be read is taken as this one)
 $running = @(Get-Process -Name RDR -ErrorAction SilentlyContinue | Where-Object { -not $_.Path -or $_.Path.StartsWith($GameDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) })
 if ($running.Count) { Say 'Red Dead Redemption is running. Quit the game and run the installer again.'; Done 1 }
+# The game's crash reporter (in the game folder) can outlive the game for a moment and hold the mod's files
+$reporter = @(Get-Process -Name crashpad_handler -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($GameDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) })
+if ($reporter.Count) { Say 'The game''s crash reporter (crashpad_handler.exe) is still running. Wait a minute and run the installer again.'; Done 1 }
 
 # Steam's folder is usually writable; if not, ask for administrator rights once
 $probe = Join-Path $GameDir ('RDRVR_write_test_{0}.tmp' -f $PID)
 try { [IO.File]::WriteAllText($probe, 'x'); Remove-Item -LiteralPath $probe -Force }
 catch {
     if ($Elevated) { Say "Cannot write to the game folder even as administrator: $($_.Exception.Message)"; Done 1 }
-    Say 'The game folder needs administrator rights to write; asking for them...'
+    Say 'The game folder needs administrator rights to write; asking for them (a second window)...'
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-GameDir', "`"$GameDir`"", '-Elevated')
     if ($Quiet) { $a += '-Quiet' }
+    # the elevated run appends to the same log: this run's transcript closed first (a second one on the same file
+    # writes nothing while the first holds it)
+    try { Stop-Transcript | Out-Null } catch {}
     try { $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $a -Wait -PassThru; exit $p.ExitCode }
-    catch { Say 'Administrator rights were declined; nothing was installed.'; Done 1 }
+    catch {
+        try { Start-Transcript -LiteralPath $LogPath -Append | Out-Null } catch {}
+        Say 'Administrator rights were declined; nothing was installed.'; Done 1
+    }
+}
+
+# Every file it would replace must be free (nothing changed yet if one is held: the game, its crash reporter, a scan)
+function Test-Free([string] $p) {
+    for ($i = 0; $i -lt 6; $i++) {
+        try { $s = [IO.File]::Open($p, 'Open', 'ReadWrite', 'None'); $s.Close(); return $true }
+        catch [System.IO.IOException] { Start-Sleep -Seconds 1 }
+    }
+    return $false
+}
+foreach ($f in $Files) {
+    $dst = Join-Path $GameDir $f
+    if ((Test-Path -LiteralPath $dst) -and -not (Test-Free $dst)) {
+        Say "  $f in the game folder is in use by another program (the game, its crash reporter, or a virus scan)."
+        Say '  Nothing was changed. Close it (or restart the PC) and run the installer again.'
+        Done 1
+    }
 }
 
 # What this installer would replace: back it up (an earlier RDRVR install's files are recorded too, so an uninstall
@@ -122,12 +165,23 @@ $backups = @()
 if ($prev -and $prev.backups) { $backups += @($prev.backups) }
 if ($backedUp.Count) { $backups += [pscustomobject]@{ dir = $backupRel; files = $backedUp } }
 
-# Copy
+# Copy (a file held by another program is tried again for 5 s, then named)
+function Copy-Retry([string] $src, [string] $dst) {
+    for ($i = 0; $i -lt 6; $i++) {
+        try { Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop; return $true }
+        catch [System.IO.IOException] { Start-Sleep -Seconds 1 }
+    }
+    return $false
+}
 $record = @()
 foreach ($f in $Files) {
     $src = Join-Path $Payload $f
     $dst = Join-Path $GameDir $f
-    Copy-Item -LiteralPath $src -Destination $dst -Force
+    if (-not (Copy-Retry $src $dst)) {
+        Say "  $f is in use by another program (the game, its crash reporter, or a virus scan)."
+        Say '  Close it (or restart the PC) and run the installer again; the files copied so far are replaced then.'
+        Done 1
+    }
     $h = Sha $dst
     if ($h -ne (Sha $src)) { Say "  copy of $f does not match; the install is incomplete"; Done 1 }
     $record += [pscustomobject]@{ file = $f; sha256 = $h }

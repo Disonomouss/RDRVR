@@ -47,6 +47,14 @@ void between_passes(void* renderer, int first_eye);  // after pass 1 (its viewpo
 void end_frame(int second_eye);                      // after pass 2
 void mono_frame();                                   // instead of the three above, in a single-pass frame
 bool set_split(const char* name, bool on);
+bool split_on(const char* name);  // false if the name is unknown
+// The single-pass study step 2 (splits "shadows" and "shadowunion", off by default): the sun cascades, the point
+// lights' cube faces and the spot shadows fit or cull against the current viewport, the pass's eye. With either split
+// the first pass runs them with camera_lever::shadow_union_vp current (both eyes covered); with "shadows" the second
+// pass skips them and its lighting reads the first pass's maps and fits (kept in the shadow objects). "shadowunion"
+// alone fits both passes to the union and skips nothing: the identity test's control.
+bool shadows_wanted();
+void shadow_status(char* out, size_t len);  // "shadows": the splits and each renderer's union runs and skips
 // Headset round 2: the rain and blood drops on the lens in both eyes ([Screen] LensDrops; off = in neither).
 void set_lens_drops(bool on);
 // Headset rounds 1-2: the god rays are skipped for an eye the sun is behind ([Stereo] SunBehindCheck).

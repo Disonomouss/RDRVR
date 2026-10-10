@@ -26,6 +26,7 @@
 #include "core/controls.h"
 #include "core/d3d_hooks.h"
 #include "core/eye_shape.h"
+#include "core/frame_probe.h"
 #include "core/hands.h"
 #include "core/anchors.h"
 #include "core/holster.h"
@@ -70,6 +71,7 @@ struct Perf {
     double start_ms = 0;
     XrTime prev = 0;
     uint64_t scene_us0 = 0, scene_n0 = 0;  // camera_lever::scene_time at the window's start
+    frame_probe::Snap probe0{};            // the single-pass probe at the window's start
 };
 // Its own lock, not g_frame_mutex: the menu's Debug tab reads it while the presenting thread holds the frame mutex
 // (headset round 4: locking g_frame_mutex there again threw std::system_error, a deadlock, and ended the game).
@@ -87,6 +89,7 @@ struct TimingWin {
     uint32_t nopen = 0;
     uint64_t pose_m0 = 0, pose_s0 = 0, pose_n0 = 0, latch0 = 0, copies0 = 0, misses0 = 0, late_binds0 = 0;
     float latch_sum0 = 0;
+    frame_probe::Snap probe0;  // the single-pass probe at the window's start
 };
 TimingWin g_tw;
 double g_open_ms = 0;  // when the open XR frame began (xrBeginFrame returned)
@@ -1315,6 +1318,7 @@ void timing_window(const XrFrameState& fs) {
         g_tw.copies0 = g_copies.load();
         g_tw.misses0 = g_misses.load();
         g_tw.late_binds0 = g_late_eye_binds.load();
+        frame_probe::snap(&g_tw.probe0);
         prev = 0;
     }
     if (fs.predictedDisplayPeriod > 0) {
@@ -1362,6 +1366,13 @@ void timing_window(const XrFrameState& fs) {
               lat ? (g_latch_sum_deg.load() - g_tw.latch_sum0) / static_cast<float>(lat) : 0.0f,
               static_cast<unsigned long long>(g_copies.load() - g_tw.copies0), static_cast<unsigned long long>(g_misses.load() - g_tw.misses0),
               static_cast<unsigned long long>(g_late_eye_binds.load() - g_tw.late_binds0));
+    if (frame_probe::on()) {  // the same window's per-frame split (research\sps\current.md 3.7)
+        frame_probe::Snap now_snap;
+        frame_probe::snap(&now_snap);
+        char line[768];
+        frame_probe::format(g_tw.probe0, now_snap, line, sizeof(line));
+        log::info("[xr] timing %s", line);
+    }
     g_tw.start_ms = 0;  // the next frame starts a new window
 }
 
@@ -1383,6 +1394,7 @@ void submit_frame_end() {
         return;
     }
     g_wait_ms = log::now_ms() - w0;
+    if (frame_probe::on()) frame_probe::add(frame_probe::kXrWait, g_wait_ms);
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     r = xrBeginFrame(g_session, &bi);
     if (XR_FAILED(r)) {
@@ -1419,6 +1431,7 @@ void submit_frame_end() {
         g_perf = Perf{};
         g_perf.start_ms = log::now_ms();
         camera_lever::scene_time(&g_perf.scene_us0, &g_perf.scene_n0);
+        frame_probe::snap(&g_perf.probe0);
     }
     if (fs.predictedDisplayPeriod > 0) {
         double period = static_cast<double>(fs.predictedDisplayPeriod);
@@ -1957,6 +1970,16 @@ void perf_status(char* out, size_t len) {
                   static_cast<unsigned long long>(p.missed),
                   100.0 * static_cast<double>(p.missed) / static_cast<double>(p.frames + p.missed ? p.frames + p.missed : 1),
                   static_cast<unsigned long long>(p.late_frames), p.longest, p.cpu_sum / n, p.gpu_sum / n, scene_ms);
+}
+
+void perf_probe(char* out, size_t len) {
+    frame_probe::Snap a, b;
+    {
+        std::lock_guard lock(g_perf_mutex);
+        a = g_perf.probe0;
+    }
+    frame_probe::snap(&b);
+    frame_probe::format(a, b, out, len);
 }
 
 void late_latch() {

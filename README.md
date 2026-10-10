@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.7.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -19,6 +19,12 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - Per-eye fixes so both eyes see the same frame: grass, wind, lights, forest, exposure, rain and particles, god rays,
   wetness and blood, cloud shadows.
 - Culling, tree billboards and distant trees follow your head, and stay upright.
+- Faster in 0.8.0, both on by default and used in a Quest 3 over Virtual Desktop at 90 Hz ("performance is smooth"),
+  each switchable in the General tab under "Performance":
+  - the game's render thread hands its recorded work to its GPU thread in batches instead of one command at a time:
+    about 2.5-3 ms less CPU a frame in the developer's tests (about a fifth of the stereo frame), the image unchanged;
+  - the shadows (the sun's, the lamps' and the spot lights') drawn once a frame for both eyes instead of once per eye:
+    about 0.9 ms less CPU a frame; the shadows' edges can move by a texel.
 - FXAA, the game's TAA or DLSS run per eye (DLSS with its own history per eye, falling back to one shared history
   if its setup fails, which `RDRVR.log` says; since 0.5.0 it is usable in the headset: its images were handed to the
   headset a few frames stale, two defects in what the game feeds DLSS are corrected, its jitter's length and units,
@@ -26,12 +32,12 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - Optional (new in 0.3.0, off by default, tried briefly in a Quest 3; the General tab, under the anti-aliasing, with
   FXAA): each eye rendered in your headset's own shape and size, with square pixels, instead of the game's 16:9
   frame stretched over it: fewer pixels drawn for the same sharpness. Restart the game after turning it on: the eye
-  images take their size at the start. New in 0.7.0, experimental and off by default (tried in the developer's
-  simulator only, not yet in a headset): the same with DLSS, the eye-shaped image upscaled by DLSS into an
-  eye-shaped output (about 13-15% less GPU time at the same resolution there): choose DLSS in the General tab's
-  Anti-aliasing, and set `[XR] EyeShapeDlss=1` with `EyeShape=1` in `%LOCALAPPDATA%\RDRVR\RDRVR.user.ini` (no menu
-  row yet), from the next start. It applies only while DLSS runs per eye; if DLSS falls back to one shared history,
-  the eyes get the game's frame (`RDRVR.log`'s `[eye]` lines say which).
+  images take their size at the start. The same with DLSS (new in 0.7.0; off by default; since 0.8.0 tried in a
+  Quest 3 over Virtual Desktop, where it looked as sharp and took about a quarter less GPU time at 3926 x 2208 with
+  DLSS Quality): the eye-shaped image upscaled by DLSS into an eye-shaped output. Choose DLSS in the General tab's
+  Anti-aliasing, then tick "Eyes in the headset's shape with DLSS" under it (new in 0.8.0), from the next start. It
+  applies only while DLSS runs per eye; if DLSS falls back to one shared history, the eyes get the game's frame
+  (`RDRVR.log`'s `[eye]` lines say which).
 - Optional (new in 0.4.0, off by default, tried briefly in a Quest 3; the General tab, "Render resolution: headset"
   and "Render resolution: size", from the next start): the game's frame at your headset's height, apart from your
   monitor's modes and without DSR. Choose your headset, then its size: 100%, 150% or 200% of its pixels (new in 0.6.0,
@@ -112,8 +118,9 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 **Controls and comfort**
 - The controllers drive the game's gamepad (every button remappable), with the game's rumble on the controllers.
 - Smooth or snap turning; on a horse, steering by the stick or by your view, the left stick click brakes. New in
-  0.7.0, on by default (tried in the developer's simulator only, not yet in a headset): with stick steering the right stick turns the view on
-  horseback too, while the left stick steers the horse (the Comfort tab, under "Steer with the stick").
+  0.7.0, on by default (used in a headset since 0.8.0): with stick steering the right stick turns the view on
+  horseback too, while the left stick steers the horse (the Comfort tab, under "Steer with the stick"). Since 0.8.0
+  the holsters turn with your view as you do (before, they kept facing the horse); recentring faces them back.
 - The game's own menus by the controllers (new in 0.7.0, on by default, tried in the developer's simulator only, not
   yet in a headset; `[Controls] MenuControls` in `RDRVR.ini`, no menu row): in the satchel and shops the triggers
   change tabs; in the satchel, the pause menu and shops the left stick moves one item a push.
@@ -141,9 +148,12 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.7.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
-   would replace, and never changes a game file.
+   would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
+   stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
+   an issue if you need help). It changes nothing if a file it would replace is in use (the game, its crash
+   reporter or a virus scan): close it and run the installer again.
 3. Start your headset's runtime, then the game.
 
 To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay in `%LOCALAPPDATA%\RDRVR`).
@@ -170,7 +180,8 @@ To open the mod's menu, hold the menu button. If your controller has no menu but
 
 ### General
 
-Where the HUD goes, the anti-aliasing, and the resolution the game renders at for your headset.
+Where the HUD goes, the anti-aliasing, the resolution the game renders at for your headset, and two performance
+options.
 
 | Setting | What it does | Default |
 |---|---|---|
@@ -179,11 +190,19 @@ Where the HUD goes, the anti-aliasing, and the resolution the game renders at fo
 | **Anti-aliasing** | Off, FXAA, Native TAA or DLSS (DLAA). DLSS turns on or off from the next start; the others switch at once. | FXAA |
 | ↳ **DLSS quality** | How many pixels DLSS renders before it upscales: DLAA (sharpest, most demanding), Dynamic, Ultra performance, Performance, Balanced, Quality; from the next start. | DLAA (native resolution) |
 | ↳ **Eyes in the headset's shape** | Draws each eye in your headset's own shape with square pixels, so fewer pixels are drawn for the same sharpness (FXAA only, takes full effect from the next start). | Off |
+| ↳ **Eyes in the headset's shape with DLSS** (new in 0.8.0) | The same with DLSS: each eye rendered smaller in your headset's shape and upscaled by DLSS into an eye-shaped image; it also turns on Eyes in the headset's shape. From the next start. | Off |
 | **Render resolution: headset** | The game's frame size from the next start: your headset's screen height, Automatic (the size your VR runtime asks for), or the game's own size. Sizes your graphics card's memory can't handle are greyed out. | The game's own (its Graphics menu) |
 | ↳ **Render resolution: size** | 100%, 150% or 200% of the chosen headset's pixels, still 16:9; from the next start. | 100% once a headset or Automatic is chosen |
 | **Now: ...** | Shows the size the game is running at now, or why it uses its own size. | – |
 
 With Automatic, leave your runtime's own resolution setting at its default (100% in SteamVR), because it multiplies with the size you choose here. A "Restart the game to apply" note appears whenever your choice differs from what is running.
+
+Under the **Performance** heading (new in 0.8.0):
+
+| Setting | What it does | Default |
+|---|---|---|
+| **Shadows drawn once for both eyes** | The sun's, the lamps' and the spot lights' shadows drawn once a frame, fitted for both eyes, instead of once per eye: about 0.9 ms less CPU a frame. The shadows' edges can move by a texel. | On |
+| **Batched hand-off to the GPU thread** | The game's render thread hands its recorded work to its GPU thread in batches instead of one command at a time: about 2.5-3 ms less CPU a frame, nothing drawn differently. | On |
 
 ### Comfort
 
@@ -236,7 +255,7 @@ Fits John's hands and arms to your controllers and sets how the gun in your hand
 | **Dual wield** | With a gun in one hand, grip another holster with the free hand to take a second gun with its own trigger, barrel and ammo. | On |
 | **The same sidearm in both hands** | With a sidearm in hand, grip a hip holster with the free hand to take a copy of it; let go at a hip to put it back. | On |
 | ↳ **The copy drawn as a prop** | Draws the copy as a model of the gun, so you see it in the free hand. | On |
-| ↳ **Your other sidearm's model** | If you own a different sidearm, the copy shows that gun instead, and its shots leave that gun's muzzle. | On |
+| ↳ **Your other sidearm's model** | If you own a different sidearm, the copy shows that gun instead, and its shots leave that gun's muzzle. Since 0.8.0 it is the gun that hip's holster shows, and the holster is empty while you hold it. | On |
 | ↳ ↳ **A second of the gun at its own holster** | Needs Your other sidearm's model on. Gripping the holster the gun was drawn from gives a second of that same gun; the other hip still gives your other sidearm. | On |
 
 ### Holsters
@@ -248,7 +267,7 @@ The body holsters: how you draw, what they follow, what is shown, and where each
 | **Body holsters** | Reach to a holster and grip to draw; grip and let go there with the gun in hand to put it away (a short buzz marks a holster). | On |
 | ↳ **Putting a gun away selects the fists** | Holstering also switches to unarmed, so the left trigger gives the fist-fight stance instead of drawing again. | On |
 | ↳ **Draw into the hand that grabs the holster** | The gun goes into whichever hand grabbed it, and that hand's trigger fires. | On |
-| ↳ **They follow: John's body / Your headset** | Whether the holsters stay with John's body or move with you (riding and cover always use the body). | Your headset |
+| ↳ **They follow: John's body / Your headset** | Whether the holsters stay with John's body or move with you (riding and cover always use the body; on horseback, since 0.8.0, they also turn with the right stick's turn of the view). | Your headset |
 | ↳ **Turn with the headset** (new in 0.7.0) | The holsters turn around you as you turn your head; off, they face the way John faces. | Off |
 | ↳ ↳ **Turn by your head and hands** (new in 0.7.0) | With Turn with the headset on: while both hands aim in front of you, the holsters turn halfway between your head and hands, so looking aside swings them less. | Off |
 | ↳ ↳ **Turn dead zone** (new in 0.7.0) | With Turn with the headset on: how far you can look aside before the holsters follow, 0 to 90°; 30 to 45 lets you glance aside without moving them. | 0° |
@@ -392,7 +411,7 @@ Live performance and view-mode readouts (frame rate, missed frames, CPU and GPU 
 - **Recentre:** Comfort, "Recentre". You can also use the headset's own recentre, Scroll Lock, or hold both stick clicks for a second.
 - **Render resolution:** General, "Render resolution: headset" and "size" (from the next start).
 - **DLSS:** General, "Anti-aliasing" then "DLSS quality" (from the next start).
-- **Eye shape:** General, "Eyes in the headset's shape" (FXAA only).
+- **Eye shape:** General, "Eyes in the headset's shape" (FXAA), or "Eyes in the headset's shape with DLSS" (DLSS, new in 0.8.0).
 - **Snap or smooth turning:** Comfort, "Turning on the right stick".
 - **Holster placement:** Holsters, "Place the holsters by hand", or each holster's Offset / Size arrows.
 - **Horse whistle:** Gestures, "Whistle for the horse".
@@ -407,7 +426,7 @@ Live performance and view-mode readouts (frame rate, missed frames, CPU and GPU 
 - **Sharpness:** each eye shows the game's own frame (16:9), or, with "Eyes in the headset's shape" on, a frame in
   the headset's own shape. For a sharper image on a high-resolution headset, choose the "Render resolution" (the General
   tab): your headset or Automatic, at 100%, 150% or 200%, if your GPU allows (new in 0.4.0, the sizes in 0.6.0); "Eyes in the headset's
-  shape" (FXAA only) makes it cheaper, and DLSS Quality (usable since 0.5.0; from the next start) renders each eye at
+  shape" (with FXAA, or "... with DLSS", new in 0.8.0) makes it cheaper, and DLSS Quality (usable since 0.5.0; from the next start) renders each eye at
   two thirds of the width and height (about 9 ms of GPU a frame at 3926 x 2208 on an RTX 4070 Ti, against FXAA's 7).
 - **Frame generation** layers (frame interpolation in the OpenXR runtime or a layer) make the guns lag behind your
   hands: the generated frames cannot follow the gun. Prefer a lower refresh rate (72 or 80 Hz) with real frames.
@@ -455,8 +474,9 @@ Live performance and view-mode readouts (frame rate, missed frames, CPU and GPU 
   to 2560 wide (new in 0.4.0): `[XR] UiQuadMaxWidth=0` and `CinemaMaxWidth=0` in `RDRVR.ini` bring back 0.3.0's
   full-size images.
 - The front hand on a long gun held two-handed can move on the gun during a shot, most on the Double-barrel (seen
-  in the developer's simulator, back on the grip within 3 seconds). `RDRVR.log` now has a `[two] a shot two-handed`
-  line after each such shot: please attach it to an issue if your hand ends up in the gun or in the air.
+  in the developer's simulator, back on the grip within 3 seconds). `RDRVR.log` has a `[two] a shot two-handed`
+  line after each such shot (since 0.8.0 measured as your eyes see it): please attach it to an issue if your hand
+  ends up in the gun or in the air.
 - The default places of the holsters, the loading and foregrip rings and the interaction spot were tuned in the
   headset by one person: if they do not suit you, move them with the menu's arrows (Holsters, Reloading, Gun in hand
   and Hands tabs).

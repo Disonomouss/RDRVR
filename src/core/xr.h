@@ -62,6 +62,7 @@ void recentre_layers();
 // R6: a measurement window of XR frames, missed display periods and mean frame times ("perf reset", "perf").
 void perf_reset();
 void perf_status(char* out, size_t len);
+void perf_probe(char* out, size_t len);  // the single-pass probe's split over the same window (frame_probe.h)
 // R5 step 3: cinema mode (DESIGN §3.7): the game's finished frame (with its UI) on a 3.2 m screen 3 m ahead of the
 // head pose taken when it is switched on, world-locked, in a dark room (no projection layer). The back buffer is copied
 // into a quad swapchain of the sRGB variant of its format, so the runtime reads its display-referred bytes as sRGB.

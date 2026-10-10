@@ -75,6 +75,11 @@ uint32_t recentre_gen();  // counts the recentres (the holsters' headset anchor 
 // yaw). rot (x y z w) -> wrot, a 3x3 row-major matrix rotating column vectors into the world. False before recentre.
 // The scene viewport's near and far planes as of the last scene render (metres; diagnostics).
 void scene_clip(float* near_m, float* far_m);
+// The single-pass study step 2 (dual_pass's splits "shadows" and "shadowunion"): a viewport covering both eyes, for
+// the shared shadow passes' fitting and culling: the centre eye's camera (the eyes' midpoint, the head's orientation)
+// with both eyes' tangents widened by a few degrees. Built on the render thread before pass 1 of a double frame with the
+// XR pose; null otherwise (and in a mono frame).
+void* shadow_union_vp();
 bool local_to_world(const float* cam, const float* pos, const float* rot, float* wpos, float* wrot);
 // A LOCAL position (a controller's) since recentre, in the recentred frame (x right, y up, z back): the hand's own
 // motion, without the game camera's (walking, turning, the head-bone anchor). False before recentre. Any thread.

@@ -52,6 +52,9 @@ add_library(rdrvr_core SHARED
     src/core/exit_guard.cpp
     src/core/frame_grab.cpp
     src/core/gpu_timer.cpp
+    src/core/frame_probe.cpp
+    src/core/playback.cpp
+    src/core/playback_head.asm
     src/core/render_settings.cpp
     src/core/ring_probe.cpp
     src/core/diag.cpp

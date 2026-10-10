@@ -131,6 +131,14 @@ bool parse_size(const std::string& s, uint32_t* w, uint32_t* h) {  // "WxH", "W 
     return true;
 }
 
+// The boot sentinel's section, one per OpenXR runtime (2026-10-10: a simulator test start that ended early blocked the
+// headset's size for the player's next session, the state file being shared)
+const char* boot_section() {
+    static char sec[32];
+    std::snprintf(sec, sizeof(sec), g_runtime_key[0] ? "Boot %s" : "Boot", g_runtime_key);
+    return sec;
+}
+
 // The runtime the XR session will use: RDRVR_xr_runtime.txt's manifest (tests: the simulator), else the system's active
 // OpenXR runtime (HKLM\SOFTWARE\Khronos\OpenXR\1 ActiveRuntime); its records are kept apart, so the simulator's
 // size never feeds a headset's Automatic.
@@ -472,7 +480,7 @@ bool install_iat() {
 
 void clear_sentinel(const char* why) {
     if (g_sentinel_cleared.exchange(true)) return;
-    state_set("Boot", "Pending", nullptr);
+    state_set(boot_section(), "Pending", nullptr);
     log::info("[renderres] %ux%u: the boot sentinel cleared (%s)", g_w, g_h, why);
 }
 
@@ -505,10 +513,10 @@ bool arm(bool early) {
         return false;
     }
     char blocked[64], want[32];
-    std::snprintf(blocked, sizeof(blocked), "%s", state_get("Boot", "Blocked").c_str());
+    std::snprintf(blocked, sizeof(blocked), "%s", state_get(boot_section(), "Blocked").c_str());
     std::snprintf(want, sizeof(want), "%ux%u", g_w, g_h);
     if (blocked[0] && std::strcmp(blocked, want) != 0) {  // another size chosen since: the old block no longer applies
-        state_set("Boot", "Blocked", nullptr);
+        state_set(boot_section(), "Blocked", nullptr);
         blocked[0] = 0;
     }
     if (blocked[0]) {
@@ -539,7 +547,7 @@ bool arm(bool early) {
     d3d::add_frame_end_listener(frame_end);
     char pending[32];
     std::snprintf(pending, sizeof(pending), "%ux%u", g_w, g_h);
-    state_set("Boot", "Pending", pending);
+    state_set(boot_section(), "Pending", pending);
     std::snprintf(g_wstr, sizeof(g_wstr), "%u", g_w);
     std::snprintf(g_hstr, sizeof(g_hstr), "%u", g_h);
     g_armed = true;
@@ -602,10 +610,10 @@ void early_arm() {
     load_choice();
     find_runtime();
     // the boot sentinel: a start that armed a size and did not reach its frame count blocks that size
-    const std::string pending = state_get("Boot", "Pending");
+    const std::string pending = state_get(boot_section(), "Pending");
     if (!pending.empty()) {
-        state_set("Boot", "Blocked", pending.c_str());
-        state_set("Boot", "Pending", nullptr);
+        state_set(boot_section(), "Blocked", pending.c_str());
+        state_set(boot_section(), "Pending", nullptr);
         log::warn("[renderres] the last start at %s ended within two minutes, not by quitting: that size is blocked until it is chosen again",
                   pending.c_str());
     }
@@ -706,7 +714,7 @@ void set_choice(int c, int s) {
     uint32_t w = 0, h = 0;  // the size too, as before (what it means without RenderHeadset)
     const std::string v = c == kOff ? "off" : c == kAuto ? "auto" : size_of(c, g_scale, 0, 0, &w, &h, nullptr, 0) ? std::to_string(h) : "off";
     config::set("Render", "RenderResolution", v);
-    state_set("Boot", "Blocked", nullptr);  // the player's own choice retries a blocked size
+    state_set(boot_section(), "Blocked", nullptr);  // the player's own choice retries a blocked size
     if (!g_armed.load() && std::strncmp(g_why, "a start at", 10) == 0)
         std::snprintf(g_why, sizeof(g_why), "blocked this start; chosen again, it is tried at the next start");
 }

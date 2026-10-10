@@ -633,6 +633,23 @@ void holster_frame() {
         std::memcpy(g_anchor_shift, sh, sizeof(sh));
         if (bp.cam_ok) std::memcpy(g_anchor_cam, bp.cam + 12, sizeof(g_anchor_cam));
     }
+    // [Horse] StickTurn (2026-10-10, the user: "When on a horse, looking around with the joystick. The holsters do not
+    // turn with you"): riding, the right stick's turn of the view turns the whole layout with it, about the head's
+    // vertical axis: the player's own hips turn with their view while John keeps facing the horse (run 9 had the holsters
+    // follow the horse)
+    const float ride_turn = (st.flags & RDRVR_ACTOR_MOUNTED) ? pose::ride_turn_deg() : 0.0f;
+    if (ride_turn != 0.0f && bp.cam_ok) {
+        const float* cp = bp.cam + 12;
+        const float a = hd + ride_turn * 0.0174532925f;
+        const float tf[3] = {-std::sin(a), 0.0f, -std::cos(a)}, tr[3] = {std::cos(a), 0.0f, -std::sin(a)};
+        for (int z = 0; z < kZones; ++z) {  // each zone's place in the horse's frame, the same in the turned one
+            const float d[3] = {zp[z][0] - cp[0], zp[z][1] - cp[1], zp[z][2] - cp[2]};
+            const float x = d[0] * hr[0] + d[2] * hr[2], f = d[0] * hf[0] + d[2] * hf[2];
+            for (int k = 0; k < 3; ++k) zp[z][k] = cp[k] + tr[k] * x + up[k] * d[1] + tf[k] * f;
+        }
+        std::memcpy(hr, tr, sizeof(hr));
+        std::memcpy(hf, tf, sizeof(hf));
+    }
     // the weapon manager (actor +0x70): +0x80 the item in hand, +0x448 the current slot, +0xa8 + s * 0x70 the slots
     uintptr_t wmgr = 0, in_hand = 0;
     int32_t cur = -1;
@@ -1070,9 +1087,12 @@ void holster_frame() {
                 dual::set_copy_model(dual::copy_as_prop() ? st.weapon : -1);  // run 7 item 1: its own model as a prop
                 log::info("[wield] %s hand at the %s, the %s's own holster: a second %s", h ? "right" : "left", z.key, kWeaponLabel[st.weapon],
                           kWeaponLabel[st.weapon]);
-            } else {  // [Hands] DualWieldOwnModel: the copy's model, the hip's weapon if another owned sidearm, else the first owned revolver
+            } else {  // [Hands] DualWieldOwnModel: the copy's model, the hip's gun if another owned sidearm, else the first owned revolver
+                // (2026-10-10: the hip's gun as it draws and shows it, automatic included; the hip's weapon alone gave an
+                // automatic hip's copy the first owned revolver while the hip showed another, which stayed in the holster)
                 auto own = [&](int w) { return w >= 0 && w < 8 && w != st.weapon && st.owned_tick != 0 && (st.owned >> w & 1); };
-                int other = own(z.weapon) ? z.weapon : -1;
+                const int hip_gun = draw_weapon(in_z[h]);
+                int other = own(hip_gun) ? hip_gun : own(z.weapon) ? z.weapon : -1;
                 static const int kPref[8] = {4, 5, 6, 7, 0, 1, 2, 3};
                 for (int w : kPref)
                     if (other < 0 && dual::own_model() && own(w)) other = w;

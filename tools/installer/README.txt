@@ -13,6 +13,8 @@ Install
     Install.cmd -GameDir "D:\SteamLibrary\steamapps\common\Red Dead Redemption"
 - Quit the game first. Files it would replace are backed up to RDRVR_backup in the game folder. No game file is
   changed.
+- Its window stays open until you press a key. If it stops on an error, the text says why; everything it printed
+  is also in %TEMP%\RDRVR_install.log (attach that file if you ask for help).
 
 Uninstall
 - Run RDRVR_Uninstall.cmd in the game folder. It removes the mod's files and logs and puts back what was backed up.

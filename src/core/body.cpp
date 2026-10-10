@@ -865,16 +865,35 @@ struct PartsSample {
     bool post_ok;
     float post[12];  // the reference bone as drawn (after every change), the world less the player's offset
     float left[12];  // the drawn left wrist then (the player's corrected set)
+    bool snap_ok;
+    float snap[12];  // the front hand's snap: its frame of the gun (the published gun_frame), the same space as post
+    // the game's own, before any change (the same space): the gun's object matrix (the record's, as 3x4: its axes as
+    // columns), its set's root, and the gun hand's attachment bone (the player's set as animated, its last draw)
+    bool game_ok;
+    float obj[12], root[12], att[12];
 };
+float g_att_game[12];  // the gun hand's attachment bone as animated, the player's last set (the world less its offset)
+bool g_att_game_ok = false;
 constexpr int kPartsMax = 300;
 PartsSample g_parts[kPartsMax];
 int g_parts_n = 0;
 std::atomic<bool> g_parts_rec{false};
 uint64_t g_parts_frame = ~0ull;
-void record_parts(const float* sm, int count, uint64_t frame) {
+extern float g_player_offset[3];
+void record_parts(const float* sm, int count, uint64_t frame, const float* rc, const float* po) {
     if (count < 1 || count > 8 || g_parts_n >= kPartsMax || g_parts_frame == frame) return;
     g_parts_frame = frame;
     PartsSample& p = g_parts[g_parts_n++];
+    p.game_ok = rc && po && g_att_game_ok;
+    if (p.game_ok) {
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) p.obj[i * 4 + j] = rc[j * 4 + i];
+            p.obj[i * 4 + 3] = rc[12 + i] - g_player_offset[i];
+        }
+        std::memcpy(p.root, sm, sizeof(p.root));
+        for (int k = 0; k < 3; ++k) p.root[k * 4 + 3] += po[k] - g_player_offset[k];
+        std::memcpy(p.att, g_att_game, sizeof(p.att));
+    }
     p.ms = log::now_ms();
     p.phase = holster::fire_clip_phase();
     if (p.phase < 0.0f && actions::since_shot_ms() < kShotHoldMs) p.phase = 2.0f;
@@ -1076,6 +1095,9 @@ std::atomic<bool> g_same_frame_cfg{true};
 // gun as drawn, and FixedGunGrip's learning paused through the fire clip. Off, or FixedGunGrip off: as before
 std::atomic<bool> g_snap_drawn_cfg{true};
 std::atomic<uint64_t> g_snap_drawn_frames{0};
+// "skel two clipshared on|off" (a test only, off): the snap's fire-clip hold one for both sets again, as before the
+// 2026-10-10 fix (the A/B of tests/sim/r10_horsefore.py)
+std::atomic<bool> g_clip_shared_test{false};
 bool fixed_grip_on();  // [Hands] FixedGunGrip (defined with it below)
 // [Reload] SnapToDrawnGun: a sample's gun as drawn: its matrix's frame (Gm, gm_o in the set's space) with its placement
 // at the drawn hand (A, ad: held_delta's) undone
@@ -1656,7 +1678,13 @@ void corr_point(const Corr& c, const float* in, float* out) {
 
 // The axis-angle of a rotation matrix.
 // "skel parts post" and TwoHandShotLog: the drawn gun against its first recorded frame (deg/mm over time) and the drawn
-// left wrist in the drawn gun's frame (under g_draw_mutex)
+// left wrist in the drawn gun's frame (under g_draw_mutex). "The left wrist on it" is its skinning matrix's origin, the
+// bind pose's origin 1.2 m from the wrist: a turn of the hand reads as a move (0.7 deg about 15 mm). Beside it
+// (2026-10-10): the wrist joint itself on the gun (mm, and its turn in deg), and the front hand's snap frame of the gun
+// on the drawn gun (mm, deg). And the game's own gun before any change: its object frame (the record's, which the
+// samples and the snap use) on its set's root (which the mesh follows), the root on the gun hand's attachment joint,
+// the object frame on that joint. The series' entries: deg/mm/left mm/clip/joint mm/joint deg/snap mm/snap deg/object
+// on root mm/root on attachment mm/object on attachment mm
 std::string parts_post() {
     int first = -1;
     for (int i = 0; i < g_parts_n; ++i)
@@ -1665,10 +1693,26 @@ std::string parts_post() {
             break;
         }
     if (first < 0) return std::string("parts post: none");
-    float worst_a = 0, worst_t = 0, worst_l = 0;
+    float worst_a = 0, worst_t = 0, worst_l = 0, worst_jm = 0, worst_jd = 0, worst_sm = 0, worst_sd = 0;
     std::string series;
-    char b[200];
+    char b[480];
     float l0[3] = {}, ll[3] = {};
+    float L0[12] = {}, S0[12] = {}, jp0[3] = {};
+    bool have_l0 = false, have_s0 = false;
+    // the game's own: the object frame on its root, the root on the gun hand's attachment, the object on the attachment
+    float G0[3][12] = {};
+    bool have_g0 = false;
+    float worst_g[3][2] = {};
+    const int ab = g_rig.att_wrist[1];
+    const float* ajb = ab >= 0 && static_cast<size_t>(ab) * 3 + 2 < g_rig.jbind.size() ? &g_rig.jbind[static_cast<size_t>(ab) * 3] : nullptr;
+    const int wl = g_rig.wrist[0];
+    const float* jb = wl >= 0 && static_cast<size_t>(wl) * 3 + 2 < g_rig.jbind.size() ? &g_rig.jbind[static_cast<size_t>(wl) * 3] : nullptr;
+    auto angle_of = [](const float* D) {
+        const float Rr[9] = {D[0], D[1], D[2], D[4], D[5], D[6], D[8], D[9], D[10]};
+        float ax[3], an = 0;
+        to_axis_angle(Rr, ax, &an);
+        return an * 57.2958f;
+    };
     for (int i = first, k = 0; i < g_parts_n; ++i, ++k) {
         if (!g_parts[i].post_ok) continue;
         float D[12], ax[3], an = 0;
@@ -1680,21 +1724,79 @@ std::string parts_post() {
         worst_t = std::fmax(worst_t, tl * 1000.0f);
         // the drawn left wrist in the drawn gun's frame: its move from the first frame (mm)
         float gi[12], L[12];
-        float lm = 0;
+        float lm = 0, jm = 0, jd = 0, smm = 0, sdg = 0;
         if (inv34(g_parts[i].post, gi)) {
             mul34(gi, g_parts[i].left, L);
             if (i == first) l0[0] = L[3], l0[1] = L[7], l0[2] = L[11];
             ll[0] = L[3], ll[1] = L[7], ll[2] = L[11];
             lm = std::sqrt((L[3] - l0[0]) * (L[3] - l0[0]) + (L[7] - l0[1]) * (L[7] - l0[1]) + (L[11] - l0[2]) * (L[11] - l0[2])) * 1000.0f;
             worst_l = std::fmax(worst_l, lm);
+            float jp[3] = {};
+            if (jb)
+                for (int r = 0; r < 3; ++r) jp[r] = L[r * 4] * jb[0] + L[r * 4 + 1] * jb[1] + L[r * 4 + 2] * jb[2] + L[r * 4 + 3];
+            if (!have_l0) {
+                std::memcpy(L0, L, sizeof(L0));
+                std::memcpy(jp0, jp, sizeof(jp0));
+                have_l0 = true;
+            }
+            float DL[12];
+            rel_set(L0, L, DL);
+            jd = angle_of(DL);
+            jm = std::sqrt((jp[0] - jp0[0]) * (jp[0] - jp0[0]) + (jp[1] - jp0[1]) * (jp[1] - jp0[1]) + (jp[2] - jp0[2]) * (jp[2] - jp0[2])) * 1000.0f;
+            worst_jm = std::fmax(worst_jm, jm);
+            worst_jd = std::fmax(worst_jd, jd);
+            if (g_parts[i].snap_ok) {
+                float Sg[12], DS[12];
+                mul34(gi, g_parts[i].snap, Sg);
+                if (!have_s0) {
+                    std::memcpy(S0, Sg, sizeof(S0));
+                    have_s0 = true;
+                }
+                rel_set(S0, Sg, DS);
+                sdg = angle_of(DS);
+                smm = std::sqrt((Sg[3] - S0[3]) * (Sg[3] - S0[3]) + (Sg[7] - S0[7]) * (Sg[7] - S0[7]) + (Sg[11] - S0[11]) * (Sg[11] - S0[11])) * 1000.0f;
+                worst_sm = std::fmax(worst_sm, smm);
+                worst_sd = std::fmax(worst_sd, sdg);
+            }
+        }
+        float gm[3] = {};
+        if (g_parts[i].game_ok) {
+            const PartsSample& q = g_parts[i];
+            float A[12];  // the attachment with its origin at its joint (its skinning matrix's origin is the bind's, 1.2 m off)
+            std::memcpy(A, q.att, sizeof(A));
+            if (ajb)
+                for (int r = 0; r < 3; ++r) A[r * 4 + 3] = q.att[r * 4] * ajb[0] + q.att[r * 4 + 1] * ajb[1] + q.att[r * 4 + 2] * ajb[2] + q.att[r * 4 + 3];
+            float G[3][12];
+            rel_set(q.root, q.obj, G[0]);
+            rel_set(A, q.root, G[1]);
+            rel_set(A, q.obj, G[2]);
+            if (!have_g0) {
+                std::memcpy(G0, G, sizeof(G0));
+                have_g0 = true;
+            }
+            for (int r = 0; r < 3; ++r) {
+                float DG[12];
+                rel_set(G0[r], G[r], DG);
+                const float* a0 = G0[r];
+                const float* a1 = G[r];
+                gm[r] = std::sqrt((a1[3] - a0[3]) * (a1[3] - a0[3]) + (a1[7] - a0[7]) * (a1[7] - a0[7]) + (a1[11] - a0[11]) * (a1[11] - a0[11])) * 1000.0f;
+                worst_g[r][0] = std::fmax(worst_g[r][0], gm[r]);
+                worst_g[r][1] = std::fmax(worst_g[r][1], angle_of(DG));
+            }
         }
         if (k % 6 == 0) {
-            std::snprintf(b, sizeof(b), " %.1f/%.0f/%.0f/%.1f", an * 57.2958f, tl * 1000.0f, lm, g_parts[i].phase);
+            std::snprintf(b, sizeof(b), " %.1f/%.0f/%.0f/%.1f/%.0f/%.1f/%.0f/%.1f/%.0f/%.0f/%.0f", an * 57.2958f, tl * 1000.0f, lm, g_parts[i].phase, jm,
+                          jd, smm, sdg, gm[0], gm[1], gm[2]);
             series += b;
         }
     }
-    std::snprintf(b, sizeof(b), "parts post: worst %.2f deg %.1f mm, the left wrist on it %.1f mm (at first (%.1f %.1f %.1f) mm in the gun, at last (%.1f %.1f %.1f)) | deg/mm/left mm/clip:",
-                  worst_a, worst_t, worst_l, l0[0] * 1000.0f, l0[1] * 1000.0f, l0[2] * 1000.0f, ll[0] * 1000.0f, ll[1] * 1000.0f, ll[2] * 1000.0f);
+    std::snprintf(b, sizeof(b),
+                  "parts post: worst %.2f deg %.1f mm, the left wrist on it %.1f mm (at first (%.1f %.1f %.1f) mm in the gun, at last (%.1f %.1f %.1f)); "
+                  "the wrist joint on it %.1f mm %.2f deg, the snap's gun on the drawn gun %.1f mm %.2f deg; the game's gun: its object frame on "
+                  "its root %.1f mm %.2f deg, its root on the hand's attachment %.1f mm %.2f deg, its object frame on the attachment %.1f mm %.2f "
+                  "deg | deg/mm/left mm/clip:",
+                  worst_a, worst_t, worst_l, l0[0] * 1000.0f, l0[1] * 1000.0f, l0[2] * 1000.0f, ll[0] * 1000.0f, ll[1] * 1000.0f, ll[2] * 1000.0f,
+                  worst_jm, worst_jd, worst_sm, worst_sd, worst_g[0][0], worst_g[0][1], worst_g[1][0], worst_g[1][1], worst_g[2][0], worst_g[2][1]);
     return b + series;
 }
 
@@ -1728,6 +1830,10 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         for (int k = 0; k < 3; ++k) o[k] = m[k * 4] * j[0] + m[k * 4 + 1] * j[1] + m[k * 4 + 2] * j[2] + m[k * 4 + 3];
     };
     g_corr.assign(n, Corr{{1, 0, 0, 0, 1, 0, 0, 0, 1}, {0, 0, 0}});
+    if (slot == 0 && g_rig.att_wrist[1] >= 0 && g_rig.att_wrist[1] < n) {  // "skel parts post": the game's gun hand attachment
+        std::memcpy(g_att_game, s + g_rig.att_wrist[1] * 12, sizeof(g_att_game));
+        g_att_game_ok = true;
+    }
     // the knuckle check (the transplant's, after the fingers below): the game's gripping hand's knuckles as animated
     float kn_g[3] = {0, 0, 0};
     bool kn_ok = false;
@@ -2330,9 +2436,15 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                     mul3(cr.A, Gs, Gd);
                     corr_point(cr, gs_o, gd_o);
                     {  // [Reload] LeverParts: the drawn gun held still in the gun hand's target through John's fire
-                       // clip, as its draw is (this frame's: the clip swings it fast)
-                        static float G2[12];
-                        static bool g2_ok = false;
+                       // clip, as its draw is (this frame's: the clip swings it fast). Kept per set (2026-10-10: one for
+                       // both, the previous frame's set wrote it last, its gun this frame's against last frame's offset:
+                       // through each clip the front hand held off the drawn gun by the player's motion in a frame, on
+                       // horseback up to 80 mm)
+                        static float G2s[2][12];
+                        static bool g2_oks[2] = {};
+                        const int g2i = slot && !g_clip_shared_test.load(std::memory_order_relaxed) ? 1 : 0;
+                        float* G2 = G2s[g2i];
+                        bool& g2_ok = g2_oks[g2i];
                         if (!mir && f.ik[1] && (worked_flags() & kSteady)) {
                             float T[12], F[12], ti[12], X[12];
                             for (int i = 0; i < 3; ++i) {
@@ -4544,7 +4656,8 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                                 g_parts_auto_weapon = api::actor_state(&ast) ? ast.weapon : -1;
                                 g_parts_rec = true;
                             }
-                            if (g_parts_rec.load(std::memory_order_relaxed)) record_parts(sm, count, g_body_frame);
+                            if (g_parts_rec.load(std::memory_order_relaxed))
+                                record_parts(sm, count, g_body_frame, rc, reinterpret_cast<const float*>(mset + 0x10));
                             float drv[kDrvCount];
                             int gw = -1;
                             unsigned mask = actions::gun_drivers(&gw, drv);
@@ -4703,12 +4816,19 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                             pose_to34(hp_pose, m);
                             follow_obj(1, hp_john, m);
                         }
-                        if (hi >= 0 && !rec_matrix && g_parts_n > 0 && g_parts_frame == g_body_frame && !g_parts[g_parts_n - 1].post_ok) {
+                        // as drawn in an eye's pass (2026-10-10: the frame's first draw is the shadow pre-pass's, pass 0)
+                        if (hi >= 0 && !rec_matrix && g_parts_n > 0 && g_parts_frame == g_body_frame && !g_parts[g_parts_n - 1].post_ok &&
+                            ((t_draw_pass & 7) == 1 || (t_draw_pass & 7) == 3)) {
                             PartsSample& ps = g_parts[g_parts_n - 1];
                             const float* po = reinterpret_cast<const float*>(mset + 0x10);
                             std::memcpy(ps.post, sm, sizeof(ps.post));
                             for (int k = 0; k < 3; ++k) ps.post[k * 4 + 3] += po[k] - g_player_offset[k];
                             std::memcpy(ps.left, g_steady[0].Sw, sizeof(ps.left));
+                            ps.snap_ok = g_points.gun_frame_ok;
+                            for (int i = 0; i < 3; ++i) {
+                                for (int j = 0; j < 3; ++j) ps.snap[i * 4 + j] = g_points.gun_frame_R[i * 3 + j];
+                                ps.snap[i * 4 + 3] = g_points.gun_frame_o[i] - g_player_offset[i];
+                            }
                             ps.post_ok = true;
                         }
                         if (hi >= 0 && hsm && copy_maps(*hsm, c, &cj.Tw, &cj.Ts) && (rec_matrix || best < static_cast<int>(g_corr_set.size()))) {
@@ -5803,6 +5923,10 @@ std::string command(const std::string& line) {
         g_snap_drawn_cfg = line.find(" snapdrawn on") != std::string::npos;
         return std::string("the snap from the gun as drawn with FixedGunGrip ") + (g_snap_drawn_cfg.load() ? "on" : "off") + " (frames " +
                std::to_string(g_snap_drawn_frames.load()) + ")";
+    }
+    if (sub == "two" && line.find(" clipshared ") != std::string::npos) {  // skel two clipshared on|off: the old shared hold (a test)
+        g_clip_shared_test = line.find(" clipshared on") != std::string::npos;
+        return std::string("the snap's fire-clip hold ") + (g_clip_shared_test.load() ? "shared by both sets (the old fault, a test)" : "per set");
     }
     if (sub == "two" && line.find(" steady ") != std::string::npos) {  // skel two steady on|off: TwoHandedSteady (the session only)
         g_same_frame_cfg = line.find(" steady on") != std::string::npos;

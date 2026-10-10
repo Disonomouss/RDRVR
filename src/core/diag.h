@@ -30,5 +30,12 @@ void dump_recorder();
 // only for its context: no unwind); the threads that used over 10% of a core meanwhile logged with their commonest RIPs
 // ("[sample] ..."). Returns a one-line summary.
 std::string sample_threads(int n);
+// "stacks <render|playback> [n]" (the single-pass study): n samples, 1-3 ms apart, of the render (recording) or the
+// playback thread's whole stack, unwound after the thread runs on, counted per function (inclusive and self) and per
+// scene phase (frame_probe::phase). Runs on its own thread; "[stack]" lines in the log, the last "... done".
+std::string sample_stacks(const char* which, int n);
+// "affinity same|split|off" (the single-pass study): the render and playback threads pinned to one P-core's two
+// logical processors (2, 3), to two P-cores (2, 4), or back to their masks. Test only.
+std::string set_affinity(const char* mode);
 
 }  // namespace rdrvr::diag

@@ -15,6 +15,7 @@
 #include "core/config.h"
 #include "core/d3d_hooks.h"
 #include "core/eye_shape.h"
+#include "core/frame_probe.h"
 #include "core/ring_probe.h"
 #include "core/hooks.h"
 #include "core/taa.h"
@@ -50,10 +51,14 @@ thread_local int t_rain_draws = 0;          // rain draws so far in this double 
 
 enum Split {
     kGrass, kGust, kLights, kForest, kPost, kMasks, kExposure, kRain, kPfxMap, kGodRays, kDamage, kClouds, kSunVis, kHold,
-    kSplitCount
+    kShadows, kShadowUnion, kSplitCount
 };
 const char* const kSplitName[kSplitCount] = {"grass",   "gust",   "lights", "forest", "post",   "masks",  "exposure",
-                                             "rain",    "pfxmap", "godrays", "damage", "clouds", "sunvis", "hold"};
+                                             "rain",    "pfxmap", "godrays", "damage", "clouds", "sunvis", "hold",
+                                             "shadows", "shadowunion"};
+// the splits off unless the ini turns them on: a measurement aid and the shared shadows' test control (the shared shadows
+// themselves on since the headset session of 2026-10-10)
+bool split_default(int i) { return i != kHold && i != kShadowUnion; }
 std::atomic<bool> g_on[kSplitCount];
 std::atomic<uint64_t> g_applied[kSplitCount];
 bool g_masks_hooked = false;
@@ -68,6 +73,18 @@ using SemRelease_t = bool (*)(void* sem);
 SemWait_t o_SemWait = nullptr;
 SemRelease_t o_SemRelease = nullptr;
 uintptr_t g_wait_ret = 0, g_release_ret = 0, g_ui_wait_ret = 0;
+// The single-pass probe's other wait sites (frame_probe.h): RenderFrame's +0x40 (two) and +0x80, PreRender's +0x18 on
+// the main thread, the playback loop's idle wait
+uintptr_t g_lock_ret_a = 0, g_lock_ret_b = 0, g_frame_wait_ret = 0, g_main_wait_ret = 0, g_play_wait_ret = 0;
+
+// A timed wait for the probe; the main thread's frame mark after its wait for the render thread
+bool timed_wait(void* sem, int timeout, frame_probe::Slot s) {
+    const double t0 = log::now_ms();
+    const bool got = o_SemWait(sem, timeout);
+    frame_probe::add(s, log::now_ms() - t0);
+    if (s == frame_probe::kMainWait) frame_probe::thread_frame(frame_probe::kMain);
+    return got;
+}
 std::atomic<uint64_t> g_skipped_waits{0}, g_skipped_releases{0}, g_ui_taken{0}, g_ui_skipped{0}, g_ui_timeouts{0},
     g_post_skipped{0};
 std::atomic<bool> g_dlss_first_eye{true};  // [Render] DlssFirstEye: the first-eye post run under DLSS (technique 5)
@@ -78,6 +95,8 @@ bool hk_SemWait(void* sem, int timeout) {
         bool got = true;
         if (t_pass == 2)
             g_skipped_waits.fetch_add(1, std::memory_order_relaxed);  // the first pass already waited for this frame's data
+        else if (frame_probe::on())
+            got = timed_wait(sem, timeout, frame_probe::kDataWait);
         else
             got = o_SemWait(sem, timeout);
         // The frame's data is in (PreRender's TAA update for the tick is done) and the viewport holds the pass's camera.
@@ -89,6 +108,13 @@ bool hk_SemWait(void* sem, int timeout) {
         g_ui_skipped.fetch_add(1, std::memory_order_relaxed);
         return true;  // taken between the passes, for the first eye's post run
     }
+    if (frame_probe::on()) {
+        if (ret == g_ui_wait_ret) return timed_wait(sem, timeout, frame_probe::kUiWait);
+        if (ret == g_play_wait_ret) return timed_wait(sem, timeout, frame_probe::kPlayIdle);
+        if (ret == g_lock_ret_a || ret == g_lock_ret_b) return timed_wait(sem, timeout, frame_probe::kLockWait);
+        if (ret == g_frame_wait_ret) return timed_wait(sem, timeout, frame_probe::kFrameWait);
+        if (ret == g_main_wait_ret) return timed_wait(sem, timeout, frame_probe::kMainWait);
+    }
     return o_SemWait(sem, timeout);
 }
 
@@ -98,6 +124,69 @@ bool hk_SemRelease(void* sem) {
         return true;  // the second pass releases, once
     }
     return o_SemRelease(sem);
+}
+
+// ---- the shared shadow passes (dual_pass.h shadows_wanted; research\sps\measure.md, step 2). Each renderer is keyed
+// on its one call site in SceneRender's tree; any other caller (another shadow object's virtual render) runs as is.
+// All three are draw paths that refill nothing (read in Ghidra: no pool, queue or ring is returned to there), so
+// running them once a frame is what a mono frame does.
+using CascadeRender_t = void (*)(void* cascades, void* a2, void* light_dir, void* a4, uint64_t a5);
+// every register argument forwarded (the spot renderer's prologue keeps r9b: a fourth one)
+using FacesRender_t = void (*)(void* faces, void* a2, void* a3, void* a4);
+using SpotRender_t = void (*)(void* spot, void* a2, void* params, void* a4);
+using SetCurrent_t = void* (*)(void* vp, char push, void* p3, char p4);
+CascadeRender_t o_CascadeRender = nullptr;
+FacesRender_t o_FacesRender = nullptr;
+SpotRender_t o_SpotRender = nullptr;
+enum ShadowKind { kCascades, kFaces, kSpot, kShadowKinds };
+const char* const kShadowName[kShadowKinds] = {"cascades", "faces", "spot"};
+uintptr_t g_shadow_ret[kShadowKinds] = {};
+thread_local bool t_shadow_done[kShadowKinds] = {};  // this double frame's first pass ran it with the union viewport
+std::atomic<uint64_t> g_shadow_union[kShadowKinds], g_shadow_skipped[kShadowKinds], g_shadow_no_union[kShadowKinds];
+
+// The pass's handling of shadow renderer k; true: the caller runs the original with the eye's viewport (as vanilla)
+enum class ShadowAct { Original, Skip, Union };
+ShadowAct shadow_act(int k, uintptr_t ret) {
+    if (ret != g_shadow_ret[k] || t_pass == 0) return ShadowAct::Original;
+    const bool share = g_on[kShadows].load(std::memory_order_relaxed);
+    if (!share && !g_on[kShadowUnion].load(std::memory_order_relaxed)) return ShadowAct::Original;
+    if (t_pass == 2 && share && t_shadow_done[k]) return ShadowAct::Skip;
+    if (!camera_lever::shadow_union_vp()) {
+        g_shadow_no_union[k].fetch_add(1, std::memory_order_relaxed);
+        return ShadowAct::Original;  // no union this frame (no XR pose): both passes as vanilla
+    }
+    return ShadowAct::Union;
+}
+template <class Run>
+void shadow_run(int k, ShadowAct act, Run run) {
+    if (act == ShadowAct::Skip) {
+        g_shadow_skipped[k].fetch_add(1, std::memory_order_relaxed);
+        g_applied[kShadows].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (act == ShadowAct::Original) {
+        run();
+        return;
+    }
+    auto set_current = reinterpret_cast<SetCurrent_t>(anchors::addr(Id::ViewportSetCurrent));
+    void* eye = set_current(camera_lever::shadow_union_vp(), 1, nullptr, 0);  // the union's globals pushed
+    run();
+    set_current(eye, 1, nullptr, 0);  // the eye's viewport and globals again, as after any shared pass
+    if (t_pass == 1) t_shadow_done[k] = true;
+    g_shadow_union[k].fetch_add(1, std::memory_order_relaxed);
+    g_applied[kShadowUnion].fetch_add(1, std::memory_order_relaxed);
+}
+void hk_CascadeRender(void* cascades, void* a2, void* light_dir, void* a4, uint64_t a5) {
+    const ShadowAct act = shadow_act(kCascades, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    shadow_run(kCascades, act, [&] { o_CascadeRender(cascades, a2, light_dir, a4, a5); });
+}
+void hk_FacesRender(void* faces, void* a2, void* a3, void* a4) {
+    const ShadowAct act = shadow_act(kFaces, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    shadow_run(kFaces, act, [&] { o_FacesRender(faces, a2, a3, a4); });
+}
+void hk_SpotRender(void* spot, void* a2, void* params, void* a4) {
+    const ShadowAct act = shadow_act(kSpot, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    shadow_run(kSpot, act, [&] { o_SpotRender(spot, a2, params, a4); });
 }
 
 // ---- split state (the grass agent's study, ENGINE-NOTES item 6)
@@ -704,7 +793,7 @@ void first_eye_post(void* renderer) {
     // cycle; the timeout keeps a wrong assumption from hanging the game.
     if (global<uint64_t>(Id::UiWaitGate) == 0) {
         if (void* sem = at<void*>(renderer, 0x38)) {
-            if (!o_SemWait(sem, 500)) {
+            if (!(frame_probe::on() ? timed_wait(sem, 500, frame_probe::kUiWaitMid) : o_SemWait(sem, 500))) {
                 g_ui_timeouts.fetch_add(1, std::memory_order_relaxed);
                 log::limited("dual.uiwait", 8, "[dual] UI data not ready within 500 ms: no first-eye post run this frame");
                 return;
@@ -753,9 +842,14 @@ bool install() {
     g_release_ret = anchors::addr(Id::SceneReleaseReturn);
     g_ui_wait_ret = anchors::addr(Id::FrameUiWaitReturn);
     g_adapt_ret = anchors::addr(Id::AdaptDrawReturn);
+    g_lock_ret_a = anchors::addr(Id::FrameLockWaitReturnA);
+    g_lock_ret_b = anchors::addr(Id::FrameLockWaitReturnB);
+    g_frame_wait_ret = anchors::addr(Id::FrameDataWaitReturn);
+    g_main_wait_ret = anchors::addr(Id::MainFrameWaitReturn);
+    g_play_wait_ret = anchors::addr(Id::PlaybackWaitReturn);
     for (int i = 0; i < kSplitCount; ++i) {
         std::string key = std::string("Split_") + kSplitName[i];
-        g_on[i] = config::get_bool("Stereo", key.c_str(), i != kHold);
+        g_on[i] = config::get_bool("Stereo", key.c_str(), split_default(i));
     }
     bool ok = hooks::install("RDR semaphore wait", reinterpret_cast<void*>(anchors::addr(Id::SemWait)), hk_SemWait,
                              &o_SemWait);
@@ -772,6 +866,18 @@ bool install() {
                         &o_ForestFrame) &&
          ok;
     rdrvr_draw_masks_on = g_on[kMasks].load() ? 1 : 0;
+    g_shadow_ret[kCascades] = anchors::addr(Id::CascadeRenderReturn);
+    g_shadow_ret[kFaces] = anchors::addr(Id::FacesRenderReturn);
+    g_shadow_ret[kSpot] = anchors::addr(Id::SpotRenderReturn);
+    ok = hooks::install("RDR sun cascades render (shared shadows)", reinterpret_cast<void*>(anchors::addr(Id::CascadeRender)),
+                        hk_CascadeRender, &o_CascadeRender) &&
+         ok;
+    ok = hooks::install("RDR light faces render (shared shadows)", reinterpret_cast<void*>(anchors::addr(Id::FacesRender)),
+                        hk_FacesRender, &o_FacesRender) &&
+         ok;
+    ok = hooks::install("RDR spot shadows render (shared shadows)", reinterpret_cast<void*>(anchors::addr(Id::SpotRender)),
+                        hk_SpotRender, &o_SpotRender) &&
+         ok;
     ok = hooks::install("RDR PostFx run (exposure)", reinterpret_cast<void*>(anchors::addr(Id::PostRun)), hk_PostRun,
                         &o_PostRun) &&
          ok;
@@ -810,6 +916,19 @@ bool install() {
 
 int pass() { return t_pass; }
 
+void shadow_status(char* out, size_t len) {
+    size_t n = static_cast<size_t>(std::snprintf(out, len, "shadows %s, shadowunion %s, union viewport %s |",
+                                                 g_on[kShadows].load() ? "on" : "off", g_on[kShadowUnion].load() ? "on" : "off",
+                                                 camera_lever::shadow_union_vp() ? "built" : "none"));
+    for (int k = 0; k < kShadowKinds && n < len; ++k)
+        n += static_cast<size_t>(std::snprintf(out + n, len - n, " %s union %llu skipped %llu no union %llu;", kShadowName[k],
+                                               static_cast<unsigned long long>(g_shadow_union[k].load()),
+                                               static_cast<unsigned long long>(g_shadow_skipped[k].load()),
+                                               static_cast<unsigned long long>(g_shadow_no_union[k].load())));
+}
+
+bool shadows_wanted() { return g_on[kShadows].load(std::memory_order_relaxed) || g_on[kShadowUnion].load(std::memory_order_relaxed); }
+
 int post_slot() { return t_pass == 1 ? 0 : t_double ? 1 : 2; }
 
 void begin_frame(void*) {
@@ -818,6 +937,7 @@ void begin_frame(void*) {
     t_ui_wait_taken = false;
     t_exposure_kept = false;
     t_double = true;
+    for (bool& d : t_shadow_done) d = false;
     t_adapt_draws = 0;
     t_rain_draws = 0;
     int armed = 1;
@@ -894,6 +1014,12 @@ bool set_split(const char* name, bool on) {
     return false;
 }
 
+bool split_on(const char* name) {
+    for (int i = 0; i < kSplitCount; ++i)
+        if (std::strcmp(name, kSplitName[i]) == 0) return g_on[i].load();
+    return false;
+}
+
 void status_text(char* out, size_t len) {
     size_t n = static_cast<size_t>(std::snprintf(
         out, len, "skipped waits %llu releases %llu | ui wait taken %llu skipped %llu timeouts %llu | post not run %llu |"
@@ -919,6 +1045,11 @@ void status_text(char* out, size_t len) {
     for (int i = 0; i < kSplitCount && n < len; ++i)
         n += static_cast<size_t>(std::snprintf(out + n, len - n, " %s %s %llu", kSplitName[i], g_on[i].load() ? "on" : "off",
                                                static_cast<unsigned long long>(g_applied[i].load())));
+    for (int k = 0; k < kShadowKinds && n < len; ++k)
+        n += static_cast<size_t>(std::snprintf(out + n, len - n, "%s %s union %llu skipped %llu no union %llu", k ? "," : " |",
+                                               kShadowName[k], static_cast<unsigned long long>(g_shadow_union[k].load()),
+                                               static_cast<unsigned long long>(g_shadow_skipped[k].load()),
+                                               static_cast<unsigned long long>(g_shadow_no_union[k].load())));
 }
 
 }  // namespace rdrvr::dual_pass

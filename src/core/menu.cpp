@@ -37,6 +37,7 @@
 #include "core/controls.h"
 #include "core/d3d_hooks.h"
 #include "core/dual_pass.h"
+#include "core/playback.h"
 #include "core/eye_shape.h"
 #include "core/hands.h"
 #include "core/log.h"
@@ -615,6 +616,17 @@ void page_general() {
         if (!eye_shape::set_enabled(eye, true)) note("Not available: the hooks it needs are not installed (see the log).");
     }
     sub_end();
+    // [XR] EyeShapeDlss (2026-10-10, the user's request after round 15 check 31): the same under DLSS, from the next start
+    sub_begin(g_set.aa == 3);
+    bool eyed = eye_shape::dlss_saved();
+    if (check("Eyes in the headset's shape with DLSS", &eyed,
+              "With DLSS: each eye rendered smaller and in the headset's own shape, and DLSS upscales it into an eye-shaped "
+              "image: fewer pixels for the same sharpness (in a headset session, a quarter less GPU time at 3926x2208). The "
+              "eye images take their size at the start: from the next start."))
+        eye_shape::set_dlss_next_start(eyed);
+    if (g_set.aa == 3 && render_settings::forced_aa() == 3 && eye_shape::dlss_saved() != eye_shape::dlss_running())
+        note("Restart the game to apply.");
+    sub_end();
     // [Render] RenderResolution: the game's frame at a headset's height, apart from the monitor (from the next start)
     heading("Resolution");
     {  // 2026-10-09: the headset first, then its size at 100%, 150% or 200% of its pixels
@@ -681,6 +693,32 @@ void page_general() {
         if (xr::frame_resized()) note("The game's frame changed size while running (its Graphics menu): restart the game for the VR view.");
         else if (want != run || (want && (want_w != run_w || want_h != run_h))) note("Restart the game to apply.");
     }
+    // [Stereo] Split_shadows (the single-pass study, step 2): the shadows drawn once a frame, fitted for both eyes
+    heading("Performance");
+    bool shared = dual_pass::split_on("shadows");
+    if (check("Shadows drawn once for both eyes", &shared,
+              "The sun's, the lamps' and the spot lights' shadows drawn once a frame, fitted for both eyes, instead of once per "
+              "eye: about 0.9 ms less CPU and a little GPU a frame. The shadows' edges can move by a texel. Off draws them "
+              "per eye, as before.")) {
+        dual_pass::set_split("shadows", shared);
+        config::set("Stereo", "Split_shadows", shared ? "1" : "0");
+    }
+    // [Render] PlaybackBatch (the single-pass study): the game's playback thread takes the recorded work in batches
+    bool batched = playback::batch() >= 1;
+    if (check("Batched hand-off to the GPU thread", &batched,
+              "The game's render thread hands its recorded work to its D3D12 thread in batches instead of one command at a "
+              "time (the two threads otherwise trade one cache line on every command): about 2.5-3 ms less CPU a frame, "
+              "nothing drawn differently. Off: one at a time, as the game does.")) {
+        if (playback::installed()) {
+            playback::set_batch(batched ? 256 : 0);
+            config::set("Render", "PlaybackBatch", batched ? "256" : "0");
+        } else {
+            batched = false;
+        }
+    }
+    if (!playback::installed())
+        note(config::get_int("Render", "PlaybackBatch", 256) < 0 ? "Off from the start ([Render] PlaybackBatch=-1): set it to 256 and restart to use it."
+                                                                  : "Not running on this game build (RDRVR.log's [playback] line says why).");
 }
 
 void page_comfort() {
