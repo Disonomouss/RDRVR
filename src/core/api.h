@@ -25,6 +25,9 @@ bool plugin_attached();
 // v7: the calling thread is inside the plugin's script tick (on_script_tick seen on this thread and end_script_tick not
 // yet): the game thread, where the plugin runs natives and the core may call into the game (gun_melee_hit).
 bool in_script_tick();
+// A function the core runs at the start of each script tick, on the game thread, before the tick's requests (one: the
+// reticle's barrel probe, aim.cpp). It may queue natives; their results come in the same tick.
+void set_tick_hook(void (*hook)());
 // A native with no arguments called on every script tick (state queries such as IS_GAME_PAUSED), its latest result
 // kept: up to 8. Returns the watch index, or -1 when full.
 int watch_native(uint32_t hash, uint64_t arg0 = 0, uint32_t argc = 0);  // argc 0 or 1 (arg0: e.g. a static string's address)

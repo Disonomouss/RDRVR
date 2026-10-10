@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.2 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.3 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -78,8 +78,10 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   hand makes the second your gun in hand (before, every holster refused that hand).
 - Shots leave the barrel of the gun in your hand; the right trigger alone fires; the gun stays drawn until you put it
   away.
-- An optional reticle where the shot will land, from the game's own aim (off by default: the Hands tab), a ring or
-  a dot (new in 0.5.0).
+- An optional reticle where the shot will land (off by default: the Hands tab), a ring or a dot (new in 0.5.0). Since
+  0.8.3 it shows whenever a gun is in hand, in Dead Eye too, found by a line test along the barrel each game tick, and it
+  turns red only while you aim and the game's target actor is under it (it could stay red before). Tried in the
+  developer's simulator, not yet in a headset; turning red on a person not yet tried.
 - Holsters you grab: hips, back, left shoulder, belt, lower back, chest (rounds); a weapon chosen per holster; each
   holster movable and resizable. They are fixed to your headset's position, so they stay with you as you step,
   crouch and lean (or to John's body: the Holsters tab).
@@ -165,7 +167,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.2.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.3.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -262,7 +264,7 @@ Fits John's hands and arms to your controllers and sets how the gun in your hand
 | ↳ **Longest arm** | The longest an arm may stretch, as a multiple of John's arm length (1.0 to 1.6). | 1.60× |
 | **Wrist offset** | How far back from the controller's grip John's wrist sits, 5 mm per press. | 0.065 m |
 | **Hand pitch / Hand yaw / Hand roll** | Tilts, turns and rolls John's hand against the controller, 2° per press (mirrored for the left hand). | -68° / 0° / 0° |
-| **Reticle where the shot lands** | While aiming, shows a reticle where the bullet will hit; it turns red over a person or animal. | Off |
+| **Reticle where the shot lands** | With a gun in hand (lowered, raised or in Dead Eye; since 0.8.3, before only while aiming), shows a reticle where the bullet will hit, found by a line test along the barrel; it turns red while you aim at a person or animal (that part not yet tried). | Off |
 | ↳ **Ring and dot / Dot only** | The reticle's look. | Ring and dot |
 | **Keep the gun drawn** | A drawn gun stays in your hand until you put it away, instead of being holstered 3 seconds after your last shot. | On |
 | **No executions up close** | Pulling the trigger close to someone fires the gun, so no third-person execution, pistol whip or butt strike starts. | On |

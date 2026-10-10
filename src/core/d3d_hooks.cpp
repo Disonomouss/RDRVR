@@ -802,6 +802,20 @@ HRESULT WINAPI hk_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REF
         ID3D12Device* dev = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&dev))) && dev) {
             log::info("[d3d] device %p created", static_cast<void*>(dev));
+            {  // single-pass stereo, view instancing (research\sps): what the device offers (two read-only queries)
+                D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
+                const bool o3_ok = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3)));
+                D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_7};
+                HRESULT smr = E_FAIL;
+                for (D3D_SHADER_MODEL m : {D3D_SHADER_MODEL_6_7, D3D_SHADER_MODEL_6_6, D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_4,
+                                           D3D_SHADER_MODEL_6_3, D3D_SHADER_MODEL_6_2, D3D_SHADER_MODEL_6_1, D3D_SHADER_MODEL_6_0}) {
+                    sm.HighestShaderModel = m;
+                    if (SUCCEEDED(smr = dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) break;
+                }
+                log::info("[d3d] view instancing tier %d%s, highest shader model %#x%s", o3_ok ? static_cast<int>(o3.ViewInstancingTier) : -1,
+                          o3_ok ? "" : " (OPTIONS3 not answered)", SUCCEEDED(smr) ? static_cast<unsigned>(sm.HighestShaderModel) : 0u,
+                          SUCCEEDED(smr) ? "" : " (not answered)");
+            }
             {
                 std::lock_guard lock(g_made_mutex);
                 if (g_n_made < 16) g_made[g_n_made++] = dev;  // the pointer only, for made_here

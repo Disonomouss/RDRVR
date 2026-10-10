@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/config.h"
 #include "core/d3d_hooks.h"
 #include "core/hooks.h"
 #include "core/log.h"
@@ -64,7 +65,58 @@ void record(void* pso, const D3D12_SHADER_BYTECODE& vs) {
     }
 }
 
+// [Debug] ShaderSwap=<folder> (single-pass stereo step 4, test only): at the start, every <16 hex digits>.dxil file there
+// is a replacement for the vertex shader of that hash (fnv of its bytecode, as "pso dump" names them); a pipeline made
+// with that vertex shader is made with the replacement instead, or with the game's own if that fails. Read-only map
+// after load_swaps().
+std::unordered_map<uint64_t, std::vector<uint8_t>> g_swap;
+std::atomic<uint64_t> g_swaps{0}, g_swap_fails{0};
+void load_swaps() {
+    const std::string dir = config::get_string("Debug", "ShaderSwap", "");
+    if (dir.empty()) return;
+    WIN32_FIND_DATAA fd{};
+    HANDLE h = FindFirstFileA((dir + "\\*.dxil").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        log::warn("[pso] ShaderSwap: no .dxil files in %s", dir.c_str());
+        return;
+    }
+    do {
+        const std::string name = fd.cFileName;
+        if (name.size() != 16 + 5) continue;
+        const uint64_t hash = std::strtoull(name.substr(0, 16).c_str(), nullptr, 16);
+        FILE* f = nullptr;
+        if (!hash || fopen_s(&f, (dir + "\\" + name).c_str(), "rb") != 0 || !f) continue;
+        std::vector<uint8_t> b(fd.nFileSizeLow);
+        const size_t got = fread(b.data(), 1, b.size(), f);
+        fclose(f);
+        if (got == b.size() && b.size() > 32 && std::memcmp(b.data(), "DXBC", 4) == 0) g_swap.emplace(hash, std::move(b));
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    log::info("[pso] ShaderSwap: %zu replacement vertex shaders from %s", g_swap.size(), dir.c_str());
+}
+const std::vector<uint8_t>* swap_for(const D3D12_SHADER_BYTECODE& vs) {
+    if (g_swap.empty() || !vs.pShaderBytecode || !vs.BytecodeLength) return nullptr;
+    auto it = g_swap.find(fnv(vs.pShaderBytecode, vs.BytecodeLength));
+    return it == g_swap.end() ? nullptr : &it->second;
+}
+
 HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out) {
+    if (d && out) {
+        if (const std::vector<uint8_t>* r = swap_for(d->VS)) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC d2 = *d;
+            d2.VS = {r->data(), r->size()};
+            const HRESULT hs = o_CreateGraphics(dev, &d2, riid, out);
+            if (SUCCEEDED(hs) && *out) {
+                g_swaps.fetch_add(1, std::memory_order_relaxed);
+                g_graphics.fetch_add(1, std::memory_order_relaxed);
+                record(*out, d->VS);  // counted under the game's own hash
+                return hs;
+            }
+            g_swap_fails.fetch_add(1, std::memory_order_relaxed);
+            log::warn("[pso] ShaderSwap: the replacement for %016llx refused (%#lx): the game's own used",
+                      static_cast<unsigned long long>(fnv(d->VS.pShaderBytecode, d->VS.BytecodeLength)), static_cast<unsigned long>(hs));
+        }
+    }
     HRESULT hr = o_CreateGraphics(dev, d, riid, out);
     if (SUCCEEDED(hr) && d && out && *out) {
         g_graphics.fetch_add(1, std::memory_order_relaxed);
@@ -94,6 +146,40 @@ bool subobject(UINT type, size_t* inner, bool* ptr) {
 }
 
 HRESULT STDMETHODCALLTYPE hk_CreateStream(ID3D12Device* dev, const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID riid, void** out) {
+    if (!g_swap.empty() && d && out && d->pPipelineStateSubobjectStream && d->SizeInBytes) {  // [Debug] ShaderSwap: a copy of the stream
+        std::vector<uint8_t> copy(static_cast<const uint8_t*>(d->pPipelineStateSubobjectStream),
+                                  static_cast<const uint8_t*>(d->pPipelineStateSubobjectStream) + d->SizeInBytes);
+        uint8_t* p = copy.data();
+        uint8_t* end = p + copy.size();
+        D3D12_SHADER_BYTECODE orig{};
+        const std::vector<uint8_t>* r = nullptr;
+        while (p + 4 <= end) {
+            UINT type = *reinterpret_cast<const UINT*>(p);
+            size_t inner = 0;
+            bool ptr = false;
+            if (!subobject(type, &inner, &ptr)) break;
+            size_t off = ptr ? 8 : 4;
+            if (type == 1) {
+                auto* bc = reinterpret_cast<D3D12_SHADER_BYTECODE*>(p + off);
+                orig = *bc;
+                if ((r = swap_for(*bc)) != nullptr) *bc = {r->data(), r->size()};
+                break;
+            }
+            p += (off + inner + 7) & ~size_t(7);
+        }
+        if (r) {
+            D3D12_PIPELINE_STATE_STREAM_DESC d2{copy.size(), copy.data()};
+            const HRESULT hs = o_CreateStream(dev, &d2, riid, out);
+            if (SUCCEEDED(hs) && *out) {
+                g_swaps.fetch_add(1, std::memory_order_relaxed);
+                g_stream.fetch_add(1, std::memory_order_relaxed);
+                record(*out, orig);
+                return hs;
+            }
+            g_swap_fails.fetch_add(1, std::memory_order_relaxed);
+            log::warn("[pso] ShaderSwap: a stream replacement refused (%#lx): the game's own used", static_cast<unsigned long>(hs));
+        }
+    }
     HRESULT hr = o_CreateStream(dev, d, riid, out);
     if (SUCCEEDED(hr) && d && out && *out && d->pPipelineStateSubobjectStream) {
         g_stream.fetch_add(1, std::memory_order_relaxed);
@@ -158,6 +244,11 @@ void on_frame_end(uint64_t) {
 }  // namespace
 
 void install_device_hooks(ID3D12Device* dev) {
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        load_swaps();
+    }
     hooks::install("ID3D12Device::CreateGraphicsPipelineState", hooks::vtable_entry(dev, 10), hk_CreateGraphics, &o_CreateGraphics);
     ID3D12Device2* d2 = nullptr;
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d2))) && d2) {
@@ -297,9 +388,10 @@ std::string command(const std::string& line) {
         v.assign(g_last.begin(), g_last.end());
     }
     std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
-    std::snprintf(buf, sizeof(buf), "pipelines: graphics %llu, stream %llu (unhashed %llu); %zu vertex shaders drew last frame:",
+    std::snprintf(buf, sizeof(buf), "pipelines: graphics %llu, stream %llu (unhashed %llu); swapped %llu (refused %llu); %zu vertex shaders drew last frame:",
                   static_cast<unsigned long long>(g_graphics.load()), static_cast<unsigned long long>(g_stream.load()),
-                  static_cast<unsigned long long>(g_unhashed.load()), v.size());
+                  static_cast<unsigned long long>(g_unhashed.load()), static_cast<unsigned long long>(g_swaps.load()),
+                  static_cast<unsigned long long>(g_swap_fails.load()), v.size());
     std::string out = buf;
     for (int i = 0; i < n && i < static_cast<int>(v.size()); ++i) {
         std::snprintf(buf, sizeof(buf), " %016llx:%llu", static_cast<unsigned long long>(v[i].first),

@@ -72,6 +72,25 @@ float g_shot_start[3] = {}, g_shot_dir[3] = {}, g_shot_err = -1;
 std::atomic<uint64_t> g_rays{0}, g_overrides{0}, g_no_gun{0}, g_no_hand{0}, g_fires{0}, g_swaps{0}, g_hand_rays{0};
 // the last override, for the status line (game thread writes, the test channel reads: torn reads are harmless)
 float g_last_muzzle[3] = {}, g_last_dir[3] = {}, g_last_offset[3] = {};
+// The reticle's own probe (2026-10-11, the user: "crosshair needs to be visible not just when aiming. Also needs to be
+// visible in dead eye. Also it sometimes gets stuck red even when not aimed at an enemy"). Before, the reticle came
+// only from the game's aim ray (hk_aim_ray, called while the game aims) and its target point and handle (stale outside
+// it). Now each script tick the drawn barrel's ray is probed with CAMERA_PROBE 0x720F2CA7 (handler 0x140355c20: args
+// [Result*][Sx Sy][Sz][Tx Ty][Tz][Owner][Flag], a by-value Vector3 packed in two slots; 1 on a hit and its point,
+// tests/sim/r13_probe.py), its result read on the next tick. Red only while the game aims and its own target point
+// agrees with the probe's hit.
+constexpr float kProbeRange = 300.0f;
+std::mutex g_rp_mutex;
+struct ReticleProbe {
+    float muzzle[3] = {}, dir[3] = {};
+    float dist = 0.0f;
+    bool hit = false;
+    double ms = 0.0;
+    int32_t tgt = 0;           // the game's target handle (targeting +0x3900) while it aims, and its GET_POSITION
+    float tgt_pos[3] = {};
+    double tgt_ms = 0.0;
+} g_rp;  // under g_rp_mutex
+std::atomic<uint64_t> g_rp_probes{0}, g_rp_hits{0}, g_rp_lost{0}, g_rp_nogun{0}, g_rp_nobarrel{0}, g_rp_red{0}, g_rp_unred{0};
 // the last barrel in the IK target's axes and the drawn wrist's, and the game's gun in its animated wrist's ("aim frames");
 // the first also for the frame end (barrel_in_target: the loading point, two-handed aim)
 float g_dir_target[3] = {}, g_dir_wrist[3] = {}, g_gun_anim[3] = {};
@@ -248,6 +267,120 @@ float* hk_aim_ray(uintptr_t self, float* out, const float* yp) {
     g_overrides.fetch_add(1, std::memory_order_relaxed);
     g_last_override_ms.store(log::now_ms(), std::memory_order_relaxed);
     return r;
+}
+
+// The drawn gun's barrel now (as hk_aim_ray places the shot): the muzzle and the direction. The game thread.
+bool barrel_ray(float muzzle[3], float dir[3]) {
+    float A[9], a[3];
+    bool ik = false;
+    if (!body::item_correction(1, A, a, &ik) || !ik) return false;
+    const uintptr_t actor = player_actor(), W = actor ? player_gun(actor) : 0;
+    float gm[16];
+    if (!W || !raw(W + 0x80, gm, sizeof(gm))) return false;
+    float rows[4][3];
+    for (int i = 0; i < 3; ++i)
+        for (int k = 0; k < 3; ++k) rows[i][k] = A[k * 3] * gm[i * 4] + A[k * 3 + 1] * gm[i * 4 + 1] + A[k * 3 + 2] * gm[i * 4 + 2];
+    for (int k = 0; k < 3; ++k) rows[3][k] = A[k * 3] * gm[12] + A[k * 3 + 1] * gm[13] + A[k * 3 + 2] * gm[14] + a[k];
+    uintptr_t info = 0;
+    float mo[3] = {0, 0, 0};
+    if (rd(W + 0x28, &info) && info && raw(info + 0x310, mo, sizeof(mo))) {
+        const float len2 = mo[0] * mo[0] + mo[1] * mo[1] + mo[2] * mo[2];
+        if (!(len2 < 1.0f)) mo[0] = mo[1] = mo[2] = 0;
+    }
+    float dl = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        muzzle[k] = rows[3][k] + rows[0][k] * mo[0] + rows[1][k] * mo[1] + rows[2][k] * mo[2];
+        dir[k] = -rows[2][k];
+        dl += dir[k] * dir[k];
+    }
+    if (!(dl > 0.98f && dl < 1.02f)) return false;  // also catches NaN
+    for (int k = 0; k < 3; ++k)
+        if (!std::isfinite(muzzle[k])) return false;
+    return true;
+}
+uint64_t f32bits(float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+uint64_t pack2(float x, float y) {
+    float xy[2] = {x, y};
+    uint64_t v = 0;
+    std::memcpy(&v, xy, sizeof(xy));
+    return v;
+}
+// Each script tick (api's tick hook): the last probe's result taken, a new one queued along the barrel now.
+void reticle_tick() {
+    static uint64_t pending = 0;
+    static double pending_ms = 0.0;
+    static float req_m[3], req_d[3];
+    const double now = log::now_ms();
+    if (pending) {
+        RdrvrNativeResult r{};
+        if (api::wait_native(pending, &r, 0)) {
+            pending = 0;
+            const bool hit = (r.value & 0xff) != 0;
+            float dd = 0.0f;
+            for (int k = 0; k < 3; ++k) dd += (r.vec[k] - req_m[k]) * (r.vec[k] - req_m[k]);
+            const float dist = hit && std::isfinite(dd) ? std::sqrt(dd) : kProbeRange;
+            std::lock_guard lock(g_rp_mutex);
+            std::memcpy(g_rp.muzzle, req_m, sizeof(req_m));
+            std::memcpy(g_rp.dir, req_d, sizeof(req_d));
+            g_rp.dist = dist > kProbeRange ? kProbeRange : dist;
+            g_rp.hit = hit;
+            g_rp.ms = now;
+            if (hit) g_rp_hits.fetch_add(1, std::memory_order_relaxed);
+        } else if (now - pending_ms > 500.0) {  // the plugin never ran it (a stall): given up
+            api::cancel_op(pending);
+            pending = 0;
+            g_rp_lost.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (pending || !g_reticle.load(std::memory_order_relaxed) || !g_barrel.load(std::memory_order_relaxed)) return;
+    RdrvrActorState st{};
+    if (!api::actor_state(&st) || !st.valid || !reload::is_gun(st.weapon)) {
+        g_rp_nogun.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    float m[3], d[3];
+    if (!barrel_ray(m, d)) {
+        g_rp_nobarrel.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const float t[3] = {m[0] + d[0] * kProbeRange, m[1] + d[1] * kProbeRange, m[2] + d[2] * kProbeRange};
+    const uint64_t args[7] = {0, pack2(m[0], m[1]), f32bits(m[2]), pack2(t[0], t[1]), f32bits(t[2]),
+                              static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), 0};
+    pending = api::queue_native(0x720F2CA7u, args, 7, 1);  // CAMERA_PROBE(Result*, Source, Target, Owner, 0)
+    pending_ms = now;
+    std::memcpy(req_m, m, sizeof(m));
+    std::memcpy(req_d, d, sizeof(d));
+    g_rp_probes.fetch_add(1, std::memory_order_relaxed);
+    // while the game aims: where its target actor is (the review of 0.8.3: its target point follows the barrel's ray,
+    // so only the actor's own position tells a stale handle from one under the reticle)
+    static uint64_t tpend = 0;
+    static int32_t treq = 0;
+    if (tpend) {
+        RdrvrNativeResult r{};
+        if (api::wait_native(tpend, &r, 0)) {
+            tpend = 0;
+            std::lock_guard lock(g_rp_mutex);
+            g_rp.tgt = treq;
+            std::memcpy(g_rp.tgt_pos, r.vec, sizeof(g_rp.tgt_pos));
+            g_rp.tgt_ms = now;
+        } else if (api::cancel_op(tpend)) {
+            tpend = 0;
+        }
+    }
+    if (!tpend && now - g_last_override_ms.load(std::memory_order_relaxed) < 150.0) {
+        const uintptr_t actor = player_actor();
+        uintptr_t T = 0;
+        int32_t h = 0;
+        if (actor && rd(actor + 0xb8, &T) && T && rd(T + 0x3900, &h) && h != 0 && h != -1) {
+            const uint64_t pa[2] = {static_cast<uint64_t>(static_cast<uint32_t>(h)), 0};
+            tpend = api::queue_native(0x99BD9D6Fu, pa, 2, 2);  // GET_POSITION(actor, Vector3*)
+            treq = h;
+        }
+    }
 }
 
 // FUN_1403237a0: the projectile launch, the one way player gun projectiles start (research\gc-aim.md 8-9):
@@ -1058,6 +1191,7 @@ void set_melee_strike(float k) { g_melee_strike = !(k >= 0.1f) ? 0.1f : k > 1.0f
 float melee_strike() { return g_melee_strike.load(); }
 
 bool install() {
+    api::set_tick_hook(reticle_tick);  // the reticle's barrel probe, each script tick
     g_quick_throw = config::get_bool("Gestures", "QuickThrow", true);
     g_grip_throw = config::get_bool("Gestures", "ThrowByGrip", false);
     g_knife_tip = config::get_bool("Gestures", "KnifeTip", true);
@@ -1122,32 +1256,35 @@ void set_reticle_dot(bool dot) {
 
 bool reticle_target(float pos[3], bool* on_actor, float* size_deg) {
     if (!g_reticle.load(std::memory_order_relaxed) || !g_barrel.load(std::memory_order_relaxed)) return false;
-    if (log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed) > 150.0) return false;  // not aiming along the barrel
     RdrvrActorState st{};
     if (!api::actor_state(&st) || !reload::is_gun(st.weapon)) return false;  // not the lasso, a thrown weapon or the fists
-    // only while the gun is up (the aim stance the trigger uses: holster::gun_raised), not lowered at the side
-    if (!holster::gun_raised()) return false;
-    const uintptr_t actor = player_actor();
-    uintptr_t T = 0;
-    float p[4];
-    int32_t handle = 0;
-    if (!actor || !rd(actor + 0xb8, &T) || !T || !raw(T + 0x3810, p, sizeof(p)) || !rd(T + 0x3900, &handle)) return false;
-    float m[3], d[3];
-    for (int k = 0; k < 3; ++k) m[k] = g_last_muzzle[k], d[k] = g_last_dir[k];
-    float v[3] = {p[0] - m[0], p[1] - m[1], p[2] - m[2]};
-    const float along = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
-    float off2 = 0.0f;
-    for (int k = 0; k < 3; ++k) {
-        const float e = v[k] - along * d[k];
-        off2 += e * e;
+    // the barrel's own probe (any time a gun is in hand: lowered, raised, in Dead Eye), fresh within 250 ms
+    ReticleProbe rp;
+    {
+        std::lock_guard lock(g_rp_mutex);
+        rp = g_rp;
     }
-    // on the barrel's line, ahead of the muzzle (the game's target point is the probe's hit along that line), and finite
-    if (!(along > 0.3f && along < 1200.0f) || !(off2 < 0.25f * 0.25f + 0.0004f * along * along)) {
-        g_reticle_offline.fetch_add(1, std::memory_order_relaxed);
-        return false;
+    const double now = log::now_ms();
+    if (now - rp.ms > 250.0) return false;
+    float hit[3];
+    for (int k = 0; k < 3; ++k) hit[k] = rp.muzzle[k] + rp.dir[k] * rp.dist;
+    std::memcpy(pos, hit, sizeof(hit));
+    // red: only while the game aims along the barrel (its aim ray fresh), at its current target handle, and with the
+    // probe's hit on that actor: within 1.2 m of its position across, from 0.3 m below it to 2.3 m above (y up: a
+    // person's or an animal's body). A stale handle, a lock elsewhere, a wall: white
+    bool red = false;
+    if (on_actor && rp.hit && now - g_last_override_ms.load(std::memory_order_relaxed) < 150.0) {
+        const uintptr_t actor = player_actor();
+        uintptr_t T = 0;
+        int32_t handle = 0;
+        if (actor && rd(actor + 0xb8, &T) && T && rd(T + 0x3900, &handle) && handle != 0 && handle != -1) {
+            const float dx = hit[0] - rp.tgt_pos[0], dy = hit[1] - rp.tgt_pos[1], dz = hit[2] - rp.tgt_pos[2];
+            red = handle == rp.tgt && now - rp.tgt_ms < 300.0 && std::isfinite(dx + dy + dz) && dx * dx + dz * dz < 1.2f * 1.2f && dy > -0.3f &&
+                  dy < 2.3f;
+            (red ? g_rp_red : g_rp_unred).fetch_add(1, std::memory_order_relaxed);
+        }
     }
-    std::memcpy(pos, p, sizeof(float) * 3);
-    if (on_actor) *on_actor = handle != 0 && handle != -1;
+    if (on_actor) *on_actor = red;
     if (size_deg) *size_deg = g_reticle_deg.load(std::memory_order_relaxed);
     g_reticle_shown.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -1246,11 +1383,15 @@ std::string command(const std::string& line) {
         float p[3] = {0, 0, 0}, sz = 0;
         bool act = false;
         const bool ok = reticle_target(p, &act, &sz);
-        char e[240];
-        std::snprintf(e, sizeof(e), "reticle %d (%s), now %s (%.2f %.2f %.2f)%s, size %.1f deg | shown %llu, off the barrel's line %llu | muzzle (%.2f %.2f %.2f) dir (%.3f %.3f %.3f)",
+        char e[600];
+        std::snprintf(e, sizeof(e), "reticle %d (%s), now %s (%.2f %.2f %.2f)%s, size %.1f deg | shown %llu, (the old barrel-line rejects %llu) | muzzle (%.2f %.2f %.2f) dir (%.3f %.3f %.3f) | probes %llu hits %llu lost %llu, no gun %llu, no barrel %llu, red %llu, not red (the game's point elsewhere) %llu",
                       g_reticle.load() ? 1 : 0, g_reticle_dot.load() ? "dot" : "ring", ok ? "at" : "none", p[0], p[1], p[2], act ? " on an actor" : "", sz,
                       static_cast<unsigned long long>(g_reticle_shown.load()), static_cast<unsigned long long>(g_reticle_offline.load()),
-                      g_last_muzzle[0], g_last_muzzle[1], g_last_muzzle[2], g_last_dir[0], g_last_dir[1], g_last_dir[2]);
+                      g_last_muzzle[0], g_last_muzzle[1], g_last_muzzle[2], g_last_dir[0], g_last_dir[1], g_last_dir[2],
+                      static_cast<unsigned long long>(g_rp_probes.load()), static_cast<unsigned long long>(g_rp_hits.load()),
+                      static_cast<unsigned long long>(g_rp_lost.load()), static_cast<unsigned long long>(g_rp_nogun.load()),
+                      static_cast<unsigned long long>(g_rp_nobarrel.load()), static_cast<unsigned long long>(g_rp_red.load()),
+                      static_cast<unsigned long long>(g_rp_unred.load()));
         return e;
     }
     if (line.find(" ledge") != std::string::npos) {  // aim ledge [trace on|off|reset]: the climb state (run 7 item 1f)

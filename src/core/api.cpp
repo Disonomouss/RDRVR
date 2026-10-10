@@ -38,12 +38,14 @@ void api_log(int level, const char* text) {
     log::write(level >= 2 ? log::Level::Error : level == 1 ? log::Level::Warn : log::Level::Info, "[red] %s", text);
 }
 
+std::atomic<void (*)()> g_tick_hook{nullptr};
 void api_on_script_tick(uint64_t tick, double /*script_ms*/) {
     if (!g_attached.exchange(true)) log::info("[api] gameplay plugin attached; first script tick %llu", tick);
     g_tick_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
     g_in_tick.store(true, std::memory_order_release);
     g_ticks.store(tick, std::memory_order_relaxed);
     g_last_tick_ms.store(log::now_ms(), std::memory_order_relaxed);
+    if (void (*h)() = g_tick_hook.load(std::memory_order_acquire)) h();  // before the lock: it may queue natives
     int n = g_watch_count.load(std::memory_order_acquire);
     if (!n) return;
     AcquireSRWLockExclusive(&g_lock);
@@ -181,6 +183,7 @@ bool plugin_attached() { return g_attached.load(); }
 bool in_script_tick() {
     return g_in_tick.load(std::memory_order_acquire) && g_tick_thread.load(std::memory_order_relaxed) == GetCurrentThreadId();
 }
+void set_tick_hook(void (*hook)()) { g_tick_hook.store(hook, std::memory_order_release); }
 
 void set_camera_job(const RdrvrCameraJob& job) {
     AcquireSRWLockExclusive(&g_cam_lock);
