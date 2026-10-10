@@ -117,6 +117,11 @@ void install() {
         return;
     }
     if (anchors::stand_down()) return;
+    if (!anchors::present(anchors::Id::ReplayDispatch)) {
+        log::warn("[playback] not installed: this build of RDR.exe has no ReplayDispatch (RDRVR_build_report.txt): the batched "
+                  "hand-off is off, the game's own playback loop runs");
+        return;
+    }
     g_yield = reinterpret_cast<Yield_t>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SwitchToThread"));
     rdrvr_rb_dispatch = reinterpret_cast<void*>(anchors::addr(anchors::Id::ReplayDispatch));
     const uintptr_t head = anchors::addr(anchors::Id::ReplayHead), entry = anchors::addr(anchors::Id::ReplayChunk);

@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.0 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.1 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -64,6 +64,18 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - A left-handed mode: a full mirror (the gun in John's left hand, the holsters and reloading mirrored).
 
 **Guns**
+- New in 0.8.1: every gun's aiming hold is built in (learned for all 21 guns in the developer's Quest 3 over Virtual
+  Desktop; for the guns tried in the developer's simulator, the game's own aim there matches it within a fraction of
+  a millimetre), and both "held by their aiming grip" settings are on by default (the Hands tab). A gun now sits in your hand the way the game aims it from its
+  first draw, instead of only after you have aimed it once, and a sidearm moves with your hand at once instead of
+  lagging when the game runs slowly. The holsters, the foregrip rings and the loading points are placed anew (in the
+  same headset), and the holster rings, the hand dots and the weapon points are hidden by default (the Holsters tab
+  shows them again). A place, size or switch you set yourself is kept: only the ones you never changed take the new
+  defaults. The new defaults on a fresh install are tried in the developer's simulator only.
+- Fixed in 0.8.1 (from a player's log; the fixes tried in the developer's simulator): after a cutscene, the gun the
+  game puts in your hands by itself went to the hand that drew last, and taking another gun then put it inside the
+  first; such a gun now goes to your gun hand. Putting away the gun in hand while a second gun is out in the other
+  hand makes the second your gun in hand (before, every holster refused that hand).
 - Shots leave the barrel of the gun in your hand; the right trigger alone fires; the gun stays drawn until you put it
   away.
 - An optional reticle where the shot will land, from the game's own aim (off by default: the Hands tab), a ring or
@@ -97,8 +109,8 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   longer flips its front hand between holds (with Automatic).
 - New in 0.7.0, off by default (tried in the developer's simulator only): throwing by letting go of the grip (the
   Gestures tab, under "Throw by hand": grip to hold the throwable, the trigger to light or ready it, swing and let
-  go; tried with dynamite and the throwing knife, the fire bottle and the tomahawk not yet); sidearms held by their aiming grip (the Hands tab, "Sidearms held by their aiming grip": a test for a revolver
-  that lags the hand; please report whether it helps).
+  go; tried with dynamite and the throwing knife, the fire bottle and the tomahawk not yet); sidearms held by their aiming grip (the Hands tab, "Sidearms held by their aiming grip", on by default since
+  0.8.1: for a revolver that lags the hand).
 - A whistle for your horse (new in 0.6.0, used in a headset; on by default since 0.7.0): your hand at your mouth and
   its trigger (the Gestures tab, "Whistle for the horse"; that trigger does nothing else there; the gun hand whistles
   only with no gun in it). New in 0.7.0 (tried in the developer's simulator only): the off hand whistles with a gun
@@ -127,7 +139,10 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - Shops in first person (new in 0.7.0, on by default; tried at a shop in the developer's simulator, not yet in a
   headset; `[Body] KeepAnchorCamera` in `RDRVR.ini`, no menu row): talking to a shopkeeper no longer takes the view to
   third person. Other scripted cameras outside cutscenes are kept first person too; this is not yet tried in
-  missions. If one looks wrong, set `KeepAnchorCamera=0` and please report it.
+  missions. Since 0.8.1 a mission's script that keeps taking its camera back (4 times in 2 seconds) is left it for
+  15 seconds: before, the two fought every frame and a mid-mission scene could stop before it began, with no control
+  of John (seen in a player's log; the fix tried at a shop in the developer's simulator, not yet in that mission).
+  If one looks wrong, set `KeepAnchorCamera=0` and please report it.
 - An in-headset menu (laser and trigger) with every setting, grouped under headings with a help line for the row
   under the laser; the tabs are two rows of buttons, and each tab's page scrolls with your gun hand's stick (the
   laser on the page); adjustments by arrows, one step a press.
@@ -148,7 +163,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.0.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.1.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -250,8 +265,8 @@ Fits John's hands and arms to your controllers and sets how the gun in your hand
 | **Keep the gun drawn** | A drawn gun stays in your hand until you put it away, instead of being holstered 3 seconds after your last shot. | On |
 | **No executions up close** | Pulling the trigger close to someone fires the gun, so no third-person execution, pistol whip or butt strike starts. | On |
 | **Shoot past the arm block** | Lets you fire when the game thinks John's shoulder-to-gun line hits a wall; a friendly in the way still blocks the shot. | Off |
-| **Long guns held by their aiming grip** | Each long gun is held the way the game holds it when aiming, in every pose (learned per gun as you aim). | Off |
-| **Sidearms held by their aiming grip** (new in 0.7.0) | Each revolver or pistol is held the way the game holds it when aimed, so it moves with your hand at once instead of lagging when the game runs slowly. | Off |
+| **Long guns held by their aiming grip** | Each long gun is held the way the game holds it when aiming, in every pose (every gun's hold built in since 0.8.1; as you aim, each gun's hold is learned again, saved, and used from then on). | On (since 0.8.1) |
+| **Sidearms held by their aiming grip** (new in 0.7.0) | Each revolver or pistol is held the way the game holds it when aimed, so it moves with your hand at once instead of lagging when the game runs slowly. | On (since 0.8.1) |
 | **Dual wield** | With a gun in one hand, grip another holster with the free hand to take a second gun with its own trigger, barrel and ammo. | On |
 | **The same sidearm in both hands** | With a sidearm in hand, grip a hip holster with the free hand to take a copy of it; let go at a hip to put it back. | On |
 | ↳ **The copy drawn as a prop** | Draws the copy as a model of the gun, so you see it in the free hand. | On |
@@ -275,15 +290,15 @@ The body holsters: how you draw, what they follow, what is shown, and where each
 | **Place the holsters by hand** (new in 0.7.0, this session) | Close the menu, grip a holster's ring and drag it to a new spot; let go to leave it there (the new place is saved). Untick it in the menu when you're done. | Off |
 | **Steady holster edges** (new in 0.7.0) | A hand counts as in a holster until it is clearly out, so there's no buzzing at a ring's edge and no flipping between the two left-hip holsters. | Off |
 | **Weapons by: The holsters / The weapon wheel** | Draw by reaching to the holsters, or hold a grip to open the game's weapon wheel, move toward a weapon and let go. | The holsters |
-| **Show the holsters** | Shows each holster as a ring: white, green with a hand in it, amber while gripped. | On |
+| **Show the holsters** | Shows each holster as a ring: white, green with a hand in it, amber while gripped. | Off (since 0.8.1) |
 | ↳ **Only near a hand** (new in 0.7.0) | Each ring appears faintly only when a hand comes near it. | Off |
-| **Show the hand dots** | A dot at each hand's grab point, green inside a holster or on the foregrip. | On |
-| **Show the weapon points** | Shows the foregrip ring, where a round goes in, and the hints for the gun's action. | On |
+| **Show the hand dots** | A dot at each hand's grab point, green inside a holster or on the foregrip. | Off (since 0.8.1) |
+| **Show the weapon points** | Shows the foregrip ring, where a round goes in, and the hints for the gun's action. | Off (since 0.8.1) |
 | **Show the guns at their holsters** | Shows each holstered gun on your body; hidden while it is in a hand. | On |
 | ↳ **The long guns on the back too** | Also shows the long guns on your back and left shoulder. | Off |
 | **Each holster: Right hip, Back, Belt, Left hip (second sidearm), Back left shoulder, Lower back** | Turns each holster on or off. | On |
 | **Left hip (knife and lasso; off: moved to the lower back)** | The old left-hip knife-and-lasso holster; the knife and lasso now sit at the lower back. | Off |
-| ↳ **Offset / Size arrows** (each holster and the chest) | Move each holster right / up / forward, 5 mm per press, and change its ring's size; saved at once. The chest spot, where you take a round to reload, is always on. | Placed for the release |
+| ↳ **Offset / Size arrows** (each holster and the chest) | Move each holster right / up / forward, 5 mm per press, and change its ring's size; saved at once. The chest spot, where you take a round to reload, is always on. Turn on Show the holsters to see them while you move them. | Placed for the release (anew in 0.8.1) |
 
 ### Gun in hand
 
@@ -291,9 +306,9 @@ Tunes the gun you are holding right now. Draw a gun first: the heading names it,
 
 | Setting | What it does | Default |
 |---|---|---|
-| **The foregrip: Offset** | Moves where John's front hand sits on this gun, 5 mm per press. | Every gun's (the Sawed-off and Pump-action have their own) |
-| **The foregrip ring: Offset / Size** | Moves and sizes the ring where your real front hand takes hold of this gun. | Every gun's (the Bolt Action, Sawed-off and Pump-action have their own) |
-| **The loading ring: Offset / Size** | Moves and sizes the ring where a hand-held round goes into this gun. | Every gun's (the Bolt Action has its own) |
+| **The foregrip: Offset** | Moves where John's front hand sits on this gun, 5 mm per press. | Every gun's (the Carbine, Winchester, Carcano, Sawed-off and Pump-action have their own) |
+| **The foregrip ring: Offset / Size** | Moves and sizes the ring where your real front hand takes hold of this gun. | Every gun's (the Winchester, Bolt Action, Sawed-off and Pump-action have their own) |
+| **The loading ring: Offset / Size** | Moves and sizes the ring where a hand-held round goes into this gun. | Every gun's (the Double-action, LeMat and Bolt Action have their own) |
 | ↳ **Use every gun's** | Clears this gun's own values so it uses the shared ones again. | – (button) |
 | **The front hand's pose: Automatic** (new in 0.7.0) | Long guns only: John's front hand uses whichever hold the game picks for its stance. | Off |
 | **The lowered hold** (new in 0.7.0) | Always uses the game's lowered-gun hold on this gun. Until the game has shown it once this session, the label says so and the other hold is used. | Off |
@@ -323,10 +338,10 @@ Reloading by hand from the chest, the round in your hand, two-handed long guns, 
 | **The game's automatic reloads** | Turns the game's own reloads back on alongside the hand reload. | Off |
 | **The game's reload button** | Turns the game's reload button back on alongside the hand reload. | Off |
 | **A round seen in the hand** | Draws a matching cartridge in your hand when you take one from the chest. | On |
-| ↳ **Offset / Direction / Turn / Tilt / Brightness** | Where the drawn round sits in your fingers, which way it points, and how bright it is (the chest rounds too). | Along the fingers, brightness 1.00 |
+| ↳ **Offset / Direction / Turn / Tilt / Brightness** | Where the drawn round sits in your fingers, which way it points, and how bright it is (the chest rounds too). | Custom (turn 0°, tilt −45°, since 0.8.1), brightness 1.00 |
 | **Two-handed long guns** | Grip a long gun's foregrip with your other hand to aim it with both hands. | On |
 | ↳ **The front hand snaps onto the gun** | While you hold the foregrip, John's front hand sits in the game's own grip instead of following your controller. | On |
-| **Every gun's rings: Offset / Size arrows** | The shared foregrip, foregrip ring and loading ring for every gun without its own (the Gun in hand tab), 5 mm per press. | Foregrip ring 0.110 m, loading ring 0.080 m |
+| **Every gun's rings: Offset / Size arrows** | The shared foregrip, foregrip ring and loading ring for every gun without its own (the Gun in hand tab), 5 mm per press. | Foregrip ring 0.110 m, loading ring 0.075 m |
 | **A round goes in at a touch** | The round loads when it touches the loading ring; off, your wrist has to be inside the ring. | On |
 
 ### Actions
@@ -441,7 +456,11 @@ Live performance and view-mode readouts (frame rate, missed frames, CPU and GPU 
 - The game's own builds: the mod was made on one build of `RDR.exe`. On another build it looks for the game code and
   data it uses by their bytes (new in 0.3.0, not yet tried on a real other build). If it finds and checks every one,
   it runs; if not, it stands down (the game plays flat). Either way it writes `RDRVR_build_report.txt` in the game
-  folder: if the mod stands down or misbehaves, please attach it, with `RDRVR.log`, to an issue. A game executable
+  folder: if the mod stands down or misbehaves, please attach it, with `RDRVR.log`, to an issue. Since 0.8.1 one of them is optional: in a player's build
+  the mod found every one but the playback thread's dispatch (used only by the batched hand-off, see Performance), and
+  it stood down there. Such a build should now run with the batched hand-off off (`RDRVR.log` and the report say so;
+  tried by forcing it on the developer's build, not yet on that player's), and the report shows the bytes near a
+  missing one so a later release can find it. A game executable
   without the Steam version's start-up stage (the same game build otherwise) should no longer start flat (new in 0.6.0,
   not yet tried on such an executable; the developer forced the path on the Steam version): the mod notices and hooks
   at once, and `RDRVR.log` says if its hooks came too late. RedHook, which runs
@@ -462,9 +481,8 @@ Live performance and view-mode readouts (frame rate, missed frames, CPU and GPU 
   render threads were doing.
 - The holsters' guns cost frame time by how many are shown: the back's long guns (off by default) are the expensive
   part.
-- John's gun hand can sit a few centimetres up a long gun (at the receiver, not the stock's wrist) when it is lowered
-  or carried: "Long guns held by their aiming grip" (the Hands tab, off by default, new in 0.3.0) holds each long gun
-  by its aiming grip in every pose.
+- With "Long guns held by their aiming grip" off (the Hands tab; on by default since 0.8.1), John's gun hand can sit
+  a few centimetres up a long gun (at the receiver, not the stock's wrist) when it is lowered or carried.
 - "Render resolution" has been tried (in the developer's simulator) in Windowed mode only (the game's Screen Type):
   use Windowed with it for now. In Fullscreen the game may undo a size smaller than your monitor's at the start (the
   row's "Now:" line then says the game changed its size).

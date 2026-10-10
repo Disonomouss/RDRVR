@@ -19,7 +19,7 @@ enum class Id : int {
 };
 
 uintptr_t base();                 // RDR.exe module base
-uintptr_t addr(Id id);            // base + rva
+uintptr_t addr(Id id);            // base + rva (0 for an optional anchor this build lacks: present())
 template <typename T>
 T ptr(Id id) { return reinterpret_cast<T>(addr(id)); }
 uint32_t rva(Id id);
@@ -33,5 +33,6 @@ bool stand_down();                // true if verify() failed (or has not run)
 bool exe_matches();               // TimeDateStamp and SizeOfImage match the analysed build
 void build_report();              // where this build keeps the anchors (verify() runs it on a mismatch; reads only)
 bool relocated();                 // another build, running on the addresses verify() found for it
+bool present(Id id);              // false: an optional anchor (anchors.cpp kOptional) this build lacks; its feature is off
 
 }  // namespace rdrvr::anchors

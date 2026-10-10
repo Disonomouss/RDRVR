@@ -114,6 +114,8 @@ std::atomic<bool> g_draw_any{true};     // [Hands] DrawToGrabbingHand
 std::atomic<int> g_draw_hand{-1};       // the controller that drew the gun in hand (-1: the layout's)
 std::atomic<int> g_pend_hand{-1}, g_pend_weapon{-1};  // a draw queued while another gun was in hand: its hand, once it is in
 std::atomic<double> g_pend_ms{0};
+// the last draw by a hand (set_draw_hand): a gun appearing in empty hands without one is the game's own (2026-10-10)
+std::atomic<double> g_hand_draw_ms{-1e9};
 bool g_trig_swapped = false;            // the triggers' roles swapped (the gun in the layout's other hand)
 float g_aim_lead_ms = 250, g_aim_tail_ms = 500;
 bool g_aim_inj = false;
@@ -726,6 +728,7 @@ int gun_hand() {
 }
 void set_draw_hand(int ctrl, int weapon, bool now) {
     if (ctrl < -1 || ctrl > 1) return;
+    if (ctrl >= 0) g_hand_draw_ms = log::now_ms();
     if (!now && ctrl >= 0) {  // the old gun stays in its hand until the new one is in hand
         g_pend_weapon = weapon;
         g_pend_ms = log::now_ms();
@@ -738,6 +741,19 @@ void set_draw_hand(int ctrl, int weapon, bool now) {
         log::info("[controls] gun hand: the %s controller%s", gun_hand() ? "right" : "left", ctrl < 0 ? " (the layout's)" : " (it drew the gun)");
 }
 void commit_draw_hand(int weapon_in_hand, bool in_hand) {
+    // 2026-10-10 (the user's other PC: after a mid-mission cutscene the game put the Cattleman in the left hand, the
+    // hand that had drawn last before it, put away since; the right hand then took a second gun at the back and no gun
+    // was "in hand"): a gun appearing in empty hands that no hand drew in the last 2 s (the game's own equip: after a
+    // cutscene, a mission's script, its own weapon choice) goes to the layout's gun hand
+    static bool had = false;
+    if (in_hand && !had && g_pend_hand.load(std::memory_order_relaxed) < 0 && g_draw_hand.load(std::memory_order_relaxed) >= 0 &&
+        log::now_ms() - g_hand_draw_ms.load(std::memory_order_relaxed) > 2000.0) {
+        g_draw_hand = -1;
+        if (draw_any_active())
+            log::info("[controls] gun hand: the %s controller again (the layout's: the game put a gun in hand, no hand drew it)",
+                      layout_gun_hand() ? "right" : "left");
+    }
+    had = in_hand;
     const int p = g_pend_hand.load(std::memory_order_relaxed);
     if (p < 0) return;
     if (in_hand && weapon_in_hand == g_pend_weapon.load(std::memory_order_relaxed)) {

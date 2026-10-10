@@ -1281,7 +1281,20 @@ void holster_frame() {
             if (pending[h] && !(g_consumed[h] && in_z[h] >= 0 && in_z[h] == press_zone[h] && in_hand))
                 log::info("[holster] %s hand let go away from the %s (in zone %d, item %d): not put away", h ? "right" : "left",
                           press_zone[h] >= 0 ? zones[press_zone[h]].key : "?", in_z[h], in_hand ? 1 : 0);
-            if (g_consumed[h] && pending[h] && in_z[h] >= 0 && in_z[h] == press_zone[h] && in_hand) {
+            if (g_consumed[h] && pending[h] && in_z[h] >= 0 && in_z[h] == press_zone[h] && in_hand && ds.on && !ds.copy && ds.ready &&
+                ds.weapon >= 0 && ds.weapon < kWeapons && ds.ctrl >= 0 && ds.ctrl != h) {
+                // 2026-10-10 (the user's other PC: the gun in hand put away, the second gun stayed in the other hand with no
+                // gun "in hand": every holster refused that hand): the second gun becomes the gun in hand, in its own hand
+                if (st.weapon >= 0 && st.weapon < kWeapons) put_zone_of[st.weapon] = in_z[h];
+                const int sec_ctrl = ds.ctrl, sec_w = ds.weapon;
+                dual::end("the gun in hand put away: it becomes the gun in hand");
+                const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(sec_w), 0ull};
+                api::queue_native(kPutWeaponInHand, args, 3, 0, nullptr);
+                controls::set_draw_hand(sec_ctrl, sec_w, false);  // that hand, once the gun is in it
+                g_puts.fetch_add(1, std::memory_order_relaxed);
+                log::info("[holster] %s hand let go at the %s: put away; the second gun (the %s) is the gun in hand now, in the %s hand",
+                          h ? "right" : "left", zones[in_z[h]].key, kWeaponLabel[sec_w], sec_ctrl ? "right" : "left");
+            } else if (g_consumed[h] && pending[h] && in_z[h] >= 0 && in_z[h] == press_zone[h] && in_hand) {
                 const uint64_t args[1] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor))};
                 api::queue_native(kPutItemAway, args, 1, 0, nullptr);
                 g_puts.fetch_add(1, std::memory_order_relaxed);

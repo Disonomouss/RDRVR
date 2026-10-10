@@ -608,8 +608,15 @@ void camera_tick(uint64_t tick) {
     invoke(0x486F4461, {static_cast<uint64_t>(g_cam), vec2(ra, rb), f32(rc), 0});                 // SET_CAMERA_ORIENTATION
     if (job.weapons & 2u) {  // [Body] KeepAnchorCamera: another camera on the channel (a shop's): ours current again
         static uint64_t retakes = 0, last_take = 0;
+        // 2026-10-10 (the user: stuck before a mid-mission cutscene, no control, the cutscene never shown; its pause menu
+        // came up): a mission's script that takes the channel back every tick fought the anchor (about 45 takes a
+        // second for over a minute). A shop takes it once; a camera taken 4 times within 2 s is a script's: left to it
+        // for 15 s, then tried again once
+        static ULONGLONG fight_t0 = 0, backoff_until = 0;
+        static int fight_n = 0;
+        const ULONGLONG now_ms = GetTickCount64();
         const bool active = (invoke(0x02BD5362, {static_cast<uint64_t>(g_cam), 0}) & 0xff) != 0;  // IS_CAMERA_ACTIVE_ON_CHANNEL
-        if (!active) {
+        if (!active && now_ms >= backoff_until) {
             invoke(0x3EA55678, {static_cast<uint64_t>(g_cam), 0, 0, 0, 0, 0, 0, 0, 0, 0});  // SET_CURRENT_CAMERA_ON_CHANNEL
             ++retakes;
             if (!last_take || tick - last_take > 300) {
@@ -619,6 +626,15 @@ void camera_tick(uint64_t tick) {
                 g_api->log(0, line);
             }
             last_take = tick;
+            if (now_ms - fight_t0 > 2000) {
+                fight_t0 = now_ms;
+                fight_n = 0;
+            }
+            if (++fight_n >= 4) {
+                backoff_until = now_ms + 15000;
+                fight_n = 0;
+                g_api->log(0, "camera anchor: a script keeps taking the camera (4 times in 2 s): its camera left current for 15 s");
+            }
         }
     }
     st.tick = tick;

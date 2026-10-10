@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "core/config.h"
 #include "core/log.h"
@@ -37,6 +38,7 @@ std::atomic<bool> g_relocated{false};
 // This build's RVAs: the analysed ones, or the ones verify() found in another build (written before any hook is
 // installed, read-only after).
 uint32_t g_rva[kEntryCount];
+bool g_absent[kEntryCount];  // an optional anchor this build lacks (relocated only): addr() is 0 for it
 bool g_prechecked[kEntryCount];  // precheck(): matched before verify() (the bootstrap thread, before verify())
 const bool g_rva_init = [] {
     for (int i = 0; i < kEntryCount; ++i) g_rva[i] = kEntries[i].rva;
@@ -154,6 +156,33 @@ const unsigned char* u8(const char* p) { return reinterpret_cast<const unsigned 
 
 constexpr long long kNone = LLONG_MIN;
 
+// The anchors a build may lack (0.8.1: a player's RDR.exe 0x6737882f had every other anchor, but not this one's
+// bytes, and the whole mod stood down: the game ran flat). Without one, its feature is off on that build and the rest
+// runs; addr() is 0 for it. Every other anchor stays required.
+struct Optional {
+    const char* name;
+    const char* what;
+};
+constexpr Optional kOptional[] = {
+    {"ReplayDispatch", "the batched hand-off to the playback thread ([Render] PlaybackBatch) is off on this build"},
+};
+const char* optional_what(const char* name) {
+    for (const Optional& o : kOptional)
+        if (std::strcmp(o.name, name) == 0) return o.what;
+    return nullptr;
+}
+// [Debug] RelocateDrop (a test of the above): the named anchors (space or comma separated) taken as not found by the
+// scan, as in a build without them. Debug only: with [Debug] RelocateTest=1 on the analysed build.
+bool dropped(const std::string& list, const char* name) {
+    const size_t n = std::strlen(name);
+    for (size_t p = list.find(name); p != std::string::npos; p = list.find(name, p + 1)) {
+        const bool l = p == 0 || list[p - 1] == ' ' || list[p - 1] == ',';
+        const bool r = p + n == list.size() || list[p + n] == ' ' || list[p + n] == ',';
+        if (l && r) return true;
+    }
+    return false;
+}
+
 // The scan of this build: where it keeps each anchor, to the log ([build]) and RDRVR_build_report.txt. reloc[i] gets
 // entry i's shift (this build's RVA minus the analysed one) when it is found. True when every anchor is found and
 // checked: the code anchors by their masked bytes at the new place, the jmp [rip] stubs by the slot they jump through,
@@ -208,17 +237,19 @@ bool scan_build(long long* reloc) {
         return false;
     };
     int full_scans = 0;
+    const std::string drop = config::get_string("Debug", "RelocateDrop", "");
+    if (!drop.empty()) out("[Debug] RelocateDrop: %s taken as not found (a test)", drop.c_str());
 
     // the code anchors: a unique pattern at a known shift or found once in .text; the others (a jmp [rip] stub, a
     // small function the build has several copies of) where their nearest found neighbour's shift puts them
     constexpr int kCount = static_cast<int>(sizeof(kSigs) / sizeof(kSigs[0]));
     static long long shift_of[kCount];
-    int same = 0, moved = 0, by_neighbour = 0, lost = 0;
+    int same = 0, moved = 0, by_neighbour = 0, lost = 0, lost_opt = 0;
     int stubs[kCount], nstubs = 0;
     for (int i = 0; i < kCount; ++i) {
         const Sig& s = kSigs[i];
         shift_of[i] = kNone;
-        if (!s.unique) continue;
+        if (!s.unique || dropped(drop, s.name)) continue;
         long long sh = 0;
         if (!at_cand(s.rva, u8(s.b), u8(s.m), s.n, &sh)) {
             const unsigned char* at = img + s.rva;
@@ -248,22 +279,61 @@ bool scan_build(long long* reloc) {
         const bool inside = want && want >= lo && want + s.n <= hi;
         const bool fixed_run = has_fixed_run(u8(s.m), s.n);
         const bool fits = inside && fixed_run && masked_eq_guarded(want, u8(s.b), u8(s.m), s.n);
-        if (fits || (inside && !fixed_run)) {
+        const bool forced = dropped(drop, s.name);
+        if (!forced && (fits || (inside && !fixed_run))) {
             ++by_neighbour;
             shift_of[i] = shift_of[nb];
             if (!fixed_run) stubs[nstubs++] = i;  // a stub: checked below by the slot it jumps through
             out("CODE %s +%#x: %s +%#llx (%+lld, the shift of %s +%#x)", s.name, s.rva, fits ? "matches at" : "a stub, placed at",
                 static_cast<unsigned long long>(s.rva + shift_of[nb]), shift_of[nb], kSigs[nb].name, kSigs[nb].rva);
         } else {
-            ++lost;
-            out("CODE %s +%#x: NOT FOUND%s", s.name, s.rva, want ? " (not at its neighbour's shift either)" : "");
+            const char* opt = optional_what(s.name);
+            ++(opt ? lost_opt : lost);
+            out("CODE %s +%#x: NOT FOUND%s%s%s", s.name, s.rva, forced ? " (forced: [Debug] RelocateDrop)" : "",
+                want && !forced ? " (not at its neighbour's shift either)" : "", opt ? " (optional)" : "");
+            // for a later release: this build's bytes where the neighbour's shift puts it, and where the pattern's first
+            // fixed bytes are near there
+            if (inside) {
+                const unsigned char* at = want - 16 >= lo ? want - 16 : want;
+                unsigned char b[64] = {};
+                const int nb2 = at + 64 <= hi ? 64 : static_cast<int>(hi - at);
+                if (nb2 > 0 && read_guarded(at, b, static_cast<size_t>(nb2))) {
+                    for (int h = 0; h < nb2; h += 32) {
+                        char hex[3 * 32 + 1] = {};
+                        for (int q = 0; q < 32 && h + q < nb2; ++q) std::snprintf(hex + q * 3, 4, "%02x ", b[h + q]);
+                        out("  bytes at +%#llx: %s", static_cast<unsigned long long>(at + h - img), hex);
+                    }
+                }
+                int k = 0;
+                while (k + 3 < s.n && !(s.m[k] && s.m[k + 1] && s.m[k + 2] && s.m[k + 3])) ++k;
+                if (k + 3 < s.n) {
+                    const unsigned char* wlo = want - 0x400 >= lo ? want - 0x400 : lo;
+                    const unsigned char* whi = want + 0x400 + 4 <= hi ? want + 0x400 + 4 : hi;
+                    const unsigned char* hit = nullptr;
+                    int hits = 0;
+                    char where[200] = {};
+                    for (const unsigned char* p = wlo; p + 4 <= whi && hits < 6;) {
+                        const unsigned char* found = nullptr;
+                        if (scan_guarded(p, whi, u8(s.b + k), u8(s.m + k), 4, p, &found) < 1 || !found) break;
+                        if (found != hit) {
+                            const size_t l = std::strlen(where);
+                            std::snprintf(where + l, sizeof(where) - l, " +%#llx", static_cast<unsigned long long>(found - k - img));
+                            ++hits;
+                        }
+                        hit = found;
+                        p = found + 1;
+                    }
+                    out("  its first fixed bytes within 0x400 of there: %s", hits ? where : " none");
+                }
+            }
         }
     }
     for (int i = 0; i < kCount; ++i) {
         const int e = entry_index(kSigs[i].name);
         if (e >= 0 && shift_of[i] != kNone) reloc[e] = shift_of[i];
     }
-    out("code anchors: %d where expected, %d moved, %d placed by a neighbour, %d not found (of %d)", same, moved, by_neighbour, lost, kCount);
+    out("code anchors: %d where expected, %d moved, %d placed by a neighbour, %d not found, %d optional not found (of %d)", same, moved,
+        by_neighbour, lost, lost_opt, kCount);
 
     // the globals: each reference found gives where this build keeps it (the disp32 from the instruction's end)
     int g_same = 0, g_moved = 0, g_conflict = 0, g_none = 0;
@@ -359,18 +429,25 @@ bool scan_build(long long* reloc) {
     }
     if (nstubs) out("stubs: %d of %d jump through their slots", stubs_ok, nstubs);
 
-    int missing = 0;
+    int missing = 0, absent = 0;
     for (int i = 0; i < kEntryCount; ++i)
         if (reloc[i] == kNone) {
-            ++missing;
-            out("NOT PLACED: %s", kEntries[i].name);
+            if (const char* what = optional_what(kEntries[i].name)) {
+                ++absent;
+                out("ABSENT (optional): %s: %s", kEntries[i].name, what);
+            } else {
+                ++missing;
+                out("NOT PLACED: %s", kEntries[i].name);
+            }
         }
     const bool can = !lost && !g_conflict && !g_none && d_uniform && stubs_ok == nstubs && !missing;
-    out("verdict: %s (%d full searches, %.0f ms)",
-        can ? (moved || by_neighbour || g_moved ? "every anchor found and checked: this build runs on the found addresses"
-                                                : "every anchor in place")
+    char without[64] = {};
+    if (absent) std::snprintf(without, sizeof(without), ", without %d optional anchor%s", absent, absent > 1 ? "s" : "");
+    out("verdict: %s%s (%d full searches, %.0f ms)",
+        can ? (moved || by_neighbour || g_moved || absent ? "every required anchor found and checked: this build runs on the found addresses"
+                                                          : "every anchor in place")
             : "some anchors were not found or checked: this build cannot be relocated",
-        full_scans, static_cast<double>(GetTickCount64() - t0));
+        can ? without : "", full_scans, static_cast<double>(GetTickCount64() - t0));
     if (f) std::fclose(f);
     return can;
 }
@@ -389,7 +466,8 @@ uintptr_t base() {
 
 uint32_t rva(Id id) { return g_rva[static_cast<int>(id)]; }
 const char* name(Id id) { return kEntries[static_cast<int>(id)].name; }
-uintptr_t addr(Id id) { return base() + rva(id); }
+uintptr_t addr(Id id) { return g_absent[static_cast<int>(id)] ? 0 : base() + rva(id); }
+bool present(Id id) { return !g_absent[static_cast<int>(id)]; }
 
 bool precheck(Id id) {
     const int i = static_cast<int>(id);
@@ -445,15 +523,23 @@ bool verify() {
         static long long reloc[kEntryCount];
         const bool can = scan_build(reloc);
         if (can && config::get_bool("Debug", "Relocate", true)) {
-            int moved = 0;
+            int moved = 0, absent = 0;
             for (int i = 0; i < kEntryCount; ++i) {
+                g_absent[i] = reloc[i] == kNone;  // scan_build accepts that only for an optional anchor
+                if (g_absent[i]) {
+                    ++absent;
+                    continue;
+                }
                 g_rva[i] = static_cast<uint32_t>(static_cast<long long>(kEntries[i].rva) + reloc[i]);
                 moved += reloc[i] != 0;
             }
             g_relocated.store(true);
             ok = true;
-            log::info("[anchors] RELOCATED: running on this build's addresses (%d of %d anchors moved; RDRVR_build_report.txt)", moved,
-                      kEntryCount);
+            log::info("[anchors] RELOCATED: running on this build's addresses (%d of %d anchors moved, %d optional absent; "
+                      "RDRVR_build_report.txt)",
+                      moved, kEntryCount, absent);
+            for (int i = 0; i < kEntryCount; ++i)
+                if (g_absent[i]) log::warn("[anchors] %s is not in this build: %s", kEntries[i].name, optional_what(kEntries[i].name));
         } else {
             ok = false;
             log::error("[anchors] STAND DOWN: %s", can ? "this build could run relocated, but [Debug] Relocate=0"

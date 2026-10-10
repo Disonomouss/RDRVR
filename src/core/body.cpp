@@ -3638,11 +3638,13 @@ struct FixedGripDiag {
     float aim_max_mm = 0, aim_max_deg = 0, low_max_mm = 0, low_max_deg = 0;  // the game's, against the learned, by pose
     float placed_max_mm = 0, placed_max_deg = 0;  // the placed relation against the learned (fixed: ~0)
     uint64_t learns = 0, fixed = 0, frames = 0, saved = 0;
+    uint64_t by_src[3] = {};  // the frames placed by each hold: learned, built-in, template (0.8.1's test)
     float wrist_pos[3] = {}, gun_pos[3] = {}, att_pos[3] = {};  // the raw positions read (the matrices' spaces)
     int why = 0;  // the last early return: 1 no wrist bone, 2 the wrist not read, 3 not rigid, 4 not a long gun
 };
 FixedGripDiag g_fg_diag;
 std::atomic<uint64_t> g_fg_aim_frames{0};
+std::atomic<uint64_t> g_fg_tick_differs{0};  // placements whose item's gun was not the script tick's (a switch's frames)
 bool is_long_gun_w(int w) { return w >= 8 && w <= 20; }
 bool rigid_axes(const float* m) {  // the three axis rows unit and orthogonal (the position anywhere)
     for (int i = 0; i < 3; ++i) {
@@ -3682,11 +3684,43 @@ void ortho_rows(float* m) {  // Gram-Schmidt on the three axis rows (after a ble
     z[1] = x[2] * y[0] - x[0] * y[2];
     z[2] = x[0] * y[1] - x[1] * y[0];
 }
-// the built-in aiming relations, measured in the simulator (none yet: filled from item 1c's measurement)
+// the built-in aiming relations (2026-10-10): every gun's, learned in the headset with FixedGunGrip and FixedSidearmGrip
+// on (the game's gun in its animated wrist while it aims: the game's data, the same for every player of this build; a
+// second learning matched the first within 0.1 mm). As saved in [Grips] GunHand.<gun>: the three axis rows, then the
+// position. A player's own learned hold still wins; a gun past the table (or a game update's new animation) learns its
+// own as before.
 bool builtin_gun_rel(int w, float* out) {
-    (void)w;
-    (void)out;
-    return false;
+    static const float kRel[21][12] = {
+        {1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.17365f, -0.98481f, 0.00000f, 0.98481f, 0.17365f, -0.02760f, -0.12899f, -0.03158f},  // 0 Volcanic
+        {1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.17365f, -0.98481f, 0.00000f, 0.98481f, 0.17365f, -0.02762f, -0.11081f, 0.00379f},  // 1 SemiAutoPistol
+        {1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.17365f, -0.98481f, 0.00000f, 0.98481f, 0.17365f, -0.02762f, -0.10518f, -0.00115f},  // 2 HighPower
+        {1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.17365f, -0.98481f, 0.00000f, 0.98481f, 0.17365f, -0.02601f, -0.14740f, -0.02356f},  // 3 Mauser
+        {1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.17365f, -0.98481f, 0.00000f, 0.98481f, 0.17365f, -0.02762f, -0.12903f, -0.03157f},  // 4 Cattleman
+        {1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.17365f, -0.98481f, 0.00000f, 0.98481f, 0.17365f, -0.02759f, -0.12895f, -0.03148f},  // 5 Schofield
+        {1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.17365f, -0.98481f, 0.00000f, 0.98481f, 0.17365f, -0.02759f, -0.11804f, -0.03300f},  // 6 DoubleAction
+        {1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.17365f, -0.98481f, 0.00000f, 0.98481f, 0.17365f, -0.03069f, -0.12902f, -0.03931f},  // 7 LeMat
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02961f, -0.12136f, -0.02091f},  // 8 Carbine
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02260f, -0.12344f, -0.03239f},  // 9 Winchester
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02328f, -0.11655f, -0.02219f},  // 10 Henry
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02406f, -0.12627f, -0.01368f},  // 11 Evans
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02718f, -0.11370f, -0.02705f},  // 12 Springfield
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02670f, -0.13028f, -0.01593f},  // 13 BoltAction
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02866f, -0.11711f, -0.03045f},  // 14 Buffalo
+        {0.99480f, 0.07976f, -0.06328f, -0.07835f, 0.20285f, -0.97607f, -0.06501f, 0.97596f, 0.20805f, -0.02410f, -0.15893f, -0.01720f},  // 15 SawedOff
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.03113f, -0.14251f, -0.04736f},  // 16 DoubleBarrel
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02764f, -0.11108f, -0.02622f},  // 17 PumpAction
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02257f, -0.12815f, -0.01560f},  // 18 SemiAutoShotgun
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02783f, -0.12408f, -0.03132f},  // 19 RollingBlock
+        {0.96905f, 0.08393f, -0.23215f, -0.24578f, 0.41582f, -0.87561f, 0.02305f, 0.90557f, 0.42358f, -0.02048f, -0.11430f, 0.00993f},  // 20 Carcano
+    };
+    if (w < 0 || w >= 21) return false;
+    const float* v = kRel[w];
+    const int map[12] = {0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14};
+    std::memset(out, 0, sizeof(float) * 16);
+    for (int i = 0; i < 12; ++i) out[map[i]] = v[i];
+    out[15] = 1.0f;
+    ortho_rows(out);  // as the user ini's are read (five decimals)
+    return true;
 }
 // the learned holds saved: once a session per gun, and only with FixedGunGrip on (run 7 item 6's review: off, the hook
 // wrote the user ini on every re-equip)
@@ -3728,7 +3762,7 @@ void load_gun_rels() {
 }
 // The game thread (hk_obj_set_matrix): src (the game's gun, this update) replaced by the aiming hold at the animated
 // wrist when [Hands] FixedGunGrip is on and the gun is a long gun; always measured (the readback).
-void fixed_grip(int side, float* src) {
+void fixed_grip(int side, float* src, int item_w) {
     const uintptr_t skel = g_skel_game.load(std::memory_order_relaxed);
     const int wi = side >= 0 && side < 2 ? g_rig.wrist[side] : -1;
     uintptr_t mtx = 0;
@@ -3749,21 +3783,33 @@ void fixed_grip(int side, float* src) {
     Wr[3] = Wr[7] = Wr[11] = 0.0f;
     Wr[15] = 1.0f;
     if (!rigid_axes(Wr) || !inv44(Wr, Wi)) return fail(3);
+    // the gun is the placed item's own (item_w: its object's eWeapon): the script tick's weapon in hand is a frame
+    // behind on a switch the mod makes (0.8.1 review: the new item placed by the last gun's hold, and that frame learned
+    // into the last gun's); the tick's only when the item's could not be read
     RdrvrActorState ws{};
-    const int w = api::actor_state(&ws) && ws.valid ? ws.weapon : -1;
+    const int tick_w = api::actor_state(&ws) && ws.valid ? ws.weapon : -1;
+    const int w = item_w >= 0 ? item_w : tick_w;
+    if (item_w >= 0 && tick_w != item_w) g_fg_tick_differs.fetch_add(1, std::memory_order_relaxed);
     const bool sidearm = w >= 0 && w <= 7;
     if (!is_long_gun_w(w) && !sidearm) return fail(4);
     const bool fix_on = sidearm ? g_fixed_sidearm.load(std::memory_order_relaxed) : g_fixed_grip.load(std::memory_order_relaxed);
     GunRel& tpl = sidearm ? g_gun_rel_tpl_side : g_gun_rel_tpl;
     mul44r(S, Wi, rel);
     const bool aiming = holster::aim_pose() || aim::aiming();  // the gun controller's aim pose (G +0x5d6 & 0x40), or the zoom
-    const uint64_t af = aiming ? g_fg_aim_frames.fetch_add(1, std::memory_order_relaxed) + 1 : (g_fg_aim_frames.store(0), 0);
     std::lock_guard lock(g_fg_mutex);
     FixedGripDiag& d = g_fg_diag;
+    // 0.8.1: the steady aim counted per gun and per draw (a gun drawn while the last one aimed, or drawn again while
+    // aiming, learned from its first frame, the draw's, and skipped its built-in hold): from 0 on a gun change or after
+    // a quarter second without a placement (put away, or not placed)
+    static double last_ms = 0;
+    const double now_ms = log::now_ms();
+    if (d.weapon != w || now_ms - last_ms > 250.0) g_fg_aim_frames.store(0, std::memory_order_relaxed);
+    last_ms = now_ms;
     if (d.weapon != w) {
         d = FixedGripDiag{};
         d.weapon = w;
     }
+    const uint64_t af = aiming ? g_fg_aim_frames.fetch_add(1, std::memory_order_relaxed) + 1 : (g_fg_aim_frames.store(0), 0);
     ++d.frames;
     d.aiming = aiming ? 1 : 0;
     d.side = side;
@@ -3834,6 +3880,7 @@ void fixed_grip(int side, float* src) {
         for (int r = 0; r < 4; ++r)
             for (int k = 0; k < 3; ++k) src[r * 4 + k] = out[r * 4 + k];  // the game's fourth column kept
         ++d.fixed;
+        ++d.by_src[d.src];
     }
 }
 void fixed_grip_placed(int side, const float* A, const double* ad, const float* placed) {  // the placed gun in the drawn wrist's frame
@@ -3996,7 +4043,12 @@ uint64_t hk_obj_set_matrix(uintptr_t obj, const float* m) {
     double ad[3] = {};
     if (!item_correction(lf ? 0 : 1, A, a, &ik, ad) || !ik || !raw(reinterpret_cast<uintptr_t>(m), src, sizeof(src)))
         return o_obj_set_matrix(obj, m);
-    fixed_grip(lf ? 0 : 1, src);  // run 7 item 1c: measured always; with [Hands] FixedGunGrip the long gun held by its aiming hold
+    int16_t item_w = -1;  // the item's eWeapon (W +0x28 -> info +8, as holster.cpp's slot_gun reads it)
+    {
+        uintptr_t info = 0;
+        if (raw(W + 0x28, &info, sizeof(info)) && info && !raw(info + 8, &item_w, sizeof(item_w))) item_w = -1;
+    }
+    fixed_grip(lf ? 0 : 1, src, item_w);  // run 7 item 1c: measured always; with [Hands] FixedGunGrip the long gun held by its aiming hold
     for (int i = 0; i < 3; ++i) {
         for (int k = 0; k < 3; ++k) g_place_buf[i * 4 + k] = A[k * 3] * src[i * 4] + A[k * 3 + 1] * src[i * 4 + 1] + A[k * 3 + 2] * src[i * 4 + 2];
         g_place_buf[i * 4 + 3] = src[i * 4 + 3];
@@ -6380,12 +6432,14 @@ std::string command(const std::string& line) {
         std::snprintf(b, sizeof(b),
                       "fixed grip %s | weapon %d side %d aiming %d src %d | now (%.4f %.4f %.4f) x (%.3f %.3f %.3f) | learned %d (%.4f %.4f %.4f) "
                       "now off it %.1f mm %.2f deg | max off it: aiming %.1f mm %.2f deg, lowered %.1f mm %.2f deg | placed (%.4f %.4f %.4f) max "
-                      "off it %.1f mm %.2f deg | learns %llu fixed %llu frames %llu saved %llu | why %d | wrist at (%.2f %.2f %.2f) gun (%.2f %.2f %.2f) "
+                      "off it %.1f mm %.2f deg | learns %llu fixed %llu frames %llu saved %llu | by src %llu %llu %llu | tick differs %llu | why %d | wrist at (%.2f %.2f %.2f) gun (%.2f %.2f %.2f) "
                       "attachment (%.2f %.2f %.2f)",
                       g_fixed_grip.load() ? "on" : "off", d.weapon, d.side, d.aiming, d.src, d.now[12], d.now[13], d.now[14], d.now[0], d.now[1],
                       d.now[2], g.valid ? 1 : 0, g.m[12], g.m[13], g.m[14], mm, deg, d.aim_max_mm, d.aim_max_deg, d.low_max_mm, d.low_max_deg,
                       d.placed[12], d.placed[13], d.placed[14], d.placed_max_mm, d.placed_max_deg, static_cast<unsigned long long>(d.learns),
-                      static_cast<unsigned long long>(d.fixed), static_cast<unsigned long long>(d.frames), static_cast<unsigned long long>(d.saved), d.why,
+                      static_cast<unsigned long long>(d.fixed), static_cast<unsigned long long>(d.frames), static_cast<unsigned long long>(d.saved),
+                      static_cast<unsigned long long>(d.by_src[0]), static_cast<unsigned long long>(d.by_src[1]),
+                      static_cast<unsigned long long>(d.by_src[2]), static_cast<unsigned long long>(g_fg_tick_differs.load()), d.why,
                       d.wrist_pos[0], d.wrist_pos[1], d.wrist_pos[2], d.gun_pos[0], d.gun_pos[1], d.gun_pos[2], d.att_pos[0], d.att_pos[1], d.att_pos[2]);
         return b;
     }
