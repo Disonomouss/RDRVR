@@ -26,10 +26,13 @@ XrPath g_hand_path[2] = {XR_NULL_PATH, XR_NULL_PATH};
 XrAction g_aim = XR_NULL_HANDLE, g_grip_pose = XR_NULL_HANDLE, g_trigger = XR_NULL_HANDLE, g_squeeze = XR_NULL_HANDLE,
          g_stick = XR_NULL_HANDLE, g_stick_click = XR_NULL_HANDLE, g_primary = XR_NULL_HANDLE, g_secondary = XR_NULL_HANDLE,
          g_menu = XR_NULL_HANDLE, g_haptic = XR_NULL_HANDLE, g_pad = XR_NULL_HANDLE, g_pad_click = XR_NULL_HANDLE;
+// Steam Frame only: the right hand's X / Y, the left D-pad (up, down, left, right) and View
+XrAction g_face_x = XR_NULL_HANDLE, g_face_y = XR_NULL_HANDLE, g_view = XR_NULL_HANDLE;
+XrAction g_dpad[4] = {XR_NULL_HANDLE, XR_NULL_HANDLE, XR_NULL_HANDLE, XR_NULL_HANDLE};
 XrSpace g_aim_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE}, g_grip_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
 bool g_ready = false;
 // The controller types (their interaction profiles): the fit's key and the trackpad buttons go by them
-enum Kind { kTouch, kIndex, kVive, kWMR, kSimple, kPico4, kPicoNeo3, kHP, kCosmos, kFocus3, kTouchPro, kTouchPlus, kOdyssey, kKinds };
+enum Kind { kTouch, kIndex, kVive, kWMR, kSimple, kPico4, kPicoNeo3, kHP, kCosmos, kFocus3, kTouchPro, kTouchPlus, kOdyssey, kFrame, kKinds };
 const char* const kKindProfile[kKinds] = {
     "/interaction_profiles/oculus/touch_controller",       "/interaction_profiles/valve/index_controller",
     "/interaction_profiles/htc/vive_controller",           "/interaction_profiles/microsoft/motion_controller",
@@ -37,9 +40,9 @@ const char* const kKindProfile[kKinds] = {
     "/interaction_profiles/bytedance/pico_neo3_controller", "/interaction_profiles/hp/mixed_reality_controller",
     "/interaction_profiles/htc/vive_cosmos_controller",    "/interaction_profiles/htc/vive_focus3_controller",
     "/interaction_profiles/facebook/touch_controller_pro", "/interaction_profiles/meta/touch_plus_controller",
-    "/interaction_profiles/samsung/odyssey_controller"};
+    "/interaction_profiles/samsung/odyssey_controller",   "/interaction_profiles/valve/frame_controller"};
 const char* const kKindName[kKinds] = {"Touch",  "Index",     "Vive",       "WMR",      "Simple",    "Pico4",   "PicoNeo3",
-                                       "HPReverb", "ViveCosmos", "ViveFocus3", "TouchPro", "TouchPlus", "Odyssey"};
+                                       "HPReverb", "ViveCosmos", "ViveFocus3", "TouchPro", "TouchPlus", "Odyssey", "Frame"};
 int g_kind[2] = {-1, -1};  // under g_mutex (read without it by fit_name: an int)
 struct Fit {
     float off[3] = {0, 0, 0};
@@ -127,7 +130,7 @@ struct Bind {
     std::string path;
 };
 
-void suggest(const char* profile, const std::vector<Bind>& binds) {
+XrResult suggest(const char* profile, const std::vector<Bind>& binds) {
     std::vector<XrActionSuggestedBinding> b;
     for (const Bind& x : binds) b.push_back({*x.action, path(x.path.c_str())});
     XrInteractionProfileSuggestedBinding s{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
@@ -136,6 +139,7 @@ void suggest(const char* profile, const std::vector<Bind>& binds) {
     s.suggestedBindings = b.data();
     XrResult r = xrSuggestInteractionProfileBindings(g_inst, &s);
     log::info("[controllers] bindings for %s (%zu) -> %d", profile, b.size(), static_cast<int>(r));
+    return r;
 }
 
 void suggest_all() {
@@ -239,6 +243,31 @@ void suggest_all() {
         std::vector<Bind> v;
         face(v, e.squeeze, e.left_menu, e.right_menu);
         suggest(e.profile, v);
+    }
+    if (has_ext("XR_VALVE_frame_controller_interaction")) {
+        // Steam Frame (2026-10-10): a split gamepad. A / B / X / Y on the right, the D-pad and View on the left, the
+        // menu button on the right. Without these SteamVR emulates Touch and folds X / Y into B and the D-pad into Y.
+        std::vector<Bind> v;
+        both(v, &g_aim, "/input/aim/pose");
+        both(v, &g_grip_pose, "/input/grip/pose");
+        both(v, &g_trigger, "/input/trigger/value");
+        both(v, &g_squeeze, "/input/squeeze/value");
+        both(v, &g_stick, "/input/thumbstick");
+        both(v, &g_stick_click, "/input/thumbstick/click");
+        both(v, &g_haptic, "/output/haptic");
+        v.push_back({&g_primary, "/user/hand/right/input/a/click"});
+        v.push_back({&g_secondary, "/user/hand/right/input/b/click"});
+        v.push_back({&g_face_x, "/user/hand/right/input/x/click"});
+        v.push_back({&g_face_y, "/user/hand/right/input/y/click"});
+        v.push_back({&g_menu, "/user/hand/right/input/menu/click"});
+        v.push_back({&g_view, "/user/hand/left/input/view/click"});
+        v.push_back({&g_dpad[0], "/user/hand/left/input/dpad_up/click"});
+        v.push_back({&g_dpad[1], "/user/hand/left/input/dpad_down/click"});
+        v.push_back({&g_dpad[2], "/user/hand/left/input/dpad_left/click"});
+        v.push_back({&g_dpad[3], "/user/hand/left/input/dpad_right/click"});
+        // SteamVR's runtime carries the profile under both names
+        if (XR_FAILED(suggest("/interaction_profiles/valve/frame_controller", v)))
+            suggest("/interaction_profiles/valve/frame_controller_valve", v);
     }
     {  // Khronos simple controller (any runtime's fallback)
         std::vector<Bind> v;
@@ -409,7 +438,14 @@ bool create(XrInstance inst, XrSession session) {
               make_action("menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, &g_menu) &&
               make_action("trackpad", "Trackpad", XR_ACTION_TYPE_VECTOR2F_INPUT, &g_pad) &&
               make_action("trackpad_click", "Trackpad click", XR_ACTION_TYPE_BOOLEAN_INPUT, &g_pad_click) &&
-              make_action("haptic", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT, &g_haptic);
+              make_action("haptic", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT, &g_haptic) &&
+              make_action("face_x", "X (Steam Frame)", XR_ACTION_TYPE_BOOLEAN_INPUT, &g_face_x) &&
+              make_action("face_y", "Y (Steam Frame)", XR_ACTION_TYPE_BOOLEAN_INPUT, &g_face_y) &&
+              make_action("view", "View (Steam Frame)", XR_ACTION_TYPE_BOOLEAN_INPUT, &g_view) &&
+              make_action("dpad_up", "D-pad up", XR_ACTION_TYPE_BOOLEAN_INPUT, &g_dpad[0]) &&
+              make_action("dpad_down", "D-pad down", XR_ACTION_TYPE_BOOLEAN_INPUT, &g_dpad[1]) &&
+              make_action("dpad_left", "D-pad left", XR_ACTION_TYPE_BOOLEAN_INPUT, &g_dpad[2]) &&
+              make_action("dpad_right", "D-pad right", XR_ACTION_TYPE_BOOLEAN_INPUT, &g_dpad[3]);
     if (!ok) return false;
     suggest_all();
     XrSessionActionSetsAttachInfo ai{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
@@ -461,6 +497,13 @@ void sync(XrSpace base, XrTime time) {
         if (get_bool(g_secondary, h, &active)) d.buttons |= hands::kB;
         if (get_bool(g_menu, h, &active)) d.buttons |= hands::kMenu;
         if (get_bool(g_stick_click, h, &active)) d.buttons |= hands::kStick;
+        if (get_bool(g_face_x, h, &active)) d.buttons |= hands::kX;
+        if (get_bool(g_face_y, h, &active)) d.buttons |= hands::kY;
+        if (get_bool(g_view, h, &active)) d.buttons |= hands::kView;
+        if (get_bool(g_dpad[0], h, &active)) d.buttons |= hands::kDpadUp;
+        if (get_bool(g_dpad[1], h, &active)) d.buttons |= hands::kDpadDown;
+        if (get_bool(g_dpad[2], h, &active)) d.buttons |= hands::kDpadLeft;
+        if (get_bool(g_dpad[3], h, &active)) d.buttons |= hands::kDpadRight;
         {  // the trackpad's click (WMR, the Vive wands): its upper half B / Y, the lower A / X; the Vive's middle, the stick click
             const int k = g_kind[h];
             if (k == kVive || k == kWMR || k == kOdyssey) {
