@@ -2,12 +2,15 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 
 #include <atomic>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -216,6 +219,7 @@ struct ListLog {
     std::string text;
     uint32_t draws = 0, dispatches = 0, barriers = 0, queries = 0, indirect = 0;
     std::string targets = "-";
+    std::map<std::tuple<uint64_t, uint64_t, uint32_t>, uint32_t> shaders;  // (vs, ps, writes) -> draws in the segment
 };
 std::unordered_map<const void*, ListLog> g_fg_lists;   // command list -> events since last flush
 
@@ -232,8 +236,14 @@ void fg_flush_segment(ListLog& l) {
         std::snprintf(line, sizeof(line), "    [%s] draws %u dispatch %u indirect %u barriers %u queries %u\n",
                       l.targets.c_str(), l.draws, l.dispatches, l.indirect, l.barriers, l.queries);
         l.text += line;
+        for (const auto& [k, n] : l.shaders) {
+            std::snprintf(line, sizeof(line), "      vs %016llx ps %016llx writes %03x: %u\n", static_cast<unsigned long long>(std::get<0>(k)),
+                          static_cast<unsigned long long>(std::get<1>(k)), std::get<2>(k), n);
+            l.text += line;
+        }
     }
     l.draws = l.dispatches = l.barriers = l.queries = l.indirect = 0;
+    l.shaders.clear();
 }
 
 void fg_event(const void* list, const char* fmt, ...) {
@@ -344,17 +354,28 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT
 
 thread_local uint64_t t_draws = 0, t_queries = 0;
 
+void fg_draw(ID3D12GraphicsCommandList* cl) {
+    if (!g_fg_armed.load(std::memory_order_relaxed)) return;
+    uint64_t vs = 0, ps = 0;
+    uint32_t w = 0;
+    const bool known = pso::current(cl, &vs, &ps, &w);
+    fg_count(cl, [&](ListLog& l) {
+        ++l.draws;
+        ++l.shaders[{known ? vs : 0, known ? ps : 0, known ? w : 0xfffu}];
+    });
+}
+
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
     if (pso::on_draw(cl)) return;
     ++t_draws;
-    fg_count(cl, [](ListLog& l) { ++l.draws; });
+    fg_draw(cl);
     pso::on_draw_args(cl, c, a);
     o_DrawInstanced(cl, a, b, c, d);
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
     if (pso::on_draw(cl)) return;
     ++t_draws;
-    fg_count(cl, [](ListLog& l) { ++l.draws; });
+    fg_draw(cl);
     pso::on_draw_args(cl, d, a);
     o_DrawIndexedInstanced(cl, a, b, c, d, e);
 }
@@ -791,8 +812,46 @@ bool made_here(ID3D12Device* d) {
     return false;
 }
 
+// [Debug] D3D12DebugLayer=1 (test only, single-pass stereo's safety net: the mod's barriers and copies checked in the
+// simulator before they could fault the GPU): the debug layer on before the game's devices are made, and its
+// warnings and errors in the log ([d3d12] lines, at most 400 of each message id).
+std::atomic<bool> g_debug_layer{false};
+void CALLBACK debug_message(D3D12_MESSAGE_CATEGORY cat, D3D12_MESSAGE_SEVERITY sev, D3D12_MESSAGE_ID id, LPCSTR text, void*) {
+    if (sev > D3D12_MESSAGE_SEVERITY_WARNING) return;
+    char key[40];
+    std::snprintf(key, sizeof(key), "d3d12.msg.%d", static_cast<int>(id));
+    log::limited(key, 400, "[d3d12] %s %d (category %d): %s", sev <= D3D12_MESSAGE_SEVERITY_ERROR ? "layer error" : "layer warning",
+                 static_cast<int>(id), static_cast<int>(cat), text ? text : "");
+}
+void enable_debug_layer() {
+    using GetDebugInterface_t = HRESULT(WINAPI*)(REFIID, void**);
+    auto gdi = reinterpret_cast<GetDebugInterface_t>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12GetDebugInterface"));
+    ID3D12Debug* d = nullptr;
+    if (!gdi || FAILED(gdi(IID_PPV_ARGS(&d))) || !d) {
+        log::warn("[d3d12] the debug layer is not available (Graphics Tools not installed?)");
+        return;
+    }
+    d->EnableDebugLayer();
+    d->Release();
+    g_debug_layer = true;
+    log::info("[d3d12] the debug layer on ([Debug] D3D12DebugLayer)");
+}
+void hook_debug_messages(ID3D12Device* dev) {
+    if (!g_debug_layer.load()) return;
+    ID3D12InfoQueue1* q = nullptr;
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&q))) || !q) {
+        log::warn("[d3d12] no ID3D12InfoQueue1: the debug layer's messages are not logged");
+        return;
+    }
+    DWORD cookie = 0;
+    const HRESULT hr = q->RegisterMessageCallback(debug_message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+    log::info("[d3d12] message callback on device %p -> %#lx", static_cast<void*>(dev), static_cast<unsigned long>(hr));
+    q->Release();  // the callback stays registered with the device
+}
+
 HRESULT WINAPI hk_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** out) {
     if (out && !state::dred_enabled && config::get_bool("Debug", "Dred", true)) enable_dred();
+    if (out && !g_debug_layer.load() && config::get_bool("Debug", "D3D12DebugLayer", false)) enable_debug_layer();
     HRESULT hr = o_D3D12CreateDevice(adapter, fl, riid, out);
     log::info("[d3d] D3D12CreateDevice(adapter %p, fl %#x, %s) -> %#lx", static_cast<void*>(adapter), static_cast<unsigned>(fl),
               out ? "create" : "probe", static_cast<unsigned long>(hr));
@@ -802,6 +861,7 @@ HRESULT WINAPI hk_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REF
         ID3D12Device* dev = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&dev))) && dev) {
             log::info("[d3d] device %p created", static_cast<void*>(dev));
+            hook_debug_messages(dev);
             {  // single-pass stereo, view instancing (research\sps): what the device offers (two read-only queries)
                 D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
                 const bool o3_ok = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3)));
@@ -1051,6 +1111,7 @@ void framegraph_arm(int frames) {
     g_fg_lists.clear();
     g_fg_frame0 = state::presents.load() + 1;
     g_fg_frames_left = frames;
+    if (frames > 0) pso::arm_census();  // the segments' shaders
     std::snprintf(g_fg_status, sizeof(g_fg_status), "armed for %d frame(s) from %llu", frames,
                   static_cast<unsigned long long>(g_fg_frame0));
     g_fg_armed = frames > 0;

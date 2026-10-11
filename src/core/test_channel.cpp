@@ -779,7 +779,7 @@ std::string execute(const std::vector<std::string>& t) {
         return st;
     }
     if (c == "affinity" && t.size() >= 2) return diag::set_affinity(t[1].c_str());  // same|split|off (test only)
-    if (c == "stacks") {  // stacks <render|playback> [n]: a thread's stack by function and scene phase ("[stack]" lines)
+    if (c == "stacks") {  // stacks <render|playback|main> [n]: a thread's stack by function and scene phase ("[stack]" lines)
         std::string split;  // stacks render n split <walk> <sites,> <entity> <draws,>
         if (t.size() >= 8 && t[3] == "split") split = t[4] + " " + t[5] + " " + t[6] + " " + t[7];
         return diag::sample_stacks(t.size() >= 2 ? t[1].c_str() : "render", t.size() >= 3 ? std::atoi(t[2].c_str()) : 2000,

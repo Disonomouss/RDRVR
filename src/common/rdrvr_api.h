@@ -153,7 +153,9 @@ typedef struct RdrvrCameraJob {
                                   // (2026-10-09, [Body] KeepAnchorCamera): the anchor's camera made current again whenever
                                   // another camera takes its channel (a shop's script); bit 3 (run 9, [Horse]
                                   // StickTurn): with heading_from_mount, heading_deg is an offset added to the mount's
-                                  // heading (the view turned by the right stick); a plugin without it faces the mount
+                                  // heading (the view turned by the right stick); a plugin without it faces the mount;
+                                  // bit 4 (2026-10-11): channel 0 is on the game's gameplay camera (no script's camera
+                                  // current): with bit 2, the anchor takes the channel back only then or in a shop
 } RdrvrCameraJob;
 
 typedef struct RdrvrActorState {

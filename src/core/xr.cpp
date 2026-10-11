@@ -27,6 +27,7 @@
 #include "core/d3d_hooks.h"
 #include "core/eye_shape.h"
 #include "core/frame_probe.h"
+#include "core/vr_mode.h"
 #include "core/hands.h"
 #include "core/anchors.h"
 #include "core/holster.h"
@@ -316,6 +317,21 @@ std::atomic<bool> g_session_running{false};
 std::mutex g_frame_mutex;                // the presenting thread's frame calls against the session thread's end
 XrInstance g_inst = XR_NULL_HANDLE;
 XrSession g_session = XR_NULL_HANDLE;
+// [XR] RefreshRate (2026-10-11, performance for weaker PCs: a missed frame drops the runtimes to half rate, SteamVR to
+// 36 Hz, Virtual Desktop to 45): the headset's refresh rate by XR_FB_display_refresh_rate where the runtime offers it.
+// 0 = the runtime's own. The session thread requests it (at the start and on each change from the menu).
+bool g_rr_ext = false;
+PFN_xrEnumerateDisplayRefreshRatesFB g_rr_enum = nullptr;
+PFN_xrGetDisplayRefreshRateFB g_rr_get = nullptr;
+PFN_xrRequestDisplayRefreshRateFB g_rr_request = nullptr;
+std::mutex g_rr_mutex;
+float g_rr_list[16] = {};
+int g_rr_count = 0;  // under g_rr_mutex
+std::atomic<float> g_rr_want{0.0f}, g_rr_now{0.0f};
+std::atomic<bool> g_rr_dirty{true};
+std::atomic<float> g_rr_start{0.0f};  // the rate the session started at: "the runtime's" (a wanted 0) asks for it again
+std::atomic<float> g_last_missed_pct{0.0f}, g_last_hz{0.0f}, g_last_gpu_ms{0.0f};
+std::atomic<int> g_struggle{0};  // consecutive stereo-gameplay timing windows with over 3% missed periods
 ID3D12CommandQueue* g_session_queue = nullptr;  // the binding's queue (a reference kept, as state's)
 ID3D12Fence* g_to_session = nullptr;            // the present queue's work ordered before the session queue's
 ID3D12Fence* g_from_session = nullptr;          // the session queue's work ordered before the game's next lists
@@ -1373,6 +1389,13 @@ void timing_window(const XrFrameState& fs) {
         frame_probe::format(g_tw.probe0, now_snap, line, sizeof(line));
         log::info("[xr] timing %s", line);
     }
+    {  // the last windows for the menu's preset suggestion: stereo gameplay only, missed periods over 3%
+        const double mp = 100.0 * static_cast<double>(g_tw.missed) / static_cast<double>(g_tw.frames + g_tw.missed ? g_tw.frames + g_tw.missed : 1);
+        g_last_missed_pct = static_cast<float>(mp);
+        g_last_hz = static_cast<float>(g_tw.frames / secs);
+        g_last_gpu_ms = static_cast<float>(g_tw.gpu_sum / n);
+        if (vr_mode::gameplay_stereo()) g_struggle = mp > 3.0 ? g_struggle.load() + 1 : 0;
+    }
     g_tw.start_ms = 0;  // the next frame starts a new window
 }
 
@@ -1552,6 +1575,7 @@ bool select_runtime() {
 
 DWORD WINAPI session_thread(void*) {
     select_runtime();
+    load_refresh_rate();
     XrInstance inst = XR_NULL_HANDLE;
     std::vector<const char*> exts = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
     {  // the extra controllers' interaction profiles, where the runtime offers them (controllers.cpp binds them)
@@ -1561,7 +1585,15 @@ DWORD WINAPI session_thread(void*) {
             props.assign(n, XrExtensionProperties{XR_TYPE_EXTENSION_PROPERTIES});
             if (XR_FAILED(xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data()))) props.clear();
         }
-        std::string got;
+        std::string got, all;
+        for (const XrExtensionProperties& p : props) {
+            all += std::string(" ") + p.extensionName;
+            if (std::strcmp(p.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0 && !g_rr_ext) {
+                exts.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+                g_rr_ext = true;
+            }
+        }
+        log::info("[xr] the runtime's instance extensions:%s", all.c_str());
         for (const char* want : controllers::kProfileExtensions)
             for (const XrExtensionProperties& p : props)
                 if (std::strcmp(p.extensionName, want) == 0) {
@@ -1693,6 +1725,33 @@ DWORD WINAPI session_thread(void*) {
     g_inst = inst;
     g_session = session;
     g_blend = blend;
+    if (g_rr_ext) {  // the headset's refresh rates (XR_FB_display_refresh_rate)
+        xrGetInstanceProcAddr(inst, "xrEnumerateDisplayRefreshRatesFB", reinterpret_cast<PFN_xrVoidFunction*>(&g_rr_enum));
+        xrGetInstanceProcAddr(inst, "xrGetDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&g_rr_get));
+        xrGetInstanceProcAddr(inst, "xrRequestDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&g_rr_request));
+        uint32_t n = 0;
+        float rates[16] = {};
+        if (g_rr_enum && XR_SUCCEEDED(g_rr_enum(session, 16, &n, rates))) {
+            std::lock_guard lock(g_rr_mutex);
+            g_rr_count = static_cast<int>(n < 16 ? n : 16);
+            std::memcpy(g_rr_list, rates, sizeof(float) * g_rr_count);
+        }
+        float now = 0.0f;
+        if (g_rr_get && XR_SUCCEEDED(g_rr_get(session, &now))) {
+            g_rr_now = now;
+            g_rr_start = now;
+        }
+        std::string list;
+        for (uint32_t i = 0; i < n && i < 16; ++i) {
+            char b[16];
+            std::snprintf(b, sizeof(b), " %.1f", rates[i]);
+            list += b;
+        }
+        log::info("[xr] refresh rates offered:%s; now %.1f Hz; [XR] RefreshRate %.1f", list.empty() ? " none" : list.c_str(), now,
+                  g_rr_want.load());
+    } else {
+        log::info("[xr] the runtime offers no refresh rate choice (XR_FB_display_refresh_rate): [XR] RefreshRate unused");
+    }
     g_submit_mode = config::get_bool("XR", "Submit", false);
 
     bool running = false;
@@ -1745,6 +1804,10 @@ DWORD WINAPI session_thread(void*) {
                     log::info("[xr] session ended");
                     return 0;
                 }
+            } else if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
+                auto* rc = reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB*>(&ev);
+                g_rr_now = rc->toDisplayRefreshRate;
+                log::info("[xr] the headset's refresh rate %.1f -> %.1f Hz", rc->fromDisplayRefreshRate, rc->toDisplayRefreshRate);
             } else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
                 controllers::on_profile_changed();
             } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
@@ -1759,6 +1822,20 @@ DWORD WINAPI session_thread(void*) {
                 return 0;
             }
             ev = XrEventDataBuffer{XR_TYPE_EVENT_DATA_BUFFER};
+        }
+        if (running && g_rr_request && g_rr_dirty.exchange(false)) {  // [XR] RefreshRate: the nearest offered rate
+            const float want = g_rr_want.load();
+            const float target = want > 0.0f ? want : g_rr_start.load();  // 0: back to the rate the session started at
+            float best = 0.0f;
+            {
+                std::lock_guard lock(g_rr_mutex);
+                for (int i = 0; i < g_rr_count; ++i)
+                    if (target > 0.0f && (best == 0.0f || std::fabs(g_rr_list[i] - target) < std::fabs(best - target))) best = g_rr_list[i];
+            }
+            if (best > 0.0f && std::fabs(best - g_rr_now.load()) > 0.5f) {
+                const XrResult rr = g_rr_request(session, best);
+                log::info("[xr] refresh rate %.1f Hz requested ([XR] RefreshRate %.1f) -> %s", best, want, result_name(inst, rr));
+            }
         }
         // Hand the frames over between idle frames (the last call here was xrEndFrame), or take them back.
         int handover = g_submit_request.exchange(0);
@@ -1889,6 +1966,29 @@ bool eye_views_peek(EyeView out[2]) {
 const char* session_state() { return g_state; }
 uint64_t frames() { return g_frames.load(); }
 const char* runtime_name() { return g_runtime; }
+int refresh_rates(float* out, int max) {
+    std::lock_guard lock(g_rr_mutex);
+    const int n = g_rr_count < max ? g_rr_count : max;
+    for (int i = 0; i < n; ++i) out[i] = g_rr_list[i];
+    return g_rr_ext ? n : -1;
+}
+float refresh_rate_now() { return g_rr_now.load(); }
+bool struggling(float* missed_pct, float* hz) {
+    if (missed_pct) *missed_pct = g_last_missed_pct.load();
+    if (hz) *hz = g_last_hz.load();
+    return g_struggle.load() >= 3;
+}
+float refresh_rate_want() { return g_rr_want.load(); }
+void set_refresh_rate_want(float hz, bool save) {
+    g_rr_want = hz;
+    g_rr_dirty = true;
+    if (save) {
+        char b[16];
+        std::snprintf(b, sizeof(b), "%.0f", hz);
+        config::set("XR", "RefreshRate", b);
+    }
+}
+void load_refresh_rate() { g_rr_want = config::get_float("XR", "RefreshRate", 0.0f); }
 
 void rings_status(char* out, size_t len) {
     char r[160];

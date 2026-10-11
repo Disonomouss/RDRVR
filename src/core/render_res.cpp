@@ -48,6 +48,7 @@ const Headset kHeadsets[] = {
     {"beyond", "Bigscreen Beyond", 2560},
     {"crystal", "Pimax Crystal", 2880},
     {"dreamair", "Pimax Dream Air", 3552},
+    {"galaxyxr", "Galaxy XR", 3840},  // 3552 x 3840 an eye (Samsung's micro-OLED)
 };
 constexpr int kHeadsetCount = static_cast<int>(sizeof(kHeadsets) / sizeof(kHeadsets[0]));
 // the headset choices: 0 the game's own, 1 Automatic, then the headsets; -1 a custom size (the ini's RenderResolution)
@@ -296,6 +297,10 @@ bool size_of(int c, int s, uint32_t cw, uint32_t ch, uint32_t* w, uint32_t* h, c
         }
         const float es = config::get_float("XR", "EyeScale", 1.0f);
         uint32_t want = static_cast<uint32_t>(std::ceil(g_rec_h * (es > 0.25f && es < 4.0f ? es : 1.0f) * scale_factor(s)));
+        // [Render] AutoMaxHeight (2026-10-11, performance for weaker PCs; the presets set it): SteamVR's request includes its
+        // own supersampling (an Index player's 4136 gave a 7352x4136 frame, the GPU at 25-39 ms): at most this tall. 0 = none
+        const int cap = config::get_int("Render", "AutoMaxHeight", 0);
+        if (cap >= 480 && want > static_cast<uint32_t>(cap)) want = static_cast<uint32_t>(cap);
         want = (want + 1) & ~1u;
         static const uint32_t own = xml_height();  // once: the xml before this start's changes
         const uint32_t floor_h = own ? own : static_cast<uint32_t>(GetSystemMetrics(SM_CYSCREEN));

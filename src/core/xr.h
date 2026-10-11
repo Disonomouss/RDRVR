@@ -34,6 +34,16 @@ void rings_status(char* out, size_t len);  // the holster rings' layers and the 
 const char* session_state();      // "none", "idle", "ready", "synchronized", "visible", "focused", "stopping", ...
 uint64_t frames();                // xrEndFrame calls
 const char* runtime_name();
+// [XR] RefreshRate (XR_FB_display_refresh_rate): the rates the headset offers (-1: the runtime has no such choice), the
+// current one, and the wanted one (0 = the runtime's own; requested on the session thread, the nearest offered rate)
+int refresh_rates(float* out, int max);
+float refresh_rate_now();
+float refresh_rate_want();
+void set_refresh_rate_want(float hz, bool save = true);
+void load_refresh_rate();
+// the last three 10 s timing windows of stereo gameplay each missed over 3% of the display periods (the menu's preset
+// suggestion); the last window's missed share and frame rate
+bool struggling(float* missed_pct = nullptr, float* hz = nullptr);
 // R5: frames submitted, copies, misses, ..., then " | cap WxH | ui quad WxH of WxH, wrist WxH of WxH | cinema quad WxH,
 // shown WxH (copies n, resampled n) | resized 0|1 (what)": the runtime's largest image, each quad's swapchain against
 // its source, and the live-resize guard (frame_resized). 1024 characters hold it.

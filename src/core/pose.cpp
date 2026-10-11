@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "core/aim.h"
 #include "core/api.h"
 #include "core/camera_lever.h"
 #include "core/config.h"
@@ -109,6 +110,7 @@ void on_frame_end(uint64_t) {
     job.no_idles = g_no_idles ? 1 : 0;
     job.hide_reticle = g_hide_reticle ? 1 : 0;
     job.weapons = (holster::weapon_choice() ? 1u : 0u) | (g_keep_cam.load(std::memory_order_relaxed) ? 2u : 0u);
+    if (aim::gameplay_camera_current()) job.weapons |= 8u;  // no script's camera holds channel 0: the anchor may take it back
     if (want) {
         RdrvrActorState st{};
         if (!g_have_scale && g_auto_height && api::actor_state(&st) && st.head_valid) {

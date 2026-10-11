@@ -662,10 +662,27 @@ void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, 
 // FUN_1403480a0(player info, weapon manager): the fire trigger; it fires (and executes Dead Eye) only while the
 // camera on channel 0 ([[CamManager +8] +0x18] +0x10) is the gameplay camera ([CamManager +0x28]).
 using Fire_t = void (*)(uintptr_t info, uintptr_t wmgr);
+
+}  // namespace
+
+std::atomic<bool> g_fire_swap{false};  // in hk_fire: channel 0 may be on the gameplay camera for its call (not the game's own)
+
+bool gameplay_camera_current() {
+    if (g_fire_swap.load(std::memory_order_acquire)) return false;
+    uintptr_t cm = 0, chs = 0, ch = 0, cur = 0, gp = 0;
+    return rd(anchors::addr(anchors::Id::CamManager), &cm) && cm && rd(cm + 8, &chs) && chs && rd(chs + 0x18, &ch) && ch &&
+           rd(ch + 0x10, &cur) && rd(cm + 0x28, &gp) && gp && cur == gp;
+}
+
+namespace {
 Fire_t o_fire = nullptr;
 
 void hk_fire(uintptr_t info, uintptr_t wmgr) {
     g_fires.fetch_add(1, std::memory_order_relaxed);
+    struct SwapFlag {  // (the plugin's camera job must not read the swap below as the game's own gameplay camera)
+        SwapFlag() { g_fire_swap.store(true, std::memory_order_release); }
+        ~SwapFlag() { g_fire_swap.store(false, std::memory_order_release); }
+    } swap_flag;
     uint8_t reload_before = 0;  // the reload request byte: the empty trigger sets it (reload.cpp holds that back)
     rd(info + 0x248, &reload_before);
     uintptr_t cm = 0, chs = 0, ch = 0, cur = 0, gp = 0;

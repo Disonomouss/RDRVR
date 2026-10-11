@@ -695,6 +695,72 @@ void page_general() {
     }
     // [Stereo] Split_shadows (the single-pass study, step 2): the shadows drawn once a frame, fitted for both eyes
     heading("Performance");
+    {  // the performance presets (2026-10-11, performance for weaker PCs): each sets the rows below and the resolution's
+       // cap; the eye shape only drops pixels the headset cannot show. Most apply from the next start.
+        static int chosen = -1;
+        const char* const kP[3] = {"Quality", "Balanced", "Performance"};
+        const char* const kTip[3] = {
+            "The sharpest: the eyes in the headset's shape, DLSS at DLAA (native), Automatic at the runtime's full size, the "
+            "runtime's refresh rate. For a fast PC.",
+            "The eyes in the headset's shape, DLSS Quality, Automatic at most 2880 tall (SteamVR's size includes its own "
+            "supersampling). For most PCs.",
+            "The eyes in the headset's shape, DLSS Performance (without DLSS: 0.85 of the size), Automatic at most 2208 tall, "
+            "72 Hz where the headset offers it. For a slower PC."};
+        ImGui::TextUnformatted("Preset:");
+        for (int p = 0; p < 3; ++p) {
+            ImGui::SameLine();
+            if (ImGui::Button(kP[p])) {
+                chosen = p;
+                eye_shape::set_enabled(true, true);
+                eye_shape::set_dlss_next_start(true);
+                dual_pass::set_split("shadows", true);
+                config::set("Stereo", "Split_shadows", "1");
+                g_set.dlss_q = p == 0 ? 0 : p == 1 ? 5 : 3;  // DLAA, Quality, Performance
+                config::set("Render", "DlssQuality", std::to_string(g_set.dlss_q));
+                config::set("Render", "AutoMaxHeight", p == 0 ? "0" : p == 1 ? "2880" : "2208");
+                config::set("XR", "EyeScale", p == 2 && g_set.aa != 3 ? "0.85" : "1.0");
+                float rates[16];
+                const int n = xr::refresh_rates(rates, 16);
+                float hz = 0.0f;
+                for (int i = 0; p == 2 && i < n; ++i)
+                    if (std::fabs(rates[i] - 72.0f) < 0.5f) hz = rates[i];
+                if (p < 2 || hz > 0.0f) xr::set_refresh_rate_want(hz);
+                log::info("[menu] the %s preset chosen", kP[p]);
+            }
+            track((std::string("Preset ") + kP[p]).c_str());
+            help(kTip[p]);
+        }
+        if (chosen >= 0) note("Set. The eye shape, DLSS and the resolution apply from the next start; the refresh rate now.");
+        float mp = 0.0f, hz = 0.0f;
+        if (xr::struggling(&mp, &hz))
+            note(("This PC is missing frames here (" + std::to_string(static_cast<int>(mp + 0.5f)) + "% of them, " +
+                  std::to_string(static_cast<int>(hz + 0.5f)) + " frames a second): the Balanced or Performance preset may help.").c_str());
+    }
+    {  // [XR] RefreshRate: the headset's refresh rate, where the runtime lets the mod choose it
+        float rates[16];
+        const int n = xr::refresh_rates(rates, 16);
+        if (n > 0) {
+            const float want = xr::refresh_rate_want();
+            ImGui::TextUnformatted("Headset refresh rate:");
+            const char* const tip = "Lower is easier on the PC: a frame that misses the headset's rate drops the runtime to half the "
+                                    "rate (90 to 45). 72 or 80 holds steadier on a slower PC. The runtime's: as the headset is set.";
+            ImGui::SameLine();
+            if (radio("The runtime's", want <= 0.0f, tip)) xr::set_refresh_rate_want(0.0f);
+            for (int i = 0; i < n; ++i) {
+                char lab[24];
+                std::snprintf(lab, sizeof(lab), "%.0f Hz##rr%d", rates[i], i);
+                ImGui::SameLine();
+                if (radio(lab, want > 0.0f && std::fabs(want - rates[i]) < 0.5f, tip)) xr::set_refresh_rate_want(rates[i]);
+            }
+            char now[64];
+            std::snprintf(now, sizeof(now), "Now: %.0f Hz", xr::refresh_rate_now());
+            note(now);
+        } else if (n == 0) {
+            note("Headset refresh rate: the runtime offered no rates.");
+        } else {
+            note("Headset refresh rate: set it in your headset's or runtime's own settings (this runtime does not let the mod choose it).");
+        }
+    }
     bool shared = dual_pass::split_on("shadows");
     if (check("Shadows drawn once for both eyes", &shared,
               "The sun's, the lamps' and the spot lights' shadows drawn once a frame, fitted for both eyes, instead of once per "
@@ -833,7 +899,7 @@ void page_comfort() {
     }
     float speed = pose::turn_speed(), angle = pose::snap_angle();
     sub_begin(turn == 0);
-    if (nudge1("Turn speed", &speed, 10.0f, 30.0f, 240.0f, "%.0f deg/s", "Smooth turning's speed at full tilt (a press 10 degrees a second).")) {
+    if (nudge1("Turn speed", &speed, 10.0f, 30.0f, 360.0f, "%.0f deg/s", "Smooth turning's speed at full tilt (a press 10 degrees a second).")) {
         pose::set_turning(pose::snap_turning(), speed, angle);
         config::set("Comfort", "TurnSpeed", std::to_string(static_cast<int>(speed)));
     }

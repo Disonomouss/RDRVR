@@ -43,6 +43,7 @@ Phase phase();
 bool set_on(bool on);                  // the test's switch (only once installed): its own cost, on against off
 void add(Slot s, double ms);
 void thread_frame(Thread t);           // once a frame on that thread: its CPU cycles since its last call
+unsigned long thread_id(Thread t);     // that thread's id, from its last thread_frame (0: none yet; the probe on)
 void render_frame_start(double now);   // SceneRender's start (render thread): the frame period, the render cycles
 void playback_frame(uint64_t draws);   // at Present (playback thread): the thread's D3D12 draw count, its cycles
 void install();                        // after dual_pass::install (the wait sites): [XR] TimingProbe, the hook

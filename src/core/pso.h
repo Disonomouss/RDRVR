@@ -19,5 +19,9 @@ bool on_draw(ID3D12GraphicsCommandList* cl);
 void on_draw_args(ID3D12GraphicsCommandList* cl, int64_t first_vertex, uint32_t count);
 // "pso census [n]" / "pso skip <hash>|off" / "pso dump <dir>" (the vertex shaders drawn last frame, as .dxbc).
 std::string command(const std::string& line);
+// The census on from now (the frame graph arms it); the list's current pipeline as the census knows it: its vertex and
+// pixel shaders' hashes and what it writes (bits 0-7 the render targets, bit 8 depth). False: not known (another list).
+void arm_census();
+bool current(const ID3D12GraphicsCommandList* cl, uint64_t* vs, uint64_t* ps, uint32_t* writes);
 
 }  // namespace rdrvr::pso

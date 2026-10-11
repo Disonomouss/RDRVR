@@ -43,9 +43,21 @@ std::unordered_map<uint64_t, std::vector<uint8_t>> g_bytecode;  // vertex shader
 std::unordered_map<uint64_t, uint64_t> g_draws, g_last;     // vertex shader hash -> draws this frame / last frame
 std::unordered_set<uint64_t> g_skip_set;  // under g_mutex
 std::atomic<bool> g_skip_any{false};
+// The per-draw census (draws per vertex shader, the skips, the vertex capture) runs only after the first "pso" test
+// command (2026-10-11, performance for weaker PCs: a mutex and a map update on every draw and pipeline set on the
+// playback thread, about 12,000 a frame). [Debug] PsoCensus=1 runs it from the start.
+std::atomic<bool> g_census{false};
 std::atomic<uint64_t> g_skip{0}, g_skipped{0}, g_graphics{0}, g_stream{0}, g_unhashed{0};
 thread_local ID3D12GraphicsCommandList* t_cl = nullptr;
 thread_local uint64_t t_vs = 0;
+// The frame graph's shader census (single-pass stereo, the pre-pass census): per graphics pipeline its pixel shader's
+// hash and what it writes (bits 0-7: render target i written, bit 8: depth written); the list's current one.
+struct PsoInfo {
+    uint64_t ps = 0;
+    uint32_t writes = 0;
+};
+std::unordered_map<void*, PsoInfo> g_info;  // under g_mutex
+thread_local PsoInfo t_info;
 
 uint64_t fnv(const void* p, size_t n) {
     const uint8_t* b = static_cast<const uint8_t*>(p);
@@ -100,7 +112,94 @@ const std::vector<uint8_t>* swap_for(const D3D12_SHADER_BYTECODE& vs) {
     return it == g_swap.end() ? nullptr : &it->second;
 }
 
+// [Debug] PsoDump=<folder> (single-pass stereo step 5, milestone 1, test only): every graphics pipeline the game makes
+// written to <folder>\\pso_<n>.bin (its desc, its shaders and its root signature's serialized blob), for creating its
+// view-instanced twin outside the game (research\\sps\\tools\\vi\\psotest.cpp). The root signatures' blobs come
+// from a CreateRootSignature hook. Format "PSO1", little-endian: each field below in order, blobs as u32 length + bytes.
+using CreateRootSig_t = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
+CreateRootSig_t o_CreateRootSig = nullptr;
+std::string g_dump_dir;
+std::mutex g_dump_mutex;
+std::unordered_map<void*, std::vector<uint8_t>> g_root_blobs;  // under g_dump_mutex
+int g_dumped = 0;
+HRESULT STDMETHODCALLTYPE hk_CreateRootSig(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T len, REFIID riid, void** out) {
+    const HRESULT hr = o_CreateRootSig(dev, mask, blob, len, riid, out);
+    if (SUCCEEDED(hr) && out && *out && blob && len) {
+        std::lock_guard lock(g_dump_mutex);
+        const uint8_t* b = static_cast<const uint8_t*>(blob);
+        g_root_blobs[*out] = std::vector<uint8_t>(b, b + len);
+    }
+    return hr;
+}
+void put_blob(FILE* f, const void* p, size_t n) {
+    const uint32_t len = static_cast<uint32_t>(p ? n : 0);
+    fwrite(&len, 4, 1, f);
+    if (len) fwrite(p, 1, len, f);
+}
+void dump_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d) {
+    std::vector<uint8_t> root;
+    int n = 0;
+    {
+        std::lock_guard lock(g_dump_mutex);
+        auto it = g_root_blobs.find(d->pRootSignature);
+        if (it != g_root_blobs.end()) root = it->second;
+        n = g_dumped++;
+    }
+    char path[600];
+    std::snprintf(path, sizeof(path), "%s\\pso_%04d.bin", g_dump_dir.c_str(), n);
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "wb") != 0 || !f) return;
+    fwrite("PSO1", 1, 4, f);
+    put_blob(f, d->VS.pShaderBytecode, d->VS.BytecodeLength);
+    put_blob(f, d->PS.pShaderBytecode, d->PS.BytecodeLength);
+    put_blob(f, d->DS.pShaderBytecode, d->DS.BytecodeLength);
+    put_blob(f, d->HS.pShaderBytecode, d->HS.BytecodeLength);
+    put_blob(f, d->GS.pShaderBytecode, d->GS.BytecodeLength);
+    put_blob(f, root.data(), root.size());
+    const uint32_t so = d->StreamOutput.NumEntries;
+    fwrite(&so, 4, 1, f);
+    fwrite(&d->BlendState, sizeof(d->BlendState), 1, f);
+    fwrite(&d->SampleMask, 4, 1, f);
+    fwrite(&d->RasterizerState, sizeof(d->RasterizerState), 1, f);
+    fwrite(&d->DepthStencilState, sizeof(d->DepthStencilState), 1, f);
+    const uint32_t ne = d->InputLayout.pInputElementDescs ? d->InputLayout.NumElements : 0;
+    fwrite(&ne, 4, 1, f);
+    for (uint32_t i = 0; i < ne; ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& e = d->InputLayout.pInputElementDescs[i];
+        put_blob(f, e.SemanticName, e.SemanticName ? std::strlen(e.SemanticName) : 0);
+        const uint32_t v[6] = {e.SemanticIndex, static_cast<uint32_t>(e.Format), e.InputSlot, e.AlignedByteOffset,
+                               static_cast<uint32_t>(e.InputSlotClass), e.InstanceDataStepRate};
+        fwrite(v, 4, 6, f);
+    }
+    const uint32_t tail[5] = {static_cast<uint32_t>(d->IBStripCutValue), static_cast<uint32_t>(d->PrimitiveTopologyType), d->NumRenderTargets,
+                              static_cast<uint32_t>(d->DSVFormat), d->NodeMask};
+    fwrite(tail, 4, 5, f);
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t fmt = static_cast<uint32_t>(d->RTVFormats[i]);
+        fwrite(&fmt, 4, 1, f);
+    }
+    const uint32_t sd[3] = {d->SampleDesc.Count, d->SampleDesc.Quality, static_cast<uint32_t>(d->Flags)};
+    fwrite(sd, 4, 3, f);
+    const uint64_t vs_hash = d->VS.pShaderBytecode && d->VS.BytecodeLength ? fnv(d->VS.pShaderBytecode, d->VS.BytecodeLength) : 0;
+    fwrite(&vs_hash, 8, 1, f);
+    fclose(f);
+}
+
+void record_info(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d) {
+    PsoInfo in;
+    in.ps = d->PS.pShaderBytecode && d->PS.BytecodeLength ? fnv(d->PS.pShaderBytecode, d->PS.BytecodeLength) : 0;
+    const UINT n = d->NumRenderTargets < 8 ? d->NumRenderTargets : 8;
+    for (UINT i = 0; i < n; ++i) {
+        const auto& bt = d->BlendState.RenderTarget[d->BlendState.IndependentBlendEnable ? i : 0];
+        if (bt.RenderTargetWriteMask && d->RTVFormats[i] != DXGI_FORMAT_UNKNOWN) in.writes |= 1u << i;
+    }
+    if (d->DepthStencilState.DepthEnable && d->DepthStencilState.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL) in.writes |= 1u << 8;
+    std::lock_guard lock(g_mutex);
+    g_info[pso] = in;
+}
+
 HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out) {
+    if (d && !g_dump_dir.empty()) dump_pso(d);
     if (d && out) {
         if (const std::vector<uint8_t>* r = swap_for(d->VS)) {
             D3D12_GRAPHICS_PIPELINE_STATE_DESC d2 = *d;
@@ -110,6 +209,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
                 g_swaps.fetch_add(1, std::memory_order_relaxed);
                 g_graphics.fetch_add(1, std::memory_order_relaxed);
                 record(*out, d->VS);  // counted under the game's own hash
+                record_info(*out, d);
                 return hs;
             }
             g_swap_fails.fetch_add(1, std::memory_order_relaxed);
@@ -121,6 +221,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
     if (SUCCEEDED(hr) && d && out && *out) {
         g_graphics.fetch_add(1, std::memory_order_relaxed);
         record(*out, d->VS);
+        record_info(*out, d);
     }
     return hr;
 }
@@ -205,19 +306,24 @@ HRESULT STDMETHODCALLTYPE hk_CreateStream(ID3D12Device* dev, const D3D12_PIPELIN
 }
 
 void STDMETHODCALLTYPE hk_SetPipelineState(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
+    if (!g_census.load(std::memory_order_relaxed)) return o_SetPipelineState(cl, ps);
     uint64_t h = 0;
+    PsoInfo in;
     {
         std::lock_guard lock(g_mutex);
         auto it = g_vs_of.find(ps);
         if (it != g_vs_of.end()) h = it->second;
+        auto ii = g_info.find(ps);
+        if (ii != g_info.end()) in = ii->second;
     }
     t_cl = cl;
     t_vs = h;
+    t_info = in;
     o_SetPipelineState(cl, ps);
 }
 
 void STDMETHODCALLTYPE hk_SetVB(ID3D12GraphicsCommandList* cl, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v) {
-    if (start == 0 && n >= 1 && v) {
+    if (g_census.load(std::memory_order_relaxed) && start == 0 && n >= 1 && v) {
         t_vb_cl = cl;
         t_vb = v[0];
     }
@@ -236,6 +342,7 @@ void on_frame_end(uint64_t) {
         }
         g_cap_state = 3;
     }
+    if (!g_census.load(std::memory_order_relaxed)) return;
     std::lock_guard lock(g_mutex);
     g_last.swap(g_draws);
     g_draws.clear();
@@ -243,11 +350,30 @@ void on_frame_end(uint64_t) {
 
 }  // namespace
 
+void arm_census() {
+    if (!g_census.exchange(true)) log::info("[pso] the draw census started (the frame graph)");
+}
+
+bool current(const ID3D12GraphicsCommandList* cl, uint64_t* vs, uint64_t* ps, uint32_t* writes) {
+    if (cl != t_cl) return false;
+    *vs = t_vs;
+    *ps = t_info.ps;
+    *writes = t_info.writes;
+    return true;
+}
+
 void install_device_hooks(ID3D12Device* dev) {
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
         load_swaps();
+        if (config::get_bool("Debug", "PsoCensus", false)) g_census = true;
+        g_dump_dir = config::get_string("Debug", "PsoDump", "");
+        if (!g_dump_dir.empty()) {
+            CreateDirectoryA(g_dump_dir.c_str(), nullptr);
+            hooks::install("ID3D12Device::CreateRootSignature", hooks::vtable_entry(dev, 16), hk_CreateRootSig, &o_CreateRootSig);
+            log::info("[pso] PsoDump: the game's pipelines written to %s", g_dump_dir.c_str());
+        }
     }
     hooks::install("ID3D12Device::CreateGraphicsPipelineState", hooks::vtable_entry(dev, 10), hk_CreateGraphics, &o_CreateGraphics);
     ID3D12Device2* d2 = nullptr;
@@ -295,6 +421,7 @@ void install_list_hooks(ID3D12GraphicsCommandList* cl) {
 }
 
 bool on_draw(ID3D12GraphicsCommandList* cl) {
+    if (!g_census.load(std::memory_order_relaxed)) return false;
     uint64_t h = cl == t_cl ? t_vs : 0;
     if (h) {
         std::lock_guard lock(g_mutex);
@@ -317,6 +444,10 @@ std::string command(const std::string& line) {
     std::string word, sub, arg;
     in >> word >> sub >> arg;
     char buf[256];
+    if (!g_census.exchange(true)) {
+        Sleep(250);  // a few frames counted (a pipeline set before now counts from its next set)
+        log::info("[pso] the draw census started");
+    }
     if (sub == "vbcap") {
         // pso vbcap <vs hash> <file>: capture the next frame's draws of that vertex shader
         std::string file;

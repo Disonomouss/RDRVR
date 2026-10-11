@@ -48,6 +48,9 @@ bool weapon_ik_offsets(uintptr_t W, float ik[3], float ik_hold[3]);
 // The weapon's MuzzleOffset (its tune, weapon info +0x310) in the gun's axes, when sane (under 1 m). Any thread.
 bool weapon_muzzle_offset(uintptr_t W, float mo[3]);
 bool aiming();
+// Channel 0's camera is the game's own gameplay camera ([[CamManager +8] +0x18] +0x10 == [CamManager +0x28]): no
+// scripted camera (the anchor's, a shop's, a mission's) is current. False when not read.
+bool gameplay_camera_current();
 // [Gestures] ThrowByGrip: hold the grip to hold a throwable, the trigger to start it (the light, the knife by its tip),
 // the grip let go to throw it with the swing. grip_throw_wanted(ctrl): that controller's grip is the throwable's (the
 // gun hand with a throwable in it), not the game's button

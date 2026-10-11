@@ -845,6 +845,21 @@ DWORD WINAPI stacks_worker(void* p) {
     std::vector<std::vector<std::pair<uintptr_t, int>>> incl(frame_probe::kPhaseCount), excl(frame_probe::kPhaseCount),
         rips(frame_probe::kPhaseCount);  // the exact instruction (where in a function the time goes: a lock's stall)
     int count[frame_probe::kPhaseCount] = {}, failed = 0, total = 0;
+    // the mod's own share (performance for weaker PCs): samples with a frame of this module anywhere, and at the top
+    uintptr_t mod_lo = 0, mod_hi = 0;
+    {
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&stacks_worker), &self) && self) {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(self);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(self) + dos->e_lfanew);
+            mod_lo = reinterpret_cast<uintptr_t>(self);
+            mod_hi = mod_lo + nt->OptionalHeader.SizeOfImage;
+        }
+    }
+    auto in_mod = [&](uintptr_t a) { return a >= mod_lo && a < mod_hi; };
+    int mod_incl = 0, mod_top = 0;
+    std::vector<std::pair<uintptr_t, int>> mod_fn;  // the mod's own code at the top, by function
     // split: [phase][site (nsites = another place in the walk)]: under the site, under the entity function, under a
     // draw function inside it
     int sp_site[frame_probe::kPhaseCount][5] = {}, sp_ent[frame_probe::kPhaseCount][5] = {}, sp_emit[frame_probe::kPhaseCount][5] = {};
@@ -876,6 +891,15 @@ DWORD WINAPI stacks_worker(void* p) {
         }
         ++total;
         ++count[ph];
+        if (in_mod(static_cast<uintptr_t>(ctx.Rip))) {
+            ++mod_top;
+            bump(mod_fn, frames[0] ? frames[0] : static_cast<uintptr_t>(ctx.Rip));
+        }
+        for (int i = 0; i < nf; ++i)
+            if (in_mod(frames[i]) || in_mod(at[i])) {
+                ++mod_incl;
+                break;
+            }
         bump(excl[ph], frames[0] ? frames[0] : static_cast<uintptr_t>(ctx.Rip));
         bump(rips[ph], static_cast<uintptr_t>(ctx.Rip));
         for (int i = 0; i < nf; ++i) {  // each function once per sample
@@ -909,6 +933,19 @@ DWORD WINAPI stacks_worker(void* p) {
     CloseHandle(h);
     const double secs = (log::now_ms() - t0) / 1000.0;
     log::info("[stack] %s: %d samples over %.1f s (%d not unwound)", job.name, total, secs, failed);
+    log::info("[stack] %s: the mod (this module) on the stack in %.1f%% of the samples, at the top in %.1f%%", job.name,
+              100.0 * mod_incl / (total ? total : 1), 100.0 * mod_top / (total ? total : 1));
+    {
+        std::sort(mod_fn.begin(), mod_fn.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        char line[1600];
+        int used = std::snprintf(line, sizeof(line), "[stack] %s: the mod's own code by function (of all samples):", job.name);
+        for (size_t i = 0; i < mod_fn.size() && i < 24 && used < static_cast<int>(sizeof(line)) - 120; ++i) {
+            char where[128];
+            module_rva(mod_fn[i].first, where, sizeof(where));
+            used += std::snprintf(line + used, sizeof(line) - used, " %s %.2f%%;", where, 100.0 * mod_fn[i].second / (total ? total : 1));
+        }
+        log::info("%s", line);
+    }
     for (int ph = 0; ph < frame_probe::kPhaseCount; ++ph) {
         if (!count[ph]) continue;
         for (int self = 0; self < 3; ++self) {
@@ -1009,8 +1046,10 @@ std::string set_affinity(const char* mode) {
 
 std::string sample_stacks(const char* which, int n, const char* split) {
     n = n < 10 ? 10 : n > 20000 ? 20000 : n;
-    const char* want = std::strcmp(which, "playback") == 0 ? "RenderThread" : "[RDR2] Render Thread";
-    DWORD tid = 0;
+    const bool main = std::strcmp(which, "main") == 0;  // the game's update thread (the script ticks): the probe's id of it
+    const char* want = main ? "main" : std::strcmp(which, "playback") == 0 ? "RenderThread" : "[RDR2] Render Thread";
+    DWORD tid = main ? frame_probe::thread_id(frame_probe::kMain) : 0;  // (known: the snapshot's loop does not run)
+    if (main && !tid) return "ERROR the main thread not known yet (probe on)";
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return "ERROR no thread snapshot";
     THREADENTRY32 te{sizeof(te)};

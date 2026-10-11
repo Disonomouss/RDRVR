@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.3 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.4 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -25,6 +25,12 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
     about 2.5-3 ms less CPU a frame in the developer's tests (about a fifth of the stereo frame), the image unchanged;
   - the shadows (the sun's, the lamps' and the spot lights') drawn once a frame for both eyes instead of once per eye:
     about 0.9 ms less CPU a frame; the shadows' edges can move by a texel.
+- New in 0.8.4 (tried in the developer's simulator only, not yet in a headset): one-click Quality, Balanced and
+  Performance presets in the General tab (they set the eye shape, DLSS's quality, a cap on Automatic's resolution and,
+  for Performance, a 72 Hz refresh rate); a headset refresh rate row where your VR runtime lets the mod choose it (the
+  row says when it does not); and a note suggesting a lighter preset when the headset keeps missing frames. The mod's
+  own work costs less on slower processors (about 1 ms a frame less on a simulated 4- or 8-core CPU, nothing measurable
+  on a fast one; the image unchanged).
 - FXAA, the game's TAA or DLSS run per eye (DLSS with its own history per eye, falling back to one shared history
   if its setup fails, which `RDRVR.log` says; since 0.5.0 it is usable in the headset: its images were handed to the
   headset a few frames stale, two defects in what the game feeds DLSS are corrected, its jitter's length and units,
@@ -41,8 +47,8 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - Optional (new in 0.4.0, off by default, tried briefly in a Quest 3; the General tab, "Render resolution: headset"
   and "Render resolution: size", from the next start): the game's frame at your headset's height, apart from your
   monitor's modes and without DSR. Choose your headset, then its size: 100%, 150% or 200% of its pixels (new in 0.6.0,
-  tried in the developer's simulator only; 14 headsets from the Valve Index to the Pimax Dream Air, by their screens'
-  heights; for example a Quest 3 at 3926 x 2208, 4808 x 2704 or 5550 x 3122). Or choose
+  tried in the developer's simulator only; 15 headsets from the Valve Index to the Galaxy XR (new in 0.8.4), by their
+  screens' heights; for example a Quest 3 at 3926 x 2208, 4808 x 2704 or 5550 x 3122). Or choose
   Automatic: the size your OpenXR runtime (SteamVR, Pimax Play, Virtual Desktop...) asks for, for its lenses, at those
   percentages; it is learned in a first session with that runtime (the game's own size until then), never below your
   own resolution. Keep the runtime's own resolution setting at its default (SteamVR's 100%): it multiplies with the
@@ -142,11 +148,12 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   respond to them (tried in the developer's simulator).
 - Shops in first person (new in 0.7.0, on by default; tried at a shop in the developer's simulator, not yet in a
   headset; `[Body] KeepAnchorCamera` in `RDRVR.ini`, no menu row): talking to a shopkeeper no longer takes the view to
-  third person. Other scripted cameras outside cutscenes are kept first person too; this is not yet tried in
-  missions. Since 0.8.1 a mission's script that keeps taking its camera back (4 times in 2 seconds) is left it for
-  15 seconds: before, the two fought every frame and a mid-mission scene could stop before it began, with no control
-  of John (seen in a player's log; the fix tried at a shop in the developer's simulator, not yet in that mission).
-  If one looks wrong, set `KeepAnchorCamera=0` and please report it.
+  third person. Fixed in 0.8.4: only a shop's camera is taken back now; any other script's camera (a mission's
+  scene) is left to it until it lets go, then first person returns. Before, the mod took the camera back from a
+  mission's scene that took it once, so the scene could stop before it began, with no control of John (seen in two
+  players' logs; 0.8.1's fix covered only a script that kept taking it). The fix is tried in the developer's simulator
+  with a stand-in script camera and at a shop, not yet in that mission. If one looks wrong, set `KeepAnchorCamera=0`
+  and please report it.
 - An in-headset menu (laser and trigger) with every setting, grouped under headings with a help line for the row
   under the laser; the tabs are two rows of buttons, and each tab's page scrolls with your gun hand's stick (the
   laser on the page); adjustments by arrows, one step a press.
@@ -167,7 +174,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.3.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.4.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -199,7 +206,7 @@ To open the mod's menu, hold the menu button. If your controller has no menu but
 
 ### General
 
-Where the HUD goes, the anti-aliasing, the resolution the game renders at for your headset, and two performance
+Where the HUD goes, the anti-aliasing, the resolution the game renders at for your headset, and the performance
 options.
 
 | Setting | What it does | Default |
@@ -216,10 +223,12 @@ options.
 
 With Automatic, leave your runtime's own resolution setting at its default (100% in SteamVR), because it multiplies with the size you choose here. A "Restart the game to apply" note appears whenever your choice differs from what is running.
 
-Under the **Performance** heading (new in 0.8.0):
+Under the **Performance** heading (new in 0.8.0; the presets and the refresh rate new in 0.8.4):
 
 | Setting | What it does | Default |
 |---|---|---|
+| **Preset: Quality / Balanced / Performance** | One click sets the eye shape, DLSS's quality, Automatic's cap, the eye scale (`[XR] EyeScale`), the shared shadows and the refresh rate. All three: the eyes in the headset's shape (with FXAA or DLSS) and the shadows drawn once; they set DLSS's quality but do not change the anti-aliasing itself. Quality: DLSS at DLAA, Automatic at your runtime's full size. Balanced: DLSS Quality, Automatic at most 2880 pixels tall (SteamVR's size includes its own supersampling). Quality and Balanced put the refresh rate back to the one the session started at. Performance: DLSS Performance (without DLSS, the eyes at 0.85 of the size instead), at most 2208 tall, 72 Hz where your headset offers it. The eye shape, DLSS and the resolution apply from the next start, the refresh rate at once. A note suggests Balanced or Performance after half a minute of gameplay missing frames. | None chosen |
+| **Headset refresh rate** | Your headset's refresh rates, where your VR runtime lets the mod choose (otherwise the row says to set it in your headset's or runtime's own settings). A frame that misses the rate drops the runtime to half the rate; 72 or 80 holds steadier on a slower PC. "The runtime's" goes back to the rate the session started at. | Your runtime's |
 | **Shadows drawn once for both eyes** | The sun's, the lamps' and the spot lights' shadows drawn once a frame, fitted for both eyes, instead of once per eye: about 0.9 ms less CPU a frame. The shadows' edges can move by a texel. | On |
 | **Batched hand-off to the GPU thread** | The game's render thread hands its recorded work to its GPU thread in batches instead of one command at a time: about 2.5-3 ms less CPU a frame, nothing drawn differently. | On |
 
@@ -242,7 +251,7 @@ How you see and move: the first-person view, how much of John's body is drawn, s
 | **Lock body facing** | The body, legs included, faces where the camera faces, so walking sideways doesn't turn a shoulder into view. | On |
 | **Body moves with the headset** | The body follows your head when you lean; off, it stays where John stands. | Off |
 | **Smooth turning / Snap turning** | How the right stick turns you. | Smooth turning |
-| ↳ **Turn speed** | Smooth turning speed with the stick pushed all the way, 10°/s per press (30 to 240). | 90°/s |
+| ↳ **Turn speed** | Smooth turning speed with the stick pushed all the way, 10°/s per press (30 to 360; 240 before 0.8.4). | 90°/s |
 | ↳ **Snap angle** | The size of each snap turn, 5° per press (10 to 90). | 30° |
 | **Riding: Steer with the stick / Steer with the head** | With the stick, the view faces the horse and the left stick steers while you look around freely; with the head, the left stick goes where you look. | Steer with the stick |
 | ↳ **The right stick turns the view while riding** (new in 0.7.0) | The right stick turns your view on horseback while the left stick still steers; mounting or recentring faces the horse again. | On |

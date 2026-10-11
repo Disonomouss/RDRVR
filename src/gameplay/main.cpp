@@ -615,8 +615,25 @@ void camera_tick(uint64_t tick) {
         static ULONGLONG fight_t0 = 0, backoff_until = 0;
         static int fight_n = 0;
         const ULONGLONG now_ms = GetTickCount64();
+        // 2026-10-11 (a player's log, the same stuck cutscene: a mission's script made its camera current once, 15 s
+        // apart, and the anchor took it back each time): taken back only in a shop (its menu's UI layer active) or once
+        // the channel is back on the game's own gameplay camera (the core's bit 4: no script's camera current). Any
+        // other script's camera is left current until it lets go.
+        static bool left_logged = false;
         const bool active = (invoke(0x02BD5362, {static_cast<uint64_t>(g_cam), 0}) & 0xff) != 0;  // IS_CAMERA_ACTIVE_ON_CHANNEL
+        bool may_take = false;
         if (!active && now_ms >= backoff_until) {
+            static const char kShop[] = "ShopMenu";
+            const bool gameplay = (job.weapons & 8u) != 0;
+            const bool shop = !gameplay && (invoke(0xB1FDB70D, {reinterpret_cast<uint64_t>(kShop)}) & 0xff) != 0;  // UI_ISACTIVE
+            may_take = gameplay || shop;
+            if (!may_take && !left_logged) {
+                g_api->log(0, "camera anchor: a script's camera holds the channel (not a shop): left to it until the game's own camera is back");
+                left_logged = true;
+            }
+        }
+        if (active || may_take) left_logged = false;
+        if (may_take) {
             invoke(0x3EA55678, {static_cast<uint64_t>(g_cam), 0, 0, 0, 0, 0, 0, 0, 0, 0});  // SET_CURRENT_CAMERA_ON_CHANNEL
             ++retakes;
             if (!last_take || tick - last_take > 300) {

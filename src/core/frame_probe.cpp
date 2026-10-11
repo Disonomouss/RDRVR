@@ -22,6 +22,7 @@ namespace {
 std::atomic<bool> g_on{false}, g_installed{false};
 std::atomic<uint64_t> g_us[kSlotCount];
 std::atomic<uint64_t> g_cycles[kThreadCount];
+std::atomic<unsigned long> g_tid[kThreadCount];
 std::atomic<uint64_t> g_frames{0}, g_stereo{0}, g_mono{0}, g_period_us{0}, g_periods{0}, g_draws{0};
 thread_local uint64_t t_cycles = 0;   // this thread's cycle count at its last thread_frame
 thread_local uint64_t t_draws = 0;    // the playback thread's draw count at its last Present
@@ -66,7 +67,9 @@ void thread_frame(Thread t) {
     if (!QueryThreadCycleTime(GetCurrentThread(), &c)) return;
     if (t_cycles && c > t_cycles) g_cycles[t].fetch_add(c - t_cycles, std::memory_order_relaxed);
     t_cycles = c;
+    g_tid[t].store(GetCurrentThreadId(), std::memory_order_relaxed);
 }
+unsigned long thread_id(Thread t) { return g_tid[t].load(std::memory_order_relaxed); }
 
 void render_frame_start(double now) {
     g_frames.fetch_add(1, std::memory_order_relaxed);
