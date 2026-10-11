@@ -129,9 +129,12 @@ bool weapon_choice();
 void set_weapon_choice(bool on);  // also written to the user ini
 bool any_weapon();
 void set_any_weapon(bool on);
+// run 10 item 10 ([Holsters] AnyWeapon: "anything in any holster"): a zone's choice may also be the rounds (the reload's:
+// the free hand takes a round there, the gun hand squeezed there reloads), kRounds; the chest's automatic is the rounds
+constexpr int kRounds = 38;  // kWeapons (an eWeapon past the last)
 int zone_weapon(int z);           // -1: automatic
 void set_zone_weapon(int z, int w, bool save);
-bool zone_takes_weapons(int z);   // not the chest
+bool zone_takes_weapons(int z);   // not the chest (with AnyWeapon on, the chest too)
 bool zone_fits(int z, int equip_slot);
 struct Arsenal {
     bool valid;
@@ -171,6 +174,11 @@ int zone_count();
 const char* zone_label(int i);
 void zone(int i, float off[3], float* radius);
 void set_zone(int i, const float off[3], float radius, bool save);  // save: also written to the user ini
+// [Holsters] <Key>GunTurn (deg: tilt, turn, lean) and <Key>GunOffset (m: right, up, forward): the gun shown at a holster
+// (ShowGuns) turned about its grip and moved (2026-10-12); only the hips' and the backs' zones show a gun
+bool zone_shows_gun(int i);
+void zone_gun(int i, float turn[3], float off[3]);
+void set_zone_gun(int i, const float turn[3], const float off[3], bool save);
 // "holster [on|off|trace [off]|dump <file>|zones|instant on|off]": the switches, the zones and the counters
 std::string command(const std::string& line);
 

@@ -32,6 +32,17 @@ bool g_trig_was[2] = {false, false};
 double g_press_until = 0.0;
 std::atomic<uint64_t> g_whistles{0}, g_polls_at_mouth{0}, g_suppressed_pulls{0};
 std::atomic<float> g_last_d[2] = {-1.0f, -1.0f};  // each hand's distance from the mouth point at the last poll (m)
+// run 10 item 5 ([Gestures] TipHat; the user: "right trigger above the head, as if he were tipping his hat"): the right
+// hand at a point over the head (TipHatOffset right/up/forward of the eyes' midpoint, within TipHatRadius) and its
+// trigger: the game's greet, INPUT_FOOT_INTERACT ("InteractWithPed": pad B in FUN_14000c0b0's table; research\run10\
+// inputs-greet-block.md), pressed for 200 ms; that trigger kept from the game as the whistle's is. Not with a gun in
+// that hand.
+std::atomic<bool> g_hat_on{false};
+float g_hat_off[3] = {0.0f, 0.15f, 0.03f};  // under g_mutex
+float g_hat_radius = 0.11f;                 // under g_mutex
+double g_hat_until = 0.0;
+std::atomic<uint64_t> g_tips{0};
+std::atomic<float> g_hat_d{-1.0f};  // the right hand's distance from the hat point at the last poll (m)
 
 // q (x y z w) applied to v
 void rotate(const float q[4], const float v[3], float out[3]) {
@@ -42,14 +53,16 @@ void rotate(const float q[4], const float v[3], float out[3]) {
     out[2] = v[2] + w * tz + (x * ty - y * tx);
 }
 
-// the mouth point in LOCAL (the eyes' midpoint, the offset turned with the head: -z forward, +y up, +x right)
-bool mouth(float out[3]) {
+// the mouth point in LOCAL (the eyes' midpoint, the offset turned with the head: -z forward, +y up, +x right); hat: the
+// tip-the-hat point instead
+bool mouth(float out[3], bool hat = false) {
     xr::EyeView v[2];
     if (!xr::eye_views_peek(v)) return false;  // a peek: not a scene pass's hand-out (the pose check)
     float off[3];
     {
         std::lock_guard lock(g_mutex);
-        off[0] = g_off[0], off[1] = g_off[1], off[2] = -g_off[2];
+        const float* o = hat ? g_hat_off : g_off;
+        off[0] = o[0], off[1] = o[1], off[2] = -o[2];
     }
     float r[3];
     rotate(v[0].orientation, off, r);
@@ -78,23 +91,43 @@ void init() {
     log::info("[whistle] the horse whistle by the hand at the mouth %d: the point (%.3f %.3f %.3f) right/up/forward of the eyes, radius %.2f m, "
               "the gun hand too %d (the game's whistle: D-pad up)",
               g_on.load() ? 1 : 0, o[0], o[1], o[2], r, g_gun_hand.load() ? 1 : 0);
+    g_hat_on = config::get_bool("Gestures", "TipHat", true);  // run 10 item 5: on (the user's request)
+    float ho[3] = {0.0f, 0.15f, 0.03f};
+    {
+        const std::string s = config::get_string("Gestures", "TipHatOffset", "0.000 0.150 0.030");
+        float a = 0, b = 0, c = 0;
+        if (sscanf_s(s.c_str(), "%f %f %f", &a, &b, &c) == 3 && std::fabs(a) < 0.5f && std::fabs(b) < 0.5f && std::fabs(c) < 0.5f) ho[0] = a, ho[1] = b, ho[2] = c;
+    }
+    float hr = config::get_float("Gestures", "TipHatRadius", 0.11f);
+    hr = !(hr >= 0.03f) ? 0.03f : hr > 0.30f ? 0.30f : hr;
+    {
+        std::lock_guard lock(g_mutex);
+        std::memcpy(g_hat_off, ho, sizeof(ho));
+        g_hat_radius = hr;
+    }
+    log::info("[whistle] tip the hat by the right hand over the head %d: the point (%.3f %.3f %.3f) right/up/forward of the eyes, radius %.2f m "
+              "(the game's greet: pad B)", g_hat_on.load() ? 1 : 0, ho[0], ho[1], ho[2], hr);
 }
 
 bool poll(double now, float trig[2]) {
-    if (!g_on.load(std::memory_order_relaxed)) {
+    const bool hat_on = g_hat_on.load(std::memory_order_relaxed);
+    if (!g_on.load(std::memory_order_relaxed) && !hat_on) {
         g_supp[0] = g_supp[1] = g_mouth[0] = g_mouth[1] = false;
         return false;
     }
-    float m[3];
+    const bool wh_on = g_on.load(std::memory_order_relaxed);
+    float m[3], hp[3];
     const bool have = mouth(m);
+    const bool have_hat = hat_on && mouth(hp, true);
     RdrvrActorState st{};
     const bool gun = api::actor_state(&st) && reload::is_gun(st.weapon);
     const int gun_h = controls::gun_hand();
     const dual::State ds = dual::state();
-    float r;
+    float r, hrad;
     {
         std::lock_guard lock(g_mutex);
         r = g_radius;
+        hrad = g_hat_radius;
     }
     for (int h = 0; h < 2; ++h) {
         const hands::Hand hd = hands::get(h);
@@ -105,14 +138,26 @@ bool poll(double now, float trig[2]) {
         if (have && (hd.grip_valid || hd.valid)) {  // the distance for every hand (the readback); at_pt only where it may whistle
             const float d = std::sqrt((p[0] - m[0]) * (p[0] - m[0]) + (p[1] - m[1]) * (p[1] - m[1]) + (p[2] - m[2]) * (p[2] - m[2]));
             g_last_d[h].store(d, std::memory_order_relaxed);
-            at_pt = d < r && (!armed || g_gun_hand.load(std::memory_order_relaxed)) && !menu::visible();
+            at_pt = wh_on && d < r && (!armed || g_gun_hand.load(std::memory_order_relaxed)) && !menu::visible();
         } else {
             g_last_d[h].store(-1.0f, std::memory_order_relaxed);
         }
-        g_mouth[h].store(at_pt, std::memory_order_relaxed);
+        bool at_hat = false;  // the right controller only, never with a gun in it
+        if (h == 1 && have_hat && (hd.grip_valid || hd.valid)) {
+            const float d = std::sqrt((p[0] - hp[0]) * (p[0] - hp[0]) + (p[1] - hp[1]) * (p[1] - hp[1]) + (p[2] - hp[2]) * (p[2] - hp[2]));
+            g_hat_d.store(d, std::memory_order_relaxed);
+            at_hat = d < hrad && !gun && !(ds.on) && !menu::visible() && !controls::game_menu_open();  // (B is the game's reload, and Cancel in its menus)
+        }
+        g_mouth[h].store(at_pt || at_hat, std::memory_order_relaxed);  // (the punch is not judged for either)
         if (at_pt) g_polls_at_mouth.fetch_add(1, std::memory_order_relaxed);
         const bool down = trig[h] > 0.5f, was = g_trig_was[h];
         g_trig_was[h] = down;
+        if (at_hat && down && !was) {  // the press over the head: the greet
+            g_hat_until = now + kPressMs;
+            g_tips.fetch_add(1, std::memory_order_relaxed);
+            controllers::pulse(h, 0.3f, 25);
+            log::info("[whistle] the right hand over the head (%.2f m from the point), the trigger: the hat tipped (the greet sent)", g_hat_d.load());
+        }
         if (at_pt && down && !was) {  // the press at the mouth: the whistle
             g_press_until = now + kPressMs;
             g_whistles.fetch_add(1, std::memory_order_relaxed);
@@ -122,7 +167,7 @@ bool poll(double now, float trig[2]) {
         }
         // the trigger is the whistle's while the hand is at the mouth, and after a press there until it is let go
         bool s = g_supp[h].load(std::memory_order_relaxed);
-        if (at_pt) s = true;
+        if (at_pt || at_hat) s = true;
         else if (trig[h] < 0.15f) s = false;
         g_supp[h].store(s, std::memory_order_relaxed);
         if (s) {
@@ -131,6 +176,13 @@ bool poll(double now, float trig[2]) {
         }
     }
     return now < g_press_until;
+}
+
+bool hat_button(double now) { return now < g_hat_until; }
+bool tip_hat_enabled() { return g_hat_on.load(std::memory_order_relaxed); }
+void set_tip_hat(bool on, bool save) {
+    if (g_hat_on.exchange(on) != on) log::info("[whistle] tip the hat by gesture %s (%s)", on ? "on" : "off", save ? "saved" : "the session");
+    if (save) config::set("Gestures", "TipHat", on ? "1" : "0");
 }
 
 bool suppressed(int ctrl) { return ctrl >= 0 && ctrl < 2 && g_supp[ctrl].load(std::memory_order_relaxed); }
@@ -166,7 +218,26 @@ std::string command(const std::string& line) {
             in >> v;
             g_gun_hand = v == "on";
         }
-        if (w == "reset") g_whistles = g_polls_at_mouth = g_suppressed_pulls = 0;
+        if (w == "reset") g_whistles = g_polls_at_mouth = g_suppressed_pulls = g_tips = 0;
+        if (w == "hat") {  // whistle hat on|off | whistle hat offset <r> <u> <f> | whistle hat radius <m>: the session only
+            std::string v;
+            in >> v;
+            if (v == "on" || v == "off") set_tip_hat(v == "on", false);
+            if (v == "offset") {
+                float o[3];
+                if (in >> o[0] >> o[1] >> o[2]) {
+                    std::lock_guard lock(g_mutex);
+                    std::memcpy(g_hat_off, o, sizeof(o));
+                }
+            }
+            if (v == "radius") {
+                float rr;
+                if (in >> rr && rr >= 0.03f && rr <= 0.30f) {
+                    std::lock_guard lock(g_mutex);
+                    g_hat_radius = rr;
+                }
+            }
+        }
     }
     float m[3] = {};
     const bool have = mouth(m);
@@ -176,7 +247,14 @@ std::string command(const std::string& line) {
         std::memcpy(o, g_off, sizeof(o));
         r = g_radius;
     }
-    char b[480];
+    float hm[3] = {}, ho[3], hr;
+    const bool have_h = mouth(hm, true);
+    {
+        std::lock_guard lock(g_mutex);
+        std::memcpy(ho, g_hat_off, sizeof(ho));
+        hr = g_hat_radius;
+    }
+    char b[760];
     std::snprintf(b, sizeof(b),
                   "whistle %d (the gun hand too %d) | the point (%.3f %.3f %.3f) radius %.2f, in LOCAL %s (%.3f %.3f %.3f) | the hands from it: left %.3f "
                   "right %.3f m, at the mouth %d %d, the trigger the whistle's %d %d | whistles %llu, polls at the mouth %llu, pulls kept from the game %llu",
@@ -184,6 +262,10 @@ std::string command(const std::string& line) {
                   g_last_d[1].load(), g_mouth[0].load() ? 1 : 0, g_mouth[1].load() ? 1 : 0, g_supp[0].load() ? 1 : 0, g_supp[1].load() ? 1 : 0,
                   static_cast<unsigned long long>(g_whistles.load()), static_cast<unsigned long long>(g_polls_at_mouth.load()),
                   static_cast<unsigned long long>(g_suppressed_pulls.load()));
+    const size_t n = std::strlen(b);
+    std::snprintf(b + n, sizeof(b) - n, " | tip the hat %d: the point (%.3f %.3f %.3f) radius %.2f, in LOCAL %s (%.3f %.3f %.3f), the right hand %.3f m | tips %llu",
+                  g_hat_on.load() ? 1 : 0, ho[0], ho[1], ho[2], hr, have_h ? "" : "(no views)", hm[0], hm[1], hm[2], g_hat_d.load(),
+                  static_cast<unsigned long long>(g_tips.load()));
     return b;
 }
 

@@ -130,5 +130,7 @@ void set_move_ramp(float dx, float dy, float dz);
 
 // The viewport SceneRender is drawing on this thread, while it runs (render thread), or nullptr.
 void* scene_viewport();
+// [Stereo] PrepassViews: the private eye-2 viewport built in this frame's pass 1 (never current), or nullptr
+void* eye2_viewport();
 
 }  // namespace rdrvr::camera_lever

@@ -16,6 +16,10 @@ void init();  // reads [Gestures] Whistle*, logs them
 // (D-pad up) is to be held in this poll. trig[2] are the controllers' triggers (zeroed where suppressed).
 bool poll(double now_ms, float trig[2]);
 bool suppressed(int ctrl);  // that controller's trigger is the whistle's (any thread)
+// run 10 item 5 ([Gestures] TipHat): the right hand over the head and its trigger: the game's greet (pad B) held now
+bool hat_button(double now_ms);
+bool tip_hat_enabled();
+void set_tip_hat(bool on, bool save);
 bool at_mouth(int ctrl);    // that hand is at the mouth (the punch is not judged for it)
 bool enabled();
 void set_enabled(bool on, bool save);

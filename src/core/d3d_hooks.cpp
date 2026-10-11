@@ -18,6 +18,7 @@
 #include "core/config.h"
 #include "core/frame_probe.h"
 #include "core/hooks.h"
+#include "core/prepass_arrays.h"
 #include "core/pso.h"
 #include "core/log.h"
 #include "core/ring_probe.h"
@@ -162,6 +163,7 @@ D3D12_COMMAND_LIST_TYPE queue_type(ID3D12CommandQueue* q) {
 std::mutex g_names_mutex;
 std::unordered_map<const void*, std::string> g_names;            // ID3D12Resource* -> name
 std::unordered_map<SIZE_T, const void*> g_rtv;                    // RTV/DSV descriptor -> resource
+std::unordered_map<SIZE_T, DXGI_FORMAT> g_view_fmt;               // RTV/DSV descriptor -> its view's format (UNKNOWN: none given)
 uint32_t g_names_logged = 0;
 
 std::string narrow(LPCWSTR w) {
@@ -341,6 +343,13 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT
         fg_flush_segment(l);
         l.targets = t.empty() ? "none" : t;
     }
+    D3D12_CPU_DESCRIPTOR_HANDLE pp_rts[8], pp_ds{};
+    if (prepass::tracing()) prepass::trace_bind(cl, n, rts, single, ds);
+    if (prepass::on() && !prepass::active()) prepass::note_bind(cl, n, rts, single, ds);  // (bound before the pre-pass's clear)
+    if (prepass::active() && prepass::bind(cl, n, rts, single, ds, pp_rts, &pp_ds)) {  // the pre-pass's targets: its arrays
+        rts = pp_rts;
+        if (ds) ds = &pp_ds;
+    }
     if (RtvSubstFn sub = g_rtv_subst.load(std::memory_order_relaxed); sub && n >= 1 && n <= 8 && rts && !single) {
         D3D12_CPU_DESCRIPTOR_HANDLE repl[8];
         if (sub(cl, n, rts, ds, &repl[0])) {
@@ -366,6 +375,7 @@ void fg_draw(ID3D12GraphicsCommandList* cl) {
 }
 
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
+    if (prepass::active()) prepass::before_draw(cl);
     if (pso::on_draw(cl)) return;
     ++t_draws;
     fg_draw(cl);
@@ -373,6 +383,7 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, U
     o_DrawInstanced(cl, a, b, c, d);
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
+    if (prepass::active()) prepass::before_draw(cl);
     if (pso::on_draw(cl)) return;
     ++t_draws;
     fg_draw(cl);
@@ -429,6 +440,8 @@ void watch_list_ends(ID3D12GraphicsCommandList* cl) {
 }
 
 void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+    if (prepass::tracing()) prepass::trace_barrier(cl, n, b);
+    if (prepass::active()) prepass::barrier(cl, n, b);  // (before the game's batch: the pre-pass copies)
     fg_count(cl, [n](ListLog& l) { l.barriers += n; });
     watch_barriers(cl, n, b);
     o_ResourceBarrier(cl, n, b);
@@ -486,6 +499,8 @@ void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         }
         fg_event(cl, "ClearRTV %s (%.2f %.2f %.2f %.2f)", name.c_str(), c[0], c[1], c[2], c[3]);
     }
+    if (prepass::tracing()) prepass::trace_clear(cl, h, false);
+    if (prepass::active()) h = prepass::clear_rtv(cl, h);
     o_ClearRTV(cl, h, c, n, r);
 }
 void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT d,
@@ -499,6 +514,8 @@ void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         }
         fg_event(cl, "ClearDSV %s depth %.3f", name.c_str(), d);
     }
+    if (prepass::tracing()) prepass::trace_clear(cl, h, true);
+    if (prepass::on()) h = prepass::clear_dsv(cl, h);  // (the pre-pass's start: its depth's clear)
     o_ClearDSV(cl, h, f, d, s, n, r);
 }
 void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, const void* data, UINT size) {
@@ -605,7 +622,10 @@ HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap*
 void STDMETHODCALLTYPE hk_CreateRTV(ID3D12Device* dev, ID3D12Resource* res, const void* desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     {
         std::lock_guard lock(g_names_mutex);
-        if (g_rtv.size() < 2000000) g_rtv[h.ptr] = res;
+        if (g_rtv.size() < 2000000) {
+            g_rtv[h.ptr] = res;
+            g_view_fmt[h.ptr] = desc ? *static_cast<const DXGI_FORMAT*>(desc) : DXGI_FORMAT_UNKNOWN;  // (Format is the first member)
+        }
     }
     o_CreateRTV(dev, res, desc, h);
 }
@@ -613,7 +633,10 @@ void STDMETHODCALLTYPE hk_CreateRTV(ID3D12Device* dev, ID3D12Resource* res, cons
 void STDMETHODCALLTYPE hk_CreateDSV(ID3D12Device* dev, ID3D12Resource* res, const void* desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     {
         std::lock_guard lock(g_names_mutex);
-        if (g_rtv.size() < 2000000) g_rtv[h.ptr] = res;
+        if (g_rtv.size() < 2000000) {
+            g_rtv[h.ptr] = res;
+            g_view_fmt[h.ptr] = desc ? *static_cast<const DXGI_FORMAT*>(desc) : DXGI_FORMAT_UNKNOWN;
+        }
     }
     o_CreateDSV(dev, res, desc, h);
 }
@@ -1128,6 +1151,33 @@ void submit_internal(ID3D12CommandQueue* queue, ID3D12CommandList* list) {
     --t_in_ecl;
 }
 
+const void* view_resource(uintptr_t handle, int* format) {
+    std::lock_guard lock(g_names_mutex);
+    auto it = g_rtv.find(handle);
+    if (it == g_rtv.end()) return nullptr;
+    if (format) {
+        auto f = g_view_fmt.find(handle);
+        *format = static_cast<int>(f == g_view_fmt.end() ? DXGI_FORMAT_UNKNOWN : f->second);
+    }
+    return it->second;
+}
+
+void raw_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
+              const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
+    if (o_OMSetRenderTargets) o_OMSetRenderTargets(cl, n, rts, single, ds);
+    else cl->OMSetRenderTargets(n, rts, single, ds);
+}
+
+void raw_barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b) {
+    if (o_ResourceBarrier) o_ResourceBarrier(cl, n, b);
+    else cl->ResourceBarrier(n, b);
+}
+
+void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src) {
+    if (o_CopyTextureRegion) o_CopyTextureRegion(cl, dst, 0, 0, 0, src, nullptr);
+    else cl->CopyTextureRegion(dst, 0, 0, 0, src, nullptr);
+}
+
 const char* resource_name(const void* resource) {
     std::lock_guard lock(g_names_mutex);
     auto it = g_names.find(resource);
@@ -1145,6 +1195,12 @@ const void* find_resource(const char* name) {
     for (const auto& [res, n] : g_names)
         if (n == name) found = res;  // the newest of several with the same name is not knowable here; any live one works
     return found;
+}
+
+bool resource_named(const void* resource, const char* name) {
+    std::lock_guard lock(g_names_mutex);
+    auto it = g_names.find(resource);
+    return it != g_names.end() && it->second == name;
 }
 
 void set_copy_tap(CopyTapFn fn) {

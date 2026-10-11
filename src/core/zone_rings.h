@@ -20,7 +20,7 @@ int frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLa
 // The reticle ([Hands] Reticle, aim::reticle_target): one quad at the shot's landing point, facing the centre eye, a
 // constant angular size ([Hands] ReticleStyle: a ring and a centre dot, or a dot only); white, red over an actor.
 // Returns whether it filled `out`.
-bool reticle_frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLayerQuad* out);
+bool reticle_frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLayerQuad* out, int which = 0);  // which 1: the second gun's
 void status_text(char* out, size_t len);
 // Test aid ("rings atlas <path.bmp>"): the atlas's pixels (sRGB, premultiplied) as a 32-bit BMP.
 std::string write_atlas(const std::string& path);

@@ -16,6 +16,8 @@ struct ID3D12CommandList;
 struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
 struct D3D12_CPU_DESCRIPTOR_HANDLE;
+struct D3D12_RESOURCE_BARRIER;
+struct D3D12_TEXTURE_COPY_LOCATION;
 
 namespace rdrvr::d3d {
 
@@ -49,6 +51,7 @@ struct InternalSubmitScope {
 const char* resource_name(const void* resource);
 void set_resource_name(const void* resource, const char* name);
 const void* find_resource(const char* name);  // a resource with that name, or nullptr
+bool resource_named(const void* resource, const char* name);  // that resource has that name (compared under the lock)
 
 // Called right after each game CopyResource, in the game's own command list, while dst and src are in COPY_DEST and
 // COPY_SOURCE: the frame grabber (and the round in hand's depth) append their own copy of src there, with no barrier
@@ -82,6 +85,14 @@ void set_bind_tap(int slot, BindTapFn fn);
 using RtvSubstFn = bool (*)(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts,
                             const D3D12_CPU_DESCRIPTOR_HANDLE* ds, D3D12_CPU_DESCRIPTOR_HANDLE* out);
 void set_rtv_substitute(RtvSubstFn fn);
+// The resource an RTV/DSV CPU handle was made for (the device's view hooks) and the view's format (UNKNOWN when the
+// game gave no view desc); nullptr if the handle was never seen.
+const void* view_resource(uintptr_t handle, int* format = nullptr);  // (format: a DXGI_FORMAT)
+// A barrier and a whole-subresource copy into the game's list, past the mod's own list hooks (the mod's own work).
+void raw_barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b);
+void raw_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
+              const D3D12_CPU_DESCRIPTOR_HANDLE* ds);
+void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src);
 // R5 pacing: while set, the game's Present runs with sync interval 0, so vsync does not hold the game to the desktop's
 // refresh and xrWaitFrame paces it (the game's own frame limiter still applies).
 void set_present_unsynced(bool on);

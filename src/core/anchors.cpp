@@ -166,6 +166,15 @@ struct Optional {
 constexpr Optional kOptional[] = {
     {"ReplayDispatch", "the batched hand-off to the playback thread ([Render] PlaybackBatch) is off on this build"},
     {"MapOpen", "the map screen is not told from the menu lists: [Controls] MenuControls takes its stick and triggers too"},
+    {"LetterboxClear", "the pre-pass arrays ([Stereo] PrepassArrays, test only) are off on this build"},
+    {"MotionBlurSetter", "motion blur is not forced off on this build ([Render] MotionBlur: the game's setting)"},
+    {"MiragerDownsample", "the heat haze toggle ([Render] HeatHaze) is off on this build"},
+    {"PrepassLetterboxCall", "the pre-pass arrays ([Stereo] PrepassArrays, test only) are off on this build"},
+    {"HandleWorldView", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
+    {"HandleViewInverse", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
+    {"HandlePrevWorldVP", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
+    {"HandlePrevViewProj", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
+    {"HandleViewport", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
 };
 const char* optional_what(const char* name) {
     for (const Optional& o : kOptional)

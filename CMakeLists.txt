@@ -86,6 +86,7 @@ add_library(rdrvr_core SHARED
     src/core/pose.cpp
     src/core/test_channel.cpp
     src/core/pso.cpp
+    src/core/prepass_arrays.cpp
     src/core/dinput8.def
 )
 set_target_properties(rdrvr_core PROPERTIES OUTPUT_NAME dinput8)

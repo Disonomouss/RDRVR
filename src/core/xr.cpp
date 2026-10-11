@@ -24,6 +24,7 @@
 #include "core/config.h"
 #include "core/controllers.h"
 #include "core/controls.h"
+#include "core/dual.h"
 #include "core/d3d_hooks.h"
 #include "core/eye_shape.h"
 #include "core/frame_probe.h"
@@ -1249,7 +1250,7 @@ void end_open_frame() {
     XrCompositionLayerQuad ui_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, menu_quad{XR_TYPE_COMPOSITION_LAYER_QUAD},
         wrist_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, wheel_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad ring_quads[holster::kMaxMarkers];
-    XrCompositionLayerQuad reticle_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad reticle_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, reticle2_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     constexpr uint32_t kLayerArray = 16;
     const XrCompositionLayerBaseHeader* layers[kLayerArray] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
     uint32_t nlayers = 1;
@@ -1261,11 +1262,14 @@ void end_open_frame() {
     if (full && !cinema_on) {
         const uint32_t cap = g_max_layers.load(std::memory_order_relaxed) < kLayerArray ? g_max_layers.load(std::memory_order_relaxed) : kLayerArray;
         const int room = static_cast<int>(cap) - static_cast<int>(nlayers) - (wheel::wheel_mode() ? 4 : 3);
+        const int keep = dual::state().on ? 2 : 1;  // run 10 item 8: a second reticle only while dual wielding
         const int nr = zone_rings::frame(g_frame_views, g_session, g_space, ring_quads,
-                                         room - 1 < holster::kMaxMarkers ? room - 1 : holster::kMaxMarkers);  // one kept for the reticle
+                                         room - keep < holster::kMaxMarkers ? room - keep : holster::kMaxMarkers);  // kept for the reticles
         for (int i = 0; i < nr; ++i) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ring_quads[i]);
         if (room - nr >= 1 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle_quad))
             layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&reticle_quad);
+        if (room - nr >= 2 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle2_quad, 1))  // run 10 item 8: dual wield
+            layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&reticle2_quad);
     }
     const bool wheel_q = full && !cinema_on && fill_wheel(wheel_quad);  // first: the floating quad leaves its rect out
     bool ui = full && !cinema_on && fill_ui(ui_quad);

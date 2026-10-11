@@ -187,7 +187,11 @@ int g_first_eye[kKeep] = {0, 0};
 std::atomic<ID3D12Resource*> g_dbuf{nullptr};
 std::atomic<uint64_t> g_dbuf_size{0};
 std::atomic<uint64_t> g_need{0};  // the size the taps wanted (the presenting thread makes it)
+// the "Depth Resolve" the game copies its scene depth into, taken from the copies themselves (2026-10-11: the game names
+// several, 4808x2704 and DLSS's render size among them, and the names of freed ones stay; find_resource's pick was any of
+// them, so with the wrong one no copy was tapped and the rounds were never drawn: the user's "invisible ammo")
 std::atomic<const void*> g_resolve{nullptr};
+std::atomic<uint64_t> g_resolve_frame{0}, g_resolve_other{0};
 struct DepthMeta {
     uint32_t w = 0, h = 0, pitch = 0, fmt = 0;
     uint64_t stride = 0;
@@ -354,8 +358,23 @@ bool make(ID3D12Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
 
 // The game's copy into "Depth Resolve", in its own list: this frame's next eye's scene depth into our buffer.
 void copy_tap(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource* src) {
-    if (dst != g_resolve.load(std::memory_order_relaxed) || !((g_on.load(std::memory_order_relaxed) && held_now()) || row_now())) return;
     const uint64_t frame = state::presents.load(std::memory_order_relaxed);
+    const void* cur = g_resolve.load(std::memory_order_relaxed);
+    if (dst != cur) {
+        // (the cheap tests first: the game records many copies; the review's) the one in use copied into lately: none other
+        if (cur && frame - g_resolve_frame.load(std::memory_order_relaxed) <= 3) return;
+        if (!((g_on.load(std::memory_order_relaxed) && held_now()) || row_now())) return;
+        if (!d3d::resource_named(dst, "Depth Resolve")) return;
+        // another Depth Resolve: taken once the one in use has had no copy for a few frames (a resize, DLSS on or off)
+        g_resolve_other.fetch_add(cur ? 1 : 0, std::memory_order_relaxed);
+        g_resolve.store(dst, std::memory_order_relaxed);
+        const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+        log::info("[round] the scene depth taken from \"Depth Resolve\" %p (%llux%u)%s", static_cast<const void*>(dst),
+                  static_cast<unsigned long long>(dd.Width), dd.Height, cur ? " (another than before)" : "");
+    } else if (!((g_on.load(std::memory_order_relaxed) && held_now()) || row_now())) {
+        return;
+    }
+    g_resolve_frame.store(frame, std::memory_order_relaxed);
     int k, first;
     {
         std::lock_guard lock(g_depth_mutex);
@@ -767,11 +786,6 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     if (g_grab_phase.load(std::memory_order_acquire) == 2 && g_grab_slot == slot) write_grab();
     if (!g_on.load(std::memory_order_relaxed) && !g_row_on.load(std::memory_order_relaxed)) return;
     const uint64_t frame = state::presents.load(std::memory_order_relaxed);
-    static uint64_t s_last_find = 0;
-    if (!g_resolve.load(std::memory_order_relaxed) || frame - s_last_find > 120) {  // the target, again now and then (a resize remakes it)
-        s_last_find = frame;
-        g_resolve.store(d3d::find_resource("Depth Resolve"), std::memory_order_relaxed);
-    }
     if (!g_ready && !g_failed) {
         g_ready = make(dev, w, h, fmt);
         g_failed = !g_ready;
@@ -834,10 +848,17 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     }
     ID3D12Resource* buf = g_dbuf.load(std::memory_order_acquire);
     const bool occlude = g_occlude.load(std::memory_order_relaxed);
+    static uint64_t s_no_depth_run = 0;  // frames in a row wanted but not drawn for want of the scene depth
     if (!buf || (occlude && (!have_depth || !dm.w))) {  // never drawn without the buffer bound (the shader names it)
         g_no_depth.fetch_add(1, std::memory_order_relaxed);
+        if (++s_no_depth_run == 450)
+            log::warn("[round] the rounds wanted for 450 frames but not drawn: no scene depth copy (%s; taps %llu)",
+                      g_resolve.load(std::memory_order_relaxed) ? "a Depth Resolve taken, no copy this frame" : "no Depth Resolve copy seen",
+                      static_cast<unsigned long long>(g_taps.load()));
         return;
     }
+    if (s_no_depth_run >= 450) log::info("[round] drawn again after %llu frames without the scene depth", static_cast<unsigned long long>(s_no_depth_run));
+    s_no_depth_run = 0;
     float pz[12] = {}, bright, bias;
     bool round_ok = want_round && pose(bp, hand, pz);
     const float *X = pz, *Y = pz + 3, *Z = pz + 6, *P = pz + 9;

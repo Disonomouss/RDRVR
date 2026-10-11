@@ -27,6 +27,7 @@
 #include "core/pose.h"
 #include "core/reload.h"
 #include "core/whistle.h"
+#include "core/xr.h"
 
 namespace rdrvr::gestures {
 namespace {
@@ -54,8 +55,106 @@ int g_count[2] = {0, 0}, g_head[2] = {0, 0};
 float g_world[2][3] = {}, g_back[2] = {0.0f, 1.0f};
 std::mutex g_mutex;  // the history: the frame end writes, the projectile launch (the game thread) reads
 
-std::atomic<uint64_t> g_punches{0}, g_lasso_throws{0}, g_yanks{0}, g_throws{0};
+std::atomic<uint64_t> g_punches{0}, g_lasso_throws{0}, g_yanks{0}, g_throws{0}, g_punches_riding{0};
 double g_last_swing_ms = 0;  // the last punch's swing (frame end only): the strike probe's reference
+// run 10 item 7 ([Gestures] Guard; the user: "with fists equipped, holding hands in front of face in a guarding pose"):
+// both hands in a box in front of the face (the head's frame: GuardBox forward min max, up min max, across), held 150 ms:
+// the game's block held (GuardButtons: rb+lt by default, the fighting stance with MELEE_BLOCK, pad RB in FUN_14000c0b0's
+// table: research\run10\inputs-greet-block.md), let go 200 ms after the pose is left; fists only, never riding,
+// driving or in the menu, and not within 0.5 s of a punch (one injection slot: the punch's own)
+std::atomic<bool> g_guard{false}, g_guard_up{false};
+std::atomic<bool> g_guard_probe{false};  // "gestures guardprobe on": the block state read each guarded frame (a test's; reads game memory)
+std::atomic<int> g_guard_buttons{3};  // bit 0 RB, bit 1 LT
+std::atomic<uint64_t> g_guards{0}, g_guard_frames{0}, g_guard_block_frames{0}, g_guard_fists{0};
+float g_gbox[5] = {0.05f, 0.40f, -0.25f, 0.10f, 0.25f};  // forward min, max; up min, max; across (|right|) max; under g_mutex
+float g_guard_hand[2][3] = {};  // each hand in the head's frame (right, up, forward) at the last frame; under g_mutex
+void qrot(const float q[4], const float v[3], float out[3]) {  // q (x y z w) applied to v
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    const float tx = 2.0f * (y * v[2] - z * v[1]), ty = 2.0f * (z * v[0] - x * v[2]), tz = 2.0f * (x * v[1] - y * v[0]);
+    out[0] = v[0] + w * tx + (y * tz - z * ty);
+    out[1] = v[1] + w * ty + (z * tx - x * tz);
+    out[2] = v[2] + w * tz + (x * ty - y * tx);
+}
+void guard_frame(double now, const RdrvrActorState& st) {
+    static double in_since = -1.0, out_since = -1.0;
+    const bool allowed = g_guard.load(std::memory_order_relaxed) && st.weapon < 0 && !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING)) &&
+                         !menu::visible() && !controls::game_menu_open() && now - g_last_swing_ms > 500.0;
+    static double up_since = 0.0;
+    bool pose = false;
+    xr::EyeView v[2];
+    if (allowed && xr::eye_views_peek(v)) {
+        float box[5];
+        {
+            std::lock_guard lock(g_mutex);
+            std::memcpy(box, g_gbox, sizeof(box));
+        }
+        const float e[3] = {0.5f * (v[0].position[0] + v[1].position[0]), 0.5f * (v[0].position[1] + v[1].position[1]),
+                            0.5f * (v[0].position[2] + v[1].position[2])};
+        const float qc[4] = {-v[0].orientation[0], -v[0].orientation[1], -v[0].orientation[2], v[0].orientation[3]};  // the head's inverse
+        pose = true;
+        for (int h = 0; h < 2; ++h) {
+            const hands::Hand hd = hands::get(h);
+            if (!(hd.grip_valid || hd.valid)) {
+                pose = false;
+                continue;
+            }
+            const float* p = hd.grip_valid ? hd.grip_pos : hd.pos;
+            const float d[3] = {p[0] - e[0], p[1] - e[1], p[2] - e[2]};
+            float l[3];
+            qrot(qc, d, l);  // (right, up, back) in the head's frame
+            const float rf[3] = {l[0], l[1], -l[2]};
+            {
+                std::lock_guard lock(g_mutex);
+                std::memcpy(g_guard_hand[h], rf, sizeof(rf));
+            }
+            if (!(rf[2] >= box[0] && rf[2] <= box[1] && rf[1] >= box[2] && rf[1] <= box[3] && std::fabs(rf[0]) <= box[4])) pose = false;
+        }
+    }
+    bool up = g_guard_up.load(std::memory_order_relaxed);
+    if (!allowed) {
+        in_since = out_since = -1.0;
+        if (up) log::info("[gestures] guard down (%s)", st.weapon >= 0 ? "a weapon in hand" : "not allowed now");
+        up = false;
+    } else if (pose) {
+        out_since = -1.0;
+        if (in_since < 0.0) {
+            in_since = now;
+            // 2026-10-12 (reg2, cycle H5): with a gun still selected (put away by the game or a script, not at a holster by
+            // hand: no fists selected) the guard's LT drew that gun and aimed it. The fists selected as the hands come
+            // into the box (SET_PLAYER_MELEE_MODE_SELECTED, as UnarmedAfterHolster; a script tick before the 150 ms the
+            // guard waits), at most every 2 s; any draw clears it
+            static double sel_ms = -1e9;
+            if (now - sel_ms > 2000.0) {
+                const uint64_t m[2] = {1, 1};
+                api::queue_native(0xAC1285A3, m, 2, 0, nullptr);  // SET_PLAYER_MELEE_MODE_SELECTED(1): the wheel's Unarmed
+                sel_ms = now;
+                g_guard_fists.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!up && now - in_since >= 150.0) {
+            up = true;
+            up_since = now;
+            g_guards.fetch_add(1, std::memory_order_relaxed);
+            log::info("[gestures] guard up: both fists before the face (the game's block held)");
+        }
+    } else {
+        in_since = -1.0;
+        if (out_since < 0.0) out_since = now;
+        if (up && now - out_since >= 200.0) {
+            up = false;
+            log::info("[gestures] guard down");
+        }
+    }
+    g_guard_up.store(up, std::memory_order_relaxed);
+    if (up) {
+        g_guard_frames.fetch_add(1, std::memory_order_relaxed);
+        if (g_guard_probe.load(std::memory_order_relaxed) && aim::player_melee_state() == 2) g_guard_block_frames.fetch_add(1, std::memory_order_relaxed);
+        const int b = g_guard_buttons.load(std::memory_order_relaxed);
+        // the fighting stance (LT) first, RB after the punch's own lead (RB alone is the game's cover: the review's)
+        const bool lead = (b & 2) && now - up_since < static_cast<double>(g_fist_lead_ms.load(std::memory_order_relaxed) + 60);
+        controls::inject((b & 1) && !lead ? 0x0200 : 0, 0, 0, 120, (b & 2) ? 255 : 0);  // 0x0200: XINPUT_GAMEPAD_RIGHT_SHOULDER (RB)
+    }
+}
 float g_last_speed[2] = {0, 0}, g_peak_speed[2] = {0, 0};  // frame end only (status)
 float g_last_throw[3] = {0, 0, 0};
 double g_last_throw_age = 0;  // ms between the hand's fastest moment and the release
@@ -454,6 +553,7 @@ void frame() {
         }
     }
     gm::frame(now, &bp, &st);  // [Gestures] GunMelee (off: one flag check)
+    guard_frame(now, st);       // [Gestures] Guard (run 10 item 7)
     // forward: where the head faces, in the local frame (positive yaw turns left)
     float hy = 0.0f;
     camera_lever::head_yaw_deg(&hy);
@@ -485,6 +585,17 @@ void frame() {
         if (melee && (st.weapon < 0 || st.weapon == kKnife || st.weapon == kTorch) && s > g_swing_speed.load(std::memory_order_relaxed) &&
             fwd_speed > 0.4f * s && now >= next_ok[h] && !whistle::at_mouth(h)) {  // run 8: a hand to the mouth is no punch
             next_ok[h] = now + 400.0;
+            // run 10 item 6 (the user: "moving hand rapidly while on horseback draws last held gun"): riding or driving,
+            // the game's attack with empty hands draws the last weapon, so no swing sends it there (as the gun melee)
+            if (st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING)) {
+                g_punches_riding.fetch_add(1, std::memory_order_relaxed);
+                static double logged = -1e9;
+                if (now - logged > 5000.0) {
+                    logged = now;
+                    log::info("[gestures] %s hand swing %.1f m/s while riding: no attack (it would draw the last gun)", h ? "right" : "left", s);
+                }
+                continue;
+            }
             if (st.weapon < 0)
                 controls::inject(0, 255, 0, 120, 255, g_fist_lead_ms.load(std::memory_order_relaxed));  // the fists: the stance first
             else
@@ -522,6 +633,19 @@ void init() {
     g_swing_speed = config::get_float("Gestures", "SwingSpeed", 2.5f);
     g_throw_gain = config::get_float("Gestures", "ThrowGain", 2.0f);
     g_fist_lead_ms = config::get_int("Gestures", "FistLeadMs", 40);
+    g_guard = config::get_bool("Gestures", "Guard", true);  // run 10 item 7: on (the user's request)
+    {
+        const std::string gb = config::get_string("Gestures", "GuardButtons", "rb+lt");
+        g_guard_buttons = gb == "rb" ? 1 : gb == "lt" ? 2 : 3;
+        float b[5];
+        const std::string s = config::get_string("Gestures", "GuardBox", "0.05 0.40 -0.25 0.10 0.25");
+        if (sscanf_s(s.c_str(), "%f %f %f %f %f", &b[0], &b[1], &b[2], &b[3], &b[4]) == 5 && b[0] < b[1] && b[2] < b[3] && b[4] > 0.0f) {
+            std::lock_guard lock(g_mutex);
+            std::memcpy(g_gbox, b, sizeof(b));
+        }
+        log::info("[gestures] the guard by both fists before the face %d (the game's %s; the box forward %.2f..%.2f, up %.2f..%.2f, across %.2f m)",
+                  g_guard.load() ? 1 : 0, gb.c_str(), g_gbox[0], g_gbox[1], g_gbox[2], g_gbox[3], g_gbox[4]);
+    }
     d3d::add_frame_end_listener([](uint64_t) { frame(); });
     log::info("[gestures] throw by hand %d, melee by swing %d, lasso by hand %d (swing %.1f m/s, throw gain %.2f)", g_throw.load() ? 1 : 0,
               g_melee.load() ? 1 : 0, g_lasso.load() ? 1 : 0, g_swing_speed.load(), g_throw_gain.load());
@@ -536,6 +660,11 @@ bool melee_by_swing() { return g_melee.load(); }
 void set_melee_by_swing(bool on) {
     if (g_melee.exchange(on) != on) log::info("[gestures] melee by swing: %s", on ? "on" : "off");
     save("Melee", on);
+}
+bool guard() { return g_guard.load(); }
+void set_guard(bool on, bool save_it) {
+    if (g_guard.exchange(on) != on) log::info("[gestures] the guard by both fists: %s", on ? "on" : "off");
+    if (save_it) save("Guard", on);
 }
 bool lasso_by_hand() { return g_lasso.load(); }
 void set_lasso_by_hand(bool on) {
@@ -587,20 +716,40 @@ std::string command(const std::string& line) {
         if (w == "gripthrow") aim::set_grip_throw(on, false);  // [Gestures] ThrowByGrip (the session only)
         if (w == "peak") g_peak_speed[0] = g_peak_speed[1] = 0;  // "peak reset"
         if (w == "strike") aim::set_melee_strike(static_cast<float>(std::atof(v.c_str())));  // the session only
+        if (w == "guard") {  // gestures guard on|off|rb|lt|rb+lt (the session only)
+            if (v == "on" || v == "off") set_guard(v == "on", false);
+            if (v == "rb") g_guard_buttons = 1;
+            if (v == "lt") g_guard_buttons = 2;
+            if (v == "rb+lt") g_guard_buttons = 3;
+        }
+        if (w == "guardprobe") g_guard_probe = v == "on";
         if (w == "fistlead") g_fist_lead_ms = std::atoi(v.c_str());                            // the session only
         if (w == "tip" || w == "tipaxis" || w == "tippivot") aim::tip_command(w, v);
     }
     char b[400];
     std::snprintf(b, sizeof(b),
                   "throw %d melee %d lasso %d | swing %.1f m/s gain %.2f strike %.2f fist lead %d ms | speed L %.2f R %.2f, peak L %.2f R %.2f | "
-                  "punches %llu "
+                  "punches %llu (riding, not sent %llu) "
                   "lasso throws %llu yanks %llu throws %llu, last throw (%.2f %.2f %.2f) %.0f ms after the hand's peak",
                   g_throw.load() ? 1 : 0, g_melee.load() ? 1 : 0, g_lasso.load() ? 1 : 0, g_swing_speed.load(), g_throw_gain.load(),
                   aim::melee_strike(), g_fist_lead_ms.load(), g_last_speed[0],
                   g_last_speed[1], g_peak_speed[0], g_peak_speed[1], static_cast<unsigned long long>(g_punches.load()),
-                  static_cast<unsigned long long>(g_lasso_throws.load()), static_cast<unsigned long long>(g_yanks.load()),
+                  static_cast<unsigned long long>(g_punches_riding.load()), static_cast<unsigned long long>(g_lasso_throws.load()), static_cast<unsigned long long>(g_yanks.load()),
                   static_cast<unsigned long long>(g_throws.load()), g_last_throw[0], g_last_throw[1], g_last_throw[2], g_last_throw_age);
-    return b + aim::tip_command("", "");
+    float gh[2][3];
+    {
+        std::lock_guard lock(g_mutex);
+        std::memcpy(gh, g_guard_hand, sizeof(gh));
+    }
+    char g[340];
+    const int gb = g_guard_buttons.load();
+    std::snprintf(g, sizeof(g), " | guard %d (%s) up %d, guards %llu (the fists selected %llu), frames %llu, blocking %llu, melee state %d | the hands before the face L (%.2f %.2f %.2f) R (%.2f %.2f %.2f)",
+                  g_guard.load() ? 1 : 0, gb == 1 ? "rb" : gb == 2 ? "lt" : "rb+lt", g_guard_up.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_guards.load()), static_cast<unsigned long long>(g_guard_fists.load()),
+                  static_cast<unsigned long long>(g_guard_frames.load()),
+                  static_cast<unsigned long long>(g_guard_block_frames.load()), aim::player_melee_state(), gh[0][0], gh[0][1], gh[0][2], gh[1][0], gh[1][1],
+                  gh[1][2]);
+    return b + std::string(g) + aim::tip_command("", "");
 }
 
 namespace {

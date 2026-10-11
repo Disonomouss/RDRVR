@@ -1,5 +1,6 @@
 #include "core/held_prop.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -37,6 +38,14 @@ uint64_t v2(float x, float y) { return fbits(x) | (fbits(y) << 32); }
 uint64_t ptr(const char* s) { return reinterpret_cast<uint64_t>(s); }
 
 enum State { kNone, kRequesting, kStreaming, kLoaded, kCreating, kLive, kDestroying, kChecking };
+// run 10 item 2: eight puts kept (four left a walking prop's own draws 3-30 cm from all of them: cycle D4). 2026-10-12 (the
+// user: a second gun at the right hip facing backwards when turning toward it, gone with ShowGuns off): turning, the
+// holster guns' own draws trailed past the eight (r16_backwards5: ~20000 draws gated in four turns, none standing) and,
+// gated: r16_backwards6 found them not the prop's own (those matched throughout) but the game's own holstered gun, the
+// same model, 0.34-0.38 m from the puts (body.cpp now hides that one while a holster shows its gun). The count kept at 8;
+// "props puts <n>" (1-64) for a session
+constexpr int kPuts = 64;  // the storage; g_puts_n of them used
+std::atomic<int> g_puts_n{8};
 struct Slot {
     // wanted (any thread, under g_mutex)
     const char* want = nullptr;
@@ -57,13 +66,21 @@ struct Slot {
     uint64_t check = 0;  // that check's request
     // the draw hook's (under g_mutex)
     float put[3] = {};      // the object's position as last queued
-    float puts[4][3] = {};  // the last four queued (the game draws the object where a script tick put it)
+    float puts[kPuts][3] = {};  // the last kPuts queued (the game draws the object where a script tick put it)
     int nput = 0;
     uint64_t gated = 0;     // draws of its drawable beyond the gate (the nearest put farther than 1.5 m)
     float gated_d = 0.0f;   // the last one's distance
     float rel[3] = {};      // its last draw's position less the root that draw used (the body-relative place)
     bool put_ok = false;
     uintptr_t drawable = 0;  // learned from its draws
+    // run 10 item 2 (the user: "guns in holsters jitter when moving including npc guns"): the drawable is the model's,
+    // shared by every gun of that model (an NPC's Cattleman too), so its own instance is learned from its first matched
+    // draw and a draw of another instance is refused (an NPC's gun within the gate was moved onto John's holster)
+    uintptr_t inst = 0;
+    uint64_t far = 0;        // matched draws over 0.3 m from every recent put (before the instance check: an NPC's gun)
+    uint64_t near_n = 0, mid_n = 0;  // matched draws within 3 cm of a recent put, 3 cm - 0.3 m
+    uint64_t other = 0;      // draws of its drawable by another instance, refused
+    uint64_t relearned = 0;  // its instance taken again (a draw of a new one within 3 cm of a put: the game remade it)
     double shown_ms = 0;     // its last moved draw
     float anchor[3] = {};    // the body's root its pose was placed by (want's anchor)
     bool anchored = false;
@@ -121,14 +138,15 @@ void collect_moves() {
 
 void push_put(Slot& s, const float* p) {  // under g_mutex: the queued position, also into the last four
     std::memcpy(s.put, p, sizeof(s.put));
-    std::memcpy(s.puts[s.nput % 4], p, sizeof(s.put));
+    std::memcpy(s.puts[s.nput % kPuts], p, sizeof(s.put));
     ++s.nput;
 }
 float put_d2(const Slot& s, const float* pos) {  // the squared distance to the nearest of the recent puts
-    const int n = s.nput < 4 ? s.nput : 4;
+    const int use = std::clamp(g_puts_n.load(std::memory_order_relaxed), 1, kPuts);
+    const int n = s.nput < use ? s.nput : use;
     float best = 1e30f;
     for (int i = 0; i < (n ? n : 1); ++i) {
-        const float* q = n ? s.puts[i] : s.put;
+        const float* q = n ? s.puts[(s.nput - 1 - i + kPuts * 64) % kPuts] : s.put;  // the newest `use`
         const float dx = pos[0] - q[0], dy = pos[1] - q[1], dz = pos[2] - q[2];
         best = std::fmin(best, dx * dx + dy * dy + dz * dz);
     }
@@ -175,8 +193,17 @@ void want_angles(int s, const float* deg) {
     if (deg) std::memcpy(g_slot[s].angles, deg, sizeof(g_slot[s].angles));
 }
 
+std::atomic<float> g_root_speed{0.0f};  // the body's speed (m/s, smoothed): the gate widens with it (the review's)
 void note_root(const float* root) {
     std::lock_guard lock(g_mutex);
+    static double last_ms = 0.0;
+    const double now = log::now_ms();
+    if (g_root_ok && now > last_ms && now - last_ms < 500.0) {
+        const float dx = root[0] - g_root_now[0], dy = root[1] - g_root_now[1], dz = root[2] - g_root_now[2];
+        const float sp = std::sqrt(dx * dx + dy * dy + dz * dz) / static_cast<float>((now - last_ms) * 0.001);
+        if (std::isfinite(sp)) g_root_speed = g_root_speed.load() + (std::fmin(sp, 30.0f) - g_root_speed.load()) * 0.2f;
+    }
+    last_ms = now;
     std::memcpy(g_root_now, root, sizeof(g_root_now));
     g_root_ok = true;
 }
@@ -376,7 +403,25 @@ void frame(uint32_t actor) {
     publish_status();
 }
 
-bool match(uintptr_t drawable, const float* pos, float* pose, int* slot) {
+std::atomic<bool> g_inst_check{true};  // "props inst on|off": the instance check (the control: off, as before)
+// run 10 item 2, measured (cycle D3): the draws carry no instance for the props (rec[0x13] empty), and with a stranger's
+// Schofield 1 m away John's right-hip slot matched ~4700 draws over 0.3 m from its puts in 7 s. The game draws the prop
+// where a script tick put it, so its own draws sit at one of its last four puts: the gate is that distance
+// ([Holsters] PropGate, "props gate <m>"; 0.30 m with eight puts kept, against the old 1.5 m: 0.10 m left 1 in 9 of a
+// walking prop's own draws unmatched, cycle D4)
+std::atomic<float> g_gate{0.30f};
+void set_puts(int n) {
+    n = std::clamp(n, 1, kPuts);
+    if (g_puts_n.exchange(n) != n) log::info("[prop] the draws matched against the last %d puts", n);
+}
+void set_gate(float m) {
+    if (m >= 0.01f && m <= 2.0f && g_gate.exchange(m) != m) log::info("[prop] the draws' gate %.2f m from the recent puts", m);
+}
+void set_inst_check(bool on) {
+    if (g_inst_check.exchange(on) != on) log::info("[prop] the draws' instance check %s", on ? "on" : "off");
+}
+
+bool match(uintptr_t drawable, uintptr_t inst, const float* pos, float* pose, int* slot) {
     if (!g_any.load(std::memory_order_relaxed) || !drawable) return false;
     if (!g_learning.load(std::memory_order_relaxed)) {  // every placed slot's drawable known: a draw of none of them needs no lock
         bool known = false;
@@ -387,11 +432,25 @@ bool match(uintptr_t drawable, const float* pos, float* pose, int* slot) {
     // of the slots with this drawable (or none learned yet and put within 3 cm), the one put nearest, within 1.5 m of
     // one of its last four puts (the game draws the object where a script tick put it: walking, that trails the latest)
     Slot* best = nullptr;
-    float bd = 1.5f * 1.5f;
+    // the gate, widened by the body's speed: the prop is drawn where a script tick put it, which trails further the faster
+    // John goes (0.3 m standing and walking; galloping at 8 m/s about 1.3 m), still far less than the old 1.5 m at rest
+    const float gate = g_gate.load(std::memory_order_relaxed) + g_root_speed.load(std::memory_order_relaxed) * 0.125f;
+    float bd = gate * gate;
+    const bool by_inst = g_inst_check.load(std::memory_order_relaxed);
     for (Slot& s : g_slot) {
         if (!s.put_ok || !s.want) continue;
         const float d2 = put_d2(s, pos);
-        const bool ok = drawable == s.drawable || (!s.drawable && d2 < 0.03f * 0.03f);
+        bool ok = drawable == s.drawable || (!s.drawable && d2 < 0.03f * 0.03f);
+        if (ok && by_inst && s.inst && inst && inst != s.inst) {
+            if (d2 < 0.03f * 0.03f) {  // a new instance at the put itself: the game remade the object
+                s.inst = inst;
+                ++s.relearned;
+            } else {
+                ++s.other;
+                ok = false;
+                continue;
+            }
+        }
         if (ok && d2 < bd) {
             best = &s, bd = d2;
         } else if (drawable == s.drawable) {
@@ -405,6 +464,10 @@ bool match(uintptr_t drawable, const float* pos, float* pose, int* slot) {
         g_learned.fetch_add(1, std::memory_order_relaxed);
         update_any();  // the lock-free filter knows it now
     }
+    if (!best->inst && inst) best->inst = inst;
+    if (bd > 0.3f * 0.3f) ++best->far;
+    else if (bd > 0.03f * 0.03f) ++best->mid_n;
+    else ++best->near_n;
     std::memcpy(pose, best->pose, sizeof(best->pose));
     if (best->anchored && g_root_ok)  // the body's walk since the pose was placed (the frame end before)
         for (int k = 0; k < 3; ++k) pose[9 + k] += g_root_now[k] - best->anchor[k];
@@ -417,6 +480,19 @@ bool match(uintptr_t drawable, const float* pos, float* pose, int* slot) {
 }
 
 bool diag_on() { return g_diag.load(std::memory_order_relaxed); }
+
+std::atomic<bool> g_twins_on{true};  // "props twins on|off": the belt's twin hidden (the session; the perf test's control)
+void set_twins(bool on) { g_twins_on = on; }
+bool shown_at_holster(uintptr_t drawable) {
+    if (!drawable || !g_any.load(std::memory_order_relaxed) || !g_twins_on.load(std::memory_order_relaxed)) return false;
+    bool known = false;  // the lock-free filter first (match's): most draws are of no prop's model
+    for (const auto& k : g_known) known = known || k.load(std::memory_order_relaxed) == drawable;
+    if (!known) return false;
+    std::lock_guard lock(g_mutex);
+    for (int i = kHolsterSlot; i < kHolsterSlot + 4 && i < kSlots; ++i)
+        if (g_slot[i].want && g_slot[i].drawable == drawable) return true;
+    return false;
+}
 
 void diag_draw(uintptr_t drawable, const float* pos, uint64_t pass, const float* m) {
     if (!g_any.load(std::memory_order_relaxed)) return;
@@ -503,6 +579,14 @@ std::string status() {
     for (int i = 0; i < kSlots; ++i) {
         std::snprintf(b, sizeof(b), " | slot %d %s obj %u state %d", i, g_shown[i].frag ? g_shown[i].frag : "-", g_shown[i].obj, g_shown[i].st);
         o += b;
+        const Slot& s = g_slot[i];
+        if (s.drawable) {
+            std::snprintf(b, sizeof(b), " inst %llx far %llu other %llu relearned %llu near %llu mid %llu gated %llu (the last %.2f m off)", static_cast<unsigned long long>(s.inst),
+                          static_cast<unsigned long long>(s.far), static_cast<unsigned long long>(s.other),
+                          static_cast<unsigned long long>(s.relearned), static_cast<unsigned long long>(s.near_n),
+                          static_cast<unsigned long long>(s.mid_n), static_cast<unsigned long long>(s.gated), s.gated_d);
+            o += b;
+        }
     }
     return o;
 }

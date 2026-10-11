@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -37,6 +38,7 @@ std::atomic<bool> g_fire{true};    // [Hands] FireInFirstPerson
 std::atomic<bool> g_reticle{false};      // [Hands] Reticle (off by default)
 std::atomic<float> g_reticle_deg{1.2f};  // [Hands] ReticleSize (degrees across)
 std::atomic<bool> g_reticle_dot{false};    // [Hands] ReticleStyle=dot: a dot only
+std::atomic<bool> g_ret_smooth{true};   // [Hands] ReticleSmooth (run 10 item 8)
 std::atomic<uint64_t> g_reticle_shown{0}, g_reticle_offline{0};
 std::atomic<bool> g_assist{false}; // [Hands] AimAssist (soft lock and the reticle magnet in first person)
 std::atomic<bool> g_tracer{true};  // [Hands] TracerFromMuzzle
@@ -83,6 +85,8 @@ constexpr float kProbeRange = 300.0f;
 std::mutex g_rp_mutex;
 struct ReticleProbe {
     float muzzle[3] = {}, dir[3] = {};
+    float hand[3] = {};  // run 10 item 8: the drawn gun hand when the probe was asked (the muzzle moves with it since)
+    bool hand_ok = false;
     float dist = 0.0f;
     bool hit = false;
     double ms = 0.0;
@@ -313,7 +317,8 @@ uint64_t pack2(float x, float y) {
 void reticle_tick() {
     static uint64_t pending = 0;
     static double pending_ms = 0.0;
-    static float req_m[3], req_d[3];
+    static float req_m[3], req_d[3], req_h[3];
+    static bool req_h_ok = false;
     const double now = log::now_ms();
     if (pending) {
         RdrvrNativeResult r{};
@@ -326,6 +331,8 @@ void reticle_tick() {
             std::lock_guard lock(g_rp_mutex);
             std::memcpy(g_rp.muzzle, req_m, sizeof(req_m));
             std::memcpy(g_rp.dir, req_d, sizeof(req_d));
+            std::memcpy(g_rp.hand, req_h, sizeof(req_h));
+            g_rp.hand_ok = req_h_ok;
             g_rp.dist = dist > kProbeRange ? kProbeRange : dist;
             g_rp.hit = hit;
             g_rp.ms = now;
@@ -354,6 +361,11 @@ void reticle_tick() {
     pending_ms = now;
     std::memcpy(req_m, m, sizeof(m));
     std::memcpy(req_d, d, sizeof(d));
+    {
+        body::BodyPoints bp;
+        req_h_ok = body::body_points(&bp) && bp.hand_ok[bp.gun];
+        if (req_h_ok) std::memcpy(req_h, bp.hand[bp.gun], sizeof(req_h));
+    }
     g_rp_probes.fetch_add(1, std::memory_order_relaxed);
     // while the game aims: where its target actor is (the review of 0.8.3: its target point follows the barrel's ray,
     // so only the actor's own position tells a stale handle from one under the reticle)
@@ -731,6 +743,7 @@ void init() {
     g_perfect = config::get_bool("Aim", "PerfectAccuracy", true);
     g_pattern = config::get_bool("Aim", "ShotgunPattern", true);
     g_reticle = config::get_bool("Hands", "Reticle", false);
+    g_ret_smooth = config::get_bool("Hands", "ReticleSmooth", true);  // run 10 item 8
     g_reticle_dot = config::get_string("Hands", "ReticleStyle", "ring") == "dot";
     {
         const float s = config::get_float("Hands", "ReticleSize", 1.2f);
@@ -875,6 +888,13 @@ using ArmBlock_t = uint64_t (*)(uintptr_t G);
 ArmBlock_t o_arm_block = nullptr;
 std::atomic<bool> g_past_arm_block{false};
 std::atomic<uint64_t> g_arm_cleared{0};
+int player_melee_state() {  // run 10 item 7: the player's melee controller's state ([[ped +0xaa8] +0x80] +0xc0): 1 a punch, 2 blocking
+    const uintptr_t actor = player_actor();
+    uintptr_t ped = 0, comp = 0, m = 0;
+    int32_t st = -1;
+    return actor && rd(actor + 0x38, &ped) && ped && rd(ped + 0xaa8, &comp) && comp && rd(comp + 0x80, &m) && m && rd(m + 0xc0, &st) ? st : -1;
+}
+
 uintptr_t player_gun_ctl() {  // the player's G: [[actor +0x38 (ped)] +0xaa8] +8
     uintptr_t ped = 0, comp = 0, G = 0;
     const uintptr_t actor = player_actor();
@@ -1271,7 +1291,169 @@ void set_reticle_dot(bool dot) {
     config::set("Hands", "ReticleStyle", dot ? "dot" : "ring");
 }
 
-bool reticle_target(float pos[3], bool* on_actor, float* size_deg) {
+// run 10 item 8 (the user: "Reticle is a bit shaky, and only one appears when dual wielding"): the probe's ray is a script
+// tick or two old (one probe every other tick) and was drawn as it was, in steps behind the hand, the hand's own tremor
+// carried 300 m out. [Hands] ReticleSmooth: each frame the barrel's line from the drawn gun hand's IK target (its axes and
+// the barrel's measured axis in them, barrel_in_target) through the muzzle moved with the hand since the probe, the
+// direction smoothed by speed (50 ms at rest down to 4 ms past 90 deg/s: a sweep keeps up), the distance eased to each
+// probe's (80 ms). The second gun (dual wield) gets its own line: its hand's target and the barrel axis mirrored, at the
+// same distance. "reticle stats": each frame's turn of the drawn reticle (its jitter) and its angle off the barrel now.
+struct RetFilter {
+    bool ok = false;
+    float dir[3] = {0, 0, -1}, raw[3] = {0, 0, -1}, dist = 0.0f, pos[3] = {};
+    double ms = 0.0;
+    bool have_pos = false;
+};
+RetFilter g_rf[2];  // written by the XR thread (advance) and read by the others, both under g_rp_mutex
+std::atomic<bool> g_ret2_line_on{true};  // "aim reticle line on|off" (the session): off, the old mirrored hold (the tests' control)
+std::atomic<uint64_t> g_ret2_line{0};  // frames the second reticle took its shot's own line (the copy's T, the second gun's barrel)
+struct RetStats {
+    uint64_t n = 0;
+    double jit_sum2 = 0.0, jit_max = 0.0, off_sum = 0.0, off_max = 0.0;
+    float last_dir[3] = {};
+    bool have = false;
+};
+RetStats g_rs[2];
+float ang_deg(const float* a, const float* b) {
+    const float d = std::clamp(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], -1.0f, 1.0f);
+    return std::acos(d) * 57.29578f;
+}
+void norm3(float* v) {
+    const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 1e-6f)
+        for (int k = 0; k < 3; ++k) v[k] /= l;
+}
+bool reticle_smoothed(int which, const ReticleProbe& rp, bool advance, float pos[3]) {
+    body::BodyPoints bp;
+    if (!body::body_points(&bp)) return false;
+    int j = bp.gun;
+    if (which == 1) {
+        const dual::State ds = dual::state();
+        if (!ds.on) return false;
+        j = dual::copy_john();
+        if (j < 0 || j > 1 || j == bp.gun) j = 1 - bp.gun;
+    }
+    if (!bp.hand_ok[j]) return false;
+    float bt[3] = {0.0f, 0.174f, -0.985f};
+    barrel_in_target(bt);
+    float d[3], m[3];
+    // 2026-10-12 (round 16 check 56, the user: "Reticle on second gun in left hand is off aim"): the second reticle on
+    // the line its shot takes, not the gun hand's hold mirrored: the copy's shot is the gun in hand's moved by T onto the
+    // copy (aim.cpp's launch), so its line is the first reticle's moved by T; a second gun of another slot fires along
+    // its own barrel (-W +0xa0). The mirror only when neither is known yet
+    bool line = false;
+    if (which == 1 && g_ret2_line_on.load(std::memory_order_relaxed)) {
+        const dual::State ds = dual::state();
+        alignas(16) float T[16];
+        const int g = bp.gun;
+        if (ds.copy && dual::copy_T(T) && bp.hand_ok[g]) {
+            float d0[3], m0[3];
+            for (int k = 0; k < 3; ++k)
+                d0[k] = bp.target_rot[g][k * 3] * bt[0] + bp.target_rot[g][k * 3 + 1] * bt[1] + bp.target_rot[g][k * 3 + 2] * bt[2];
+            norm3(d0);
+            if (rp.hand_ok)
+                for (int k = 0; k < 3; ++k) m0[k] = rp.muzzle[k] + (bp.hand[g][k] - rp.hand[k]);
+            else
+                for (int k = 0; k < 3; ++k) m0[k] = bp.hand[g][k] + d0[k] * 0.2f;
+            for (int c = 0; c < 3; ++c) {  // p' = p T (row vectors): a point takes the translation row, a direction not
+                d[c] = d0[0] * T[c] + d0[1] * T[4 + c] + d0[2] * T[8 + c];
+                m[c] = m0[0] * T[c] + m0[1] * T[4 + c] + m0[2] * T[8 + c] + T[12 + c];
+            }
+            norm3(d);
+            line = std::isfinite(d[0] + d[1] + d[2] + m[0] + m[1] + m[2]);
+        } else if (!ds.copy) {
+            int sj = -1;
+            const uintptr_t W = dual::secondary_W(&sj);
+            float bz[3] = {};
+            if (W && raw(W + 0xa0, bz, sizeof(bz))) {
+                for (int k = 0; k < 3; ++k) d[k] = -bz[k];
+                norm3(d);
+                for (int k = 0; k < 3; ++k) m[k] = bp.hand[j][k] + d[k] * 0.2f;  // a barrel's length past the hand
+                line = std::isfinite(d[0] + d[1] + d[2]) && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 0.5f;
+            }
+        }
+        if (line) g_ret2_line.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (which == 1 && !line) bt[0] = -bt[0];  // the other hand's: the mirror of the gun hand's hold
+    if (!line) {
+        for (int k = 0; k < 3; ++k) d[k] = bp.target_rot[j][k * 3] * bt[0] + bp.target_rot[j][k * 3 + 1] * bt[1] + bp.target_rot[j][k * 3 + 2] * bt[2];
+        norm3(d);
+        if (!std::isfinite(d[0] + d[1] + d[2])) return false;
+        if (which == 0 && rp.hand_ok)
+            for (int k = 0; k < 3; ++k) m[k] = rp.muzzle[k] + (bp.hand[j][k] - rp.hand[k]);
+        else
+            for (int k = 0; k < 3; ++k) m[k] = bp.hand[j][k] + d[k] * 0.2f;  // a barrel's length past the hand
+    }
+    std::lock_guard lock(g_rp_mutex);  // the filter and its stats: the XR thread writes, the commands read (the review's)
+    RetFilter& f = g_rf[which];
+    const double now = log::now_ms();
+    if (advance) {
+        const double dt = (now - f.ms) * 0.001;
+        if (!f.ok || dt <= 0.0 || dt > 0.5) {
+            std::memcpy(f.dir, d, sizeof(d));
+            f.dist = rp.dist;
+        } else {
+            const float speed = ang_deg(d, f.raw) / static_cast<float>(dt);  // deg/s
+            const float t = std::clamp((speed - 10.0f) / 80.0f, 0.0f, 1.0f);
+            const float tau = 0.05f + (0.004f - 0.05f) * t;
+            const float a = static_cast<float>(1.0 - std::exp(-dt / tau));
+            for (int k = 0; k < 3; ++k) f.dir[k] += (d[k] - f.dir[k]) * a;
+            norm3(f.dir);
+            const float ad = static_cast<float>(1.0 - std::exp(-dt / 0.08));
+            f.dist += (rp.dist - f.dist) * (std::fabs(rp.dist - f.dist) > 0.5f * f.dist ? 1.0f : ad);  // a new surface: at once
+        }
+        std::memcpy(f.raw, d, sizeof(d));
+        f.ms = now;
+        f.ok = true;
+        for (int k = 0; k < 3; ++k) f.pos[k] = m[k] + f.dir[k] * f.dist;
+        f.have_pos = true;
+        RetStats& s = g_rs[which];
+        float rd_[3] = {f.pos[0] - m[0], f.pos[1] - m[1], f.pos[2] - m[2]};
+        norm3(rd_);
+        if (s.have) {
+            const double jit = ang_deg(rd_, s.last_dir);
+            s.jit_sum2 += jit * jit;
+            s.jit_max = std::fmax(s.jit_max, jit);
+        }
+        const double off = ang_deg(rd_, d);
+        s.off_sum += off;
+        s.off_max = std::fmax(s.off_max, off);
+        ++s.n;
+        std::memcpy(s.last_dir, rd_, sizeof(rd_));
+        s.have = true;
+    }
+    if (!f.have_pos) return false;
+    std::memcpy(pos, f.pos, sizeof(f.pos));
+    return true;
+}
+// the unsmoothed reticle's stats (the control: the probe's own place each frame)
+void stats_raw(int which, const float* m, const float* hit) {
+    body::BodyPoints bp;
+    if (!body::body_points(&bp) || !bp.hand_ok[bp.gun]) return;
+    float bt[3] = {0.0f, 0.174f, -0.985f};
+    barrel_in_target(bt);
+    float d[3];
+    const int j = bp.gun;
+    for (int k = 0; k < 3; ++k) d[k] = bp.target_rot[j][k * 3] * bt[0] + bp.target_rot[j][k * 3 + 1] * bt[1] + bp.target_rot[j][k * 3 + 2] * bt[2];
+    norm3(d);
+    std::lock_guard lock(g_rp_mutex);
+    RetStats& s = g_rs[which];
+    float rd_[3] = {hit[0] - m[0], hit[1] - m[1], hit[2] - m[2]};
+    norm3(rd_);
+    if (s.have) {
+        const double jit = ang_deg(rd_, s.last_dir);
+        s.jit_sum2 += jit * jit;
+        s.jit_max = std::fmax(s.jit_max, jit);
+    }
+    const double off = ang_deg(rd_, d);
+    s.off_sum += off;
+    s.off_max = std::fmax(s.off_max, off);
+    ++s.n;
+    std::memcpy(s.last_dir, rd_, sizeof(rd_));
+    s.have = true;
+}
+
+bool reticle_target(float pos[3], bool* on_actor, float* size_deg, int which, bool advance) {
     if (!g_reticle.load(std::memory_order_relaxed) || !g_barrel.load(std::memory_order_relaxed)) return false;
     RdrvrActorState st{};
     if (!api::actor_state(&st) || !reload::is_gun(st.weapon)) return false;  // not the lasso, a thrown weapon or the fists
@@ -1285,7 +1467,18 @@ bool reticle_target(float pos[3], bool* on_actor, float* size_deg) {
     if (now - rp.ms > 250.0) return false;
     float hit[3];
     for (int k = 0; k < 3; ++k) hit[k] = rp.muzzle[k] + rp.dir[k] * rp.dist;
-    std::memcpy(pos, hit, sizeof(hit));
+    if (which == 1) {  // the second gun's: smoothed only, never red
+        if (!g_ret_smooth.load(std::memory_order_relaxed) || !reticle_smoothed(1, rp, advance, pos)) return false;
+        if (on_actor) *on_actor = false;
+        if (size_deg) *size_deg = g_reticle_deg.load(std::memory_order_relaxed);
+        return true;
+    }
+    if (g_ret_smooth.load(std::memory_order_relaxed) && reticle_smoothed(0, rp, advance, pos)) {
+        // (red below judged on the probe's own hit, as before)
+    } else {
+        std::memcpy(pos, hit, sizeof(hit));
+        if (advance) stats_raw(0, rp.muzzle, hit);
+    }
     // red: only while the game aims along the barrel (its aim ray fresh), at its current target handle, and with the
     // probe's hit on that actor: within 1.2 m of its position across, from 0.3 m below it to 2.3 m above (y up: a
     // person's or an animal's body). A stale handle, a lock elsewhere, a wall: white
@@ -1391,6 +1584,32 @@ std::string command(const std::string& line) {
                       g_dir_target[0], g_dir_target[1], g_dir_target[2], g_dir_wrist[0], g_dir_wrist[1], g_dir_wrist[2], g_gun_anim[0],
                       g_gun_anim[1], g_gun_anim[2]);
         return f;
+    }
+    if (line.find(" reticle stats") != std::string::npos || line.find(" reticle smooth") != std::string::npos ||
+        line.find(" reticle line") != std::string::npos) {
+        // aim reticle stats [reset] | aim reticle smooth on|off (the session): run 10 item 8's jitter and lag
+        if (line.find(" smooth on") != std::string::npos) g_ret_smooth = true;
+        if (line.find(" smooth off") != std::string::npos) g_ret_smooth = false;
+        if (line.find(" line on") != std::string::npos) g_ret2_line_on = true;
+        if (line.find(" line off") != std::string::npos) g_ret2_line_on = false;
+        std::lock_guard lock(g_rp_mutex);
+        char e[400];
+        std::snprintf(e, sizeof(e), "reticle smooth %d, the second on its shot's line %d (%llu frames)", g_ret_smooth.load() ? 1 : 0,
+                      g_ret2_line_on.load() ? 1 : 0, static_cast<unsigned long long>(g_ret2_line.load()));
+        std::string o = e;
+        for (int wi = 0; wi < 2; ++wi) {
+            const RetStats& s = g_rs[wi];
+            std::snprintf(e, sizeof(e), " | %s: frames %llu, jitter rms %.4f max %.4f deg, off the barrel mean %.4f max %.4f deg", wi ? "second" : "main",
+                          static_cast<unsigned long long>(s.n), s.n > 1 ? std::sqrt(s.jit_sum2 / static_cast<double>(s.n - 1)) : 0.0, s.jit_max,
+                          s.n ? s.off_sum / static_cast<double>(s.n) : 0.0, s.off_max);
+            o += e;
+        }
+        if (g_rf[1].have_pos) {
+            std::snprintf(e, sizeof(e), " | second at (%.3f %.3f %.3f)", g_rf[1].pos[0], g_rf[1].pos[1], g_rf[1].pos[2]);
+            o += e;
+        }
+        if (line.find(" reset") != std::string::npos) g_rs[0] = g_rs[1] = RetStats{};
+        return o;
     }
     if (line.find(" reticle") != std::string::npos) {  // aim reticle [on|off|dot|ring]: where it is drawn now, its counters (the session)
         if (line.find(" reticle on") != std::string::npos) g_reticle = true;

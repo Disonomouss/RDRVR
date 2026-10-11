@@ -11,6 +11,8 @@
 #include <cstddef>
 #include <string>
 
+#include "common/rdrvr_api.h"
+
 namespace rdrvr::pose {
 
 void init();  // frame-end listener
@@ -26,6 +28,12 @@ void set_steer_by_head(bool on);
 // [Horse] StickTurn (run 9 item 4, on): with stick steering the right stick turns the view on horseback (TurnMode's
 // snap or smooth), an offset over the horse's heading; mounting and recentre set it to 0 ("pose rideturn on|off")
 bool stick_turn_riding();
+bool vehicle_heading();
+// [Body] ArmedStance=stand (run 10 item 8b): a gun drawn standing, the view's (and the still body's) height held
+bool armed_stand();
+void set_armed_stand(bool on, bool save);
+bool holds_armed_height(const RdrvrActorState& st);  // [Horse] VehicleHeading (run 10 item 3): driving a wagon, the view's heading the vehicle's
+void set_vehicle_heading(bool on, bool save);
 void set_stick_turn_riding(bool on, bool save = true);
 float ride_turn_deg();  // the offset now (0 on foot or steering by the head)
 // John's body's heading: the body heading less the ride's turn (the horse's while riding with the view turned): the

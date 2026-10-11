@@ -12,6 +12,7 @@
 #include <string>
 
 namespace rdrvr::aim {
+int player_melee_state();  // the player's melee controller's state (1 a punch, 2 blocking; -1 none or unread)
 
 void init();
 bool install();  // after anchors::verify()
@@ -19,7 +20,9 @@ bool barrel_aim();
 // [Hands] Reticle (off by default): where the shot lands, the game's own reticle target point (T +0x3810, on the barrel's line at
 // the probe's hit) while aiming with a gun in hand; on_actor: an actor under it. False when none (lowered, no gun, a
 // stale or off-line point). size_deg: [Hands] ReticleSize. Any thread (SEH-guarded reads).
-bool reticle_target(float pos[3], bool* on_actor, float* size_deg);
+// which: 0 the gun in hand's, 1 the second gun's (dual wield; never red); advance: the frame's call (the XR thread), which
+// moves the smoothing on (any other caller reads the last place)
+bool reticle_target(float pos[3], bool* on_actor, float* size_deg, int which = 0, bool advance = false);
 bool reticle_on();
 void set_reticle_on(bool on);  // also written to the user ini
 // [Hands] ReticleStyle: ring (a ring and a centre dot, the default) or dot (a dot only)

@@ -17,6 +17,7 @@
 #include "core/log.h"
 #include "core/state.h"
 #include "core/vr_mode.h"
+#include "core/reload.h"
 #include "core/xinput.h"
 #include "core/xr.h"
 
@@ -55,6 +56,41 @@ std::atomic<bool> g_saddle_climb{true};  // [Horse] SaddleClimb (run 6 item 8): 
 // plugin adds to the mount's own (the job's `weapons` bit 3: heading_deg is that offset). Mounting starts it at 0 (the
 // view faces the horse), recentre clears it; the left stick still steers the horse relative to itself
 std::atomic<bool> g_ride_turn{true};
+std::atomic<bool> g_vehicle_heading{true};
+// run 10 item 8b ([Body] ArmedStance=stand; the user: "When john draws a gun, he changes his stance, bending his knees and
+// lowering his height slightly. Can we prevent this?"): measured (run10_armed), the game's armed stance lowers the head
+// bone 6 cm (0.60 -> 0.54 m over the root) and bends the knees 167 -> 153 deg; the eye height followed it. Standing (not
+// crouching, not riding or driving) with a gun in hand, the eye height is held at its value from before
+std::atomic<bool> g_armed_stand{true};
+// 2026-10-12 (round 16 check 57, the user: "After putting a gun away John crouches slightly then slowly returns to normal
+// posture. John almost crouching when fists are drawn"): held too in the fists' fighting stance (empty hands, the game's
+// LT pressed within the last 1.5 s: the guard, a punch's lead, the player's own LT), and after either ends while the head
+// is still below the held height (the game's stance easing back after a put-away), at most 8 s (the simulator, r16_stance:
+// a gun put back by hand dips the head 10 cm for 6-7 s; the fists' guard lowers it 32 cm while held)
+bool armed_cond(const RdrvrActorState& st, double now) {
+    if (!g_armed_stand.load(std::memory_order_relaxed) ||
+        (st.flags & (RDRVR_ACTOR_CROUCHING | RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_IN_COVER)))
+        return false;
+    return reload::is_gun(st.weapon) || (st.weapon < 0 && now - controls::last_lt_ms() < 1500.0);
+}
+std::atomic<bool> g_hold_now{false};  // the frame's verdict (the still body reads it: body.cpp)
+std::atomic<uint64_t> g_hold_after{0};  // frames held after the stance ended (the head still low)
+double g_hold_release_ms = 0.0;
+bool armed_hold(const RdrvrActorState& st, float up, float held, double now) {
+    bool h = armed_cond(st, now);
+    if (h) {
+        g_hold_release_ms = now;
+    } else if (g_hold_release_ms > 0.0 && g_armed_stand.load(std::memory_order_relaxed) &&
+               !(st.flags & (RDRVR_ACTOR_CROUCHING | RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_IN_COVER)) &&
+               now - g_hold_release_ms < 8000.0 && up < held - 0.005f) {
+        h = true;  // the stance easing back: held until the head is back up
+        g_hold_after.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_hold_release_ms = 0.0;
+    }
+    g_hold_now.store(h, std::memory_order_relaxed);
+    return h;
+}  // [Horse] VehicleHeading (run 10 item 3): driving, the view's heading the vehicle's
 float g_ride_off = 0.0f;
 std::atomic<float> g_ride_off_shared{0.0f};
 bool g_ride_snapped = false;
@@ -145,16 +181,25 @@ void on_frame_end(uint64_t) {
         g_last_ms = now;
         if (dt <= 0 || dt > 0.1f) dt = 1.0f / 90.0f;
         // riding: the rider's head over the horse's root, averaged (the gait's bounce out), for the saddle anchor
-        const bool riding = api::actor_state(&st) && st.mount != 0;
+        // run 10 item 3 ([Horse] VehicleHeading): driving a wagon or a coach rides as a horse does for the view's heading
+        // (it follows the vehicle's, StickTurn's offset over it), not for the saddle anchor (the driver's bench is not
+        // over the vehicle's middle line: the camera stays over John's own root)
+        const bool have_st = api::actor_state(&st);
+        const bool vehicle = have_st && st.mount != 0 && (st.flags & RDRVR_ACTOR_VEHICLE);
+        const bool riding = have_st && st.mount != 0 && (!vehicle || g_vehicle_heading.load(std::memory_order_relaxed));
         if (riding != g_was_riding) {
             g_was_riding = riding;
             g_saddle_valid = false;
             g_ride_off = 0.0f;  // [Horse] StickTurn: the view faces the horse at the mount (the dismount keeps the turned heading)
             g_ride_snapped = true;  // a stick still held from a turn on foot: no snap until it comes back
-            log::info("[pose] %s (steering by the %s, saddle anchor %s)", riding ? "riding" : "on foot", g_steer_head.load() ? "head" : "stick",
-                      g_saddle.load() ? "on" : "off");
+            if (vehicle)
+                log::info("[pose] driving (the view's heading the vehicle's %.1f deg, steering by the %s)", st.mount_heading,
+                          g_steer_head.load() ? "head" : "stick");
+            else
+                log::info("[pose] %s (steering by the %s, saddle anchor %s)", riding ? "riding" : "on foot", g_steer_head.load() ? "head" : "stick",
+                          g_saddle.load() ? "on" : "off");
         }
-        if (riding && st.head_valid && g_up_axis == 1) {
+        if (riding && !vehicle && st.head_valid && g_up_axis == 1) {
             const float mh = st.mount_heading * 0.0174532925f;
             const float up = st.head_pos[1] - st.mount_pos[1];
             const float fw = (st.head_pos[0] - st.mount_pos[0]) * -std::sin(mh) + (st.head_pos[2] - st.mount_pos[2]) * -std::cos(mh);
@@ -193,7 +238,7 @@ void on_frame_end(uint64_t) {
             std::lock_guard lock(g_trace_mutex);
             if (g_trace.size() < 20000) g_trace.push_back(r);
         }
-        if (riding && g_saddle_valid && g_saddle.load(std::memory_order_relaxed)) {
+        if (riding && !vehicle && g_saddle_valid && g_saddle.load(std::memory_order_relaxed)) {
             job.saddle = g_saddle_climb.load(std::memory_order_relaxed) ? 3u : 1u;
             job.saddle_height = g_saddle_h + g_lift;
             job.saddle_forward = g_saddle_f + g_forward;
@@ -242,7 +287,17 @@ void on_frame_end(uint64_t) {
         g_heading = std::fmod(g_heading + 540.0f, 360.0f) - 180.0f;
         job.heading_deg = (job.weapons & 4u) ? g_ride_off : g_heading;
         g_heading_shared = g_heading;
-        if (g_height_follow && g_have_scale && api::actor_state(&st) && st.head_valid) {
+        const bool have = g_height_follow && g_have_scale && g_height_s_valid && api::actor_state(&st) && st.head_valid;
+        const float up_now = have ? (g_up_axis == 1 ? st.head_pos[1] - st.pos[1] : st.head_pos[2] - st.pos[2]) : 0.0f;
+        const bool hold = have ? armed_hold(st, up_now, g_height_s, log::now_ms()) : (g_hold_now.store(false), false);
+        if (hold) {  // run 10 item 8b: the height held (its last value), only a rise let through (a crouch left with the gun out)
+            const float up = up_now;
+            if (up > g_height_s && up < 2.5f) {
+                const float a = 1.0f - std::exp(-dt / (g_height_tau > 0.01f ? g_height_tau : 0.01f));
+                g_height_s += (up - g_height_s) * a;
+            }
+            job.height = g_height_s + g_lift;
+        } else if (g_height_follow && g_have_scale && api::actor_state(&st) && st.head_valid) {
             float up = g_up_axis == 1 ? st.head_pos[1] - st.pos[1] : st.head_pos[2] - st.pos[2];
             if (up > 0.2f && up < 2.5f) {
                 float a = 1.0f - std::exp(-dt / (g_height_tau > 0.01f ? g_height_tau : 0.01f));
@@ -297,6 +352,8 @@ void init() {
     g_saddle_tau = config::get_float("Horse", "SaddleSmoothing", 0.15f);
     g_saddle_climb = config::get_bool("Horse", "SaddleClimb", true);
     g_ride_turn = config::get_bool("Horse", "StickTurn", true);
+    g_armed_stand = config::get_string("Body", "ArmedStance", "stand") != "game";
+    g_vehicle_heading = config::get_bool("Horse", "VehicleHeading", true);
     log::info("[pose] horse: steering by the %s, saddle anchor %d (smoothing %.2f s), the right stick turns the view %d", g_steer_head.load() ? "head" : "stick",
               g_saddle.load() ? 1 : 0, g_saddle_tau.load(), g_ride_turn.load() ? 1 : 0);
     d3d::add_frame_end_listener(on_frame_end);
@@ -319,6 +376,18 @@ void set_orient_mode(int m) {
     log::info("[pose] scripted camera orientation mode %d", m);
 }
 
+bool armed_stand() { return g_armed_stand.load(); }
+void set_armed_stand(bool on, bool save) {
+    if (g_armed_stand.exchange(on) != on) log::info("[pose] a gun drawn: the view's height %s", on ? "held (standing)" : "the game's stance");
+    if (save) config::set("Body", "ArmedStance", on ? "stand" : "game");
+}
+bool holds_armed_height(const RdrvrActorState&) { return g_hold_now.load(std::memory_order_relaxed); }  // the frame's verdict
+uint64_t hold_after_frames() { return g_hold_after.load(std::memory_order_relaxed); }
+bool vehicle_heading() { return g_vehicle_heading.load(); }
+void set_vehicle_heading(bool on, bool save) {
+    if (g_vehicle_heading.exchange(on) != on) log::info("[pose] driving: the view's heading %s", on ? "the vehicle's" : "as on foot");
+    if (save) config::set("Horse", "VehicleHeading", on ? "1" : "0");
+}
 bool stick_turn_riding() { return g_ride_turn.load(); }
 void set_stick_turn_riding(bool on, bool save) {
     if (g_ride_turn.exchange(on) != on) log::info("[pose] the right stick turns the view on horseback (StickTurn) %d", on ? 1 : 0);
@@ -401,7 +470,8 @@ void status_text(char* out, size_t len) {
     std::snprintf(out, len,
                   "anchor %s (%s), heading %.1f deg, head yaw %.1f, eye height %.3f%s, turns %llu, walk frames %llu | actor %s (%.2f %.2f %.2f) "
                   "heading %.1f, camera %d at (%.2f %.2f %.2f), tick %llu | mount %d (%.2f %.2f %.2f) heading %.1f, saddle %s h %.2f f %.2f, "
-                  "steer %s, ride turn %d %.1f deg (turns %llu), ride frames %llu, jitter %.4f m/tick (camera height %.4f) over %llu",
+                  "steer %s, ride turn %d %.1f deg (turns %llu), ride frames %llu, jitter %.4f m/tick (camera height %.4f) over %llu | "
+                  "armed hold %d (after the stance %llu, LT %.0f ms ago), the head's height %.4f",
                   g_anchor.load() ? "on" : "off", g_active ? "active" : "idle", g_heading, g_last_head_yaw, g_height,
                   g_have_scale ? " (head bone)" : g_auto_height ? " (not yet measured)" : " (ini)",
                   static_cast<unsigned long long>(g_turns), static_cast<unsigned long long>(g_walk_frames), have ? "" : "none",
@@ -411,7 +481,8 @@ void status_text(char* out, size_t len) {
                   g_ride_off_shared.load(), static_cast<unsigned long long>(g_ride_turns),
                   static_cast<unsigned long long>(g_ride_frames), g_jit_n ? std::sqrt(g_jit_sum / static_cast<double>(g_jit_n)) : 0.0,
                   g_jit_n ? std::sqrt(g_jit_abs / static_cast<double>(g_jit_n)) : 0.0,
-                  static_cast<unsigned long long>(g_jit_n));
+                  static_cast<unsigned long long>(g_jit_n), g_hold_now.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_hold_after.load()), log::now_ms() - controls::last_lt_ms(), g_height_s);
 }
 
 }  // namespace rdrvr::pose

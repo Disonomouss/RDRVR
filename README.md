@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.4 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.5 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -59,6 +59,13 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   your headset asks for, at most this tall. Larger is sharper and costs more GPU time. A size too large for the
   graphics card's memory is greyed out in the menu, and a size whose start ended (a crash) within two minutes is not
   used again until you choose it again; the row's "Now:" line says which size runs, or why not.
+- New in 0.8.5, on by default (used in a Quest 3 over Virtual Desktop): motion blur held off (the General tab, "No
+  motion blur"; it smears the view as you turn your head). The game's settings file is not changed, and its Graphics
+  menu still shows and saves your own setting. A switch for the desert's heat haze (the General tab, "Heat haze", on
+  as in the game; some find it uncomfortable in VR): off removes the shimmer.
+- Fixed in 0.8.5 (tried in the developer's simulator only): coming back from Undead Nightmare restarts the game, and
+  that start ran at the game's own size instead of the "Render resolution" one, so the view was blurry. The size is
+  now put back; `RDRVR.log` records each start's command line.
 - The HUD on a floating panel, or on your wrist like a watch (radar, meters, ammo shown when you look at it).
 - Automatic view modes: stereo in gameplay, a cinema screen for loading, menus and videos; cutscenes on the screen or
   in 3D.
@@ -68,6 +75,13 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - Arms that follow the controllers (two-bone IK, stretching past John's reach), the eye height following crouching
   and riding.
 - A left-handed mode: a full mirror (the gun in John's left hand, the holsters and reloading mirrored).
+- New in 0.8.5, off by default (used in a Quest 3: "looks really good"; the Comfort tab, Torso: "Still"): a still body,
+  the torso, hips and belt held still under your view, only the arms and legs moving. The belt and the holster on it
+  stay with the body (they swung with the legs). Optional, in `RDRVR.ini` only (`[Body] StillFeet=1`, tried in the
+  developer's simulator only): the feet kept where the game plants them, by a leg solve.
+- New in 0.8.5, on by default (used in a Quest 3): drawing a gun no longer lowers the view (the game's armed stance
+  lowered the view by about 10 cm; `[Body] ArmedStance=game` in `RDRVR.ini` turns this off, no menu row). Since the same release, tried in the developer's simulator only: the view also keeps its
+  height for a few seconds after putting a gun away, and in the fist-fight stance (they lowered it by 10 and 30 cm).
 
 **Guns**
 - New in 0.8.1: every gun's aiming hold is built in (learned for all 21 guns in the developer's Quest 3 over Virtual
@@ -82,12 +96,19 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   game puts in your hands by itself went to the hand that drew last, and taking another gun then put it inside the
   first; such a gun now goes to your gun hand. Putting away the gun in hand while a second gun is out in the other
   hand makes the second your gun in hand (before, every holster refused that hand).
+- Fixed in 0.8.5 (used in a Quest 3): the holsters keep their places after riding and after cutscenes (they were
+  placed again during the dismount, or from the cutscene's camera, once across the road); a fast swing of an empty hand
+  on horseback no longer draws your last gun; the holstered guns no longer take a nearby person's gun of the same model
+  onto your holster.
 - Shots leave the barrel of the gun in your hand; the right trigger alone fires; the gun stays drawn until you put it
   away.
 - An optional reticle where the shot will land (off by default: the Hands tab), a ring or a dot (new in 0.5.0). Since
   0.8.3 it shows whenever a gun is in hand, in Dead Eye too, found by a line test along the barrel each game tick, and it
   turns red only while you aim and the game's target actor is under it (it could stay red before). Tried in the
   developer's simulator, not yet in a headset; turning red on a person not yet tried.
+  Since 0.8.5 (used in a Quest 3) it follows the barrel every frame with your hand's tremor smoothed (it moved in steps
+  a tick behind the hand), and with two guns each has its own reticle (the second one never turns red); fixed later in 0.8.5 (tried in the developer's
+  simulator only): the second gun's reticle on that gun's own line of fire (it was off its aim).
 - Holsters you grab: hips, back, left shoulder, belt, lower back, chest (rounds); a weapon chosen per holster; each
   holster movable and resizable. They are fixed to your headset's position, so they stay with you as you step,
   crouch and lean (or to John's body: the Holsters tab).
@@ -105,6 +126,15 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   edges (no buzzing at a ring's edge); each ring shown only while
   a hand is near it; and placing the holsters by hand (grip a ring and move it). An experimental holster model at the
   hips (`[Holsters] ShowModels`, ini only) still looks like a strap.
+- New in 0.8.5, off by default (used in a Quest 3; the Weapons tab, "Anything in any holster"): any holster, the chest
+  included, takes anything you own: a gun, the knife, the lasso, a throwable, or the rounds (a holster set to Rounds
+  gives your free hand a round to reload, as the chest does). Put an item away at a holster and it is drawn from there
+  again. Only guns are shown at the holsters.
+- New in 0.8.5 (used in a Quest 3; the Holsters tab, under "Show the guns at their holsters"): each shown gun's angle
+  and place at its holster, by arrows. Fixed in 0.8.5 (tried in the developer's simulator, from a player's
+  description): turning toward a holster could show a second copy of its gun beside it, facing another way (the game's
+  own holstered gun drawn apart from the mod's).
+- The holsters placed anew for 0.8.5 (in the developer's headset); a place or size you set yourself is kept.
 - The foregrip ring held still on the gun (new in 0.6.0, tried in the developer's simulator, not yet in a headset): it
   followed the game's arm sway, so the off hand could grab the air beside the gun, worst on the Sawed-off (which now
   has a grip of its own).
@@ -127,6 +157,10 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - New in 0.6.0, off by default (tried in the developer's simulator, not yet in a headset): the game's weapon wheel
   instead of the holsters, a grip held opening it in front of your hand, the hand moved toward a weapon's picture and
   the grip let go to take it (the Holsters tab, "The weapon wheel").
+- New in 0.8.5, on by default (used in a Quest 3, in a fist fight): with your fists out, both hands raised before your
+  face hold the game's block for as long as you hold them there (the Gestures tab, "Guard with both fists"). Fixed
+  later in 0.8.5 (tried in the developer's simulator): when the game had put a gun away itself, the guard could draw
+  that gun; it selects the fists first now.
 - New in 0.3.0, off by default (each in the menu, most not yet tried in a headset): a gun-butt melee, the gun in your
   hand swung into someone landing the game's own melee blow where it meets them (knock-out damage, as a punch does;
   the Gestures tab, "Gun-butt melee"; tried in a headset with 0.5.0, where it hardly ever hit: it needed 3 m/s at the
@@ -141,6 +175,8 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   0.7.0, on by default (used in a headset since 0.8.0): with stick steering the right stick turns the view on
   horseback too, while the left stick steers the horse (the Comfort tab, under "Steer with the stick"). Since 0.8.0
   the holsters turn with your view as you do (before, they kept facing the horse); recentring faces them back.
+  New in 0.8.5, on by default (used in a Quest 3): driving a wagon or a coach, the view's heading follows it as it
+  follows a horse (`[Horse] VehicleHeading=0` in `RDRVR.ini` turns it off, no menu row).
 - The game's own menus by the controllers (new in 0.7.0, on by default, tried in the developer's simulator only, not
   yet in a headset; `[Controls] MenuControls` in `RDRVR.ini`, no menu row): in the satchel and shops the triggers
   change tabs; in the satchel, the pause menu and shops the left stick moves one item a push. Fixed in 0.8.2: the pause
@@ -154,6 +190,9 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   players' logs; 0.8.1's fix covered only a script that kept taking it). The fix is tried in the developer's simulator
   with a stand-in script camera and at a shop, not yet in that mission. If one looks wrong, set `KeepAnchorCamera=0`
   and please report it.
+  Fixed in 0.8.5 (tried in the developer's simulator only, where it did not happen): leaving a shop could leave the
+  view in third person; for 10 seconds after a shop's menu closes, first person is taken back too. `RDRVR.log` notes
+  the shop's menu opening and closing.
 - An in-headset menu (laser and trigger) with every setting, grouped under headings with a help line for the row
   under the laser; the tabs are two rows of buttons, and each tab's page scrolls with your gun hand's stick (the
   laser on the page); adjustments by arrows, one step a press.
@@ -174,7 +213,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.4.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.5.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -213,6 +252,8 @@ options.
 |---|---|---|
 | **HUD on the left wrist** | Puts the radar, meters and ammo counter on the back of your off hand like a watch: turn the palm down and look at it to see them (prompts stay on the floating screen). | On |
 | ↳ **A double tap of Y at the wrist opens the satchel** (new in 0.7.0) | With the wrist HUD in view, two quick presses of Y open John's satchel and B closes it. A single press still reaches the game as Y, about a third of a second late. | Off |
+| **No motion blur** (new in 0.8.5) | Holds the game's motion blur off. Off: the game's own setting applies again from its next Apply or start. The game's settings file is not changed. | On |
+| **Heat haze** (new in 0.8.5) | The desert's heat shimmer; off removes it. | On |
 | **Anti-aliasing** | Off, FXAA, Native TAA or DLSS (DLAA). DLSS turns on or off from the next start; the others switch at once. | FXAA |
 | ↳ **DLSS quality** | How many pixels DLSS renders before it upscales: DLAA (sharpest, most demanding), Dynamic, Ultra performance, Performance, Balanced, Quality; from the next start. | DLAA (native resolution) |
 | ↳ **Eyes in the headset's shape** | Draws each eye in your headset's own shape with square pixels, so fewer pixels are drawn for the same sharpness (FXAA only, takes full effect from the next start). | Off |
@@ -245,6 +286,7 @@ How you see and move: the first-person view, how much of John's body is drawn, s
 | **Forearms and hands when crouching, in cover or riding** | Draws only the forearms and hands at those times, when the body gets in the way of the view. | On |
 | **Hide head and hat** | Hides John's head and hat in first person; cutscenes still show them. | On |
 | **Torso: Upper body upright / Remove lean only / Game animation** | Holds the drawn torso upright over the hips, removes only its forward/back lean, or draws it exactly as animated. | Upper body upright |
+| **Torso: Still** (new in 0.8.5) | The torso, hips and belt held still under your view; only the arms and legs move. | Off (Upper body upright is the default) |
 | ↳ **Torso pitch** | Tilts the upright torso, 1 degree per press; positive leans it forward. | +2° |
 | **Body back** | How far behind the camera the body is drawn, so looking down shows your chest from outside. | 0.04 m |
 | **Keep the torso over the hips** | Stops running from pushing the torso forward into view. | On |
@@ -309,9 +351,10 @@ The body holsters: how you draw, what they follow, what is shown, and where each
 | **Show the weapon points** | Shows the foregrip ring, where a round goes in, and the hints for the gun's action. | Off (since 0.8.1) |
 | **Show the guns at their holsters** | Shows each holstered gun on your body; hidden while it is in a hand. | On |
 | ↳ **The long guns on the back too** | Also shows the long guns on your back and left shoulder. | Off |
+| ↳ **Gun's angle / Gun's place** (new in 0.8.5, each hip and back holster) | Turns the gun shown at that holster about its grip (tilt, turn, lean; 2.5° per press) and moves it (5 mm per press), so it sits in the holster; saved at once. The left holsters mirror the right ones until you set them. | Placed for the release |
 | **Each holster: Right hip, Back, Belt, Left hip (second sidearm), Back left shoulder, Lower back** | Turns each holster on or off. | On |
 | **Left hip (knife and lasso; off: moved to the lower back)** | The old left-hip knife-and-lasso holster; the knife and lasso now sit at the lower back. | Off |
-| ↳ **Offset / Size arrows** (each holster and the chest) | Move each holster right / up / forward, 5 mm per press, and change its ring's size; saved at once. The chest spot, where you take a round to reload, is always on. Turn on Show the holsters to see them while you move them. | Placed for the release (anew in 0.8.1) |
+| ↳ **Offset / Size arrows** (each holster and the chest) | Move each holster right / up / forward, 5 mm per press, and change its ring's size; saved at once. The chest spot, where you take a round to reload, is always on. Turn on Show the holsters to see them while you move them. | Placed for the release (anew in 0.8.5) |
 
 ### Gun in hand
 
@@ -334,7 +377,7 @@ Picks which weapon each body holster draws, instead of the game's weapon for tha
 | Setting | What it does | Default |
 |---|---|---|
 | **Choose the weapon in each holster** | Each holster draws the weapon you pick below, and the game's weapon wheel follows; Automatic draws the game's weapon. | On |
-| ↳ **List every weapon you own for every holster** | Lists every owned weapon in every holster's choices, not only the ones that fit (a rifle still sits on the back). | Off |
+| ↳ **Anything in any holster** (new in 0.8.5) | Every holster, the chest too, takes anything you own: a gun, the knife, the lasso, a throwable, or the rounds (a holster set to Rounds gives your free hand a round). An item put away at a holster is drawn from there again; only guns are shown at the holsters. | Off |
 | **Right hip, Back, Belt, Left hip (knife and lasso), Left hip (second sidearm), Back left shoulder, Lower back** | The weapon each holster draws. On Automatic, the second sidearm and second long gun holsters take a different owned gun when you have one. A weapon you no longer own shows "(not owned: automatic)". | Automatic |
 
 The lists fill in once you are in gameplay.
@@ -399,6 +442,8 @@ Actions you do with your own hand movements.
 | **Lasso by hand** | With the lasso in hand, swing forward to throw it and yank back to pull. | On |
 | ↳ **Swing speed** | How fast a swing must be to count (1.0 to 8.0 m/s). | 2.50 m/s |
 | **Whistle for the horse** | Put a hand at your mouth and pull its trigger to whistle (the gun hand whistles only when it holds no gun). With a gun raised in the other hand, the aim drops for under a second and no shot fires; it comes back on its own, or at once with a trigger pull. | On |
+| **Tip the hat to greet** (new in 0.8.5) | Your right hand over your head and its trigger press the game's greet button (B). Not yet seen to make John greet anyone. | Off |
+| **Guard with both fists** (new in 0.8.5) | With your fists out, both hands raised before your face hold the game's block. Not riding, not in the game's menus. | On |
 | **Gun-butt melee** | Swing the gun in your hand into someone to land the game's knock-out hit (with the usual crime and anger). | Off |
 | ↳ **Dry run** | For testing: hits are only written to the log, never made. | Off |
 | ↳ **Hit speed** | How fast the gun's swing must peak to hit (1.0 to 6.0 m/s). | 1.80 m/s |
@@ -509,6 +554,11 @@ Live performance and view-mode readouts (frame rate, missed frames, CPU and GPU 
   in the developer's simulator, back on the grip within 3 seconds). `RDRVR.log` has a `[two] a shot two-handed`
   line after each such shot (since 0.8.0 measured as your eyes see it): please attach it to an issue if your hand
   ends up in the gun or in the air.
+- The hat tip (the Gestures tab, off by default, new in 0.8.5) presses the game's greet button, but John has not been
+  seen to greet anyone with it yet.
+- Short bursts of stutter (single frames of about 90 ms for 10 to 20 seconds, the GPU not the limit) were seen in the
+  developer's headset in 0.8.5 as in earlier versions; the cause is not known yet. `RDRVR.log`'s `[xr] timing` lines
+  show them: please attach it to an issue with what you were doing.
 - The default places of the holsters, the loading and foregrip rings and the interaction spot were tuned in the
   headset by one person: if they do not suit you, move them with the menu's arrows (Holsters, Reloading, Gun in hand
   and Hands tabs).

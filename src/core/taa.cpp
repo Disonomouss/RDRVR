@@ -15,6 +15,7 @@
 #include "core/eye_shape.h"
 #include "core/hooks.h"
 #include "core/log.h"
+#include "core/prepass_arrays.h"
 
 namespace rdrvr::taa {
 namespace {
@@ -315,6 +316,57 @@ void frame_start() {
               at<float>(p, kTaaParams + 4), at<float>(p, kTaaParams + 8), at<float>(p, kTaaParams + 12));
 }
 
+// The TAA update on vp with the jitter in DLSS's render units ([Render] DlssJitterUnits): true when the units applied.
+bool update_on(char* p, void* vp) {
+    int screen[2] = {at<int>(vp, kVpScreenW), at<int>(vp, kVpScreenH)};
+    bool units = false;
+    if (g_jitter_units.load(std::memory_order_relaxed) && at<int>(p, kTechApplied) == 5) {
+        if (char* d = at<char*>(p, kDlssObject)) {
+            int rw = at<int>(d, kDlssRenderW), rh = at<int>(d, kDlssRenderH);
+            uint32_t srw = 0, srh = 0, sew = 0, seh = 0;
+            if (eye_shape::dlss_shape(&srw, &srh, &sew, &seh)) {  // [XR] EyeShapeDlss: the shaped render size (per axis)
+                rw = static_cast<int>(srw);
+                rh = static_cast<int>(srh);
+            }
+            if (rw > 0 && rh > 0 && rw <= screen[0] && rh <= screen[1] && (rw != screen[0] || rh != screen[1])) {
+                at<int>(vp, kVpScreenW) = rw;
+                at<int>(vp, kVpScreenH) = rh;
+                units = true;
+            }
+        }
+    }
+    reinterpret_cast<TaaUpdate_t>(anchors::addr(Id::TaaUpdate))(p, vp, 0);
+    if (units) {
+        at<int>(vp, kVpScreenW) = screen[0];
+        at<int>(vp, kVpScreenH) = screen[1];
+    }
+    return units;
+}
+
+// [Stereo] PrepassViews (single-pass stereo, milestone 3): in pass 1, after eye 1's own update, the update pass 2 will
+// run (from pass 2's snapshot, the tick's sample) run now on the private eye-2 viewport, for its jittered rows and its
+// gPrevViewProj; then eye 1's TAA state put back (the two blocks the update writes and the NDCToPrevNDC variable, as
+// the rain's call is put back). The snapshot itself is not touched.
+std::atomic<uint64_t> g_eye2_updates{0};
+void eye2_update(char* p) {
+    void* vp2 = camera_lever::eye2_viewport();
+    Snap& s2 = g_snap[1];
+    if (!vp2 || !s2.valid) return;
+    char a[0x20], b[0x100];
+    std::memcpy(a, p + kJitter, sizeof(a));
+    std::memcpy(b, p + kPrevBlock, sizeof(b));
+    std::memcpy(p + kJitter, s2.jitter, sizeof(s2.jitter));
+    std::memcpy(p + kPrevBlock, s2.prev, sizeof(s2.prev));
+    at<int>(p, kJitterIndex) = t_index_base - 1;
+    reinterpret_cast<Persp_t>(anchors::addr(Id::ViewportPerspective))(vp2);  // without jitter, as pass 2 starts it
+    update_on(p, vp2);
+    prepass::set_eye2(vp2, p + kPrevBlock + 0xc0);  // +0x4f0: gPrevViewProj
+    std::memcpy(p + kJitter, a, sizeof(a));
+    std::memcpy(p + kPrevBlock, b, sizeof(b));
+    if (void* eff = at<void*>(p, kTaaEffect)) set_vec(eff, at<int>(p, kVarNdcToPrev), p + kNdcToPrev, 0x40);
+    g_eye2_updates.fetch_add(1, std::memory_order_relaxed);
+}
+
 void after_scene_wait(int pass) {
     if (!jitter_active()) return;
     char* p = postfx();
@@ -340,33 +392,12 @@ void after_scene_wait(int pass) {
     std::memcpy(p + kJitter, s.jitter, sizeof(s.jitter));
     std::memcpy(p + kPrevBlock, s.prev, sizeof(s.prev));
     at<int>(p, kJitterIndex) = t_index_base - 1;  // the function advances it first: the tick's sample again
-    int screen[2] = {at<int>(vp, kVpScreenW), at<int>(vp, kVpScreenH)};
-    bool units = false;
-    if (g_jitter_units.load(std::memory_order_relaxed) && at<int>(p, kTechApplied) == 5) {
-        if (char* d = at<char*>(p, kDlssObject)) {
-            int rw = at<int>(d, kDlssRenderW), rh = at<int>(d, kDlssRenderH);
-            uint32_t srw = 0, srh = 0, sew = 0, seh = 0;
-            if (eye_shape::dlss_shape(&srw, &srh, &sew, &seh)) {  // [XR] EyeShapeDlss: the shaped render size (per axis)
-                rw = static_cast<int>(srw);
-                rh = static_cast<int>(srh);
-            }
-            if (rw > 0 && rh > 0 && rw <= screen[0] && rh <= screen[1] && (rw != screen[0] || rh != screen[1])) {
-                at<int>(vp, kVpScreenW) = rw;
-                at<int>(vp, kVpScreenH) = rh;
-                units = true;
-            }
-        }
-    }
-    reinterpret_cast<TaaUpdate_t>(anchors::addr(Id::TaaUpdate))(p, vp, 0);
-    if (units) {
-        at<int>(vp, kVpScreenW) = screen[0];
-        at<int>(vp, kVpScreenH) = screen[1];
-        g_units_applied.fetch_add(1, std::memory_order_relaxed);
-    }
+    if (update_on(p, vp)) g_units_applied.fetch_add(1, std::memory_order_relaxed);
     std::memcpy(s.jitter, p + kJitter, sizeof(s.jitter));
     std::memcpy(s.prev, p + kPrevBlock, sizeof(s.prev));
     std::memcpy(p + kJitterDelta, delta, sizeof(delta));
     (mono_update ? g_mono_updates : g_pass_updates).fetch_add(1, std::memory_order_relaxed);
+    if (pass == 1 && !mono_update && prepass::views_wanted()) eye2_update(p);
 }
 
 bool skip_scene_rain(uintptr_t ret) {

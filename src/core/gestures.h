@@ -15,7 +15,9 @@ bool throw_by_hand();  // [Gestures] Throw
 void set_throw_by_hand(bool on);  // these setters also write the user ini
 bool melee_by_swing();  // [Gestures] Melee
 void set_melee_by_swing(bool on);
-bool lasso_by_hand();  // [Gestures] Lasso
+bool lasso_by_hand();
+bool guard();  // [Gestures] Guard (run 10 item 7): both fists before the face hold the game's block
+void set_guard(bool on, bool save);  // [Gestures] Lasso
 void set_lasso_by_hand(bool on);
 
 float swing_speed();  // [Gestures] SwingSpeed, m/s

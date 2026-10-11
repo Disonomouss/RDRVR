@@ -298,10 +298,10 @@ int frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLa
     return n;
 }
 
-bool reticle_frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLayerQuad* out) {
+bool reticle_frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLayerQuad* out, int which) {
     float p[3], deg = 1.2f;
     bool hot = false;
-    if (!camera_lever::eyes_follow_head() || !aim::reticle_target(p, &hot, &deg)) return false;
+    if (!camera_lever::eyes_follow_head() || !aim::reticle_target(p, &hot, &deg, which, true)) return false;
     body::BodyPoints bp;
     if (!body::body_points(&bp) || !bp.cam_ok || !ensure(session)) return false;
     float l[3];

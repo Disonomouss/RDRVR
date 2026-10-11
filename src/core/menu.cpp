@@ -446,8 +446,10 @@ bool reset_button(const char* label, bool enabled, const char* tip) {
 // one step a press, the value between; true when a press changed it. Each arrow tracked as "<name> <axis> minus" /
 // "plus", the name the label's part after "##" (else the label). Run 7 item 5: the row's help line, every
 // adjustment by arrows (no sliders left)
-bool nudge3(const char* label, float v[3], float step, float lim = 1.0f, const char* tip = nullptr) {
-    static const char* const kAxis[3] = {"right", "up", "forward"};
+bool nudge3(const char* label, float v[3], float step, float lim = 1.0f, const char* tip = nullptr, const char* const* axes = nullptr,
+            const char* vfmt = "%s %+.3f") {
+    static const char* const kPlace[3] = {"right", "up", "forward"};
+    const char* const* kAxis = axes ? axes : kPlace;
     const char* nm = track_name(label);
     bool changed = false;
     ImGui::PushID(label);
@@ -461,7 +463,7 @@ bool nudge3(const char* label, float v[3], float step, float lim = 1.0f, const c
         std::snprintf(name, sizeof(name), "%s %s minus", nm, kAxis[i]);
         track(name);
         ImGui::SameLine();
-        ImGui::Text("%s %+.3f", kAxis[i], v[i]);
+        ImGui::Text(vfmt, kAxis[i], v[i]);
         ImGui::SameLine();
         if (ImGui::ArrowButton("##up", ImGuiDir_Right)) v[i] += step, changed = true;
         std::snprintf(name, sizeof(name), "%s %s plus", nm, kAxis[i]);
@@ -575,6 +577,16 @@ void page_general() {
               "every press is Y at once. Held, Y opens this menu either way."))
         controls::set_wrist_satchel(ws);
     sub_end();
+    heading("Motion blur and heat haze");  // run 10 items 8c and 8d
+    bool mb = render_settings::motion_blur_off();
+    if (check("No motion blur", &mb,
+              "Motion blur forced off (it smears the view as you turn your head). Off: the game's own setting applies again from its next "
+              "Apply or start. The game's settings file is not changed: its graphics menu shows your own setting, and an Apply there saves yours."))
+        render_settings::set_motion_blur_off(mb, true);
+    bool haze = render_settings::heat_haze_on();
+    if (check("Heat haze", &haze, "The desert's heat shimmer. Some find it uncomfortable in VR: off removes it."))
+        render_settings::set_heat_haze(haze, true);
+
     heading("Anti-aliasing");
     // DLSS is chosen for the next start: switching to or from it while the game runs would re-create its swapchain
     const char* aa[] = {"Off", "FXAA", "Native TAA", "DLSS (from the next start)"};
@@ -842,20 +854,23 @@ void page_comfort() {
     int st = body::stance();
     {
         const char* const kStanceTip = "The drawn torso: upright (the spine, chest and shoulders over the hips; the arms and legs "
-                                       "still animate), only the lean removed, or the game's animation.";
+                                       "still animate), still (the torso held in one pose under the view: only the arms and legs "
+                                       "move), only the lean removed, or the game's animation.";
         ImGui::TextUnformatted("Torso:");
         ImGui::SameLine();
         if (radio("Upper body upright", st == 1, kStanceTip)) st = 1;
+        ImGui::SameLine();
+        if (radio("Still", st == 3, kStanceTip)) st = 3;
         ImGui::SameLine();
         if (radio("Remove lean only", st == 2, kStanceTip)) st = 2;
         ImGui::SameLine();
         if (radio("Game animation", st == 0, kStanceTip)) st = 0;
         if (st != body::stance()) {
             body::set_stance(st);
-            config::set("Body", "Stance", st == 0 ? "game" : st == 2 ? "lean" : "upright");
+            config::set("Body", "Stance", st == 0 ? "game" : st == 2 ? "lean" : st == 3 ? "still" : "upright");
         }
     }
-    sub_begin(st == 1);
+    sub_begin(st == 1 || st == 3);
     float pitch = body::torso_pitch();
     if (nudge1("Torso pitch", &pitch, 1.0f, -20.0f, 20.0f, "%+.0f deg", "Degrees added to the upright torso: positive leans it forward.")) {
         body::set_torso_pitch(pitch);
@@ -1200,6 +1215,27 @@ void page_holsters() {
     sub_begin(sg);
     bool sb = holster::show_back_guns();  // round 13 item 14
     if (check("The long guns on the back too", &sb, "Off: only the hips' guns are shown.")) holster::set_show_back_guns(sb);
+    // 2026-10-12 (the user: "change gun holster model angle so it better fits in holster"): each shown gun's angle and
+    // place at its holster ([Holsters] <Key>GunTurn, <Key>GunOffset), a press 2.5 degrees or 5 mm, saved at once
+    if (sg) {
+        static const char* const kTurnAxis[3] = {"tilt", "turn", "lean"};
+        for (int z = 0; z < holster::zone_count(); ++z) {
+            if (!holster::zone_shows_gun(z)) continue;
+            float tn[3], go[3];
+            holster::zone_gun(z, tn, go);
+            const std::string zl = holster::zone_label(z);
+            ImGui::PushID(100 + z);
+            ImGui::TextUnformatted(zl.c_str());
+            bool ch = nudge3(("Gun's angle##" + zl + " gun angle").c_str(), tn, 2.5f, 90.0f,
+                             "The gun shown here turned about its grip, in degrees: tilt (the barrel forward or back), turn (about "
+                             "up), lean (to the side). The left holsters mirror the right's until set.",
+                             kTurnAxis, "%s %+.1f");
+            ch |= nudge3(("Gun's place##" + zl + " gun place").c_str(), go, 0.005f, 0.15f,
+                         "The gun shown here moved right, up or forward (m), after its angle.");
+            if (ch) holster::set_zone_gun(z, tn, go, true);
+            ImGui::PopID();
+        }
+    }
     sub_end();
 
     heading("Each holster (m, a press 5 mm)");
@@ -1286,8 +1322,10 @@ void page_weapons() {
         holster::set_weapon_choice(wc);
     sub_begin(wc);
     bool any = holster::any_weapon();
-    if (check("List every weapon you own for every holster", &any,
-              "Every owned weapon offered for every holster; a gun still holsters where the game carries it (a rifle on the back)."))
+    if (check("Anything in any holster", &any,
+              "Every holster, the chest too, takes anything you own: a gun, the knife, the lasso, a throwable, or the rounds (a round "
+              "to reload). Put an item away at any holster and it is drawn from there again; a holster set to Rounds gives a round "
+              "to the free hand, as the chest does."))
         holster::set_any_weapon(any);
     holster::Arsenal a{};
     const bool have = holster::arsenal(&a);
@@ -1296,15 +1334,17 @@ void page_weapons() {
         if (!holster::zone_takes_weapons(z)) continue;
         const int chosen = holster::zone_weapon(z);
         const std::string label = holster::zone_label(z);
-        std::string preview = chosen < 0 ? std::string("Automatic (the game's weapon for it)") : holster::weapon_label(chosen);
-        if (chosen >= 0 && have && !(a.owned >> chosen & 1)) preview += " (not owned: automatic)";
+        std::string preview = chosen < 0 ? std::string(z == 4 ? "Automatic (the rounds)" : "Automatic (the game's weapon for it)")
+                              : chosen == holster::kRounds ? std::string("Rounds (a round to reload)") : holster::weapon_label(chosen);
+        if (chosen >= 0 && chosen < holster::kRounds && have && !(a.owned >> chosen & 1)) preview += " (not owned: automatic)";
         ImGui::TextUnformatted(label.c_str());
         ImGui::Indent();
         ImGui::SetNextItemWidth(460);
         const bool open = ImGui::BeginCombo(("##" + label).c_str(), preview.c_str());
         if (!open) track(label.c_str());
         if (open) {
-            if (ImGui::Selectable("Automatic (the game's weapon for it)", chosen < 0)) holster::set_zone_weapon(z, -1, true);
+            if (ImGui::Selectable(z == 4 ? "Automatic (the rounds)" : "Automatic (the game's weapon for it)", chosen < 0)) holster::set_zone_weapon(z, -1, true);
+            if (any && ImGui::Selectable("Rounds (a round to reload)", chosen == holster::kRounds)) holster::set_zone_weapon(z, holster::kRounds, true);  // run 10 item 10
             track((label + ": Automatic").c_str());
             for (int w = 0; have && w < holster::kWeapons; ++w) {
                 if (!(a.owned >> w & 1) || (!any && !holster::zone_fits(z, a.equip_slot[w]))) continue;
@@ -1588,6 +1628,16 @@ void page_gestures() {
               "A hand at your mouth and its trigger: John whistles for his horse. The trigger of that hand does nothing else while it is "
               "at the mouth. The gun hand whistles only with no gun in it."))
         whistle::set_enabled(wh, true);
+    bool tiph = whistle::tip_hat_enabled();  // run 10 item 5: [Gestures] TipHat
+    if (check("Tip the hat to greet", &tiph,
+              "Your right hand over your head and its trigger press the game's greet button (B); not yet seen to make John greet "
+              "anyone. The trigger does nothing else while the hand is there. Not with a gun in that hand."))
+        whistle::set_tip_hat(tiph, true);
+    bool guard = gestures::guard();  // run 10 item 7: [Gestures] Guard
+    if (check("Guard with both fists", &guard,
+              "With your fists out, both hands raised before your face hold the game's block (its fighting stance with the block "
+              "button), for as long as you hold them there. Not riding, not in the game's menus."))
+        gestures::set_guard(guard, true);
 
     heading("The gun-butt melee");  // run 7 item 2: [Gestures] GunMelee, GunMeleeDryRun
     bool gm = gun_melee::enabled();

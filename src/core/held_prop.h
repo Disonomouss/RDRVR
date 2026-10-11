@@ -40,7 +40,15 @@ bool last_drawn(int s, float pos[3], double* ms, float rel[3] = nullptr, uint64_
 // is within 3 cm of where the object was put), its wanted pose (12 floats as above), its slot (if `slot`) and true. Of
 // the slots with that drawable the one put nearest `pos`, within 1.5 m of one of its last four puts (two props of one
 // model; another's gun of it).
-bool match(uintptr_t drawable, const float* pos, float* pose, int* slot = nullptr);
+// inst: the draw's instance (its record's owner: run 10 item 2), 0 when unknown
+bool match(uintptr_t drawable, uintptr_t inst, const float* pos, float* pose, int* slot = nullptr);
+void set_inst_check(bool on);  // "props inst on|off" (on by default)
+// 2026-10-12: a holster's shown gun (slots kHolsterSlot..+3, wanted) has this model: the game's own holstered gun of the
+// same model on John's belt is hidden then (body.cpp), so one gun shows at the hip
+bool shown_at_holster(uintptr_t drawable);
+void set_twins(bool on);  // "props twins on|off" (the session)
+void set_puts(int n);          // "props puts <n>": the recent puts a draw is matched against (8; 1-64; the session)
+void set_gate(float m);         // "props gate <m>": a draw matched within that distance of a recent put ([Holsters] PropGate)
 // "props diag [on|off|reset]" (a test command): the draws near each placed slot (within 0.5 m of its recent puts) by
 // pass, of its own model and of any other (the last other's drawable). The draw hook calls diag_draw only while on.
 bool diag_on();

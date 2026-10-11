@@ -460,11 +460,19 @@ void weapons_state(int32_t actor, uint64_t tick, RdrvrActorState* st) {
     for (int e = 0; e < RDRVR_WEAPONS; ++e) st->equip_slot[e] = e < 38 && slot_read[e] && (owned >> e & 1) ? slot_of[e] : -1;
 }
 
-// The mount under the player (riding and in the saddle): its handle, position and heading.
+// The mount under the player (riding and in the saddle): its handle, position and heading. Driving a wagon or a coach
+// (run 10 item 3, the user: "the camera does not follow the orientation of the vehicle"), the vehicle's instead, flagged
+// RDRVR_ACTOR_VEHICLE: GET_VEHICLE 0xA0936EB6 (one argument, no pointer; 0 when none) gives an actor handle of the
+// mount's kind, which GET_POSITION and GET_HEADING take as they take the mount's (research\run10\vehicle-driving.md).
 void mount_state(int32_t actor, uint32_t flags, RdrvrActorState* st) {
     st->mount = 0;
-    if (!(flags & RDRVR_ACTOR_MOUNTED)) return;
-    const int32_t m = static_cast<int32_t>(invoke(0xDD31EC4E, {static_cast<uint64_t>(static_cast<uint32_t>(actor))}));  // GET_MOUNT
+    int32_t m = 0;
+    if (flags & RDRVR_ACTOR_MOUNTED) {
+        m = static_cast<int32_t>(invoke(0xDD31EC4E, {static_cast<uint64_t>(static_cast<uint32_t>(actor))}));  // GET_MOUNT
+    } else if (flags & RDRVR_ACTOR_DRIVING) {
+        m = static_cast<int32_t>(invoke(0xA0936EB6, {static_cast<uint64_t>(static_cast<uint32_t>(actor))}));  // GET_VEHICLE
+        if (m) st->flags |= RDRVR_ACTOR_VEHICLE;
+    }
     if (!m) return;
     alignas(16) float mp[4] = {};
     invoke(0x99BD9D6F, {static_cast<uint64_t>(static_cast<uint32_t>(m)), reinterpret_cast<uint64_t>(mp)});  // GET_POSITION
@@ -621,12 +629,33 @@ void camera_tick(uint64_t tick) {
         // other script's camera is left current until it lets go.
         static bool left_logged = false;
         const bool active = (invoke(0x02BD5362, {static_cast<uint64_t>(g_cam), 0}) & 0xff) != 0;  // IS_CAMERA_ACTIVE_ON_CHANNEL
+        // 2026-10-12 (the user: "Leaving shops sometimes puts John into the third person view and gets stuck"): the shop's
+        // menu read every tick; for 10 s after it closes the anchor is taken back as in the shop (the shop's own camera
+        // can stay current after its menu: not the game's gameplay camera, so the rule above left it there)
+        static const char kShop[] = "ShopMenu";
+        static bool shop_was = false;
+        static ULONGLONG shop_closed_ms = 0;
+        static uint64_t after_shop_takes = 0;
+        const bool shop_now = (invoke(0xB1FDB70D, {reinterpret_cast<uint64_t>(kShop)}) & 0xff) != 0;  // UI_ISACTIVE
+        if (shop_now != shop_was) {
+            char line[160];
+            std::snprintf(line, sizeof(line), "camera anchor: the shop's menu %s (our camera %s)", shop_now ? "open" : "closed",
+                          active ? "current" : "not current");
+            g_api->log(0, line);
+            if (!shop_now) shop_closed_ms = now_ms, after_shop_takes = 0;
+            shop_was = shop_now;
+        }
+        const bool after_shop = !shop_now && shop_closed_ms && now_ms - shop_closed_ms < 10000;
         bool may_take = false;
         if (!active && now_ms >= backoff_until) {
-            static const char kShop[] = "ShopMenu";
             const bool gameplay = (job.weapons & 8u) != 0;
-            const bool shop = !gameplay && (invoke(0xB1FDB70D, {reinterpret_cast<uint64_t>(kShop)}) & 0xff) != 0;  // UI_ISACTIVE
-            may_take = gameplay || shop;
+            may_take = gameplay || shop_now || after_shop;
+            if (may_take && !gameplay && after_shop && after_shop_takes++ < 3) {  // the first three of each exit
+                char line[160];
+                std::snprintf(line, sizeof(line), "camera anchor: after the shop (%.1f s after its menu closed): another camera held the channel, ours taken back",
+                              static_cast<double>(now_ms - shop_closed_ms) / 1000.0);
+                g_api->log(0, line);
+            }
             if (!may_take && !left_logged) {
                 g_api->log(0, "camera anchor: a script's camera holds the channel (not a shop): left to it until the game's own camera is back");
                 left_logged = true;
@@ -662,7 +691,7 @@ void camera_tick(uint64_t tick) {
     st.valid = 1;
     int32_t object = static_cast<int32_t>(invoke(0x4A2063EC, {static_cast<uint64_t>(static_cast<uint32_t>(actor))}));  // GET_OBJECT_FROM_ACTOR
     st.object = object;
-    st.flags = flags;
+    st.flags = flags | (st.flags & RDRVR_ACTOR_VEHICLE);  // run 10 item 3: mount_state's vehicle bit kept (the review's)
     st.actor = actor;
     weapon_state(actor, &st);
     if (job.weapons & 1u) weapons_state(actor, tick, &st);

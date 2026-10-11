@@ -36,6 +36,7 @@
 #include "core/hooks.h"
 #include "core/log.h"
 #include "core/lum_check.h"
+#include "core/prepass_arrays.h"
 #include "core/pso.h"
 #include "core/render_settings.h"
 #include "core/align_grab.h"
@@ -303,6 +304,16 @@ std::string execute(const std::vector<std::string>& t) {
         dlss::set_mv_scale(std::strtof(t[2].c_str(), nullptr));
         return "dlss mvscale " + t[2];
     }
+    if (c == "postfx") {  // postfx [blur off|game] [haze on|off]: run 10 items 8c and 8d (the session only)
+        for (size_t i = 1; i + 1 < t.size(); i += 2) {
+            if (t[i] == "blur") render_settings::set_motion_blur_off(t[i + 1] == "off", false);
+            if (t[i] == "haze") render_settings::set_heat_haze(t[i + 1] == "on", false);
+            if (t[i] == "style" || t[i] == "hazetest") render_settings::post_test(t[i].c_str(), std::strtof(t[i + 1].c_str(), nullptr));
+        }
+        char st[400];
+        render_settings::post_text(st, sizeof(st));
+        return st;
+    }
     if (c == "dlss" && t.size() >= 2 && t[1] == "phases") {  // dlss phases [on|off]: the jitter sequence's length
         if (t.size() >= 3) render_settings::set_full_jitter(t[2] == "on");
         char st[300];
@@ -414,6 +425,8 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 3 && t[1] == "jitter") pose::reset_ride_jitter();
         if (t.size() >= 3 && t[1] == "keepcam") pose::set_keep_camera(t[2] == "on");
         if (t.size() >= 3 && t[1] == "rideturn") pose::set_stick_turn_riding(t[2] == "on", false);  // run 9 item 4: the session only
+        if (t.size() >= 3 && t[1] == "vehicle") pose::set_vehicle_heading(t[2] == "on", false);    // run 10 item 3: the session only
+        if (t.size() >= 3 && t[1] == "armed") pose::set_armed_stand(t[2] == "on", false);          // run 10 item 8b: the session only
         if (t.size() >= 3 && t[1] == "turn")  // pose turn snap|smooth [speed] [snap angle]
             pose::set_turning(t[2] == "snap", t.size() >= 4 ? std::strtof(t[3].c_str(), nullptr) : pose::turn_speed(),
                               t.size() >= 5 ? std::strtof(t[4].c_str(), nullptr) : pose::snap_angle());
@@ -459,6 +472,10 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "props") {  // the props the mod made and holds (held_prop); props diag [on|off|reset]: the draws near each
         if (t.size() >= 2 && t[1] == "diag") return held_prop::diag_command(t.size() >= 3 ? t[2] : "");
+        if (t.size() >= 3 && t[1] == "inst") held_prop::set_inst_check(t[2] == "on");  // run 10 item 2's control
+        if (t.size() >= 3 && t[1] == "gate") held_prop::set_gate(std::strtof(t[2].c_str(), nullptr));  // run 10 item 2 (the session)
+        if (t.size() >= 3 && t[1] == "puts") held_prop::set_puts(std::atoi(t[2].c_str()));  // 2026-10-12 (the session)
+        if (t.size() >= 3 && t[1] == "twins") held_prop::set_twins(t[2] == "on");  // 2026-10-12 (the session)
         return held_prop::status();
     }
     if (c == "dual") {  // dual [on|off] [begin <slot> [left|right]] [fire] [end]: the second gun (DualWield)
@@ -514,6 +531,9 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 3 && t[1] == "raised") controls::set_aim_when_raised(t[2] == "on", false);  // the session only
         if (t.size() >= 3 && t[1] == "wristsatchel") controls::set_wrist_satchel(t[2] == "on", false);  // the session only
         if (t.size() >= 3 && t[1] == "drawhand") controls::set_draw_to_grabbing_hand(t[2] == "on", false);  // the session only
+        // controls gunhand left|right|layout: the hand the gun in hand belongs to, as a draw by that hand would set it (a
+        // test's native give is the game's own equip, which goes to the layout's hand: reg4's left-hand long guns)
+        if (t.size() >= 3 && t[1] == "gunhand") controls::set_draw_hand(t[2] == "left" ? 0 : t[2] == "right" ? 1 : -1, -1, true);
         if (t.size() >= 3 && t[1] == "clickbrake") controls::set_click_brake_session(t[2] == "on");
         if (t.size() >= 3 && t[1] == "sprint") controls::set_sprint_drops_aim(t[2] == "on", false);  // this session only
         if (t.size() >= 3 && t[1] == "jump") controls::set_jump_drops_aim(t[2] == "on", false);  // run 7 item 1f, this session only
@@ -639,6 +659,13 @@ std::string execute(const std::vector<std::string>& t) {
             run_native(0xECE8520Bu, {handle, h, 0}, 0);
         }
         return "teleported: " + r;
+    }
+    if (c == "prepass") {  // prepass [on|off]: [Stereo] PrepassArrays (test only, stageVI-prepass.md milestone 2)
+        if (t.size() >= 2 && (t[1] == "on" || t[1] == "off")) prepass::set_on(t[1] == "on");
+        if (t.size() >= 2 && t[1] == "trace") prepass::trace_start(t.size() >= 3 ? std::atoi(t[2].c_str()) : 2);
+        if (t.size() >= 4 && t[1] == "views" && t[2] == "size") prepass::views_size(t[3] == "on");
+        if (t.size() >= 2 && t[1] == "views") return prepass::views_status();
+        return prepass::status();
     }
     if (c == "pso") {
         std::string line;

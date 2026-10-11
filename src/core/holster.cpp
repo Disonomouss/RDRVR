@@ -272,6 +272,12 @@ struct Zone {
     bool mirror = false;   // its bone mirrored across the body's middle (the left twins of the right hip and the back)
     int partner = -1;      // automatic: another owned weapon than this zone's (the twin's), when there is one
     bool enabled = true;   // [Holsters] <Key>Enabled
+    // [Holsters] <Key>GunTurn, <Key>GunOffset (2026-10-12, the user: "change gun holster model angle so it better fits in
+    // holster"): the shown gun (ShowGuns) turned about its grip at the holster, deg: its tilt (about the right axis, the
+    // barrel forward or back), its turn (about up), its lean (about forward); then moved, m: right, up, forward. The
+    // left twins mirror their partner's unless set
+    float gun_turn[3] = {0.0f, 0.0f, 0.0f};
+    float gun_off[3] = {0.0f, 0.0f, 0.0f};
 };
 Zone g_zones[kZones] = {
     {"RightHip", "Right hip (sidearm)", 0, {1, -1, -1}, {0.0f, 0.0f, 0.0f}, 0.15f, -1},
@@ -304,6 +310,10 @@ std::atomic<bool> g_lean_steady{false}, g_turn_hands{false};
 std::atomic<float> g_torso_len{0.55f}, g_lean_pub{0.0f}, g_hands_yaw_pub{-999.0f};
 float g_anchor_shift[3] = {0, 0, 0};    // that move (world, m); under g_zone_mutex
 float g_anchor_cam[3] = {0, 0, 0};      // the frame camera's position (the neutral head) then; under g_zone_mutex
+// run 10 items 1 and 4: the places' takes (a recentre or the anchor newly chosen; never a dismount or a cutscene's end),
+// the frames a take waited for John to settle, the frames the camera was not the anchored one; the right hip's place
+std::atomic<uint32_t> g_place_takes{0}, g_place_waits{0}, g_place_offcam{0};
+float g_place_hip[3] = {0, 0, 0};  // under g_zone_mutex
 const int kShowZones[4] = {0, 1, 5, 6};  // the right hip, the back, the left hip, the left shoulder
 // [Holsters] ShowModels (2026-10-09, the user's request): a holster model at the hips (held_prop kModelSlot + i), the
 // game's own prop by its fragment name ([Holsters] Model), turned by ModelTurn (degrees about the holster's up, right,
@@ -340,6 +350,7 @@ struct ShowDiag {
     uint64_t stale[4] = {};  // frames shown with no draw of it in the last 100 ms (its draws not moved)
     uint64_t gated[4] = {};  // its model's draws gated out (held_prop)
     uint64_t over[4] = {};   // frames whose error passed 2 cm
+    float rel[4][3] = {};    // the last drawn place against the pelvis (the anchor), m (2026-10-12: GunOffset's test)
     uint64_t frames = 0;
 };
 ShowDiag g_show_diag;  // under g_zone_mutex
@@ -379,9 +390,35 @@ void show_pose(int zi, const float* at, const float* rgt, const float* up, const
     std::memcpy(pz + 6, Z, sizeof(Z));
     std::memcpy(pz + 9, P, sizeof(P));
 }
+// a vector turned about a unit axis (Rodrigues)
+void turn_about(float* v, const float* ax, float rad) {
+    const float c = std::cos(rad), s = std::sin(rad), d = v[0] * ax[0] + v[1] * ax[1] + v[2] * ax[2];
+    const float cr[3] = {ax[1] * v[2] - ax[2] * v[1], ax[2] * v[0] - ax[0] * v[2], ax[0] * v[1] - ax[1] * v[0]};
+    for (int k = 0; k < 3; ++k) v[k] = v[k] * c + cr[k] * s + ax[k] * d * (1.0f - c);
+}
+// the zone's GunTurn and GunOffset applied to a shown gun's pose (12 floats) at its zone point `at`: turned about the
+// grip at the zone in the holster's axes (the lean about forward, the tilt about right, the turn about up, in that
+// order), then moved right, up, forward
+void adjust_pose(const float turn[3], const float off[3], const float* at, const float* rgt, const float* up, const float* fwd,
+                 float* pz) {
+    if (turn[0] == 0.0f && turn[1] == 0.0f && turn[2] == 0.0f && off[0] == 0.0f && off[1] == 0.0f && off[2] == 0.0f) return;
+    const float* axes[3] = {fwd, rgt, up};
+    const float rad[3] = {turn[2] * 0.0174532925f, turn[0] * 0.0174532925f, turn[1] * 0.0174532925f};
+    float rel[3] = {pz[9] - at[0], pz[10] - at[1], pz[11] - at[2]};
+    for (int a = 0; a < 3; ++a) {
+        if (rad[a] == 0.0f) continue;
+        turn_about(pz, axes[a], rad[a]);
+        turn_about(pz + 3, axes[a], rad[a]);
+        turn_about(pz + 6, axes[a], rad[a]);
+        turn_about(rel, axes[a], rad[a]);
+    }
+    for (int k = 0; k < 3; ++k) pz[9 + k] = at[k] + rel[k] + rgt[k] * off[0] + up[k] * off[1] + fwd[k] * off[2];
+}
 std::atomic<uint64_t> g_choice_draws{0};
+const char* token_of(int w) { return w == kRounds ? "Rounds" : w >= 0 && w < kWeapons ? kWeaponToken[w] : "auto"; }
 int weapon_from_token(const std::string& t) {
     if (t.empty() || _stricmp(t.c_str(), "auto") == 0) return -1;
+    if (_stricmp(t.c_str(), "Rounds") == 0) return kRounds;  // run 10 item 10
     for (int w = 0; w < kWeapons; ++w)
         if (_stricmp(t.c_str(), kWeaponToken[w]) == 0) return w;
     char* end = nullptr;
@@ -486,6 +523,15 @@ void holster_frame() {
         std::lock_guard lock(g_zone_mutex);
         std::memcpy(zones, g_zones, sizeof(zones));
     }
+    // run 10 item 10: a zone holding the rounds (the chest by default; with AnyWeapon on, any zone chosen so, the chest
+    // only while automatic or chosen so)
+    const bool any_item = g_any_weapon.load(std::memory_order_relaxed);
+    if (!any_item) zones[kAmmoZone].weapon = -1;  // the chest's choice only with AnyWeapon on (the review's)
+    auto zone_rounds = [&](int z) {
+        if (z < 0 || z >= kZones) return false;
+        if (!any_item) return z == kAmmoZone;
+        return zones[z].weapon == kRounds || (z == kAmmoZone && zones[z].weapon == -1);
+    };
     const bool lefty = controls::left_handed();
     const float hd = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's, not the ride's turned view
     const float fwd[3] = {-std::sin(hd), 0.0f, -std::cos(hd)}, right[3] = {std::cos(hd), 0.0f, -std::sin(hd)}, up[3] = {0, 1, 0};
@@ -495,7 +541,7 @@ void holster_frame() {
     bool zok[kZones];
     for (int z = 0; z < kZones; ++z) {
         // the wheel mode (run 8 item 5): no holster draws or put-aways, the chest's rounds kept
-        zok[z] = zones[z].enabled && bp.bone_ok[zones[z].bone] && (z == kAmmoZone || !wheel::wheel_mode());
+        zok[z] = zones[z].enabled && bp.bone_ok[zones[z].bone] && (zone_rounds(z) || !wheel::wheel_mode());
         float base[3] = {bp.bone[zones[z].bone][0], bp.bone[zones[z].bone][1], bp.bone[zones[z].bone][2]};
         if (zones[z].mirror) {  // the twin's bone: mirrored across the body's middle
             const float d = (base[0] - bp.root[0]) * right[0] + (base[2] - bp.root[2]) * right[2];
@@ -514,8 +560,27 @@ void holster_frame() {
        // body does not; with BodyFollowsHead the body already moves sideways with the head: only the height then
         float no[3], sh[3] = {0, 0, 0};
         const bool seated = (st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_IN_COVER)) != 0;
-        const bool use = g_anchor.load(std::memory_order_relaxed) == 1 && !seated && bp.cam_ok && camera_lever::neck_offset(no);
-        static int was_anchor = 0;  // the last update used the headset anchor (a new choice of it takes the places again)
+        // run 10 item 4 (the user: "after in game cutscenes holsters are wherever they were when the cutscene ended, one
+        // time being across the road"): the frame's camera is the anchored one only near John (the neutral head over the
+        // root); a script's or a cutscene's camera elsewhere: the anchor neither followed nor its places taken
+        bool cam_here = false;
+        if (bp.cam_ok) {
+            const float* c = bp.cam + 12;
+            const float dx = c[0] - bp.root[0], dz = c[2] - bp.root[2], dy = c[1] - bp.root[1];
+            cam_here = dx * dx + dz * dz < 0.6f * 0.6f && dy > -0.3f && dy < 1.4f;
+            if (!cam_here && g_anchor.load(std::memory_order_relaxed) == 1 && !seated) g_place_offcam.fetch_add(1, std::memory_order_relaxed);
+        }
+        const bool use = g_anchor.load(std::memory_order_relaxed) == 1 && !seated && cam_here && camera_lever::neck_offset(no);
+        // run 10 item 1 (the user: "after getting off horse, holsters are too high"): the places are the zones relative to
+        // the neutral head, so a dismount or a cutscene keeps them; before, each frame without the anchor (riding, a
+        // cutscene) took them again on the next, inside the dismount's animation (the right hip 0.53-0.70 m below the head
+        // against 0.75-0.80). Taken again only after a recentre or when the anchor is newly chosen.
+        static int was_choice = 0;  // the anchor's setting at the last update (headset chosen anew: the places taken again)
+        const int choice = g_anchor.load(std::memory_order_relaxed);
+        static uint32_t take_gen = 0;  // bumped when the setting turns to headset
+        if (choice == 1 && was_choice != 1) ++take_gen;
+        was_choice = choice;
+        static int was_anchor = 0;  // the last update used the headset anchor
         if (use) {
             // the zones' places relative to the neutral head (the camera), in the body's yaw frame: taken over 30 frames
             // standing, after the anchor is chosen and after each recentre; then the zones rigid to the neck
@@ -524,15 +589,42 @@ void holster_frame() {
             static bool rel_ok = false;
             static uint32_t rel_gen = ~0u;
             const float* cp = bp.cam + 12;
-            const uint32_t gen = camera_lever::recentre_gen();
+            const uint32_t gen = camera_lever::recentre_gen() + take_gen * 0x10000u;
             const bool standing = !(st.flags & RDRVR_ACTOR_CROUCHING);
-            if (gen != rel_gen || was_anchor != 1) {
+            if (gen != rel_gen) {
                 rel_gen = gen;
                 rel_n = 0;
                 rel_ok = false;  // the body's places until the new ones are taken
                 std::memset(acc, 0, sizeof(acc));
             }
-            if (rel_n >= 0 && rel_n < 30 && standing) {
+            // John settled: the right hip against the camera and the camera's height each moving under 0.2 and 0.1 m/s
+            // for a quarter of a second (a dismount, a stand from a crouch, the eye height still easing: not yet)
+            // (judged over 100 ms windows: this runs faster than the frames, a frame's step over a millisecond is no speed)
+            static float last_hip[3] = {0, 0, 0}, last_cy = 0.0f;
+            static double pl_ms = 0.0, still_since = -1.0;
+            static bool still = false;
+            const double now = log::now_ms();
+            {
+                const float h[3] = {bases[0][0] - cp[0], bases[0][1] - cp[1], bases[0][2] - cp[2]};
+                const double pdt = (now - pl_ms) * 0.001;
+                if (pdt >= 0.1 || pdt < 0.0) {
+                    if (pdt < 0.5 && pdt > 0.0) {
+                        const float dh = std::sqrt((h[0] - last_hip[0]) * (h[0] - last_hip[0]) + (h[1] - last_hip[1]) * (h[1] - last_hip[1]) +
+                                                   (h[2] - last_hip[2]) * (h[2] - last_hip[2]));
+                        still = dh / pdt < 0.2 && std::fabs((cp[1] - bp.root[1]) - last_cy) / pdt < 0.1;  // over the root: a slope settles
+                    } else {
+                        still = false;  // a stall: judged again from here
+                    }
+                    std::memcpy(last_hip, h, sizeof(h));
+                    last_cy = cp[1] - bp.root[1];
+                    pl_ms = now;
+                }
+                if (!still || !standing) still_since = -1.0;
+                else if (still_since < 0.0) still_since = now;
+            }
+            const bool settled = still_since >= 0.0 && now - still_since >= 250.0;
+            if (rel_n >= 0 && rel_n < 30 && !settled) g_place_waits.fetch_add(1, std::memory_order_relaxed);
+            if (rel_n >= 0 && rel_n < 30 && standing && settled) {
                 for (int z = 0; z < kZones; ++z) {
                     const float d[3] = {bases[z][0] - cp[0], bases[z][1] - cp[1], bases[z][2] - cp[2]};
                     acc[z][0] += d[0] * right[0] + d[2] * right[2];
@@ -543,6 +635,11 @@ void holster_frame() {
                     for (int z = 0; z < kZones; ++z)
                         for (int k = 0; k < 3; ++k) rel[z][k] = acc[z][k] / 30.0f;
                     rel_ok = true;
+                    g_place_takes.fetch_add(1, std::memory_order_relaxed);
+                    {
+                        std::lock_guard lk(g_zone_mutex);
+                        std::memcpy(g_place_hip, rel[0], sizeof(g_place_hip));
+                    }
                     log::info("[holster] the headset anchor's places taken (the right hip %.2f m right, %.2f m below the head, %.2f m ahead)",
                               rel[0][0], -rel[0][1], rel[0][2]);
                 }
@@ -637,7 +734,7 @@ void holster_frame() {
     // turn with you"): riding, the right stick's turn of the view turns the whole layout with it, about the head's
     // vertical axis: the player's own hips turn with their view while John keeps facing the horse (run 9 had the holsters
     // follow the horse)
-    const float ride_turn = (st.flags & RDRVR_ACTOR_MOUNTED) ? pose::ride_turn_deg() : 0.0f;
+    const float ride_turn = (st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_VEHICLE)) ? pose::ride_turn_deg() : 0.0f;
     if (ride_turn != 0.0f && bp.cam_ok) {
         const float* cp = bp.cam + 12;
         const float a = hd + ride_turn * 0.0174532925f;
@@ -689,6 +786,7 @@ void holster_frame() {
     static int zone_last[kZones] = {-1, -1, -1, -1, -1, -1, -1, -1};  // the gun each zone drew last (a twin keeps its own)
     static int drawn_from = -1;  // the zone of the last draw (round 13 item 10: the gun in hand's own holster)
     static int put_zone_of[kWeapons];  // run 7 item 1b: the zone each gun was last put away in (-1: not known)
+    static int zone_item[kZones] = {-1, -1, -1, -1, -1, -1, -1, -1};  // run 10 item 10: the item put away there (AnyWeapon)
     static const bool put_zone_init = [] {
         for (int& z : put_zone_of) z = -1;
         return true;
@@ -700,7 +798,8 @@ void holster_frame() {
     auto exact = [&](int zi) { return in_hand && zok[zi] && owns(zones[zi].weapon) && st.weapon == zones[zi].weapon; };
     bool any_exact = false;
     for (int zi = 0; zi < kZones; ++zi) any_exact = any_exact || exact(zi);
-    auto holds = [&](int zi) {
+    // the holster's own test (its choice, else its slots), as before AnyWeapon
+    auto holds_slot = [&](int zi) {
         if (!in_hand) return false;
         if (exact(zi)) return true;
         if (any_exact) return false;
@@ -708,11 +807,22 @@ void holster_frame() {
             if (s >= 0 && s == cur) return true;
         return false;
     };
+    auto holds = [&](int zi) {
+        if (!in_hand) return false;
+        if (any_item && zone_rounds(zi)) return false;  // a zone of rounds holds no item
+        if (holds_slot(zi)) return true;
+        // run 10 item 10 (AnyWeapon): an automatic holster takes the item in hand unless another item was put there (its
+        // game slots' guns do not stop it: cycle D5, the Back's long guns made the Schofield draw the Bolt Action)
+        const int w = st.weapon >= 0 && st.weapon < kWeapons ? st.weapon : -1;
+        return any_item && !any_exact && zones[zi].weapon == -1 && w >= 0 && (zone_item[zi] == w || zone_item[zi] < 0);
+    };
     // the weapon a zone draws: its choice; else for a twin, another owned weapon of its slots than the partner's (another
     // kind first: a rifle against a shotgun); else -1 (the slots in order, the game's)
     auto draw_weapon = [&](int zi) -> int {
         const Zone& z = zones[zi];
         if (owns(z.weapon)) return z.weapon;
+        if (any_item && z.weapon == -1 && owns(zone_item[zi]) && !(in_hand && st.weapon == zone_item[zi])) return zone_item[zi];  // what was put there
+        if (any_item && z.slots[0] < 0) return -1;  // the chest holding an item: only what was put there
         const int zl = zone_last[zi];
         if (choosing && zl >= 0 && zl < kWeapons && owns(zl)) {  // its own last gun, while owned and of its slots
             bool fits = false;
@@ -802,8 +912,7 @@ void holster_frame() {
                 log::write(back ? log::Level::Warn : log::Level::Info,
                            "[holster] the %s in hand (from the %s, the %s hand): its barrel in the hand's frame (%.2f %.2f %.2f)%s | the hips' choices %s, %s",
                            kWeaponLabel[st.weapon], drawn_from >= 0 ? zones[drawn_from].key : "?", gun_h ? "right" : "left", b[0], b[1], b[2],
-                           back ? " BACKWARDS" : "", zones[0].weapon >= 0 ? kWeaponToken[zones[0].weapon] : "auto",
-                           zones[5].weapon >= 0 ? kWeaponToken[zones[5].weapon] : "auto");
+                           back ? " BACKWARDS" : "", token_of(zones[0].weapon), token_of(zones[5].weapon));
             }
         } else {
             diag_w = -1;
@@ -994,7 +1103,7 @@ void holster_frame() {
                 continue;  // no draws, put-aways or rounds while placing
             }
         }
-        if (pressed && in_z[h] == kAmmoZone) {
+        if (pressed && zone_rounds(in_z[h])) {
             // a round from the chest for the gun in the other hand (the game's count: the gun not full, spare rounds)
             g_consumed[h] = true;
             press_zone[h] = in_z[h];
@@ -1102,7 +1211,7 @@ void holster_frame() {
             }
             dual::begin(h, jh, dual::kCopySlot, z.key);
             controllers::pulse(h, 0.5f, 30);
-        } else if (pressed && in_z[h] >= 0 && dual::enabled() && !ds.on && gun && h == off_h && !holds(in_z[h]) && [&] {
+        } else if (pressed && in_z[h] >= 0 && dual::enabled() && !ds.on && gun && h == off_h && !holds_slot(in_z[h]) && [&] {
                        for (int s : zones[in_z[h]].slots)  // a gun slot (1 the sidearms, 4-6 the long guns) other than the gun's
                            if ((s == 1 || (s >= 4 && s <= 6)) && s != cur && slot_filled(s)) return true;
                        return false;
@@ -1298,7 +1407,14 @@ void holster_frame() {
                 const uint64_t args[1] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor))};
                 api::queue_native(kPutItemAway, args, 1, 0, nullptr);
                 g_puts.fetch_add(1, std::memory_order_relaxed);
-                if (st.weapon >= 0 && st.weapon < kWeapons) put_zone_of[st.weapon] = in_z[h];  // item 1b: where it was put away
+                if (st.weapon >= 0 && st.weapon < kWeapons) {
+                    put_zone_of[st.weapon] = in_z[h];  // item 1b: where it was put away
+                    if (any_item) {  // run 10 item 10: that zone holds it now (and no other does)
+                        for (int& zi : zone_item)
+                            if (zi == st.weapon) zi = -1;
+                        zone_item[in_z[h]] = st.weapon;
+                    }
+                }
                 const bool fists = g_unarmed.load(std::memory_order_relaxed);
                 if (fists) {
                     const uint64_t m[2] = {1, 1};
@@ -1359,10 +1475,15 @@ void holster_frame() {
         // [Reload] ShowAmmo (run 6 item 6b): while a round could go in now (the gun open for it, or a gate gun with room),
         // a row of the gun's rounds at the chest: as many as could go in, up to six
         if (round_draw::show_ammo()) {
+            int rz = -1;  // run 10 item 10: the zone holding the rounds (the chest first)
+            if (zone_rounds(kAmmoZone)) rz = kAmmoZone;
+            for (int z = 0; z < kZones && rz < 0; ++z)
+                if (zone_rounds(z)) rz = z;
             const bool room = gun && reload::hand_reload() && st.clip + 0.5f <= st.clip_max && st.spare >= 1.0f && actions::can_load(st.weapon) &&
-                              !(st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) && zok[kAmmoZone];
+                              !(st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) && rz >= 0 && zok[rz];
             const float can = std::fmin(std::fmin(st.spare, st.clip_max - st.clip), 6.0f);
-            round_draw::set_row(room ? audio::click_family(st.weapon) : 0, room ? static_cast<int>(can + 0.01f) : 0, zp[kAmmoZone], hr, up, hf);
+            round_draw::set_row(room ? audio::click_family(st.weapon) : 0, room ? static_cast<int>(can + 0.01f) : 0, zp[rz >= 0 ? rz : kAmmoZone], hr, up,
+                                hf);
         }
         // [Reload] RoundInHand = 2: the game's own shotgun shell in the hand (held_prop; its draw moved onto the pose)
         float pz[12];
@@ -1385,7 +1506,7 @@ void holster_frame() {
         for (int i = 0; i < 4; ++i) {
             const int zi = kShowZones[i];
             int gw = -1;
-            if (show && zok[zi] && (show_back || (i != 1 && i != 3))) {  // 1, 3: the back, the left shoulder
+            if (show && zok[zi] && !zone_rounds(zi) && (show_back || (i != 1 && i != 3))) {  // 1, 3: the back, the left shoulder
                 gw = draw_weapon(zi);
                 const int s0 = zones[zi].slots[0];
                 if (gw < 0 && s0 >= 0 && s0 < 8) gw = slot_weapon[s0];
@@ -1419,6 +1540,7 @@ void holster_frame() {
             float gp[12];
             if (frag) {
                 show_pose(zi, zp[zi], hr, up, hf, bp.root, gp);
+                adjust_pose(zones[zi].gun_turn, zones[zi].gun_off, zp[zi], hr, up, hf, gp);
                 float dp[3], rel[3];
                 double dms = 0;
                 uint64_t gated = 0;
@@ -1429,6 +1551,7 @@ void holster_frame() {
                 if (sd.weapon[i] == gw && got && now_ms - dms < 100.0) {
                     const float ex = rel[0] - (gp[9] - anc[0]), ey = rel[1] - (gp[10] - anc[1]), ez = rel[2] - (gp[11] - anc[2]);
                     sd.err[i] = std::sqrt(ex * ex + ey * ey + ez * ez);
+                    std::memcpy(sd.rel[i], rel, sizeof(rel));
                     sd.worst[i] = std::fmax(sd.worst[i], sd.err[i]);
                     if (sd.err[i] > 0.02f) ++sd.over[i];
                 } else if (sd.weapon[i] == gw && got) {
@@ -1560,12 +1683,26 @@ void load_zones() {
             z.off[1] = p.off[1];
             z.off[2] = p.off[2];
             z.radius = p.radius;
+            z.gun_turn[0] = p.gun_turn[0];  // the shown gun's: the turn and the lean reversed, the offset's right
+            z.gun_turn[1] = -p.gun_turn[1];
+            z.gun_turn[2] = -p.gun_turn[2];
+            z.gun_off[0] = -p.gun_off[0];
+            z.gun_off[1] = p.gun_off[1];
+            z.gun_off[2] = p.gun_off[2];
         }
         std::string o = config::get_string("Holsters", (std::string(z.key) + "Offset").c_str(), "");
         float v[3];
         if (!o.empty() && sscanf_s(o.c_str(), "%f %f %f", &v[0], &v[1], &v[2]) == 3) std::memcpy(z.off, v, sizeof(v));
+        o = config::get_string("Holsters", (std::string(z.key) + "GunTurn").c_str(), "");
+        if (!o.empty() && sscanf_s(o.c_str(), "%f %f %f", &v[0], &v[1], &v[2]) == 3)
+            for (int k = 0; k < 3; ++k) z.gun_turn[k] = std::isfinite(v[k]) ? std::fmin(180.0f, std::fmax(-180.0f, v[k])) : 0.0f;
+        o = config::get_string("Holsters", (std::string(z.key) + "GunOffset").c_str(), "");
+        if (!o.empty() && sscanf_s(o.c_str(), "%f %f %f", &v[0], &v[1], &v[2]) == 3)
+            for (int k = 0; k < 3; ++k) z.gun_off[k] = std::isfinite(v[k]) ? std::fmin(0.3f, std::fmax(-0.3f, v[k])) : 0.0f;
         z.radius = config::get_float("Holsters", (std::string(z.key) + "Radius").c_str(), z.radius);
-        if (z.slots[0] >= 0) {
+        if (!std::strcmp(z.key, "Ammo")) {  // run 10 item 10: the chest's choice (automatic: the rounds), used with AnyWeapon on
+            z.weapon = weapon_from_token(config::get_string("Holsters", "AmmoWeapon", "auto"));
+        } else if (z.slots[0] >= 0) {
             // the lower back takes the old knife holster's choice unless it has its own
             const std::string def = !std::strcmp(z.key, "LowerBack") ? config::get_string("Holsters", "KnifeWeapon", "auto") : "auto";
             z.weapon = weapon_from_token(config::get_string("Holsters", (std::string(z.key) + "Weapon").c_str(), def.c_str()));
@@ -1585,6 +1722,18 @@ void save_zone(int i) {
     config::set("Holsters", (std::string(z.key) + "Offset").c_str(), b);
     std::snprintf(b, sizeof(b), "%.3f", z.radius);
     config::set("Holsters", (std::string(z.key) + "Radius").c_str(), b);
+}
+void save_zone_gun(int i) {
+    Zone z;
+    {
+        std::lock_guard lock(g_zone_mutex);
+        z = g_zones[i];
+    }
+    char b[64];
+    std::snprintf(b, sizeof(b), "%.1f %.1f %.1f", z.gun_turn[0], z.gun_turn[1], z.gun_turn[2]);
+    config::set("Holsters", (std::string(z.key) + "GunTurn").c_str(), b);
+    std::snprintf(b, sizeof(b), "%.3f %.3f %.3f", z.gun_off[0], z.gun_off[1], z.gun_off[2]);
+    config::set("Holsters", (std::string(z.key) + "GunOffset").c_str(), b);
 }
 
 // ---- trace ("holster trace"): the player's transitions and weapon ops, to the log
@@ -1759,7 +1908,7 @@ void init() {
         int o = std::snprintf(b, sizeof(b), "[holster] weapons: choice %d, any %d:", g_weapon_choice.load() ? 1 : 0, g_any_weapon.load() ? 1 : 0);
         for (int z = 0; z < kZones && o > 0 && o < static_cast<int>(sizeof(b)); ++z)
             if (g_zones[z].slots[0] >= 0)
-                o += std::snprintf(b + o, sizeof(b) - o, " %s=%s", g_zones[z].key, g_zones[z].weapon >= 0 ? kWeaponToken[g_zones[z].weapon] : "auto");
+                o += std::snprintf(b + o, sizeof(b) - o, " %s=%s", g_zones[z].key, token_of(g_zones[z].weapon));
         log::info("%s", b);
     }
     {
@@ -1792,6 +1941,7 @@ void init() {
         sscanf_s(lp.c_str(), "%f %f %f", &lo[0], &lo[1], &lo[2]);
         set_load_point(lo, config::get_float("Reload", "LoadPointRadius", 0.12f), config::get_bool("Reload", "InsertOnTouch", true), false);
         g_show_guns = config::get_bool("Holsters", "ShowGuns", false);
+        held_prop::set_gate(config::get_float("Holsters", "PropGate", 0.30f));  // run 10 item 2
         g_show_back_guns = config::get_bool("Holsters", "ShowBackGuns", true);
         g_anchor = config::get_string("Holsters", "Anchor", "headset") == "body" ? 0 : 1;
         g_turn_head = config::get_bool("Holsters", "TurnWithHead", false);
@@ -2036,17 +2186,17 @@ int zone_weapon(int z) {
 }
 void set_zone_weapon(int z, int w, bool save) {
     if (z < 0 || z >= kZones || !zone_takes_weapons(z)) return;
-    if (w < -1 || w >= kWeapons) w = -1;
+    if (w < -1 || w > kRounds) w = -1;
     const char* key = nullptr;
     {
         std::lock_guard lock(g_zone_mutex);
         g_zones[z].weapon = w;
         key = g_zones[z].key;
     }
-    log::info("[holster] the %s draws %s", key, w >= 0 ? kWeaponLabel[w] : "its slots (automatic)");
-    if (save) config::set("Holsters", (std::string(key) + "Weapon").c_str(), w >= 0 ? kWeaponToken[w] : "auto");
+    log::info("[holster] the %s draws %s", key, w == kRounds ? "the rounds (a round to reload)" : w >= 0 ? kWeaponLabel[w] : "its slots (automatic)");
+    if (save) config::set("Holsters", (std::string(key) + "Weapon").c_str(), token_of(w));
 }
-bool zone_takes_weapons(int z) { return z >= 0 && z < kZones && g_zones[z].slots[0] >= 0; }
+bool zone_takes_weapons(int z) { return z >= 0 && z < kZones && (g_zones[z].slots[0] >= 0 || (z == kAmmoZone && g_any_weapon.load())); }
 bool zone_enabled(int z) {
     std::lock_guard lock(g_zone_mutex);
     return z >= 0 && z < kZones && g_zones[z].enabled;
@@ -2194,6 +2344,28 @@ void set_zone(int i, const float off[3], float radius, bool save) {
     }
     if (save) save_zone(i);
 }
+bool zone_shows_gun(int i) {
+    for (int z : kShowZones)
+        if (z == i) return true;
+    return false;
+}
+void zone_gun(int i, float turn[3], float off[3]) {
+    if (i < 0 || i >= kZones) return;
+    std::lock_guard lock(g_zone_mutex);
+    std::memcpy(turn, g_zones[i].gun_turn, sizeof(g_zones[i].gun_turn));
+    std::memcpy(off, g_zones[i].gun_off, sizeof(g_zones[i].gun_off));
+}
+void set_zone_gun(int i, const float turn[3], const float off[3], bool save) {
+    if (i < 0 || i >= kZones) return;
+    {
+        std::lock_guard lock(g_zone_mutex);
+        for (int k = 0; k < 3; ++k) {
+            g_zones[i].gun_turn[k] = std::isfinite(turn[k]) ? std::fmin(180.0f, std::fmax(-180.0f, turn[k])) : 0.0f;
+            g_zones[i].gun_off[k] = std::isfinite(off[k]) ? std::fmin(0.3f, std::fmax(-0.3f, off[k])) : 0.0f;
+        }
+    }
+    if (save) save_zone_gun(i);
+}
 
 void set_keeps_drawn(bool on) {
     if (g_keep.exchange(on) != on) log::info("[holster] keep the gun drawn: %s", on ? "on" : "off");
@@ -2216,7 +2388,14 @@ std::string command(const std::string& line) {
         g_trace = x != "off";
         return std::string("trace ") + (g_trace.load() ? "on" : "off") + "; player ped " + std::to_string(g_player_ped.load());
     }
-    if (v == "weapon") {  // holster weapon <Key> <token|auto> (writes the user ini, as the menu does)
+    if (v == "any") {  // holster any on|off: [Holsters] AnyWeapon for the session (run 10 item 10)
+        std::string x;
+        in >> x;
+        g_any_weapon = x == "on";
+        log::info("[holster] anything in any holster: %s (the session)", g_any_weapon.load() ? "on" : "off");
+        v = "weapons";
+    }
+    if (v == "weapon") {  // holster weapon <Key> <token|auto|Rounds> (writes the user ini, as the menu does)
         std::string key, tok;
         in >> key >> tok;
         for (int z = 0; z < kZones; ++z)
@@ -2250,7 +2429,7 @@ std::string command(const std::string& line) {
         for (int z = 0; z < kZones; ++z)
             if (g_zones[z].slots[0] >= 0) {
                 const int w = zone_weapon(z);
-                r += std::string(" ") + g_zones[z].key + "=" + (w >= 0 ? kWeaponToken[w] : "auto");
+                r += std::string(" ") + g_zones[z].key + "=" + token_of(w);
                 if (w >= 0 && ok && !(a.owned >> w & 1)) r += "(not owned)";
             }
         r += " | choice draws " + std::to_string(g_choice_draws.load()) + ", second-gun slot switches " + std::to_string(g_sec_switches.load()) +
@@ -2304,22 +2483,39 @@ std::string command(const std::string& line) {
             if (y == "on" || y == "off") set_turn_with_head(y == "on", false);
             if (dz >= 0.0f) set_turn_dead_zone(dz, false);
         }
-        float sh[3], cp[3];
+        float sh[3], cp[3], ph[3];
         {
             std::lock_guard lock(g_zone_mutex);
             std::memcpy(sh, g_anchor_shift, sizeof(sh));
             std::memcpy(cp, g_anchor_cam, sizeof(cp));
+            std::memcpy(ph, g_place_hip, sizeof(ph));
         }
         float no[3] = {0, 0, 0};
         const bool nk = camera_lever::neck_offset(no);
         float hy = 0.0f;
         const bool hk = camera_lever::head_yaw_deg(&hy);
-        char b[420];
+        char b[600];
         std::snprintf(b, sizeof(b), "anchor %s, used %d, shift (%.3f %.3f %.3f) | neck since recentre%s (%.3f %.3f %.3f) | camera (%.3f %.3f %.3f) | "
-                      "turn %d, dead zone %.0f, the holsters' yaw %.1f, the head's%s %.1f deg | lean steady %d (the lean %.3f m), by hands %d (%.1f)",
+                      "turn %d, dead zone %.0f, the holsters' yaw %.1f, the head's%s %.1f deg | lean steady %d (the lean %.3f m), by hands %d (%.1f) | "
+                      "places taken %u, the right hip %.3f right %.3f below %.3f ahead, waits %u, camera elsewhere %u",
                       g_anchor.load() ? "headset" : "body", g_anchor_used.load() ? 1 : 0, sh[0], sh[1], sh[2], nk ? "" : " (none)", no[0],
                       no[1], no[2], cp[0], cp[1], cp[2], g_turn_head.load() ? 1 : 0, g_turn_dead.load(), g_zone_yaw_pub.load(), hk ? "" : " (none)", hy,
-                      g_lean_steady.load() ? 1 : 0, g_lean_pub.load(), g_turn_hands.load() ? 1 : 0, g_hands_yaw_pub.load());
+                      g_lean_steady.load() ? 1 : 0, g_lean_pub.load(), g_turn_hands.load() ? 1 : 0, g_hands_yaw_pub.load(), g_place_takes.load(), ph[0],
+                      -ph[1], ph[2], g_place_waits.load(), g_place_offcam.load());
+        return b;
+    }
+    if (v == "gunturn") {  // holster gunturn <zone index> <tilt> <turn> <lean> [<right> <up> <forward>]: a shown gun's GunTurn/GunOffset (session)
+        int zi = -1;
+        float t[3] = {}, o[3] = {};
+        in >> zi >> t[0] >> t[1] >> t[2];
+        if (!(in >> o[0] >> o[1] >> o[2])) o[0] = o[1] = o[2] = 0.0f;
+        if (zi < 0 || zi >= kZones) return "holster gunturn: no such zone";
+        set_zone_gun(zi, t, o, false);
+        float tn[3], go[3];
+        zone_gun(zi, tn, go);
+        char b[200];
+        std::snprintf(b, sizeof(b), "gunturn %s: turn %.1f %.1f %.1f deg, offset %.3f %.3f %.3f m", g_zones[zi].key, tn[0], tn[1], tn[2], go[0],
+                      go[1], go[2]);
         return b;
     }
     if (v == "guns") {  // holster guns [on|off|reset|back on|off]: [Holsters] ShowGuns (ShowBackGuns) for the session; each shown gun, its drawn error
@@ -2339,11 +2535,12 @@ std::string command(const std::string& line) {
         }
         static const char* const kName[4] = {"right hip", "back", "left hip", "left shoulder"};
         std::string o = std::string("guns shown ") + (g_show_guns.load() ? "1" : "0") + " back " + (g_show_back_guns.load() ? "1" : "0");
-        char b[200];
+        char b[260];
         for (int i = 0; i < 4; ++i) {
-            std::snprintf(b, sizeof(b), " | %s %d err %.4f worst %.4f stale %llu gated %llu over %llu", kName[i], g_show_diag.weapon[i], g_show_diag.err[i],
-                          g_show_diag.worst[i], static_cast<unsigned long long>(g_show_diag.stale[i]), static_cast<unsigned long long>(g_show_diag.gated[i]),
-                          static_cast<unsigned long long>(g_show_diag.over[i]));
+            std::snprintf(b, sizeof(b), " | %s %d err %.4f worst %.4f stale %llu gated %llu over %llu at (%.3f %.3f %.3f)", kName[i], g_show_diag.weapon[i],
+                          g_show_diag.err[i], g_show_diag.worst[i], static_cast<unsigned long long>(g_show_diag.stale[i]),
+                          static_cast<unsigned long long>(g_show_diag.gated[i]), static_cast<unsigned long long>(g_show_diag.over[i]),
+                          g_show_diag.rel[i][0], g_show_diag.rel[i][1], g_show_diag.rel[i][2]);
             o += b;
         }
         std::snprintf(b, sizeof(b), " | frames %llu | twins hidden %llu", static_cast<unsigned long long>(g_show_diag.frames),

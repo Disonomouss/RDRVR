@@ -23,6 +23,14 @@ int forced_aa();
 // [Render] DlssFullJitter: DLSS's jitter sequence at 8 x (output / render width)^2 samples (the game leaves DLAA's 8)
 void set_full_jitter(bool on);
 void jitter_text(char* out, size_t len);  // "dlss jitter: ..."
+// run 10: [Render] MotionBlur off|game (forced off in memory: PostFx +0x5a4/+0xe1c each frame) and HeatHaze 1|0 (the
+// HeatShimmer strength zeroed at the Mirager pass)
+bool motion_blur_off();
+void set_motion_blur_off(bool off, bool save);
+bool heat_haze_on();
+void set_heat_haze(bool on, bool save);
+void post_text(char* out, size_t len);  // "postfx: ..."
+void post_test(const char* what, float v);  // tests: "style" 0..2 (the game's motion blur style set), "hazetest" <strength> (-1 off)
 int dlss_quality();  // the DLSS quality index in effect since boot (0..5)  // the AA mode forced since boot or the last set_aa (-1 none, 0..3)
 
 }  // namespace rdrvr::render_settings

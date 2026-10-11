@@ -24,6 +24,8 @@ namespace rdrvr::controls {
 // punch with the fists needs the game's fighting stance, LT, before RT), the whole press lasting rt_after_ms + ms.
 // Any thread.
 void inject(uint16_t buttons, uint8_t rt, int16_t ly, int ms, uint8_t lt = 0, int rt_after_ms = 0);
+bool game_menu_open();  // a game menu open now (the pause menu, the satchel, a shop's): MenuControls' test
+double last_lt_ms();    // log::now_ms() of the last frame the game's LT was pressed (the mod's or the player's): the fists' stance
 
 void init();
 // Presenting thread, once per frame end: true and the pad when a controller is in use and the RDRVR menu is closed.

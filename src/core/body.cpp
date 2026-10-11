@@ -103,7 +103,10 @@ uintptr_t player_skeleton() {
 std::mutex g_cfg_mutex;
 bool g_cfg_hide = true;
 float g_cfg_back = 0.04f;
-int g_cfg_stance = 1;  // 0 the game's animation, 1 upper body upright, 2 the forward/back lean removed
+int g_cfg_stance = 1;  // 0 the game's animation, 1 upper body upright, 2 the forward/back lean removed, 3 still
+float g_cfg_height_tau = 0.35f;  // [Body] HeightSmoothing (the camera's eye height's): the still body's height follows it
+bool g_cfg_still_feet = false;   // [Body] StillFeet (run 10 item 9 stage 2): the still body's feet where the game planted them
+bool g_cfg_still_belt = true;    // [Body] StillBelt (run 10 item 9b): the belt and holster still with the body
 bool g_cfg_follow = false;
 bool g_cfg_lock = true;     // [Body] LockFacing: the drawn body faces the camera's heading
 HandCfg g_hand_cfg;
@@ -143,6 +146,19 @@ struct Rig {
     std::vector<int> pelvis_set;
     std::vector<int> chain_set[4];      // each one's subtree
     std::vector<uint8_t> in_head, in_up;
+    // [Body] Stance=still (2026-10-11): each bone's parent (-1 the root's), and the pinned bones: the torso (the pelvis
+    // and spine00's subtrees) less the arms below the clavicles, the legs and the attachment bones; each pinned bone is
+    // drawn in its bind pose under one frame, the rest hang from their nearest pinned ancestor
+    std::vector<int> parent;
+    std::vector<uint8_t> pin;
+    // run 10 item 9b ([Body] StillBelt): the belt's attachment bones pinned with the torso. `skel belt scan` (cycle D7): the
+    // outfit's gun belt and holster is one geometry weighted pelvis 65%, pistol 31%, hip_r 4%; the holster's leather
+    // follows the `pistol` attachment bone, which hangs from the leg (so it swung with the legs); the pouch is `thrower`'s
+    std::vector<uint8_t> belt_pin;
+    int clav[2] = {-1, -1};
+    int foot[2] = {-1, -1};  // the lowest leg joints found (foot_l/r, else ankle_l/r): the still diagnostic's feet
+    int knee[2] = {-1, -1}, hipj[2] = {-1, -1};  // run 10 item 8b's measure: the knee (the foot's leg parent) and hip joints
+    std::vector<int> leg_set[2][3];  // run 10 item 9 stage 2 ([Body] StillFeet): the hip's, the knee's and the foot's subtrees
     int max_index = -1;
     std::string up_name;
     // each joint's rest position in the model (bind) space: the skeleton data's default local matrices (+0x20, 0x40
@@ -372,6 +388,55 @@ bool build_rig(uintptr_t data, const std::string& up_name) {
                   g_rig.att_wrist[0], g_rig.att_wrist[1], pairs.size(), g_rig.mir_n[0], g_rig.mir_n[1], g_rig.mir_n[2], g_rig.mir_c, g_rig.mir_res,
                   g_rig.mirror_ok ? "on" : "off");
     }
+    {  // the still stance's parents and pinned bones
+        g_rig.parent.assign(count, -1);
+        for (int i = 0; i < count; ++i) {
+            uintptr_t par = 0;
+            if (rd(bones + i * 0x110 + 0x20, &par) && par >= bones && (par - bones) % 0x110 == 0) {
+                const int pi = static_cast<int>((par - bones) / 0x110);
+                if (pi >= 0 && pi < i) g_rig.parent[i] = pi;
+            }
+        }
+        g_rig.pin.assign(count, 0);
+        std::vector<uint8_t> skip(count, 0);
+        for (int h = 0; h < 2; ++h) {
+            for (int b : g_rig.arm_set[h]) skip[b] = 1;
+            g_rig.clav[h] = bone_index(bones, count, h ? "clavicle_r" : "clavicle_l");
+            g_rig.foot[h] = bone_index(bones, count, h ? "foot_r" : "foot_l");
+            if (g_rig.foot[h] < 0) g_rig.foot[h] = bone_index(bones, count, h ? "ankle_r" : "ankle_l");
+            g_rig.hipj[h] = bone_index(bones, count, h ? "hip_r" : "hip_l");
+            if (g_rig.hipj[h] >= 0) g_rig.leg_set[h][0] = subtree(bones, count, g_rig.hipj[h]);
+            if (g_rig.foot[h] >= 0) g_rig.leg_set[h][2] = subtree(bones, count, g_rig.foot[h]);
+            // the knee: up the foot's parents to the one whose parent is the hip's child (hip -> knee -> ... -> foot)
+            int k = g_rig.foot[h];
+            for (int d = 0; k >= 0 && d < 6; ++d) {
+                const int pk = g_rig.parent[k];
+                if (pk < 0) break;
+                if (g_rig.parent[pk] == g_rig.hipj[h] || pk == g_rig.hipj[h]) {
+                    g_rig.knee[h] = pk == g_rig.hipj[h] ? k : pk;
+                    g_rig.leg_set[h][1] = subtree(bones, count, g_rig.knee[h]);
+                    break;
+                }
+                k = pk;
+            }
+        }
+        for (int b : g_rig.attach) skip[b] = 1;
+        g_rig.belt_pin.assign(count, 0);
+        for (const char* nm : {"pistol", "thrower", "melee"}) {
+            const int bi = bone_index(bones, count, nm);
+            if (bi > 0 && bi < count && !(bi < static_cast<int>(g_rig.side.size()) && g_rig.side[bi] >= 0)) g_rig.belt_pin[bi] = 1;  // never an arm's
+        }
+        auto pin_all = [&](const std::vector<int>& v) {
+            for (int b : v)
+                if (b > 0 && b < count && !skip[b]) g_rig.pin[b] = 1;
+        };
+        pin_all(g_rig.pelvis_set);
+        pin_all(g_rig.chain_set[0]);
+        int np = 0;
+        for (uint8_t p : g_rig.pin) np += p;
+        log::info("[body] the still stance: %d bones pinned (the torso less the arms, the legs and the attachments); feet %d %d", np,
+                  g_rig.foot[0], g_rig.foot[1]);
+    }
     // the highest bone anything here touches: a set is transformed only when it holds it (the draw's count test)
     auto cover = [](int b) { g_rig.max_index = b > g_rig.max_index ? b : g_rig.max_index; };
     auto cover_all = [&](const std::vector<int>& v) {
@@ -403,6 +468,7 @@ bool build_rig(uintptr_t data, const std::string& up_name) {
             cover_all(g_rig.seg_att[h][k]);
         }
         for (int i = 0; i < 15; ++i) cover(g_rig.finger[h][i]);
+        cover(g_rig.clav[h]);
     }
     log::info("[body] rig: %u bones (the highest used %d); head %d (+%zu under it); upright bone \"%s\" %d (+%zu under it)", count,
               g_rig.max_index, g_rig.head, g_rig.head_set.size() - 1, up_name.c_str(), g_rig.up, g_rig.up_set.empty() ? 0 : g_rig.up_set.size() - 1);
@@ -470,6 +536,14 @@ struct Frame {
     bool still_cloth = true;   // [Body] HiddenNoFlutter: no cloth flutter on the player's draws while parts are hidden
     float yaw = 0;        // radians about the world's up through the root: the facing lock
     bool lock = false;
+    // [Body] Stance=still: where the bind pose's origin is drawn (world), this frame's and the last frame's (the
+    // previous set's): the actor's position across, and up so the bind head joint sits at the head bone's height over
+    // the actor low-passed as the camera's eye height is ([Body] HeightSmoothing)
+    bool still = false;
+    bool still_feet = false;  // [Body] StillFeet
+    bool still_belt = true;   // [Body] StillBelt (run 10 item 9b)
+    float still_t[3] = {}, still_t_prev[3] = {};
+    float view_h = 0;  // the view's heading (radians; faces (-sin h, -cos h)): the still diagnostic's axes
     std::vector<float> attach_pos;  // the attachment bones' world positions (3 each, the order of g_rig.attach)
     HeldSample held[kHeldRing];     // the item in hand's game matrices, the last builds
     HeldSample sec[kHeldRing];      // [Hands] DualWield: the second gun's placed matrices, the last builds
@@ -1253,6 +1327,27 @@ uint64_t g_pub_frame = ~0ull;  // the frame g_hand_seq's data was last published
 std::vector<Corr> g_corr_set;    // the latest current set's, in the set's own space (the world less its offset)
 float g_ik_diag[2][20];          // per hand: S, E, W, T (set space), l1, l2, d, the world target's y, the wrist as drawn, the stretch
 float g_cam_diag[12];            // the frame's camera position, the head bone, the root bone, the right wrist target (world)
+// "skel still" (2026-10-11): the drawn pelvis, spine00, spine03, the clavicles, the shoulders, the head and the feet against
+// the camera in the view's heading (right, up, forward): each one's min xyz and max xyz since the last reset
+constexpr int kStillDiag = 11;
+float g_still_rng[kStillDiag][6];
+uint64_t g_still_n = 0, g_still_sets = 0, g_still_refused = 0;
+std::atomic<uint64_t> g_still_off_cam{0};  // (the body job's, outside g_draw_mutex)
+bool g_still_init = false;
+float g_feet_err[2] = {0, 0};  // run 10 item 9 stage 2: each drawn foot's distance from its animated place (m), the last set
+float g_knee_deg[2] = {0, 0}, g_knee_rng[2][2] = {{1e9f, -1e9f}, {1e9f, -1e9f}}, g_hip_h[2] = {0, 0};  // run 10 item 8b (under g_draw_mutex)
+std::vector<uint8_t> g_still_carried;
+void still_reset() {
+    for (auto& r : g_still_rng)
+        for (int k = 0; k < 3; ++k) {
+            r[k] = 1e30f;
+            r[3 + k] = -1e30f;
+        }
+    g_still_n = g_still_sets = g_still_refused = 0;
+    g_still_off_cam = 0;
+    for (auto& r : g_knee_rng) r[0] = 1e9f, r[1] = -1e9f;
+    g_still_init = true;
+}
 float g_torso_diag[2] = {0, 0};  // the torso lock's last horizontal correction (m) and the largest since the last read
 // The hands' world corrections for the aim (aim.cpp reads them on the game thread): the wrist bones' T_world of the
 // latest current player set, written on the render thread behind a sequence counter (odd while writing).
@@ -1265,6 +1360,7 @@ struct HandCorr {
 std::atomic<uint32_t> g_hand_seq{0};
 std::atomic<uint64_t> g_seq_waits{0}, g_seq_misses{0};
 std::atomic<uintptr_t> g_player_drawable{0};  // rec[0x10] of the player's set draw (the "skel geoms" probe)
+std::atomic<uintptr_t> g_player_drawables[8] = {};  // run 10 item 9b: each distinct drawable drawn on the player's set (the body, its accessories)
 // [Body] HiddenGeometry (round 8: the sliver from elbow to elbow was still there). The character shaders compute the
 // world position in float (gWorldSingle x the skinned position, then less the camera): at the world's coordinates
 // (|z| about 2400, a float step of 0.24 mm) the collapsed hidden points, all on the line between the cuts, round off it
@@ -1411,6 +1507,67 @@ bool classify_tris(const uint8_t* vd, uint32_t stride, uint32_t vcount, int offw
     for (uint32_t t = 0; t < ntri; ++t) cls[t] = tri_class(vc[ix[t * 3]], vc[ix[t * 3 + 1]], vc[ix[t * 3 + 2]]);
     return true;
 }
+// run 10 item 9b's probe ("skel belt scan"): one geometry's vertices summed by bone (the blend indices index the set
+// directly), with the bind-space box and centroid of its positions (channel 0, float3). The command thread only.
+struct GeomScan {
+    uint16_t vcount = 0;
+    uint32_t icount = 0;
+    float w[256] = {};  // the summed weight per bone (0..1 per vertex)
+    float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f}, c[3] = {};
+    int why = 0;
+};
+bool scan_geom_seh(uintptr_t geom, GeomScan* o) {
+    __try {
+        uintptr_t vb = 0, ib = 0, vdata = 0, fvf = 0;
+        uint32_t stride = 0, mask = 0;
+        uint8_t ordered = 0;
+        uint64_t fmt = 0;
+        std::memcpy(&vb, reinterpret_cast<const void*>(geom + 0x18), 8);
+        std::memcpy(&ib, reinterpret_cast<const void*>(geom + 0x38), 8);
+        if (!vb || !ib) return o->why = 1, false;
+        std::memcpy(&o->icount, reinterpret_cast<const void*>(ib + 8), 4);
+        std::memcpy(&o->vcount, reinterpret_cast<const void*>(vb + 8), 2);
+        std::memcpy(&stride, reinterpret_cast<const void*>(vb + 0x18), 4);
+        std::memcpy(&vdata, reinterpret_cast<const void*>(vb + 0x20), 8);
+        std::memcpy(&fvf, reinterpret_cast<const void*>(vb + 0x30), 8);
+        if (!vdata || !fvf || !o->vcount || stride == 0 || stride > 256) return o->why = 2, false;
+        std::memcpy(&mask, reinterpret_cast<const void*>(fvf), 4);
+        std::memcpy(&ordered, reinterpret_cast<const void*>(fvf + 6), 1);
+        std::memcpy(&fmt, reinterpret_cast<const void*>(fvf + 8), 8);
+        const int offp = vtx_channel_offset(mask, ordered, fmt, 0), offw = vtx_channel_offset(mask, ordered, fmt, 1),
+                  offi = vtx_channel_offset(mask, ordered, fmt, 2);
+        const uint32_t f0 = static_cast<uint32_t>(fmt & 0xf);
+        const uint8_t* vd = reinterpret_cast<const uint8_t*>(vdata);
+        for (uint32_t v = 0; v < o->vcount; ++v) {
+            const uint8_t* p = vd + static_cast<size_t>(v) * stride;
+            if (offp >= 0 && f0 == 6 && offp + 12 <= static_cast<int>(stride)) {  // float3
+                float x[3];
+                std::memcpy(x, p + offp, 12);
+                for (int k = 0; k < 3; ++k) {
+                    o->lo[k] = std::fmin(o->lo[k], x[k]);
+                    o->hi[k] = std::fmax(o->hi[k], x[k]);
+                    o->c[k] += x[k];
+                }
+            }
+            if (offw >= 0 && offi >= 0 && offw + 4 <= static_cast<int>(stride) && offi + 4 <= static_cast<int>(stride))
+                for (int i = 0; i < 4; ++i) o->w[p[offi + i]] += p[offw + i] / 255.0f;
+        }
+        for (float& x : o->c) x /= static_cast<float>(o->vcount);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        o->why = 9;
+        return false;
+    }
+}
+std::string bone_name(uintptr_t data, int i) {  // data: the skeleton data (Rig::data), copied under g_draw_mutex
+    uintptr_t bones = 0, p = 0;
+    char s[40] = {};
+    if (!data || !rd(data, &bones) || !bones || !rd(bones + static_cast<uintptr_t>(i) * 0x110, &p) || !p) return "?";
+    for (int k = 0; k < 39; ++k)
+        if (!rd(p + k, &s[k]) || !s[k]) break;
+    return s;
+}
+
 bool build_cull_seh(uintptr_t geom, int show, bool collapse_root, CullEntry* e, uint8_t* cls_a, uint8_t* cls_b, uint8_t* vc, uint16_t* ix) {
     __try {
         uint8_t prim = 0, dbl = 0;
@@ -1914,7 +2071,145 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
             axis_angle(side, ang, rc);
         }
     };
-    if (f.stance && g_rig.chain[0] >= 0 && g_rig.chain[0] < n) {
+    // 1s. the still stance ([Body] Stance=still, 2026-10-11, the user: "a body that doesn't move at all except for the
+    //     arms and legs"): every pinned bone (the torso) drawn in its bind pose under one frame F, the levelled root's
+    //     axes ro with the bind origin at f.still_t (in the bind pose every skinning matrix is the root's, so each pinned
+    //     bone's matrix becomes F itself); the bones below a pinned one carried with it as animated (the arms from the
+    //     clavicles, then the IK; the legs from the pelvis; the attachments). Far from the animation (a ragdoll, a
+    //     fall): the upright stance for that set instead.
+    bool still = false;
+    float still_o[3] = {0, 0, 0};  // F's origin in the set's space
+    if (f.stance == 3 && f.still && g_rig.chain[0] > 0 && g_rig.chain[0] < n && static_cast<int>(g_rig.parent.size()) >= n &&
+        static_cast<int>(g_rig.pin.size()) >= n) {
+        const float* tw = slot ? f.still_t_prev : f.still_t;
+        for (int k = 0; k < 3; ++k) still_o[k] = tw[k] - off[k];
+        const float* js = &g_rig.jbind[static_cast<size_t>(g_rig.chain[0]) * 3];
+        float sj[3], d2 = 0.0f;
+        jdrawn(g_rig.chain[0], sj);
+        for (int k = 0; k < 3; ++k) {
+            const float p = ro[k * 3] * js[0] + ro[k * 3 + 1] * js[1] + ro[k * 3 + 2] * js[2] + still_o[k];
+            d2 += (p - sj[k]) * (p - sj[k]);
+        }
+        still = std::isfinite(d2) && d2 < 0.5f * 0.5f;
+        if (slot == 0) (still ? g_still_sets : g_still_refused)++;
+    }
+    if (still) {
+        std::vector<uint8_t>& carried = g_still_carried;
+        carried.assign(n, 0);
+        for (int b = 1; b < n; ++b) {
+            if (g_rig.pin[b] || (f.still_belt && b < static_cast<int>(g_rig.belt_pin.size()) && g_rig.belt_pin[b])) {
+                const float* m = s + b * 12;
+                float mo[9], mt[9];
+                ortho_cols(m, mo);
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j) mt[i * 3 + j] = mo[j * 3 + i];
+                Corr& c = g_corr[b];
+                mul3(ro, mt, c.A);
+                const float tb[3] = {m[3], m[7], m[11]};
+                for (int k = 0; k < 3; ++k) c.a[k] = still_o[k] - (c.A[k * 3] * tb[0] + c.A[k * 3 + 1] * tb[1] + c.A[k * 3 + 2] * tb[2]);
+                carried[b] = 1;
+            } else {
+                const int p = g_rig.parent[b];
+                if (p > 0 && p < n && carried[p]) {
+                    g_corr[b] = g_corr[p];
+                    carried[b] = 1;
+                }
+            }
+        }
+        if (f.pitch != 0) {  // [Body] TorsoPitch on the upper body, about spine00's pinned joint
+            float rp[9], piv[3];
+            axis_angle(side, f.pitch, rp);
+            const float* js = &g_rig.jbind[static_cast<size_t>(g_rig.chain[0]) * 3];
+            for (int k = 0; k < 3; ++k) piv[k] = ro[k * 3] * js[0] + ro[k * 3 + 1] * js[1] + ro[k * 3 + 2] * js[2] + still_o[k];
+            for (int b : g_rig.chain_set[0])
+                if (b < n) corr_apply(g_corr[b], rp, piv);
+        }
+        // stage 2 ([Body] StillFeet): each leg carried with the pinned pelvis keeps the animation's own sway from the
+        // hips, so standing the feet slid 25-96 mm (cycle r10d). A two-bone solve puts each foot back where the animation
+        // planted it: the hip where the pinned pelvis carries it, the knee in the leg's own bend plane, the foot turned to
+        // its animated orientation
+        if (f.still_feet)
+            for (int h = 0; h < 2; ++h) {
+                const int hj = g_rig.hipj[h], kj = g_rig.knee[h], fj = g_rig.foot[h];
+                if (hj < 0 || kj < 0 || fj < 0 || hj >= n || kj >= n || fj >= n || g_rig.leg_set[h][1].empty()) continue;
+                float ah[3], ak[3], af[3], H[3], K0[3], F0[3];
+                jdrawn(hj, ah);
+                jdrawn(kj, ak);
+                jdrawn(fj, af);
+                corr_point(g_corr[hj], ah, H);
+                corr_point(g_corr[kj], ak, K0);
+                corr_point(g_corr[fj], af, F0);
+                auto dist3 = [](const float* x, const float* y) {
+                    return std::sqrt((x[0] - y[0]) * (x[0] - y[0]) + (x[1] - y[1]) * (x[1] - y[1]) + (x[2] - y[2]) * (x[2] - y[2]));
+                };
+                const float l1 = dist3(ak, ah), l2 = dist3(af, ak);
+                float u[3] = {af[0] - H[0], af[1] - H[1], af[2] - H[2]};
+                float d = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+                if (!(l1 > 0.05f && l2 > 0.05f && d > 1e-3f) || d > 1.5f * (l1 + l2)) continue;  // not a leg here (a ragdoll)
+                for (float& c : u) c /= d;
+                d = std::clamp(d, std::fabs(l1 - l2) + 1e-3f, l1 + l2 - 1e-3f);
+                // the bend plane from the carried leg: its normal, and the knee's side within it
+                float a1[3] = {K0[0] - H[0], K0[1] - H[1], K0[2] - H[2]}, a2[3] = {F0[0] - H[0], F0[1] - H[1], F0[2] - H[2]}, nrm[3], v[3];
+                cross(a1, a2, nrm);
+                const float nl = std::sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+                if (nl < 1e-5f) {  // a straight leg: the plane holds the body's forward
+                    const float fw[3] = {-ro[2], -ro[5], -ro[8]};
+                    cross(u, fw, nrm);
+                }
+                norm(nrm);
+                cross(nrm, u, v);
+                norm(v);
+                if (v[0] * a1[0] + v[1] * a1[1] + v[2] * a1[2] < 0.0f)
+                    for (float& c : v) c = -c;
+                const float along = (l1 * l1 - l2 * l2 + d * d) / (2.0f * d);
+                const float up = std::sqrt(std::fmax(0.0f, l1 * l1 - along * along));
+                float K[3];
+                for (int k = 0; k < 3; ++k) K[k] = H[k] + u[k] * along + v[k] * up;
+                // the turn taking from -> to (unit vectors), about their common normal
+                auto turn = [&](const float* from, const float* to, float* R) {
+                    float f1[3] = {from[0], from[1], from[2]}, t1[3] = {to[0], to[1], to[2]}, ax[3];
+                    norm(f1);
+                    norm(t1);
+                    cross(f1, t1, ax);
+                    const float s = std::sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+                    const float c = std::clamp(f1[0] * t1[0] + f1[1] * t1[1] + f1[2] * t1[2], -1.0f, 1.0f);
+                    if (s < 1e-6f) {
+                        for (int k = 0; k < 9; ++k) R[k] = (k % 4 == 0) ? 1.0f : 0.0f;
+                        return;
+                    }
+                    for (float& x : ax) x /= s;
+                    axis_angle(ax, std::atan2(s, c), R);
+                };
+                float R1[9], R2[9];
+                const float kf[3] = {K0[0] - H[0], K0[1] - H[1], K0[2] - H[2]}, kt[3] = {K[0] - H[0], K[1] - H[1], K[2] - H[2]};
+                turn(kf, kt, R1);
+                for (int b : g_rig.leg_set[h][0])
+                    if (b < n) corr_apply(g_corr[b], R1, H);
+                float F1[3];
+                corr_point(g_corr[fj], af, F1);
+                const float ff[3] = {F1[0] - K[0], F1[1] - K[1], F1[2] - K[2]}, ft[3] = {af[0] - K[0], af[1] - K[1], af[2] - K[2]};
+                turn(ff, ft, R2);
+                for (int b : g_rig.leg_set[h][1])
+                    if (b < n) corr_apply(g_corr[b], R2, K);
+                // the foot's own orientation back to the animation's (planted flat as the game had it)
+                if (!g_rig.leg_set[h][2].empty()) {
+                    // drawn A M, wanted M: the turn A^T about the foot's joint
+                    float Rf[9];
+                    for (int i = 0; i < 3; ++i)
+                        for (int k = 0; k < 3; ++k) Rf[i * 3 + k] = g_corr[fj].A[k * 3 + i];
+                    float Fc[3];
+                    corr_point(g_corr[fj], af, Fc);
+                    for (int b : g_rig.leg_set[h][2])
+                        if (b < n) corr_apply(g_corr[b], Rf, Fc);
+                }
+                if (slot == 0) {
+                    float Fd[3];
+                    corr_point(g_corr[fj], af, Fd);
+                    g_feet_err[h] = dist3(Fd, af);
+                }
+            }
+    }
+    if (f.stance && !still && g_rig.chain[0] >= 0 && g_rig.chain[0] < n) {
         float rc[9];
         stance_rot(s + g_rig.chain[0] * 12, rc);
         if (f.pitch != 0) {
@@ -1928,7 +2223,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         for (int b : g_rig.chain_set[0])
             if (b < n) corr_apply(g_corr[b], rc, piv);
     }
-    if (f.stance && g_rig.pelvis >= 0 && g_rig.pelvis < n) {
+    if (f.stance && !still && g_rig.pelvis >= 0 && g_rig.pelvis < n) {
         float rc[9], piv[3];
         stance_rot(s + g_rig.pelvis * 12, rc);
         jdrawn(g_rig.pelvis, piv);
@@ -1938,7 +2233,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
     // 1b. the torso position: running pushes spine00 forward of the root; the whole body (legs too, so nothing stretches)
     //     moves horizontally so spine00's joint sits over the root as at rest (round 6: with the pivots right, the
     //     torso came forward again when running)
-    if (f.lock_torso && f.actor_valid && g_rig.chain[0] >= 0) {
+    if (f.lock_torso && !still && f.actor_valid && g_rig.chain[0] >= 0) {  // (still: already over the actor)
         // over the character's own position (the camera anchor's base), as at rest: the rest offset of spine00 from
         // the model's origin, turned by the levelled root
         float sj[3], sjc[3];
@@ -1971,7 +2266,56 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         axis_angle(ups, f.yaw, ry);
         float rootj[3];
         jdrawn(0, rootj);
+        if (still) {  // about the pinned frame's own root joint (the animated one sways)
+            const float* j0 = &g_rig.jbind[0];
+            for (int k = 0; k < 3; ++k) rootj[k] = ro[k * 3] * j0[0] + ro[k * 3 + 1] * j0[1] + ro[k * 3 + 2] * j0[2] + still_o[k];
+        }
         for (int b = 1; b < n; ++b) corr_apply(g_corr[b], ry, rootj);
+    }
+    if (slot == 0 && !g_still_init) still_reset();
+    if (slot == 0) {  // "skel still": the torso's, the shoulders', the head's and the feet's drawn joints against the camera
+        const int bs[kStillDiag] = {g_rig.pelvis, g_rig.chain[0], g_rig.chain[3], g_rig.clav[0], g_rig.clav[1], g_rig.arm[0], g_rig.arm[1],
+                                    g_rig.head, g_rig.foot[0], g_rig.foot[1], g_rig.holster[0]};  // (the holster: the pistol bone)
+        if (f.cam_ok) {
+            const float ch = std::cos(f.view_h), sh = std::sin(f.view_h);
+            for (int i = 0; i < kStillDiag; ++i) {
+                const int b = bs[i];
+                if (b < 0 || b >= n) continue;
+                float p[3], q[3], d[3];
+                jdrawn(b, p);
+                corr_point(g_corr[b], p, q);
+                for (int k = 0; k < 3; ++k) d[k] = q[k] + off[k] + (f.shift ? f.shift_world[k] : 0.0f) - f.cam[12 + k];
+                // in the view's heading: right (cos h, -sin h), up, forward (-sin h, -cos h)
+                const float v[3] = {ch * d[0] - sh * d[2], d[1], -sh * d[0] - ch * d[2]};
+                float* rg = g_still_rng[i];
+                for (int k = 0; k < 3; ++k) {
+                    rg[k] = std::fmin(rg[k], v[k]);
+                    rg[3 + k] = std::fmax(rg[3 + k], v[k]);
+                }
+            }
+            ++g_still_n;
+        }
+        // run 10 item 8b: the knees' bend as drawn (the angle at the knee from the hip to the foot; 180 straight)
+        for (int h = 0; h < 2; ++h) {
+            const int hj = g_rig.hipj[h], kj = g_rig.knee[h], fj = g_rig.foot[h];
+            if (hj < 0 || kj < 0 || fj < 0 || hj >= n || kj >= n || fj >= n) continue;
+            float ph[3], pk[3], pf[3], t[3];
+            jdrawn(hj, t);
+            corr_point(g_corr[hj], t, ph);
+            jdrawn(kj, t);
+            corr_point(g_corr[kj], t, pk);
+            jdrawn(fj, t);
+            corr_point(g_corr[fj], t, pf);
+            float u[3] = {ph[0] - pk[0], ph[1] - pk[1], ph[2] - pk[2]}, v[3] = {pf[0] - pk[0], pf[1] - pk[1], pf[2] - pk[2]};
+            norm(u);
+            norm(v);
+            const float c = std::clamp(u[0] * v[0] + u[1] * v[1] + u[2] * v[2], -1.0f, 1.0f);
+            const float a = std::acos(c) * 57.29578f;
+            g_knee_deg[h] = a;
+            g_knee_rng[h][0] = std::fmin(g_knee_rng[h][0], a);
+            g_knee_rng[h][1] = std::fmax(g_knee_rng[h][1], a);
+            g_hip_h[h] = ph[1] - pf[1];  // the hip joint over the foot (the leg's height)
+        }
     }
     // 3. the shift
     if (f.shift) {
@@ -3334,6 +3678,15 @@ std::atomic<bool> g_near_on{false};
 std::mutex g_near_mutex;
 NearDraw g_near[24];
 int g_nnear = 0;
+// run 10 item 2: a draw's instance (the record's +0x98 object: its owner at +0x18, the skeleton the player's draws are
+// told by; the object itself when it has none), so props the mod made are told from the same model's other copies
+uintptr_t draw_instance(void* const* rec) {
+    const uintptr_t o = reinterpret_cast<uintptr_t>(rec[0x13]);
+    uintptr_t owner = 0;
+    if (o && raw(o + 0x18, &owner, 8) && owner) return owner;
+    return o;
+}
+
 void note_near(uintptr_t drawable, int kind, int count, const float* pos, const float* item) {
     const float dx = pos[0] - item[0], dy = pos[1] - item[1], dz = pos[2] - item[2];
     const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
@@ -4114,9 +4467,15 @@ struct PropDiag {
     int bone;
     uint8_t count;
     uint32_t flags;
-    float set_t[3], rec_t[3], set_x[3], rec_x[3];
+    float set_t[3], rec_t[3], set_x[3], rec_x[3], rec_z[3];
+    // 2026-10-12 (the user's "second model of a gun in the holster facing backwards"): the record's x and z axes after
+    // the body's world correction for its bone (A x), and whether the still stance pins that bone (StillBelt's)
+    float cor_x[3], cor_z[3];
+    bool cor;
+    bool pinned;
 };
 PropDiag g_prop_diag[8];
+std::atomic<uint64_t> g_belt_twins{0};  // the game's holstered gun's draws hidden for a holster's shown gun (2026-10-12)
 int g_nprop_diag = 0;
 
 
@@ -4439,6 +4798,14 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
             if (count > g_rig.max_index && count <= g_rig.count && rec[0x13] &&
                 raw(reinterpret_cast<uintptr_t>(rec[0x13]) + 0x18, &owner, 8) && owner == g_frame.skel) {
                 g_player_drawable.store(reinterpret_cast<uintptr_t>(rec[0x10]), std::memory_order_relaxed);
+                {  // each distinct one, up to eight (lock-free: the first empty slot taken)
+                    const uintptr_t dr = reinterpret_cast<uintptr_t>(rec[0x10]);
+                    for (auto& slot_d : g_player_drawables) {
+                        uintptr_t cur_d = slot_d.load(std::memory_order_relaxed);
+                        if (cur_d == dr) break;
+                        if (!cur_d && slot_d.compare_exchange_strong(cur_d, dr)) break;
+                    }
+                }
                 if (g_frame.show && o_draw_geom && g_geom_mode.load(std::memory_order_relaxed) != 0) cull_show = g_frame.show;
                 std::lock_guard lock(g_draw_mutex);
                 save.assign(sm, sm + n);
@@ -4544,11 +4911,16 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 float hp_pose[12];
                 int hp_slot = -1, hp_john = -1;
                 if (held_prop::diag_on()) held_prop::diag_draw(reinterpret_cast<uintptr_t>(rec[0x10]), rc + 12, t_draw_pass, rc);  // "props diag"
-                const bool hp = hi < 0 && si < 0 && held_prop::match(reinterpret_cast<uintptr_t>(rec[0x10]), rc + 12, hp_pose, &hp_slot);
+                const bool hp = hi < 0 && si < 0 && held_prop::match(reinterpret_cast<uintptr_t>(rec[0x10]), draw_instance(rec), rc + 12, hp_pose, &hp_slot);
                 if (hp && hp_slot == 1) {  // [Hands] OwnModelFollow: the other sidearm at the copy's hand of this frame
                     std::lock_guard lock(g_draw_mutex);
                     hp_john = own_follow_pose(hp_pose);
                 }
+                // 2026-10-12 (the user: a second gun at the right hip facing backwards when turning toward it, gone with
+                // ShowGuns off): the game's own holstered gun on John's belt, the same model as a holster's shown gun, was
+                // matched onto the shown gun's pose only within the 0.3 m gate; turning, it was 0.34-0.38 m from it
+                // (r16_backwards6) and drawn on its own at the game's holster. Hidden while a holster shows that model
+                bool belt_twin = false;
                 const HeldSample* hsm = hi >= 0 ? &g_frame.held[hi] : si >= 0 ? &g_frame.sec[si] : nullptr;
                 const int held = hi >= 0 ? (g_frame.held[hi].left ? 0 : 1) : si >= 0 ? g_frame.sec[si].john : -1;
                 if (!hsm && g_frame.sec_any) {  // "skel dual": near the second gun, matched to none of its samples
@@ -4598,6 +4970,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     }
                 }
                 const uintptr_t drawable = reinterpret_cast<uintptr_t>(rec[0x10]);
+                belt_twin = best >= 0 && held_prop::shown_at_holster(drawable);  // before the draw lock (held_prop's own)
                 {
                     std::lock_guard lock(g_draw_mutex);
                     const bool head_5cm = g_frame.held_fix;  // [Body] HeldPropFix: also this rule
@@ -4654,6 +5027,16 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                             pd.set_x[k] = sm[k * 4];
                             pd.rec_t[k] = rc[12 + k];
                             pd.rec_x[k] = rc[k];
+                            pd.rec_z[k] = rc[8 + k];
+                        }
+                        pd.cor = g_corr_world_valid && best < static_cast<int>(g_corr_world.size());
+                        pd.pinned = best < static_cast<int>(g_rig.belt_pin.size()) && g_rig.belt_pin[best];
+                        if (pd.cor) {
+                            const float* A = g_corr_world[best].A;
+                            for (int k = 0; k < 3; ++k) {
+                                pd.cor_x[k] = A[k * 3] * rc[0] + A[k * 3 + 1] * rc[1] + A[k * 3 + 2] * rc[2];
+                                pd.cor_z[k] = A[k * 3] * rc[8] + A[k * 3 + 1] * rc[9] + A[k * 3 + 2] * rc[10];
+                            }
                         }
                     }
                     save.assign(sm, sm + n);
@@ -4662,7 +5045,8 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     std::memcpy(rec_save, rc, sizeof(rec_save));
                     rec_at = rc;
                     const bool part_hidden = g_frame.show && !(g_frame.show == 1 ? g_rig.in_elbow[best] : g_rig.in_wrist[best]);
-                    if ((g_frame.hide && g_rig.in_head[best]) || part_hidden) {
+                    if (belt_twin) g_belt_twins.fetch_add(1, std::memory_order_relaxed);
+                    if ((g_frame.hide && g_rig.in_head[best]) || part_hidden || belt_twin) {
                         for (size_t j = 0; j < static_cast<size_t>(count) * 2; ++j) shrink_axes(sm + j * 12);
                         shrink_axes(rc);
                         shrink_axes(rw);
@@ -4931,7 +5315,8 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
     int hp_slot2 = -1;
     if (rigid && held_prop::diag_on())
         held_prop::diag_draw(reinterpret_cast<uintptr_t>(rec[0x10]), reinterpret_cast<const float*>(rec) + 12, t_draw_pass, reinterpret_cast<const float*>(rec));
-    const bool rigid_hp = rigid && held_prop::match(reinterpret_cast<uintptr_t>(rec[0x10]), reinterpret_cast<const float*>(rec) + 12, hp_pose2, &hp_slot2);
+    const bool rigid_hp = rigid && held_prop::match(reinterpret_cast<uintptr_t>(rec[0x10]), draw_instance(rec), reinterpret_cast<const float*>(rec) + 12, hp_pose2,
+                                                    &hp_slot2);
     if (rigid_hp) {
         float* rc = reinterpret_cast<float*>(rec);
         std::lock_guard lock(g_draw_mutex);
@@ -5102,8 +5487,9 @@ int stance() {
 }
 void set_stance(int s) {
     std::lock_guard lock(g_cfg_mutex);
-    g_cfg_stance = s < 0 || s > 2 ? 1 : s;
-    log::info("[body] stance %s", g_cfg_stance == 0 ? "the game's" : g_cfg_stance == 1 ? "upper body upright" : "lean removed");
+    g_cfg_stance = s < 0 || s > 3 ? 1 : s;
+    log::info("[body] stance %s", g_cfg_stance == 0 ? "the game's" : g_cfg_stance == 1 ? "upper body upright" : g_cfg_stance == 2 ? "lean removed"
+                                                                                                             : "still (only the arms and legs move)");
 }
 float body_back() {
     std::lock_guard lock(g_cfg_mutex);
@@ -5409,7 +5795,10 @@ bool install() {
         g_cfg_lock_torso = config::get_bool("Body", "LockTorso", true);
         g_cfg_auto_show = config::get_bool("Body", "AutoShow", true);
         std::string st = config::get_string("Body", "Stance", "upright");
-        g_cfg_stance = st == "game" ? 0 : st == "lean" ? 2 : 1;
+        g_cfg_stance = st == "game" ? 0 : st == "lean" ? 2 : st == "still" ? 3 : 1;
+        g_cfg_height_tau = config::get_float("Body", "HeightSmoothing", 0.35f);
+        g_cfg_still_feet = config::get_bool("Body", "StillFeet", false);
+        g_cfg_still_belt = config::get_bool("Body", "StillBelt", true);
         g_cfg_follow = config::get_bool("Body", "BodyFollowsHead", false);
         g_cfg_up_bone = config::get_string("Body", "UprightBone", "spine00");
         g_cfg_fwd_sign = config::get_float("Body", "ForwardSign", 1.0f) < 0 ? -1.0f : 1.0f;
@@ -5540,6 +5929,117 @@ void before_scene(const float* cam) {
         }
     }
     g_actor_flags.store(flags, std::memory_order_relaxed);
+    {  // [Body] Stance=still: the bind pose's origin, the head's height low-passed as the camera's (pose.cpp)
+        static bool s_ok = false, prev_ok = false;
+        static float s_h = 0.0f, prev_t[3] = {};
+        static double s_ms = 0.0;
+        const double now = log::now_ms();
+        if (f.stance == 3 && f.actor_valid && g_rig.head >= 0) {
+            float tau;
+            bool feet;
+            {
+                std::lock_guard lock(g_cfg_mutex);
+                tau = g_cfg_height_tau;
+                feet = g_cfg_still_feet;
+            }
+            // the height by the head's (stage 1, the user's "looks really good"): the camera's height follows the head, so
+            // the body stays rigid with the view (by the pelvis's alone, the head's own bob and look moved it 6-11 mm up and
+            // down against the camera: run 10 cycles F1, F2). With StillFeet, plus the pelvis's own place against the
+            // head's, low-passed over 3 s (run 10, cycle D5: by the head's alone the pinned pelvis sat lower than the
+            // animation's, the head being lower against the pelvis than in the bind pose: the knees bent to 153-159 deg
+            // standing against the animation's 167)
+            const int hb = g_rig.head;
+            const float jh = g_rig.jbind[static_cast<size_t>(hb) * 3 + 1];
+            const float hy = f.head_world[1] - f.actor_world[1];
+            const double dt = (now - s_ms) * 0.001;
+            static float s_pd = 0.0f;  // the pelvis's height against the head's, each from its bind place (StillFeet)
+            static bool s_pd_ok = false;
+            if (feet && g_rig.pelvis >= 0) {
+                const float pd = (reinterpret_cast<const float*>(mtx + static_cast<uintptr_t>(g_rig.pelvis) * 0x40 + 0x30)[1] -
+                                  g_rig.jbind[static_cast<size_t>(g_rig.pelvis) * 3 + 1]) -
+                                 (f.head_world[1] - jh);
+                if (!std::isfinite(pd) || std::fabs(pd) > 0.5f) {
+                } else if (!s_pd_ok || dt > 1.0 || dt < 0.0) {
+                    s_pd = pd;
+                    s_pd_ok = true;
+                } else {
+                    s_pd += (pd - s_pd) * static_cast<float>(1.0 - std::exp(-dt / 3.0));
+                }
+            } else {
+                s_pd_ok = false;
+            }
+            bool hold = false;  // run 10 item 8b: a gun drawn standing, the height held as the view's is (pose.cpp)
+            {
+                RdrvrActorState ast{};
+                hold = s_ok && api::actor_state(&ast) && pose::holds_armed_height(ast);
+            }
+            if (!s_ok || !std::isfinite(s_h) || dt > 1.0 || std::fabs(hy - s_h) > 1.0f) s_h = hy;  // a first frame, a stall, a jump
+            else if (hold) {  // only a rise let through (a crouch left with the gun out), as the view's
+                if (hy > s_h && tau > 1e-3f) s_h += (hy - s_h) * static_cast<float>(1.0 - std::exp(-dt / tau));
+            } else if (tau > 1e-3f) s_h += (hy - s_h) * static_cast<float>(1.0 - std::exp(-dt / tau));
+            else s_h = jh;  // 0: the standing height always
+            s_ok = true;
+            f.still_t[0] = f.actor_world[0];
+            f.still_t[1] = f.actor_world[1] + s_h - jh + (s_pd_ok ? s_pd : 0.0f);
+            f.still_t[2] = f.actor_world[2];
+            // held under this frame's camera: the actor's position comes from the script thread (a tick old, 18 mm at
+            // a walk) and the camera from the frame, so the origin's offset from the camera, in the view's heading, is
+            // low-passed (0.5 s) and the origin put at the camera less it. A camera far from the actor (a script's, a
+            // cutscene's, a teleport): the actor's place, the filter restarted.
+            static bool o_ok = false;
+            static float o_lp[3] = {};
+            if (f.cam_ok && dt >= 0.0) {
+                const float h = pose::torso_heading_deg() * 0.0174532925f, ch = std::cos(h), sh = std::sin(h);
+                const float d[3] = {f.cam[12] - f.still_t[0], f.cam[13] - f.still_t[1], f.cam[14] - f.still_t[2]};
+                // right (cos h, -sin h), up, forward (-sin h, -cos h)
+                const float ov[3] = {ch * d[0] - sh * d[2], d[1], -sh * d[0] - ch * d[2]};
+                const float jump = std::sqrt((ov[0] - o_lp[0]) * (ov[0] - o_lp[0]) + (ov[1] - o_lp[1]) * (ov[1] - o_lp[1]) +
+                                             (ov[2] - o_lp[2]) * (ov[2] - o_lp[2]));
+                if (!std::isfinite(ov[0] + ov[1] + ov[2]) || ov[0] * ov[0] + ov[2] * ov[2] > 1.0f || std::fabs(ov[1] - jh) > 1.5f) {
+                    o_ok = false;  // not the anchored camera
+                    ++g_still_off_cam;
+                } else {
+                    // learned only while the camera stands (moving, the actor's lag behind it grows and shrinks, and the
+                    // height's smoothing differs from the camera's by the bob's remainder: the offset held, so the body
+                    // stays rigid with the camera; a crouch or a slope moves the camera, and the body with it)
+                    static float c_last[3] = {}, c_speed = 0.0f;
+                    if (o_ok && dt > 1e-4) {
+                        const float dx = f.cam[12] - c_last[0], dz = f.cam[14] - c_last[2];
+                        const float sp = std::sqrt(dx * dx + dz * dz) / static_cast<float>(dt);
+                        c_speed += (sp - c_speed) * static_cast<float>(1.0 - std::exp(-dt / 0.2));
+                    }
+                    c_last[0] = f.cam[12];
+                    c_last[2] = f.cam[14];
+                    const float a = static_cast<float>(1.0 - std::exp(-dt / 0.5));
+                    if (!o_ok || jump > 0.3f || dt > 1.0) {
+                        std::memcpy(o_lp, ov, sizeof(o_lp));
+                        c_speed = 0.0f;
+                    } else {
+                        if (c_speed < 0.1f)
+                            for (int k = 0; k < 3; ++k) o_lp[k] += (ov[k] - o_lp[k]) * a;
+                    }
+                    o_ok = true;
+                    f.still_t[0] = f.cam[12] - (ch * o_lp[0] - sh * o_lp[2]);
+                    f.still_t[1] = f.cam[13] - o_lp[1];
+                    f.still_t[2] = f.cam[14] - (-sh * o_lp[0] - ch * o_lp[2]);
+                }
+            } else {
+                o_ok = false;
+            }
+            std::memcpy(f.still_t_prev, prev_ok ? prev_t : f.still_t, sizeof(f.still_t_prev));
+            std::memcpy(prev_t, f.still_t, sizeof(prev_t));
+            prev_ok = true;
+            f.still = true;
+            {
+                std::lock_guard lock(g_cfg_mutex);
+                f.still_feet = g_cfg_still_feet;
+                f.still_belt = g_cfg_still_belt;
+            }
+        } else {
+            s_ok = prev_ok = false;
+        }
+        s_ms = now;
+    }
     // the user's choice (2026-10-04): crouching, in cover, riding or driving show the forearms and hands (or less, if the
     // global setting already shows less), the body getting in the way of the view there
     f.show = hc.show;
@@ -5700,6 +6200,7 @@ void before_scene(const float* cam) {
     // (heading h faces (-sin h, -cos h))
     float h = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's while the ride's view is turned
     float cfx = -std::sin(h), cfz = -std::cos(h);
+    f.view_h = h;
     {
         float ax = -w[8] * sign, az = -w[10] * sign, al = std::sqrt(ax * ax + az * az);
         if (lock_facing && al > 1e-3f) {
@@ -6561,6 +7062,89 @@ std::string command(const std::string& line) {
                       }(), g_cull_pass_mask.load());
         return b;
     }
+    if (sub == "belt") {  // skel belt scan [file]: each LOD 0 geometry of the player's drawable, its bones by weight (run 10 item 9b)
+        std::string x, file;
+        in >> x >> file;
+        std::string o = "belt scan:";
+        for (const auto& slot_d : g_player_drawables) {
+        const uintptr_t d = slot_d.load();
+        if (!d) continue;
+        uintptr_t list = 0, models = 0;
+        uint16_t nm = 0;
+        if (!rd(d + 0x20 + 0x30, &list) || !list || !rd(list, &models) || !rd(list + 8, &nm)) continue;
+        {
+            char hb[80];
+            std::snprintf(hb, sizeof(hb), " ### drawable %llx: %u models", static_cast<unsigned long long>(d), nm);
+            o += hb;
+        }
+        // the rig's parts it reads, copied under the lock (the render thread rebuilds the rig under it: an outfit change)
+        uintptr_t rig_data = 0;
+        std::vector<uint8_t> calf(256, 0);
+        {
+            std::lock_guard lock(g_draw_mutex);
+            rig_data = g_rig.data;
+            for (int h = 0; h < 2; ++h)
+                for (int bi : g_rig.leg_set[h][1])
+                    if (bi >= 0 && bi < 256) calf[bi] = 1;
+        }
+        char b[600];
+        for (int mi = 0; mi < nm && mi < 40; ++mi) {
+            uintptr_t m = 0, geoms = 0;
+            uint8_t bone = 0, skinned = 0;
+            uint16_t ng = 0;
+            if (!rd(models + mi * 8, &m) || !m) continue;
+            rd(m + 0x2b, &bone);
+            rd(m + 0x2d, &skinned);
+            rd(m + 0x2e, &ng);
+            rd(m + 8, &geoms);
+            std::snprintf(b, sizeof(b), " || m%d bone %u (%s) skinned %u, %u geometries", mi, bone, bone_name(rig_data, bone).c_str(), skinned, ng);
+            o += b;
+            for (int gi = 0; geoms && gi < ng && gi < 48; ++gi) {
+                uintptr_t g = 0;
+                if (!rd(geoms + gi * 8, &g) || !g) continue;
+                GeomScan* gs = new GeomScan;
+                const bool ok = scan_geom_seh(g, gs);
+                if (!ok) {
+                    std::snprintf(b, sizeof(b), " | g%d unread (%d)", gi, gs->why);
+                    o += b;
+                    delete gs;
+                    continue;
+                }
+                // the five heaviest bones, and the legs' share (the calves and feet: trousers or boots, not a belt)
+                int top[5] = {-1, -1, -1, -1, -1};
+                float total = 0.0f, legs = 0.0f;
+                for (int bi = 0; bi < 256; ++bi) {
+                    total += gs->w[bi];
+                    if (calf[bi]) legs += gs->w[bi];
+                    for (int t = 0; t < 5; ++t)
+                        if (top[t] < 0 || gs->w[bi] > gs->w[top[t]]) {
+                            for (int u = 4; u > t; --u) top[u] = top[u - 1];
+                            top[t] = bi;
+                            break;
+                        }
+                }
+                std::snprintf(b, sizeof(b), " | g%d v%u i%u box (%.2f %.2f %.2f)..(%.2f %.2f %.2f) c (%.2f %.2f %.2f) legs %.0f%%:", gi, gs->vcount, gs->icount,
+                              gs->lo[0], gs->lo[1], gs->lo[2], gs->hi[0], gs->hi[1], gs->hi[2], gs->c[0], gs->c[1], gs->c[2],
+                              total > 0 ? 100.0f * legs / total : 0.0f);
+                o += b;
+                for (int t = 0; t < 5; ++t)
+                    if (top[t] >= 0 && gs->w[top[t]] > 0.0f) {
+                        std::snprintf(b, sizeof(b), " %s %.0f%%", bone_name(rig_data, top[t]).c_str(), total > 0 ? 100.0f * gs->w[top[t]] / total : 0.0f);
+                        o += b;
+                    }
+                delete gs;
+            }
+        }
+        }  // the drawables
+        if (!file.empty()) {  // the whole of it (a reply is cut at about 2 KB)
+            if (FILE* fp = std::fopen(file.c_str(), "w")) {
+                std::fputs(o.c_str(), fp);
+                std::fclose(fp);
+                return "belt scan written to " + file + " (" + std::to_string(o.size()) + " bytes)";
+            }
+        }
+        return o;
+    }
     if (sub == "geoms") {  // skel geoms [on|off]: the hidden-geometry skip; its counts; the player's drawable (reads only)
         std::string x;
         in >> x;
@@ -6631,6 +7215,34 @@ std::string command(const std::string& line) {
         for (size_t i = 0; i < o.size(); i += 400) log::info("[body] geoms %zu: %s", i / 400, o.substr(i, 400).c_str());
         return o;
     }
+    if (sub == "still") {  // skel still [reset]: what of the drawn body moved against the camera (mm) since the last reset
+        std::string v;
+        in >> v;
+        const int st = stance();
+        std::lock_guard lock(g_draw_mutex);
+        if (!g_still_init || v == "reset") {
+            still_reset();
+            if (v == "reset") return "still diagnostic reset";
+        }
+        static const char* const kName[kStillDiag] = {"pelvis", "spine00", "spine03", "clavicle_l", "clavicle_r", "arm_l", "arm_r", "head", "foot_l", "foot_r", "holster"};
+        char b[200];
+        std::snprintf(b, sizeof(b), "still: stance %d, %llu frames, sets pinned %llu, refused %llu, frames not under the camera %llu |", st,
+                      static_cast<unsigned long long>(g_still_n), static_cast<unsigned long long>(g_still_sets),
+                      static_cast<unsigned long long>(g_still_refused), static_cast<unsigned long long>(g_still_off_cam.load()));
+        std::string r = b;
+        std::snprintf(b, sizeof(b), " knees L %.1f (%.1f..%.1f) R %.1f (%.1f..%.1f) deg, hips over the feet L %.3f R %.3f m, feet off their planted place L %.4f R %.4f m |",
+                      g_knee_deg[0], g_knee_rng[0][0], g_knee_rng[0][1], g_knee_deg[1], g_knee_rng[1][0], g_knee_rng[1][1], g_hip_h[0], g_hip_h[1],
+                      g_feet_err[0], g_feet_err[1]);
+        r += b;
+        for (int i = 0; i < kStillDiag; ++i) {
+            const float* q = g_still_rng[i];
+            if (q[0] > q[3]) continue;
+            std::snprintf(b, sizeof(b), " %s range %.1f %.1f %.1f mm at (%.3f %.3f %.3f) |", kName[i], (q[3] - q[0]) * 1000.0f, (q[4] - q[1]) * 1000.0f,
+                          (q[5] - q[2]) * 1000.0f, (q[0] + q[3]) * 0.5f, (q[1] + q[4]) * 0.5f, (q[2] + q[5]) * 0.5f);
+            r += b;
+        }
+        return r;
+    }
     if (sub == "stretch") {  // skel stretch: each arm's last stretch, its reach and how far the drawn wrist misses
         const HandCfg hc = hand_cfg();
         std::lock_guard lock(g_draw_mutex);
@@ -6655,13 +7267,16 @@ std::string command(const std::string& line) {
             g_nprop_diag = 0;
             g_skinned_bone = -1;
         }
-        std::string r = "props:";
-        char b[300];
+        std::string r = "props (the belt's twins hidden " + std::to_string(g_belt_twins.load()) + "):";
+        char b[420];
         for (int i = 0; i < g_nprop_diag; ++i) {
             const PropDiag& d = g_prop_diag[i];
-            std::snprintf(b, sizeof(b), " | bone %d count %u flags %#x set t (%.2f %.2f %.2f) x (%.2f %.2f %.2f) rec t (%.2f %.2f %.2f) x (%.2f %.2f %.2f)",
-                          d.bone, d.count, d.flags, d.set_t[0], d.set_t[1], d.set_t[2], d.set_x[0], d.set_x[1], d.set_x[2], d.rec_t[0],
-                          d.rec_t[1], d.rec_t[2], d.rec_x[0], d.rec_x[1], d.rec_x[2]);
+            std::snprintf(b, sizeof(b), " | bone %d%s count %u flags %#x set t (%.2f %.2f %.2f) x (%.2f %.2f %.2f) rec t (%.2f %.2f %.2f) x (%.2f %.2f %.2f) "
+                          "z (%.2f %.2f %.2f) corrected x (%.2f %.2f %.2f) z (%.2f %.2f %.2f)",
+                          d.bone, d.pinned ? " (pinned)" : "", d.count, d.flags, d.set_t[0], d.set_t[1], d.set_t[2], d.set_x[0], d.set_x[1], d.set_x[2],
+                          d.rec_t[0], d.rec_t[1], d.rec_t[2], d.rec_x[0], d.rec_x[1], d.rec_x[2], d.rec_z[0], d.rec_z[1], d.rec_z[2],
+                          d.cor ? d.cor_x[0] : 0.0f, d.cor ? d.cor_x[1] : 0.0f, d.cor ? d.cor_x[2] : 0.0f, d.cor ? d.cor_z[0] : 0.0f,
+                          d.cor ? d.cor_z[1] : 0.0f, d.cor ? d.cor_z[2] : 0.0f);
             r += b;
         }
         if (g_skinned_bone >= 0) {
@@ -6701,10 +7316,24 @@ std::string command(const std::string& line) {
         std::string v;
         in >> v;
         if (v == "on" || v == "off" || v == "auto") g_override = v == "on" ? 1 : v == "off" ? 2 : 0;
+        if (v == "stillbelt") {  // skel body stillbelt on|off: [Body] StillBelt for the session (run 10 item 9b)
+            std::string s;
+            in >> s;
+            std::lock_guard lock(g_cfg_mutex);
+            g_cfg_still_belt = s == "on";
+            log::info("[body] the belt and holster still with the still body: %s", g_cfg_still_belt ? "on" : "off");
+        }
+        if (v == "stillfeet") {  // skel body stillfeet on|off: [Body] StillFeet for the session (run 10 item 9 stage 2)
+            std::string s;
+            in >> s;
+            std::lock_guard lock(g_cfg_mutex);
+            g_cfg_still_feet = s == "on";
+            log::info("[body] the still body's feet where the game planted them: %s", g_cfg_still_feet ? "on" : "off");
+        }
         if (v == "stance") {
             std::string s;
             in >> s;
-            set_stance(s == "game" ? 0 : s == "lean" ? 2 : 1);
+            set_stance(s == "game" ? 0 : s == "lean" ? 2 : s == "still" ? 3 : 1);
         } else if (v == "back") {
             float m = 0;
             in >> m;
@@ -6794,7 +7423,7 @@ std::string command(const std::string& line) {
                       static_cast<unsigned long long>(g_props.load()), static_cast<unsigned long long>(g_rigid_props.load()));
         return out;
     }
-    return "ERROR usage: skel q|f|s <addr> [n] | skel bones <file> | skel ik | skel stretch | skel body [on|off|auto|stance upright|lean|game|back <m>|follow on|off|hidehead on|off|stretch on|off|<max>]";
+    return "ERROR usage: skel q|f|s <addr> [n] | skel bones <file> | skel ik | skel stretch | skel body [on|off|auto|stance upright|lean|still|game|back <m>|follow on|off|hidehead on|off|stretch on|off|<max>]";
 }
 
 }  // namespace rdrvr::body

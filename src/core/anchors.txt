@@ -67,6 +67,13 @@ PauseGate                global 0x2b73e18  # RenderFrame's inline pause-menu blo
 PauseMenuState           global 0x2c45768  # ... and *(this)+0x34 is set
 PauseTint                global 0x2c8aca8  # the block's tint alpha
 MapOpen                  global 0x2ac50bb  # byte: the map screen open (1 from rdrMapLayer's OnActivate FUN_140621690 -> FUN_1405fba90 to OnDeactivate FUN_140621aa0 -> FUN_1405fc480; 0 in gameplay, the pause list, the satchel: tests/sim/r13_mapprobe.py)
+LetterboxClear           func   0x5bdd30 16 # (renderer): the letterbox bars' clear (renderer +0x6e0); called by FUN_1405cbfd0 right after the eye's depth pre-pass walk (single-pass stereo, stageVI-prepass.md)
+PrepassLetterboxCall     site   0x5cc32f 5 # that call (after the shadow object's vt+8 walk, before the collector passes): its return address marks the walk's end
+HandleWorldView          global 0x2c371e8  # int: the shader global gWorldView's id (resolved by name in SetCurrent 0x130940): ShaderGlobalTable[id] = rage_matrices b1
+HandleViewInverse        global 0x2c371f0  # int: gViewInverse's id (b1)
+HandlePrevWorldVP        global 0x2c371f4  # int: gPrevWorldViewProjSingle's id (rage_prev_world)
+HandlePrevViewProj       global 0x2c44e78  # int: gPrevViewProj's id (rage_prev_proj; resolved in rdrvr_TaaGlobals 0x8721b0)
+HandleViewport           global 0x2c44e7c  # int: gViewport's id (rage_prev_world)
 PostRun                  func   0x86bff0   # PostFx vt+0x30 (postfx, 0): the whole chain (exposure hold wraps it)
 PostTail                 func   0x678710   # (PostFx), right after RenderFrame's post chain: last eye's capture point
 # --- R4a one exposure writer (R4 study, ENGINE-NOTES item 7)
@@ -256,3 +263,6 @@ PlaybackLoop             func   0xecfad0   # "RenderThread", the D3D12 playback 
 RecorderWaitDone         func   0xecfd80   # the recorder's wait for the finished chunk (MsgWaitForMultipleObjects on recorder +0xd0, then FUN_140ecea30): Rdi the recorder
 RecorderEndFrame         func   0xecda50   # the recorder's EndFrame (vtable +0x28): packet 2 (the immediate context's EndFrame), packet 0x50, then RecorderWaitDone
 ImmCtxVtbl               global 0x1094568  # the immediate context's vtable (the playback side; D3dDeviceSingleton +0x50 -> +0x128)
+# --- run 10 items 8c and 8d: motion blur and the heat haze (research\run10\motionblur-heathaze.md)
+MotionBlurSetter         site   0x5d2ac0 32 # the motion blur option's setter (vt+0x68): PostFx+0x5a4 = (style 2), +0xe1c = (style 1); the bytes prove both offsets
+MiragerDownsample        func   0x678b00 # PostFx vt+0x98 (postfx): the post chain's first downsample, through the Mirager shader when PostFx+0xe48 (the HeatShimmer strength) > 0.15; the first reader of +0xe48 in the chain

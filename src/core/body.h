@@ -18,7 +18,7 @@ namespace rdrvr::body {
 bool install();  // the entity draw hook
 bool hide_enabled();         // [Body] HideHead
 void set_hide_enabled(bool on);
-int stance();                // [Body] Stance: 0 the game's animation, 1 upper body upright, 2 the forward/back lean removed
+int stance();                // [Body] Stance: 0 the game's animation, 1 upper body upright, 2 the forward/back lean removed, 3 still
 void set_stance(int s);
 float body_back();           // [Body] BodyBack: metres the drawn body sits behind the camera's place
 void set_body_back(float m);

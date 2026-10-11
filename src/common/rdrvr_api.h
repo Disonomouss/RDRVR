@@ -192,6 +192,7 @@ typedef struct RdrvrActorState {
 #define RDRVR_ACTOR_IN_COVER 2u   // IS_ACTOR_USING_COVER
 #define RDRVR_ACTOR_MOUNTED 4u    // IS_ACTOR_RIDING_AND_IN_SADDLE (a horse; IS_ACTOR_MOUNTED stays 0 for the rider)
 #define RDRVR_ACTOR_DRIVING 8u    // IS_ACTOR_DRIVING_VEHICLE (a wagon, a coach)
+#define RDRVR_ACTOR_VEHICLE 16u   // run 10 item 3: the mount fields hold the driven vehicle (GET_VEHICLE), not a horse
 
 typedef struct RdrvrApi {
     uint32_t version;          // RDRVR_API_VERSION

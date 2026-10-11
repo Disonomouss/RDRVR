@@ -21,6 +21,8 @@
 #include "core/log.h"
 #include "core/pose.h"
 #include "core/ring_probe.h"
+#include "core/prepass_arrays.h"
+#include "core/state.h"
 #include "core/xr.h"
 
 namespace rdrvr::camera_lever {
@@ -205,6 +207,8 @@ bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false) {
 alignas(16) char g_saved_vp[0x470 + 0x10];  // render thread only
 alignas(16) char g_cover_vp[kViewportSize + 0x10];
 alignas(16) char g_union_vp[kViewportSize + 0x10];  // render thread only: shadow_union_vp
+alignas(16) char g_eye2_vp[kViewportSize + 0x10];   // render thread only: [Stereo] PrepassViews' private eye-2 viewport (never current)
+uint64_t g_eye2_frame = ~0ull;                       // the frame it was built in
 bool g_union_ok = false;
 // The union's margin: each eye sits 3 cm or so off the centre, so its frustum edge leaves the centre's by up to
 // atan(0.032/z) at depth z, against tangents near 1.4 at the edge: 3 degrees covers it from about 0.25 m on.
@@ -295,6 +299,7 @@ bool build_union_vp(void* vp, const float* cam_in);
 // the second pass would see consumed, and runs the post chain for the first eye between the passes (with the first
 // pass's viewport still current).
 std::atomic<float> g_scene_near{0}, g_scene_far{0};
+thread_local float t_frame_yaw = 0.0f;  // the test yaw latched once a frame: both passes and the union see the same
 
 void hk_SceneRender(void* renderer, void* vp, const float* cam, void* a4) {
     if (const float st = g_yaw_step.load(std::memory_order_relaxed); st != 0.0f) {  // the test's ramp, once a frame
@@ -309,6 +314,7 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam, void* a4) {
         for (int k = 0; k < 3; ++k) g_offset.d[k] += g_move_step[k];
         g_active.store(true, std::memory_order_relaxed);
     }
+    t_frame_yaw = g_yaw.load(std::memory_order_relaxed);
     struct Timed {  // once a frame (no clock reads in the draws under it)
         double t0 = log::now_ms();
         ~Timed() {
@@ -379,7 +385,7 @@ bool build_union_vp(void* vp, const float* cam_in) {
     if (!vp || !cam_in || !xr::eye_views_peek(v)) return false;
     alignas(16) float c[16], centre[16];
     std::memcpy(c, cam_in, sizeof(c));
-    const float yaw = g_yaw.load(std::memory_order_relaxed);
+    const float yaw = t_frame_yaw;
     if (yaw != 0) yaw_rows(c, yaw);  // the passes draw the yawed camera (the truth capture's presets)
     if (!xr_eye_camera(c, 2, centre, true)) return false;
     const float m = kUnionMarginDeg / 57.29577951f;
@@ -397,7 +403,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
     g_scenes.fetch_add(1, std::memory_order_relaxed);
     alignas(16) float yawed[16];
     const float* cam = cam_in;
-    float yaw = g_yaw.load(std::memory_order_relaxed);
+    float yaw = t_frame_yaw;
     if (yaw != 0 && cam_in) {
         std::memcpy(yawed, cam_in, sizeof(yawed));
         yaw_rows(yawed, yaw);
@@ -440,6 +446,17 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
         }
     }
     if (cam) ring_probe::matrix_expect(pass_eye, copy + 12, other + 12, cam + 12);
+    if (xr_pose && have && eye == 3 && pass_eye == (g_swap.load(std::memory_order_relaxed) ? 1 : 0) && prepass::views_wanted() &&
+        xr::eye_views(views)) {
+        // [Stereo] PrepassViews: the other eye's viewport now, as pass 2 will make it (its saved copy, that eye's
+        // tangents, its camera); never current, so the engine pushes and records nothing for it
+        const float* a2 = views[pass_eye == 1 ? 0 : 1].fov;
+        std::memcpy(g_eye2_vp, g_saved_vp, kViewportSize);
+        apply_tangents(g_eye2_vp, std::tan(a2[0]), std::tan(a2[1]), std::tan(a2[2]), std::tan(a2[3]));
+        o_SetCamera(g_eye2_vp, other);
+        prepass::set_eye2(g_eye2_vp, nullptr);  // (without jitter; the TAA update's jittered rows replace these)
+        g_eye2_frame = state::presents.load();
+    }
     if (pass_eye >= 0 && (ipd != 0 || xr_pose) && cam) {
         if (have) round_draw::note_pass(pass_eye, copy, l, r, u, d);  // [Reload] RoundInHand: this eye's camera
         o_SceneRender(renderer, vp, copy, a4);
@@ -1002,6 +1019,7 @@ void status_text(char* out, size_t len) {
 }
 
 void* scene_viewport() { return t_scene_vp; }
+void* eye2_viewport() { return g_eye2_frame == state::presents.load() ? static_cast<void*>(g_eye2_vp) : nullptr; }
 void* shadow_union_vp() { return g_union_ok ? g_union_vp : nullptr; }
 void scene_clip(float* near_m, float* far_m) {
     *near_m = g_scene_near.load();

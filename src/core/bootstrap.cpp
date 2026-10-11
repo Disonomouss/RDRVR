@@ -36,6 +36,7 @@
 #include "core/gpu_timer.h"
 #include "core/log.h"
 #include "core/render_settings.h"
+#include "core/prepass_arrays.h"
 #include "core/ring_probe.h"
 #include "core/body.h"
 #include "core/holster.h"
@@ -133,6 +134,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     xinput::install();
     gpu_timer::init();
     ring_probe::init();
+    prepass::init();
     exit_guard::install();
     frame_grab::init();
     eye_grab::init();
@@ -174,6 +176,7 @@ DWORD WINAPI bootstrap_thread(void*) {
         dual_pass::install();
         frame_probe::install();  // after dual_pass: its wait sites
         playback::install();
+        prepass::install();
         eye_shape::install();
         body::install();
         holster::install();

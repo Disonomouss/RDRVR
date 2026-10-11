@@ -69,6 +69,7 @@ char g_scale_label[kScaleCount][96];
 // This start (the bootstrap thread writes them before the hooks run; read by the game's threads after)
 std::atomic<bool> g_armed{false};    // the sysParams written, the hooks live
 std::atomic<bool> g_took{false};     // the device init took the size (the window create saw it)
+bool g_over_args = false;             // the game's own -width/-height replaced the armed size, put back (2026-10-12)
 std::atomic<bool> g_defer{false};    // another build: armed after anchors::verify(), if still in time
 uint32_t g_w = 0, g_h = 0;           // the size armed
 int g_player_w = 0, g_player_h = 0;  // the xml's size (the window, and what the xml keeps)
@@ -367,7 +368,36 @@ uintptr_t g_ret_next = 0;
 uintptr_t hk_window(uintptr_t a1, uintptr_t fullscreen, uintptr_t a3, uintptr_t a4) {
     if (g_armed.load()) {
         g_window_ms = log::now_ms();
-        const uint32_t sw = static_cast<uint32_t>(*at<int>(Id::ScreenWidth)), sh = static_cast<uint32_t>(*at<int>(Id::ScreenHeight));
+        {  // [Debug] RenderResolutionTestArgs = WxH (the tests only): as the relaunch's command line, the size strings and the
+           // game's size replaced before the window create
+            static char tw[16], th[16];
+            unsigned aw = 0, ah = 0;
+            if (sscanf_s(config::get_string("Debug", "RenderResolutionTestArgs", "").c_str(), "%ux%u", &aw, &ah) == 2 && aw >= 640 && ah >= 480) {
+                std::snprintf(tw, sizeof(tw), "%u", aw);
+                std::snprintf(th, sizeof(th), "%u", ah);
+                *at<const char*>(Id::SysParamWidth) = tw;
+                *at<const char*>(Id::SysParamHeight) = th;
+                *at<int>(Id::ScreenWidth) = static_cast<int>(aw);
+                *at<int>(Id::ScreenHeight) = static_cast<int>(ah);
+                log::info("[renderres] [Debug] RenderResolutionTestArgs: the game's -width/-height as %ux%u (a relaunch's)", aw, ah);
+            }
+        }
+        uint32_t sw = static_cast<uint32_t>(*at<int>(Id::ScreenWidth)), sh = static_cast<uint32_t>(*at<int>(Id::ScreenHeight));
+        // 2026-10-12 (the user: Undead Nightmare, back to the menu and into the normal save, "The game was really blurry":
+        // the relaunched game made its window at 2560x1440 though armed): the game's own -width/-height (its command line,
+        // read after the arm) replaced the armed strings. The armed size put back for the window create; never for a
+        // size the game chose itself (the strings still ours: a low-VRAM card's 1920x1080)
+        const char* const pw = *at<const char*>(Id::SysParamWidth);
+        const char* const ph = *at<const char*>(Id::SysParamHeight);
+        if ((sw != g_w || sh != g_h) && (pw != g_wstr || ph != g_hstr) && config::get_bool("Render", "RenderResolutionOverArgs", true)) {
+            log::info("[renderres] the game's own -width/-height (%s x %s, its command line) replaced the armed %ux%u: put back for the window "
+                      "(the game had %ux%u)", pw ? pw : "?", ph ? ph : "?", g_w, g_h, sw, sh);
+            *at<int>(Id::ScreenWidth) = static_cast<int>(g_w);
+            *at<int>(Id::ScreenHeight) = static_cast<int>(g_h);
+            sw = g_w;
+            sh = g_h;
+            g_over_args = true;
+        }
         auto* opt = at<uint8_t>(Id::GraphicsOptions);
         g_player_w = *reinterpret_cast<int*>(opt + 4);
         g_player_h = *reinterpret_cast<int*>(opt + 8);
@@ -614,6 +644,12 @@ void load_choice() {
 void early_arm() {
     load_choice();
     find_runtime();
+    {  // 2026-10-12: the start's command line (a relaunch from Undead Nightmare passes the game's own -width/-height)
+        const wchar_t* cl = GetCommandLineW();
+        char b[400] = {};
+        if (cl) WideCharToMultiByte(CP_UTF8, 0, cl, -1, b, static_cast<int>(sizeof(b)) - 1, nullptr, nullptr);
+        log::info("[renderres] the command line: %s", b);
+    }
     // the boot sentinel: a start that armed a size and did not reach its frame count blocks that size
     const std::string pending = state_get(boot_section(), "Pending");
     if (!pending.empty()) {

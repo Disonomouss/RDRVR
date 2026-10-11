@@ -180,6 +180,7 @@ bool game_menu_now() {
 // [Controls] WristSatchel (2026-10-09, the user's choice): that short press is the pad's Back (the satchel), not Y
 std::atomic<bool> g_wrist_satchel{false};
 std::atomic<uint64_t> g_satchels{0}, g_wy_single{0}, g_y_frames{0};
+std::atomic<double> g_lt_ms{0.0};  // the last frame the game's LT was pressed (2026-10-12: the fists' fighting stance)
 double g_back_until = 0;
 // run 9 item 2 (the user: "too easy to accidentally trigger with one press"): two taps within SatchelTapMs open the
 // satchel. The first tap is held back for that window (from its release): a second press inside it makes the pair (no Y
@@ -220,6 +221,9 @@ bool in_use(int h, const hands::Hand& d, double now) {
 }
 
 }  // namespace
+
+bool game_menu_open() { return game_menu_now(); }
+double last_lt_ms() { return g_lt_ms.load(std::memory_order_relaxed); }  // run 10 (the review): the guard, the hat tip, the motion blur in the menu
 
 void init() {
     g_grip_on = config::get_float("Controls", "GripThreshold", 0.6f);
@@ -561,6 +565,7 @@ bool pad(xinput::PadState* out) {
                 log::info("[whistle] from the aim stance: LT let go, the whistle sent after %.0f ms", now - g_wh_since);
             }
             if ((whistle_btn && !g_wh_pending) || now < g_wh_pulse_until) p.buttons |= XINPUT_GAMEPAD_DPAD_UP;
+            if (whistle::hat_button(now)) p.buttons |= XINPUT_GAMEPAD_B;  // run 10 item 5: tip the hat (the game's greet)
         }
         if (!g_wh_pending && now >= g_wh_pulse_until && rt > 0.15f && g_wh_drop_until > now) g_wh_drop_until = now;  // a pull: the aim back
         const bool whist = now < g_wh_drop_until;
@@ -661,6 +666,7 @@ bool pad(xinput::PadState* out) {
         }
     }
     g_frames_in_use.fetch_add(1, std::memory_order_relaxed);
+    if (p.lt > 64) g_lt_ms.store(now, std::memory_order_relaxed);  // 2026-10-12: the fists' fighting stance (pose.cpp's height hold)
     if (p.buttons & XINPUT_GAMEPAD_Y) g_y_frames.fetch_add(1, std::memory_order_relaxed);  // run 9: the Ys the game got (the tests)
     g_last = p;
     *out = p;
