@@ -17,6 +17,7 @@ bool melee_by_swing();  // [Gestures] Melee
 void set_melee_by_swing(bool on);
 bool lasso_by_hand();
 bool guard();  // [Gestures] Guard (run 10 item 7): both fists before the face hold the game's block
+bool guard_up();  // GuardTriggers on and the guard held or its pose taken now (any thread): the right trigger's RT held back meanwhile
 void set_guard(bool on, bool save);  // [Gestures] Lasso
 void set_lasso_by_hand(bool on);
 

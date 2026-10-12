@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.5 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.6 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -160,7 +160,10 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - New in 0.8.5, on by default (used in a Quest 3, in a fist fight): with your fists out, both hands raised before your
   face hold the game's block for as long as you hold them there (the Gestures tab, "Guard with both fists"). Fixed
   later in 0.8.5 (tried in the developer's simulator): when the game had put a gun away itself, the guard could draw
-  that gun; it selects the fists first now.
+  that gun; it selects the fists first now. Changed in 0.8.6 (tried in the developer's simulator, not yet in a
+  headset): the guard needs both triggers held too, so raising your fists alone no longer takes the fighting stance
+  (which alarmed people nearby); the right trigger does not punch while guarding. `GuardTriggers=0` under `[Gestures]`
+  in your ini brings back the hands alone.
 - New in 0.3.0, off by default (each in the menu, most not yet tried in a headset): a gun-butt melee, the gun in your
   hand swung into someone landing the game's own melee blow where it meets them (knock-out damage, as a punch does;
   the Gestures tab, "Gun-butt melee"; tried in a headset with 0.5.0, where it hardly ever hit: it needed 3 m/s at the
@@ -213,7 +216,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.5.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.6.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -443,7 +446,7 @@ Actions you do with your own hand movements.
 | ↳ **Swing speed** | How fast a swing must be to count (1.0 to 8.0 m/s). | 2.50 m/s |
 | **Whistle for the horse** | Put a hand at your mouth and pull its trigger to whistle (the gun hand whistles only when it holds no gun). With a gun raised in the other hand, the aim drops for under a second and no shot fires; it comes back on its own, or at once with a trigger pull. | On |
 | **Tip the hat to greet** (new in 0.8.5) | Your right hand over your head and its trigger press the game's greet button (B). Not yet seen to make John greet anyone. | Off |
-| **Guard with both fists** (new in 0.8.5) | With your fists out, both hands raised before your face hold the game's block. Not riding, not in the game's menus. | On |
+| **Guard with both fists** (new in 0.8.5) | With your fists out, both hands raised before your face and both triggers held (since 0.8.6; tried in the developer's simulator) keep the game's block up. Fists raised without the triggers stay unarmed. Not riding, not in the game's menus. | On |
 | **Gun-butt melee** | Swing the gun in your hand into someone to land the game's knock-out hit (with the usual crime and anger). | Off |
 | ↳ **Dry run** | For testing: hits are only written to the log, never made. | Off |
 | ↳ **Hit speed** | How fast the gun's swing must peak to hit (1.0 to 6.0 m/s). | 1.80 m/s |

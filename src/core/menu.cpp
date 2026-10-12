@@ -1635,8 +1635,10 @@ void page_gestures() {
         whistle::set_tip_hat(tiph, true);
     bool guard = gestures::guard();  // run 10 item 7: [Gestures] Guard
     if (check("Guard with both fists", &guard,
-              "With your fists out, both hands raised before your face hold the game's block (its fighting stance with the block "
-              "button), for as long as you hold them there. Not riding, not in the game's menus."))
+              "With your fists out, both hands raised before your face with both triggers held keep the game's block up (its "
+              "fighting stance with the block button) for as long as you hold them there; the right trigger does not punch "
+              "meanwhile. Fists raised without the triggers stay unarmed (the fighting stance alarms people). Not riding, not in "
+              "the game's menus. GuardTriggers=0 in the ini: the hands alone."))
         gestures::set_guard(guard, true);
 
     heading("The gun-butt melee");  // run 7 item 2: [Gestures] GunMelee, GunMeleeDryRun

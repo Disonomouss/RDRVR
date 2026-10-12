@@ -19,6 +19,7 @@
 #include "core/anchors.h"
 #include "core/config.h"
 #include "core/dual.h"
+#include "core/gestures.h"
 #include "core/hands.h"
 #include "core/holster.h"
 #include "core/physics.h"
@@ -486,6 +487,9 @@ bool pad(xinput::PadState* out) {
         else if (t > kNone && t < kTargets && value[s] > 0.5f) p.buttons |= kTargetButton[t];
     }
     if (actions::fire_blocked()) rt = 0.0f;  // [Reload] ManualActions: the gun's action not worked (open, or not cycled)
+    // [Gestures] GuardTriggers (2026-10-12): both triggers held with the fists before the face are the guard's, which
+    // holds the game's block (LT, RB): RT, the fists' attack, would break it (cycle G1: no block with it held)
+    if (gestures::guard_up()) rt = 0.0f;
     const bool on_map = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now() && map_open();  // only in a paused menu
     if (on_map) g_map_frames.fetch_add(1, std::memory_order_relaxed);
     const bool menu_mode = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now() && !on_map;
