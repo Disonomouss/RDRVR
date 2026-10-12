@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.6 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.7 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -69,6 +69,11 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - The HUD on a floating panel, or on your wrist like a watch (radar, meters, ammo shown when you look at it).
 - Automatic view modes: stereo in gameplay, a cinema screen for loading, menus and videos; cutscenes on the screen or
   in 3D.
+- New in 0.8.7, on by default (used in a Quest 3: skinning a deer stayed first person): a script's short scenes that
+  showed John in third person (a mission's quick shots, looting and skinning, a chest, a bed, a door) stay at John's
+  eyes; the game's own camera for the scene still runs behind it, so the scene plays on as made. The full cutscenes
+  are unchanged (the screen or 3D; a cutscene's very first frame may still show from John's eyes). The Screen tab,
+  "Short scenes in first person". Not yet tried: looting, a mission's quick shots, a chest, a bed, a door.
 
 **Body**
 - A first-person body (full, forearms and hands, or hands only), upright and facing your view, no head in the way.
@@ -116,7 +121,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - Every gun's action worked by hand except the magazine pistols' (revolvers flicked open, levers, pumps, bolts,
   breeches, break-actions), with the game's own sounds on your movements; two-handed long guns; dual wielding (a second gun, or a copy of your sidearm);
   perfect accuracy (your shots only: other people's keep the game's spread); the guns shown at their holsters;
-  throwing, punching and the lasso by swinging. All on by default, each can be switched off in the menu. Off by
+  throwing and punching by swinging, the lasso by its trigger where you look (since 0.8.7). All on by default, each can be switched off in the menu. Off by
   default: pushing and grabbing loose objects.
 - The holsters, the dots at your hands and the guns' points (the foregrip ring, the loading point, the action hints)
   each shown or hidden by its own switch (new in 0.6.0, tried in the developer's simulator; the Holsters tab).
@@ -139,6 +144,11 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   followed the game's arm sway, so the off hand could grab the air beside the gun, worst on the Sawed-off (which now
   has a grip of its own).
 - No executions: the trigger fires at close range instead of starting John's third-person execution.
+- Changed in 0.8.7 (used in a Quest 3: "head aim and trigger work well"): the lasso is aimed where you look and thrown
+  by the lasso hand's trigger (the game's aim held 0.3 s first, so it locks on). Other choices on the Gestures tab,
+  under "Lasso by hand": thrown by a swing toward the aim (overhand, sidearm or straight; still hard to time) or
+  either, aimed by the lasso hand (held still once the swing starts) or by the other controller (these three tried in
+  the developer's simulator only).
 - New in 0.7.0, on by default (tried in the developer's simulator, not yet in a headset): the lasso held in your
   hands (the coil in the off hand, the loop in the gun hand; it floated in front of them before); with dual wielding,
   a second gun drawn from a back holster is that holster's gun (a sidearm in hand made every back holster give the
@@ -216,7 +226,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.6.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.7.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -442,7 +452,9 @@ Actions you do with your own hand movements.
 | ↳ **Throw strength** | How hard throws fly, as a multiple of your hand's speed (0.5× to 4.0×). | 2.0× |
 | ↳ **Throw by letting go of the grip** (new in 0.7.0) | Hold the grip to hold the throwable, pull the trigger to light or ready it, then swing and let go of the grip to throw. A lit one held too long goes off in your hand. | Off |
 | **Melee by swing** | A fast swing of either hand punches, stabs with the knife or strikes with the torch. | On |
-| **Lasso by hand** | With the lasso in hand, swing forward to throw it and yank back to pull. | On |
+| **Lasso by hand** | With the lasso in hand, its trigger (or a swing, as chosen below) throws it; a yank back pulls. | On |
+| ↳ **Thrown by** (new in 0.8.7) | Trigger (the game's aim held a moment for its lock, then the throw), Swing (a fast swing toward the aim), or Either. | Trigger |
+| ↳ **Aimed by** (new in 0.8.7) | Head (where you look), Lasso hand (held still once a swing starts), or Other hand (where your other controller points). | Head |
 | ↳ **Swing speed** | How fast a swing must be to count (1.0 to 8.0 m/s). | 2.50 m/s |
 | **Whistle for the horse** | Put a hand at your mouth and pull its trigger to whistle (the gun hand whistles only when it holds no gun). With a gun raised in the other hand, the aim drops for under a second and no shot fires; it comes back on its own, or at once with a trigger pull. | On |
 | **Tip the hat to greet** (new in 0.8.5) | Your right hand over your head and its trigger press the game's greet button (B). Not yet seen to make John greet anyone. | Off |
@@ -477,6 +489,7 @@ How cutscenes are shown in the headset.
 |---|---|---|
 | **On the cinema screen / In 3D** | Cutscenes on a floating 16:9 screen, or in 3D around you from the cutscene camera with your head's turning added (you can switch mid-cutscene). | On the cinema screen |
 | ↳ **3D separation** | The cutscenes' 3D depth as a fraction of your eye distance (1.00 = your own; lower is flatter). | 1.00 |
+| **Short scenes in first person** (new in 0.8.7) | A script's short scenes that show John in third person (a mission's quick shots, looting and skinning, chests, beds, doors) stay at John's eyes; the scene plays on as made. Not the full cutscenes. | On |
 
 ### Debug
 

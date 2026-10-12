@@ -56,6 +56,19 @@ float g_world[2][3] = {}, g_back[2] = {0.0f, 1.0f};
 std::mutex g_mutex;  // the history: the frame end writes, the projectile launch (the game thread) reads
 
 std::atomic<uint64_t> g_punches{0}, g_lasso_throws{0}, g_yanks{0}, g_throws{0}, g_punches_riding{0};
+// 2026-10-12 (the user: the lasso "hard to aim and trigger the throw, not a sensitivity issue"): [Gestures] LassoThrow
+// (0 swing, 1 trigger, 2 both) and LassoAim (0 the lasso hand, 1 the head, 2 the other hand's controller). A swing
+// counts when the hand moves toward the aim (within 60 deg), not along the controller's own axis (an overhand or a
+// sidearm throw); with the hand's aim it is frozen once the hand starts the swing (over 1 m/s), so the swing's wrist
+// cannot turn it. The trigger: its press holds the game's aim (LT) kLassoLeadMs for its lock, then throws (RT); the
+// controller's own RT is held back meanwhile (controls.cpp)
+std::atomic<int> g_lasso_throw{1}, g_lasso_aim{1};  // the defaults the trigger and the head (the user: "work well")
+std::atomic<bool> g_lasso_trig_owned{false};
+std::atomic<uint64_t> g_lasso_trigger_throws{0}, g_lasso_freezes{0};
+constexpr int kLassoLeadMs = 300;
+float g_lasso_frozen[3] = {0, 0, -1}, g_lasso_off_dir[3] = {0, 0, -1};  // world; under g_mutex
+double g_lasso_frozen_until = 0;  // under g_mutex
+bool g_lasso_off_ok = false;      // under g_mutex
 double g_last_swing_ms = 0;  // the last punch's swing (frame end only): the strike probe's reference
 // run 10 item 7 ([Gestures] Guard; the user: "with fists equipped, holding hands in front of face in a guarding pose"):
 // both hands in a box in front of the face (the head's frame: GuardBox forward min max, up min max, across), held 150 ms:
@@ -539,6 +552,7 @@ void frame() {
         // held back meanwhile (the 0.8.6 review)
         if (g_guard_up.exchange(false, std::memory_order_relaxed)) log::info("[gestures] guard down (out of first person)");
         g_guard_pose.store(false, std::memory_order_relaxed);
+        g_lasso_trig_owned.store(false, std::memory_order_relaxed);  // nor the lasso's (the 0.8.7 review: a pause kept it)
         return;
     }
     float bx = 0.0f, bz = 1.0f;
@@ -583,6 +597,53 @@ void frame() {
         point[2] = w[0] * back[0] + w[2] * back[2];
     }
     const int gun_h = controls::gun_hand();
+    // the lasso's aim in the local frame (the swing is judged toward it), and the other hand's pointing (world)
+    float aim_l[3] = {point[0], point[1], point[2]};
+    const bool lasso_in = lasso && st.weapon == kLassoWeapon;
+    auto local = [&](const float* w, float* o) {
+        o[0] = w[0] * right[0] + w[2] * right[2];
+        o[1] = w[1];
+        o[2] = w[0] * back[0] + w[2] * back[2];
+    };
+    {
+        // the other controller's own pointing: its aim pose's -z (the local frame: x right, y up, z back), in the world
+        // by the camera's rows (cycle LA1: the drawn hand's frame, calibrated for a gun, pointed 130 deg off with none)
+        float wo[3] = {0, 0, -1};
+        const hands::Hand oh = hands::get(1 - gun_h);
+        const bool off_ok = oh.valid;
+        if (off_ok) {
+            const float f[3] = {0.0f, 0.0f, -1.0f};
+            float l[3];
+            qrot(oh.rot, f, l);
+            for (int k = 0; k < 3; ++k) wo[k] = right[k] * l[0] + (k == 1 ? l[1] : 0.0f) + back[k] * l[2];
+        }
+        const int am = g_lasso_aim.load(std::memory_order_relaxed);
+        float hf[3];
+        const bool head_ok = am == 1 && camera_lever::head_forward(hf);
+        std::lock_guard lock(g_mutex);
+        g_lasso_off_ok = off_ok;
+        if (off_ok) std::memcpy(g_lasso_off_dir, wo, sizeof(wo));
+        if (head_ok) local(hf, aim_l);
+        else if (am == 2 && off_ok) local(wo, aim_l);
+        else if (am == 0 && now < g_lasso_frozen_until) local(g_lasso_frozen, aim_l);
+    }
+    static bool trig_down = false, lasso_was = false;
+    if (lasso_in && !lasso_was) trig_down = hands::get(gun_h).trigger > 0.4f;  // taken with it held: no press (the review)
+    lasso_was = lasso_in;
+    if (lasso_in) {  // the trigger throw: its press (with hysteresis) holds the aim for the lock, then throws
+        const int tm = g_lasso_throw.load(std::memory_order_relaxed);
+        const float tv = hands::get(gun_h).trigger;
+        const bool was = trig_down;
+        trig_down = tv > (was ? 0.4f : 0.6f);
+        if ((tm == 1 || tm == 2) && trig_down && !was && now >= next_ok[gun_h]) {
+            next_ok[gun_h] = now + 800.0;
+            lasso_out_until = now + 15000.0;
+            controls::inject(0, 255, 0, 150, 255, kLassoLeadMs);
+            g_lasso_trigger_throws.fetch_add(1, std::memory_order_relaxed);
+            log::info("[gestures] lasso thrown by the trigger (the aim held %d ms first)", kLassoLeadMs);
+        }
+    }
+    g_lasso_trig_owned.store(lasso_in && g_lasso_throw.load(std::memory_order_relaxed) != 0, std::memory_order_relaxed);
     for (int h = 0; h < 2; ++h) {
         float v[3], s = 0;
         if (!velocity(h, now, 60.0, v, &s, nullptr)) continue;  // the latest step or two
@@ -616,9 +677,30 @@ void frame() {
             log::info("[gestures] %s hand swing %.1f m/s: the attack (weapon %d)", h ? "right" : "left", s, st.weapon);
         }
         if (lasso && st.weapon == kLassoWeapon && h == gun_h) {
-            // thrown by a forward swing; then a yank back steps John back on the rope for a moment
-            if (s > g_swing_speed.load(std::memory_order_relaxed) && along > 0.5f * s && now >= next_ok[h]) {
+            const int tm = g_lasso_throw.load(std::memory_order_relaxed);
+            // the hand's aim frozen as the swing starts (its wrist turns through the swing): for 0.7 s, or through a throw
+            if (g_lasso_aim.load(std::memory_order_relaxed) == 0 && tm != 1 && s > 1.0f) {
+                float w[3], bt[3] = {0.0f, 0.174f, -0.985f};
+                aim::barrel_in_target(bt);
+                const int gj = bp.gun;
+                for (int k = 0; k < 3; ++k) w[k] = bp.target_rot[gj][k * 3] * bt[0] + bp.target_rot[gj][k * 3 + 1] * bt[1] + bp.target_rot[gj][k * 3 + 2] * bt[2];
+                std::lock_guard lock(g_mutex);
+                if (now >= g_lasso_frozen_until) {
+                    std::memcpy(g_lasso_frozen, w, sizeof(w));
+                    g_lasso_freezes.fetch_add(1, std::memory_order_relaxed);
+                    local(w, aim_l);  // (the swing judged toward the frozen aim from here)
+                }
+                g_lasso_frozen_until = std::fmax(g_lasso_frozen_until, now + 700.0);
+            }
+            const float al = std::sqrt(aim_l[0] * aim_l[0] + aim_l[1] * aim_l[1] + aim_l[2] * aim_l[2]);
+            const float toward = al > 1e-4f ? (v[0] * aim_l[0] + v[1] * aim_l[1] + v[2] * aim_l[2]) / al : along;
+            // thrown by a swing toward the aim (within 60 deg); then a yank back steps John back on the rope for a moment
+            if (tm != 1 && s > g_swing_speed.load(std::memory_order_relaxed) && toward > 0.5f * s && now >= next_ok[h]) {
                 next_ok[h] = now + 800.0;
+                {
+                    std::lock_guard lock(g_mutex);
+                    if (g_lasso_aim.load(std::memory_order_relaxed) == 0) g_lasso_frozen_until = std::fmax(g_lasso_frozen_until, now + 400.0);
+                }
                 lasso_out_until = now + 15000.0;
                 controls::inject(0, 255, 0, 150);
                 g_lasso_throws.fetch_add(1, std::memory_order_relaxed);
@@ -641,6 +723,12 @@ void init() {
     g_throw = config::get_bool("Gestures", "Throw", false);
     g_melee = config::get_bool("Gestures", "Melee", false);
     g_lasso = config::get_bool("Gestures", "Lasso", false);
+    {  // 2026-10-12: [Gestures] LassoThrow, LassoAim
+        // the defaults (the user, after their headset round: "head aim and trigger work well"): the trigger, the head
+        const std::string t = config::get_string("Gestures", "LassoThrow", "trigger"), a = config::get_string("Gestures", "LassoAim", "head");
+        g_lasso_throw = t == "swing" ? 0 : t == "both" ? 2 : 1;
+        g_lasso_aim = a == "hand" ? 0 : a == "offhand" ? 2 : 1;
+    }
     g_swing_speed = config::get_float("Gestures", "SwingSpeed", 2.5f);
     g_throw_gain = config::get_float("Gestures", "ThrowGain", 2.0f);
     g_fist_lead_ms = config::get_int("Gestures", "FistLeadMs", 40);
@@ -683,6 +771,38 @@ void set_guard(bool on, bool save_it) {
     if (save_it) save("Guard", on);
 }
 bool lasso_by_hand() { return g_lasso.load(); }
+int lasso_throw() { return g_lasso_throw.load(); }
+void set_lasso_throw(int m, bool save_it) {
+    m = m < 0 || m > 2 ? 0 : m;
+    static const char* const kN[3] = {"swing", "trigger", "both"};
+    if (g_lasso_throw.exchange(m) != m) log::info("[gestures] the lasso thrown by: %s", kN[m]);
+    if (save_it) config::set("Gestures", "LassoThrow", kN[m]);
+}
+int lasso_aim() { return g_lasso_aim.load(); }
+void set_lasso_aim(int m, bool save_it) {
+    m = m < 0 || m > 2 ? 0 : m;
+    static const char* const kN[3] = {"hand", "head", "offhand"};
+    if (g_lasso_aim.exchange(m) != m) log::info("[gestures] the lasso aimed by: %s", kN[m]);
+    if (save_it) config::set("Gestures", "LassoAim", kN[m]);
+}
+bool lasso_aim_dir(const float* hand_dir, float d[3]) {
+    (void)hand_dir;
+    const int am = g_lasso_aim.load(std::memory_order_relaxed);
+    if (am == 1) return camera_lever::head_forward(d);
+    std::lock_guard lock(g_mutex);
+    if (am == 2) {
+        if (!g_lasso_off_ok) return false;
+        std::memcpy(d, g_lasso_off_dir, 12);
+    } else {
+        if (log::now_ms() >= g_lasso_frozen_until) return false;
+        std::memcpy(d, g_lasso_frozen, 12);
+    }
+    const float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (n < 1e-4f) return false;
+    for (int k = 0; k < 3; ++k) d[k] /= n;
+    return true;
+}
+bool lasso_trigger_owned() { return g_lasso_trig_owned.load(std::memory_order_relaxed); }
 void set_lasso_by_hand(bool on) {
     if (g_lasso.exchange(on) != on) log::info("[gestures] lasso by hand: %s", on ? "on" : "off");
     save("Lasso", on);
@@ -729,6 +849,8 @@ std::string command(const std::string& line) {
         if (w == "throw") set_throw_by_hand(on);
         if (w == "melee") set_melee_by_swing(on);
         if (w == "lasso") set_lasso_by_hand(on);
+        if (w == "lassothrow") set_lasso_throw(v == "trigger" ? 1 : v == "both" ? 2 : 0, false);  // the session only
+        if (w == "lassoaim") set_lasso_aim(v == "head" ? 1 : v == "offhand" ? 2 : 0, false);
         if (w == "gripthrow") aim::set_grip_throw(on, false);  // [Gestures] ThrowByGrip (the session only)
         if (w == "peak") g_peak_speed[0] = g_peak_speed[1] = 0;  // "peak reset"
         if (w == "strike") aim::set_melee_strike(static_cast<float>(std::atof(v.c_str())));  // the session only
@@ -766,7 +888,23 @@ std::string command(const std::string& line) {
                   static_cast<unsigned long long>(g_guard_frames.load()),
                   static_cast<unsigned long long>(g_guard_block_frames.load()), aim::player_melee_state(), gh[0][0], gh[0][1], gh[0][2], gh[1][0], gh[1][1],
                   gh[1][2], g_guard_triggers.load() ? 1 : 0);
-    return b + std::string(g) + aim::tip_command("", "");
+    char l[200];
+    {
+        static const char* const kT[3] = {"swing", "trigger", "both"};
+        static const char* const kA[3] = {"hand", "head", "offhand"};
+        float fz[3];
+        double until;
+        {
+            std::lock_guard lock(g_mutex);
+            std::memcpy(fz, g_lasso_frozen, sizeof(fz));
+            until = g_lasso_frozen_until;
+        }
+        std::snprintf(l, sizeof(l), " | lasso throw by %s, aim by %s: trigger throws %llu, aims frozen %llu (frozen now %d at (%.2f %.2f %.2f)), RT owned %d",
+                      kT[g_lasso_throw.load()], kA[g_lasso_aim.load()], static_cast<unsigned long long>(g_lasso_trigger_throws.load()),
+                      static_cast<unsigned long long>(g_lasso_freezes.load()), log::now_ms() < until ? 1 : 0, fz[0], fz[1], fz[2],
+                      g_lasso_trig_owned.load() ? 1 : 0);
+    }
+    return b + std::string(g) + l + aim::tip_command("", "");
 }
 
 namespace {

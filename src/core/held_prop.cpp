@@ -27,7 +27,9 @@ constexpr uint32_t kIsValid = 0xD7E7187B;         // IS_OBJECT_VALID(object)
 constexpr uint32_t kDestroy = 0x21144994;         // DESTROY_OBJECT(object)
 const char kLayoutName[] = "rdrvr_held_props";
 const char* const kObjName[kSlots] = {"rdrvr_round",     "rdrvr_second_gun", "rdrvr_holster_0", "rdrvr_holster_1",
-                                      "rdrvr_holster_2", "rdrvr_holster_3",  "rdrvr_model_0",   "rdrvr_model_1"};
+                                      "rdrvr_holster_2", "rdrvr_holster_3",  "rdrvr_model_0",   "rdrvr_model_1",
+                                      "rdrvr_census",    "rdrvr_belt_0",     "rdrvr_belt_1",    "rdrvr_belt_2",
+                                      "rdrvr_belt_3",    "rdrvr_belt_4",     "rdrvr_belt_5",    "rdrvr_belt_6"};
 
 uint64_t fbits(float f) {
     uint32_t u;
@@ -114,7 +116,7 @@ struct DiagSlot {
     float near_m[12] = {};   // its record's axes (rows 0-2 of the 4x4) and position
 };
 DiagSlot g_diag_slot[kSlots];  // under g_mutex
-constexpr int kMoves = 64;
+constexpr int kMoves = 128;  // run 11: 16 slots (the room check leaves 3 a slot for the creations)
 uint64_t g_moves[kMoves] = {};  // requests whose results are not needed, collected (an uncollected one stays in the map)
 int g_nmoves = 0;
 void later(uint64_t id) {
@@ -208,6 +210,13 @@ void note_root(const float* root) {
     g_root_ok = true;
 }
 
+bool last_put(int s, float pos[3]) {
+    if (s < 0 || s >= kSlots) return false;
+    std::lock_guard lock(g_mutex);
+    if (!g_slot[s].put_ok) return false;
+    std::memcpy(pos, g_slot[s].put, sizeof(g_slot[s].put));
+    return true;
+}
 bool last_drawn(int s, float pos[3], double* ms, float rel[3], uint64_t* gated) {
     if (s < 0 || s >= kSlots) return false;
     std::lock_guard lock(g_mutex);
@@ -581,10 +590,11 @@ std::string status() {
         o += b;
         const Slot& s = g_slot[i];
         if (s.drawable) {
-            std::snprintf(b, sizeof(b), " inst %llx far %llu other %llu relearned %llu near %llu mid %llu gated %llu (the last %.2f m off)", static_cast<unsigned long long>(s.inst),
+            std::snprintf(b, sizeof(b), " inst %llx far %llu other %llu relearned %llu near %llu mid %llu gated %llu (the last %.2f m off) drawable %llx", static_cast<unsigned long long>(s.inst),
                           static_cast<unsigned long long>(s.far), static_cast<unsigned long long>(s.other),
                           static_cast<unsigned long long>(s.relearned), static_cast<unsigned long long>(s.near_n),
-                          static_cast<unsigned long long>(s.mid_n), static_cast<unsigned long long>(s.gated), s.gated_d);
+                          static_cast<unsigned long long>(s.mid_n), static_cast<unsigned long long>(s.gated), s.gated_d,
+                          static_cast<unsigned long long>(s.drawable));
             o += b;
         }
     }

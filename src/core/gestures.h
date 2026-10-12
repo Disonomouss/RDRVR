@@ -16,6 +16,17 @@ void set_throw_by_hand(bool on);  // these setters also write the user ini
 bool melee_by_swing();  // [Gestures] Melee
 void set_melee_by_swing(bool on);
 bool lasso_by_hand();
+// 2026-10-12 (the user: "Lasso gesture controls are difficult ... hard to aim and trigger the throw"): [Gestures]
+// LassoThrow 0 swing (a fast swing toward the aim), 1 trigger (the lasso hand's trigger: the game's aim held a moment
+// for its lock, then the throw), 2 both; LassoAim 0 the lasso hand (frozen once a swing starts), 1 the head, 2 the
+// other hand's controller
+int lasso_throw();
+void set_lasso_throw(int m, bool save);
+int lasso_aim();
+void set_lasso_aim(int m, bool save);
+// The lasso's aim now (world, unit; aim.cpp's ray): false: the lasso hand's own pointing (not frozen)
+bool lasso_aim_dir(const float* hand_dir, float d[3]);
+bool lasso_trigger_owned();  // the lasso in hand, LassoThrow trigger or both: the raw RT held back (controls.cpp)
 bool guard();  // [Gestures] Guard (run 10 item 7): both fists before the face hold the game's block
 bool guard_up();  // GuardTriggers on and the guard held or its pose taken now (any thread): the right trigger's RT held back meanwhile
 void set_guard(bool on, bool save);  // [Gestures] Lasso

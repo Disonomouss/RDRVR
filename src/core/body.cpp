@@ -1374,6 +1374,29 @@ DrawModelGeometry_t o_draw_geom = nullptr;
 // (run 3: skip those, and draw a mixed geometry without its hidden triangles that span two cut targets: the sliver)
 std::atomic<int> g_geom_mode{0};
 thread_local int t_cull_show = 0;  // the player's draw in a show mode (1 forearms, 2 hands), around o_DrawVisEntity
+// run 11, [Holsters] PropBelt (below): the belt's geometries, the hidden ones
+struct BeltGeom {  // the belt's geometries as drawn (its first draw's): index, palette size, its first bones
+    bool seen = false;
+    uint16_t cnt = 0;
+    uint16_t bones[8] = {};
+};
+BeltGeom g_belt_geoms[16];  // written by the render thread only (a test's readout)
+thread_local bool t_belt_draw = false;  // around the belt's o_DrawVisEntity: hk_draw_geom's geometry skip
+std::atomic<uint32_t> g_belt_geom_hide{0};
+// run 11 item 3, [Holsters] PropBeltHideOwn: John's own belt and holster (his outfit's geometries chosen by their bones:
+// own_belt_scan) not drawn while the props belt is (first person only: the props belt is made there alone). The list
+// published by count (entries written before it); the render thread skips a geometry of the player's draw found in it
+struct OwnGeom {
+    std::atomic<uintptr_t> model{0};
+    std::atomic<uint32_t> gi{0};
+};
+OwnGeom g_own[32];
+std::atomic<int> g_own_n{0};
+std::atomic<bool> g_own_hide_on{true};
+std::atomic<bool> g_own_keep_holster{false};  // "skel ownbelt keepholster on|off" (item 5's choice b): his holster's geometry kept
+std::atomic<uint64_t> g_own_skipped{0}, g_own_scans{0};
+uint64_t g_belt_frame = 0;            // the render thread: the body frame of the props belt's last bent draw
+thread_local bool t_own_hide = false;  // around the player's o_DrawVisEntity while the own belt is hidden
 // the filter's entries (render thread): one per (geometry, index buffer, count, show mode, rig)
 // a filtered geometry's draw: its index runs (the kept triangles), drawn instead of its whole index range
 constexpr int kCullRuns = 64;  // at most this many index runs per geometry (one draw packet each), else it is drawn whole
@@ -1568,6 +1591,90 @@ std::string bone_name(uintptr_t data, int i) {  // data: the skeleton data (Rig:
     return s;
 }
 
+// run 11 item 3: John's own belt and holster among the player's drawables' LOD 0 geometries, by their bones' weights
+// (run 10 item 9b's scan: the default outfit's model 29 geometry 11, pelvis 65 % and pistol 31 %; models 17-21 the
+// belt's small pieces, pelvis 90-100 %; the throwables' pouch, thrower 43 %): a geometry whose weight is a fifth or
+// more on the belt's attachment bones (pistol, thrower, melee, or a name with "holster"), or nine tenths or more on the
+// pelvis with at most 600 vertices and no weight below the knees. Each outfit's own (its drawables, scanned anew when
+// they change). apply: published to the draw's list (g_own). The command and game threads (rd: VirtualQuery).
+std::string own_belt_scan(bool apply) {
+    uintptr_t rig_data = 0;
+    std::vector<uint8_t> attach(256, 0), pelvis(256, 0), legs(256, 0);
+    {
+        std::lock_guard lock(g_draw_mutex);
+        rig_data = g_rig.data;
+        for (int h = 0; h < 2; ++h)
+            for (int bi : g_rig.leg_set[h][1])
+                if (bi >= 0 && bi < 256) legs[bi] = 1;
+    }
+    if (!rig_data) return "own belt: no rig";
+    uintptr_t bones = 0;
+    uint16_t count = 0;
+    if (!rd(rig_data, &bones) || !rd(rig_data + 0x30, &count) || !bones) return "own belt: no skeleton";
+    for (int i = 0; i < count && i < 256; ++i) {
+        const std::string n = bone_name(rig_data, i);
+        attach[i] = n == "pistol" || n == "thrower" || n == "melee" || n.find("holster") != std::string::npos;
+        pelvis[i] = n == "pelvis";
+    }
+    struct Pick {
+        uintptr_t model;
+        uint32_t gi;
+    };
+    std::vector<Pick> picks;
+    std::string o = "own belt:";
+    char b[300];
+    for (const auto& slot_d : g_player_drawables) {
+        const uintptr_t d = slot_d.load();
+        if (!d) continue;
+        uintptr_t list = 0, models = 0;
+        uint16_t nm = 0;
+        if (!rd(d + 0x20 + 0x30, &list) || !list || !rd(list, &models) || !rd(list + 8, &nm)) continue;
+        for (int mi = 0; mi < nm && mi < 40; ++mi) {
+            uintptr_t m = 0, geoms = 0;
+            uint16_t ng = 0;
+            if (!rd(models + mi * 8, &m) || !m || !rd(m + 0x2e, &ng) || !rd(m + 8, &geoms) || !geoms) continue;
+            for (int gi = 0; gi < ng && gi < 48; ++gi) {
+                uintptr_t g = 0;
+                if (!rd(geoms + gi * 8, &g) || !g) continue;
+                GeomScan* gs = new GeomScan;
+                if (scan_geom_seh(g, gs)) {
+                    float total = 0, wa = 0, wp = 0, wl = 0;
+                    for (int bi = 0; bi < 256; ++bi) {
+                        total += gs->w[bi];
+                        if (attach[bi]) wa += gs->w[bi];
+                        if (pelvis[bi]) wp += gs->w[bi];
+                        if (legs[bi]) wl += gs->w[bi];
+                    }
+                    const float fa = total > 0 ? wa / total : 0, fp = total > 0 ? wp / total : 0, fl = total > 0 ? wl / total : 0;
+                    // (choice b: the holster itself, attachment and pelvis both, kept)
+                    const bool holster = fa >= 0.2f && fp >= 0.5f;
+                    const bool pick = (fa >= 0.2f || (fp >= 0.9f && gs->vcount <= 600 && fl == 0.0f)) &&
+                                      !(holster && g_own_keep_holster.load(std::memory_order_relaxed));
+                    if (pick && picks.size() < 32) picks.push_back({m, static_cast<uint32_t>(gi)});
+                    if (pick || fa > 0.0f || fp >= 0.5f) {
+                        std::snprintf(b, sizeof(b), " | d%llx m%d g%d v%u attach %.0f%% pelvis %.0f%% legs %.0f%%%s", static_cast<unsigned long long>(d & 0xffffff),
+                                      mi, gi, gs->vcount, 100 * fa, 100 * fp, 100 * fl, pick ? " HIDDEN" : "");
+                        o += b;
+                    }
+                }
+                delete gs;
+            }
+        }
+    }
+    if (apply) {
+        g_own_n.store(0, std::memory_order_release);
+        for (size_t i = 0; i < picks.size(); ++i) {
+            g_own[i].model.store(picks[i].model, std::memory_order_relaxed);
+            g_own[i].gi.store(picks[i].gi, std::memory_order_relaxed);
+        }
+        g_own_n.store(static_cast<int>(picks.size()), std::memory_order_release);
+        g_own_scans.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::snprintf(b, sizeof(b), " || %d hidden (scans %llu, skipped draws %llu)", static_cast<int>(picks.size()),
+                  static_cast<unsigned long long>(g_own_scans.load()), static_cast<unsigned long long>(g_own_skipped.load()));
+    return o + b;
+}
+
 bool build_cull_seh(uintptr_t geom, int show, bool collapse_root, CullEntry* e, uint8_t* cls_a, uint8_t* cls_b, uint8_t* vc, uint16_t* ix) {
     __try {
         uint8_t prim = 0, dbl = 0;
@@ -1748,6 +1855,31 @@ void hk_rec_draw(uintptr_t rec, uint32_t topo, uint32_t count) {
 }
 
 void hk_draw_geom(uintptr_t shader, uintptr_t model, uint64_t gi, uintptr_t mset, uint64_t a5, uint64_t a6) {
+    if (t_own_hide) {  // run 11 item 3: John's own belt (PropBeltHideOwn)
+        const int n = g_own_n.load(std::memory_order_acquire);
+        const uint32_t g = static_cast<uint32_t>(gi & 0xffffffffull);
+        for (int i = 0; i < n; ++i)
+            if (g_own[i].model.load(std::memory_order_relaxed) == model && g_own[i].gi.load(std::memory_order_relaxed) == g) {
+                g_own_skipped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+    }
+    if (t_belt_draw) {  // run 11, [Holsters] PropBelt: the belt's geometries (their palettes noted once; the hidden ones skipped)
+        const uint32_t g = static_cast<uint32_t>(gi & 0xffffffffull);
+        if (g < 16 && !g_belt_geoms[g].seen) {
+            uintptr_t geoms = 0, geom = 0, pal = 0;
+            uint16_t cnt = 0;
+            if (model && raw(model + 8, &geoms, sizeof(geoms)) && geoms && raw(geoms + g * 8ull, &geom, sizeof(geom)) && geom &&
+                raw(geom + 0x68, &pal, sizeof(pal)) && raw(geom + 0x72, &cnt, sizeof(cnt))) {
+                BeltGeom& bg = g_belt_geoms[g];
+                bg.cnt = cnt;
+                if (pal && cnt) raw(pal, bg.bones, static_cast<size_t>(cnt < 8 ? cnt : 8) * 2);
+                bg.seen = true;
+            }
+        }
+        if (g < 32 && (g_belt_geom_hide.load(std::memory_order_relaxed) >> g & 1)) return;
+        return o_draw_geom(shader, model, gi, mset, a5, a6);
+    }
     const int show = t_cull_show;
     if (!show) return o_draw_geom(shader, model, gi, mset, a5, a6);
     // raw() (SEH only), never rd(): rd's VirtualQuery is a system call, and four of them per player geometry draw cost
@@ -4475,6 +4607,139 @@ struct PropDiag {
     bool pinned;
 };
 PropDiag g_prop_diag[8];
+// run 11 item 2 ("skel skinprobe on|off|<file>"): the first skinned draw (more than eight matrices, not the player's
+// set) whose record lies within 0.6 m of the census prop's place: its matrix count, its record matrix, the set's world
+// offset and its matrices (the gun belt prop is drawn so: the draw hook's prop path takes one to eight). Off: one relaxed
+// load a draw
+std::atomic<bool> g_skin_probe{false};
+float g_skin_probe_at[3] = {};  // under g_draw_mutex: the centre (the census slot's last put)
+struct SkinProbe {
+    bool have = false;
+    int count = 0;
+    uintptr_t drawable = 0;
+    float rec[16] = {}, off[3] = {};
+    float m[64][12] = {};
+};
+SkinProbe g_skin_probe_got;  // under g_draw_mutex
+// run 11 item 2 ("skel skinpose <drawable>|off|clear|bone <i> <x y z> [scale]"): a skinned prop's bones set (its draws
+// of that drawable, more than eight matrices): bone i's skinning matrix the scale times the identity plus the
+// translation (the prop's own axes, metres), in the current and the previous set; restored after the draw. To find
+// which bones move which part of the gun belt (the strap's bones bent around the hips; a part's bones scaled to 0)
+std::atomic<uintptr_t> g_skin_pose{0};
+struct SkinBone {
+    bool on = false;
+    float m[12] = {};
+};
+SkinBone g_skin_bones[64];  // under g_draw_mutex
+std::atomic<uint64_t> g_skin_posed{0};
+
+// run 11 item 2: a strap's straight chain of joints (rest places p[i], along its -x from the buckle end, as the gun
+// belt's: "skel skinpose bind") bent round an ellipse in the prop's x-y plane, its semi-axes a (along x) and b (along
+// y), centred on the prop's origin: each joint at its arc length (-x, plus s0) along the ellipse from the front centre
+// (0, -dir b), turned about z to the ellipse's tangent there (the rest strap's -x along it). dir -1 mirrors the ring in
+// y (the strap's +y side outward or inward). drop: bones collapsed to their joint's place (bit i: bone i; the holster's
+// 5 for a plain belt), the strap after each closed up over its span and the whole stretched along itself to go round
+// (with 3 cm over at the buckle). The skinning matrices (rows: R S, then q - R S p) into out[0..count)
+void bend_strap(const float* p, int count, float a, float b, float dir, float s0, uint64_t drop, SkinBone* out) {
+    constexpr int kSteps = 1024;
+    float len[kSteps + 1];  // the arc length to each step's angle
+    auto pt = [&](float f, float* o) {
+        o[0] = -a * std::sin(f);
+        o[1] = -dir * b * std::cos(f);
+    };
+    len[0] = 0;
+    float prev[2], cur[2];
+    pt(0, prev);
+    for (int k = 1; k <= kSteps; ++k) {
+        pt(6.2831853f * k / kSteps, cur);
+        len[k] = len[k - 1] + std::hypot(cur[0] - prev[0], cur[1] - prev[1]);
+        prev[0] = cur[0];
+        prev[1] = cur[1];
+    }
+    const float per = len[kSteps];
+    count = count < 64 ? count : 64;
+    float along[64], removed = 0;  // each joint's length along the strap, the dropped spans before it taken out
+    for (int i = 0; i < count; ++i) {
+        along[i] = -p[i * 3] - removed;
+        if ((drop >> i & 1) && i + 1 < count) removed += std::fabs(p[(i + 1) * 3] - p[i * 3]);
+    }
+    constexpr float kTail = 0.053f;  // the strap past its last joint (the bounds' -1.041 against -0.988)
+    const float kept = (count ? -p[(count - 1) * 3] : 0.0f) + kTail - removed;
+    const float st = drop && kept > 0.1f ? std::fmax(1.0f, (per + 0.03f) / kept) : 1.0f;
+    for (int i = 0; i < count; ++i) {
+        float s = std::fmod(along[i] * st + s0, per);
+        if (s < 0) s += per;
+        int k = 0;
+        while (k < kSteps && len[k + 1] < s) ++k;
+        const float t = len[k + 1] > len[k] ? (s - len[k]) / (len[k + 1] - len[k]) : 0.0f;
+        const float f = 6.2831853f * (k + t) / kSteps;
+        float q[2];
+        pt(f, q);
+        float ux = -a * std::cos(f), uy = dir * b * std::sin(f);  // the tangent (d/df)
+        const float ul = std::hypot(ux, uy);
+        ux /= ul;
+        uy /= ul;
+        const float c = -ux, sn = -uy;  // R (about z) takes the rest strap's -x onto the tangent
+        const float* pp = p + i * 3;
+        const float sx = (drop >> i & 1) ? 0.0f : st, sy = (drop >> i & 1) ? 0.0f : 1.0f, sz = sy;
+        // M v = R S (v - p) + q: the columns R's times S, the translation q - R S p
+        const float m[12] = {c * sx, -sn * sy, 0, q[0] - (c * sx * pp[0] - sn * sy * pp[1]),
+                             sn * sx, c * sy,  0, q[1] - (sn * sx * pp[0] + c * sy * pp[1]),
+                             0,       0,       sz, pp[2] - sz * pp[2]};
+        std::memcpy(out[i].m, m, sizeof(m));
+        out[i].on = true;
+    }
+}
+
+// [Holsters] PropBelt (body.h PropBelt): the config, its generation, and the bent bones for the belt's drawable
+std::mutex g_belt_cfg_mutex;
+PropBelt g_belt_cfg;  // under g_belt_cfg_mutex
+std::atomic<bool> g_belt_on{false};
+std::atomic<uint32_t> g_belt_gen{1};
+struct BeltBones {  // under g_draw_mutex
+    uintptr_t drawable = 0;
+    uint32_t gen = 0;
+    int count = 0;
+    bool ok = false;
+    SkinBone bones[64];
+};
+BeltBones g_belt_bones;
+std::atomic<uint64_t> g_belt_draws{0}, g_belt_census{0}, g_belt_norec{0}, g_belt_nobind{0};
+
+// the gun belt's skeleton (its drawable's +0x18, laid out as the player's), each joint's rest place; SEH reads only
+// (the render thread). 0: none
+int strap_bind(uintptr_t dr, float* gt, int max) {
+    uintptr_t data = 0, bones = 0, locals = 0;
+    uint16_t count = 0;
+    if (!dr || !raw(dr + 0x18, &data, 8) || !data || !raw(data, &bones, 8) || !raw(data + 0x20, &locals, 8) || !raw(data + 0x30, &count, 2) ||
+        !bones || !locals || count == 0 || count > max)
+        return 0;
+    float L[64 * 16];
+    if (!raw(locals, L, static_cast<size_t>(count) * 0x40)) return 0;
+    float grot[64 * 9];
+    for (int i = 0; i < count; ++i) {
+        const float* l = L + i * 16;
+        float rl[9];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) rl[r * 3 + c] = l[c * 4 + r];
+        uintptr_t par = 0;
+        raw(bones + i * 0x110 + 0x20, &par, 8);
+        const int pi = par && par >= bones ? static_cast<int>((par - bones) / 0x110) : -1;
+        float* gr = grot + i * 9;
+        float* g = gt + i * 3;
+        if (pi < 0 || pi >= i) {
+            std::memcpy(gr, rl, sizeof(rl));
+            for (int k = 0; k < 3; ++k) g[k] = l[12 + k];
+        } else {
+            mul3(grot + pi * 9, rl, gr);
+            const float* pr = grot + pi * 9;
+            const float* pt = gt + pi * 3;
+            for (int k = 0; k < 3; ++k) g[k] = pr[k * 3] * l[12] + pr[k * 3 + 1] * l[13] + pr[k * 3 + 2] * l[14] + pt[k];
+        }
+    }
+    return count;
+}
+
 std::atomic<uint64_t> g_belt_twins{0};  // the game's holstered gun's draws hidden for a holster's shown gun (2026-10-12)
 int g_nprop_diag = 0;
 
@@ -4777,6 +5042,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
     float* rec_at = nullptr;
     float rec_save[32];  // the record's two matrices (+0x00 drawn, +0x40 last frame's), restored after the draw
     int cull_show = 0;   // the player's set in a show mode: its all-hidden geometries are skipped (HiddenGeometry)
+    bool own_hide = false;  // the player's set while the props belt is drawn: John's own belt skipped (PropBeltHideOwn)
     if (g_frame.valid && rec && rec[0x12]) {
         uintptr_t mset = reinterpret_cast<uintptr_t>(rec[0x12]);
         uint8_t count = 0;
@@ -4807,6 +5073,9 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     }
                 }
                 if (g_frame.show && o_draw_geom && g_geom_mode.load(std::memory_order_relaxed) != 0) cull_show = g_frame.show;
+                // run 11 item 3: the props belt drawn within the last three body frames: John's own not drawn
+                own_hide = o_draw_geom && g_own_hide_on.load(std::memory_order_relaxed) && g_belt_on.load(std::memory_order_relaxed) &&
+                           g_own_n.load(std::memory_order_relaxed) > 0 && g_body_frame - g_belt_frame <= 3;
                 std::lock_guard lock(g_draw_mutex);
                 save.assign(sm, sm + n);
                 set_at = sm;
@@ -4880,6 +5149,96 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     wind_y = wt;
                 std::memcpy(g_player_offset, reinterpret_cast<const void*>(mset + 0x10), sizeof(g_player_offset));
                 g_sets.fetch_add(1, std::memory_order_relaxed);
+            } else if (count > 8 && (g_skin_probe.load(std::memory_order_relaxed) || g_skin_pose.load(std::memory_order_relaxed) ||
+                                     g_belt_on.load(std::memory_order_relaxed))) {
+                // run 11: a skinned prop (more than eight matrices, not the player's set). [Holsters] PropBelt: the gun
+                // belt in held_prop's belt slot (or the census's), matched by its drawable as the rigid props: its record
+                // moved exactly onto the slot's pose (both halves, as the rigid path), the belt slot's strap bent round
+                // the hips (its joints' matrices, the current set's and the previous); restored after the draw
+                float* rr = reinterpret_cast<float*>(rec);
+                const uintptr_t dr = reinterpret_cast<uintptr_t>(rec[0x10]);
+                float bp[12];
+                int bs = -1;
+                const bool rec_m = (*reinterpret_cast<const uint32_t*>(reinterpret_cast<uintptr_t>(rec) + 0xac) & 0x10000) != 0;
+                const bool belt_hp = g_belt_on.load(std::memory_order_relaxed) && count <= 64 &&
+                                     held_prop::match(dr, draw_instance(rec), rr + 12, bp, &bs) &&
+                                     (bs == held_prop::kCensusSlot || (bs >= held_prop::kBeltSlot && bs < held_prop::kBeltSlot + held_prop::kBeltSlots));
+                std::lock_guard lock(g_draw_mutex);
+                if (belt_hp && !rec_m) g_belt_norec.fetch_add(1, std::memory_order_relaxed);
+                if (belt_hp && rec_m) {
+                    std::memcpy(rec_save, rr, sizeof(rec_save));
+                    rec_at = rr;
+                    float Rc[9];
+                    for (int i = 0; i < 3; ++i)
+                        for (int j = 0; j < 3; ++j) Rc[i * 3 + j] = rr[j * 4 + i];
+                    const Corr c = pose_corr(Rc, rr + 12, bp);
+                    for (int half = 0; half < 2; ++half) {
+                        float* rm = rr + half * 16;
+                        for (int ax = 0; ax < 3; ++ax) {
+                            float v[3] = {rm[ax * 4], rm[ax * 4 + 1], rm[ax * 4 + 2]};
+                            for (int k = 0; k < 3; ++k) rm[ax * 4 + k] = c.A[k * 3] * v[0] + c.A[k * 3 + 1] * v[1] + c.A[k * 3 + 2] * v[2];
+                        }
+                        float t[3] = {rm[12], rm[13], rm[14]};
+                        for (int k = 0; k < 3; ++k) rm[12 + k] = c.A[k * 3] * t[0] + c.A[k * 3 + 1] * t[1] + c.A[k * 3 + 2] * t[2] + c.a[k];
+                    }
+                    if (bs == held_prop::kCensusSlot) {
+                        g_belt_census.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        BeltBones& bb = g_belt_bones;
+                        const uint32_t gen = g_belt_gen.load(std::memory_order_relaxed);
+                        if (bb.drawable != dr || bb.gen != gen) {  // the bind read and the bend: once per drawable and config
+                            float gt[64 * 3];
+                            PropBelt cfg;
+                            {
+                                std::lock_guard cl(g_belt_cfg_mutex);
+                                cfg = g_belt_cfg;
+                            }
+                            bb = BeltBones{};
+                            bb.drawable = dr;
+                            bb.gen = gen;
+                            bb.count = strap_bind(dr, gt, 64);
+                            bb.ok = bb.count == count;
+                            if (bb.ok)
+                                // the front centre at the prop's +y (dir -1; holster.cpp's belt_pose: +y the body's front)
+                                bend_strap(gt, bb.count, cfg.a, cfg.b, cfg.flip ? 1.0f : -1.0f, cfg.s0, cfg.holster ? 0 : (1ull << 5), bb.bones);
+                        }
+                        if (bb.ok) {
+                            save.assign(sm, sm + n);
+                            set_at = sm;
+                            set_n = n;
+                            for (int i = 0; i < count; ++i) {
+                                std::memcpy(sm + i * 12, bb.bones[i].m, 48);
+                                std::memcpy(sm + (count + i) * 12, bb.bones[i].m, 48);
+                            }
+                            t_belt_draw = true;
+                            g_belt_frame = g_body_frame;
+                            g_belt_draws.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            g_belt_nobind.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                if (!belt_hp && dr && dr == g_skin_pose.load(std::memory_order_relaxed) && count <= 64) {
+                    save.assign(sm, sm + n);
+                    set_at = sm;
+                    set_n = n;
+                    for (int i = 0; i < count; ++i)
+                        if (g_skin_bones[i].on) {
+                            std::memcpy(sm + i * 12, g_skin_bones[i].m, 48);
+                            std::memcpy(sm + (count + i) * 12, g_skin_bones[i].m, 48);
+                        }
+                    g_skin_posed.fetch_add(1, std::memory_order_relaxed);
+                }
+                const float dx = rr[12] - g_skin_probe_at[0], dy = rr[13] - g_skin_probe_at[1], dz = rr[14] - g_skin_probe_at[2];
+                if (g_skin_probe.load(std::memory_order_relaxed) && !g_skin_probe_got.have && dx * dx + dy * dy + dz * dz < 0.6f * 0.6f) {
+                    SkinProbe& p = g_skin_probe_got;
+                    p.count = count;
+                    p.drawable = reinterpret_cast<uintptr_t>(rec[0x10]);
+                    std::memcpy(p.rec, rr, sizeof(p.rec));
+                    const int nm = count < 64 ? count : 64;
+                    p.have = raw(mset + 0x10, p.off, sizeof(p.off)) && raw(reinterpret_cast<uintptr_t>(sm), p.m, static_cast<size_t>(nm) * 48);
+                    if (p.have) g_skin_probe.store(false, std::memory_order_relaxed);  // one draw recorded: done
+                }
             } else if (count >= 1 && count <= 8) {
                 // a prop on the player (the hat, the guns, the knife, the rifle on the back): a small draw whose
                 // record matrix (+0x00, the drawn one; the translation at +0x30) is within 15 cm of one of the
@@ -4920,7 +5279,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 // ShowGuns off): the game's own holstered gun on John's belt, the same model as a holster's shown gun, was
                 // matched onto the shown gun's pose only within the 0.3 m gate; turning, it was 0.34-0.38 m from it
                 // (r16_backwards6) and drawn on its own at the game's holster. Hidden while a holster shows that model
-                bool belt_twin = false;
+                bool belt_twin = false, own_gun_gone = false, knife_gone = false;
                 const HeldSample* hsm = hi >= 0 ? &g_frame.held[hi] : si >= 0 ? &g_frame.sec[si] : nullptr;
                 const int held = hi >= 0 ? (g_frame.held[hi].left ? 0 : 1) : si >= 0 ? g_frame.sec[si].john : -1;
                 if (!hsm && g_frame.sec_any) {  // "skel dual": near the second gun, matched to none of its samples
@@ -4971,6 +5330,13 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 }
                 const uintptr_t drawable = reinterpret_cast<uintptr_t>(rec[0x10]);
                 belt_twin = best >= 0 && held_prop::shown_at_holster(drawable);  // before the draw lock (held_prop's own)
+                // run 11 item 5: John's own holster hidden for the props belt's, a gun shown at the right hip: the game's
+                // own holstered gun (on the pistol bone, at his hidden holster) not drawn either (cycle H2: at the thigh)
+                own_gun_gone = best >= 0 && !belt_twin && g_own_hide_on.load(std::memory_order_relaxed) &&
+                                          g_belt_on.load(std::memory_order_relaxed) && g_body_frame - g_belt_frame <= 3 &&
+                                          held_prop::shown(held_prop::kHolsterSlot);
+                // run 11 item 6, [Holsters] ShowKnife: the knife shown at its holster: the game's own on the melee bone not drawn
+                knife_gone = best >= 0 && !belt_twin && holster::show_knife() && held_prop::shown(held_prop::kBeltSlot + 1);
                 {
                     std::lock_guard lock(g_draw_mutex);
                     const bool head_5cm = g_frame.held_fix;  // [Body] HeldPropFix: also this rule
@@ -5045,6 +5411,8 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     std::memcpy(rec_save, rc, sizeof(rec_save));
                     rec_at = rc;
                     const bool part_hidden = g_frame.show && !(g_frame.show == 1 ? g_rig.in_elbow[best] : g_rig.in_wrist[best]);
+                    if (own_gun_gone && best == g_rig.holster[0]) belt_twin = true;
+                    if (knife_gone && best == g_rig.holster[3]) belt_twin = true;
                     if (belt_twin) g_belt_twins.fetch_add(1, std::memory_order_relaxed);
                     if ((g_frame.hide && g_rig.in_head[best]) || part_hidden || belt_twin) {
                         for (size_t j = 0; j < static_cast<size_t>(count) * 2; ++j) shrink_axes(sm + j * 12);
@@ -5406,7 +5774,10 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
     WindHold wind;
     if (wind_y >= 0.0f) wind_hold(&wind, wind_y);
     t_cull_show = cull_show;
+    t_own_hide = own_hide;
     o_DrawVisEntity(ctx, rec, pass, bucket, a5, a6, a7);
+    t_belt_draw = false;
+    t_own_hide = false;
     if (cj.kind && dual::copy_model() >= 0 && held_prop::shown(1)) {  // run 5: the copy's model as a prop is drawn there instead
         cj.kind = 0;
         g_copy_own_skips.fetch_add(1, std::memory_order_relaxed);
@@ -5471,6 +5842,38 @@ void dump_bones(const std::string& file, std::string* out) {
 }
 
 }  // namespace
+
+void set_prop_belt(const PropBelt& c) {
+    {
+        std::lock_guard lock(g_belt_cfg_mutex);
+        g_belt_cfg = c;
+    }
+    g_belt_geom_hide.store(c.hide_geoms, std::memory_order_relaxed);
+    g_own_hide_on.store(c.hide_own, std::memory_order_relaxed);
+    g_belt_gen.fetch_add(1, std::memory_order_relaxed);  // the bones bent again at the next draw
+    g_belt_on.store(c.on, std::memory_order_relaxed);
+}
+
+bool prop_belt_bone(int i, float m[12]) {
+    std::lock_guard lock(g_draw_mutex);
+    const BeltBones& bb = g_belt_bones;
+    if (!bb.ok || i < 0 || i >= bb.count || bb.gen != g_belt_gen.load(std::memory_order_relaxed)) return false;
+    std::memcpy(m, bb.bones[i].m, 48);
+    return true;
+}
+
+void own_belt_refresh() {
+    static uintptr_t last = 0;
+    static double last_ms = -1e9;
+    uintptr_t fp = 0;
+    for (const auto& d : g_player_drawables) fp = fp * 31 + d.load(std::memory_order_relaxed);
+    const double now = log::now_ms();
+    if (!fp || (fp == last && g_own_scans.load(std::memory_order_relaxed) > 0) || now - last_ms < 1000.0) return;
+    last = fp;
+    last_ms = now;
+    const std::string r = own_belt_scan(true);
+    log::info("[body] John's own belt for the props belt: %s", r.c_str());
+}
 
 bool hide_enabled() {
     std::lock_guard lock(g_cfg_mutex);
@@ -7256,6 +7659,235 @@ std::string command(const std::string& line) {
                                std::sqrt(mx * mx + my * my + mz * mz));
         }
         return b;
+    }
+    if (sub == "ownbelt") {  // skel ownbelt [scan|list|on|off]: John's own belt hidden with the props belt (run 11 item 3)
+        std::string x;
+        in >> x;
+        if (x == "on" || x == "off") g_own_hide_on = x == "on";
+        if (x == "keepholster") {
+            std::string y;
+            in >> y;
+            g_own_keep_holster = y == "on";
+            return own_belt_scan(true);
+        }
+        if (x == "scan") return own_belt_scan(true);
+        if (x == "list") return own_belt_scan(false);
+        char b[160];
+        std::snprintf(b, sizeof(b), "ownbelt hide %d, %d geometries listed, scans %llu, skipped draws %llu", g_own_hide_on.load() ? 1 : 0, g_own_n.load(),
+                      static_cast<unsigned long long>(g_own_scans.load()), static_cast<unsigned long long>(g_own_skipped.load()));
+        return b;
+    }
+    if (sub == "propbelt") {  // skel propbelt [scan]: [Holsters] PropBelt's draws (run 11 item 2)
+        std::string x;
+        in >> x;
+        if (x == "scan") {  // its drawable's LOD 0 geometries in the model's rest space: the box, the centroid, the heaviest bones
+            uintptr_t d = 0;
+            {
+                std::lock_guard lock(g_draw_mutex);
+                d = g_belt_bones.drawable;
+            }
+            uintptr_t list = 0, models = 0;
+            uint16_t nm = 0;
+            if (!d || !rd(d + 0x20 + 0x30, &list) || !list || !rd(list, &models) || !rd(list + 8, &nm)) return "propbelt scan: no drawable yet";
+            std::string o = "propbelt scan: " + std::to_string(nm) + " models";
+            char b[260];
+            for (int mi = 0; mi < nm && mi < 8; ++mi) {
+                uintptr_t m = 0, geoms = 0;
+                uint16_t ng = 0;
+                if (!rd(models + mi * 8, &m) || !m || !rd(m + 0x2e, &ng) || !rd(m + 8, &geoms) || !geoms) continue;
+                for (int gi = 0; gi < ng && gi < 8; ++gi) {
+                    uintptr_t g = 0;
+                    if (!rd(geoms + gi * 8, &g) || !g) continue;
+                    GeomScan* gs = new GeomScan;
+                    if (scan_geom_seh(g, gs)) {
+                        int top = 0;
+                        float total = 0;
+                        for (int bi = 0; bi < 256; ++bi) {
+                            total += gs->w[bi];
+                            if (gs->w[bi] > gs->w[top]) top = bi;
+                        }
+                        std::snprintf(b, sizeof(b), " | m%d g%d v%u box (%.3f %.3f %.3f)..(%.3f %.3f %.3f) c (%.3f %.3f %.3f) bone %d %.0f%%", mi, gi, gs->vcount,
+                                      gs->lo[0], gs->lo[1], gs->lo[2], gs->hi[0], gs->hi[1], gs->hi[2], gs->c[0], gs->c[1], gs->c[2], top,
+                                      total > 0 ? 100 * gs->w[top] / total : 0.0f);
+                    } else {
+                        std::snprintf(b, sizeof(b), " | m%d g%d unread (%d)", mi, gi, gs->why);
+                    }
+                    o += b;
+                    delete gs;
+                }
+            }
+            return o;
+        }
+        PropBelt c;
+        {
+            std::lock_guard cl(g_belt_cfg_mutex);
+            c = g_belt_cfg;
+        }
+        std::lock_guard lock(g_draw_mutex);
+        char b[600];
+        int o = std::snprintf(b, sizeof(b),
+                              "propbelt %s a %.3f b %.3f s0 %.3f holster %d flip %d hide %x | draws bent %llu census %llu no record matrix %llu no bind %llu | "
+                              "drawable %llx bones %d ok %d | geoms:",
+                              c.on ? "on" : "off", c.a, c.b, c.s0, c.holster ? 1 : 0, c.flip ? 1 : 0, c.hide_geoms,
+                              static_cast<unsigned long long>(g_belt_draws.load()), static_cast<unsigned long long>(g_belt_census.load()),
+                              static_cast<unsigned long long>(g_belt_norec.load()), static_cast<unsigned long long>(g_belt_nobind.load()),
+                              static_cast<unsigned long long>(g_belt_bones.drawable), g_belt_bones.count, g_belt_bones.ok ? 1 : 0);
+        for (int g = 0; g < 16 && o > 0 && o < static_cast<int>(sizeof(b)) - 40; ++g)
+            if (g_belt_geoms[g].seen) {
+                o += std::snprintf(b + o, sizeof(b) - o, " %d(%u:", g, g_belt_geoms[g].cnt);
+                for (int k = 0; k < g_belt_geoms[g].cnt && k < 8 && o < static_cast<int>(sizeof(b)) - 8; ++k)
+                    o += std::snprintf(b + o, sizeof(b) - o, "%s%u", k ? "," : "", g_belt_geoms[g].bones[k]);
+                o += std::snprintf(b + o, sizeof(b) - o, ")");
+            }
+        return b;
+    }
+    if (sub == "skinpose") {  // skel skinpose <drawable hex>|off|clear|bone <i> <x y z> [scale]: run 11 item 2 (see g_skin_pose)
+        std::string v;
+        in >> v;
+        std::lock_guard lock(g_draw_mutex);
+        if (v == "off") {
+            g_skin_pose.store(0);
+            return "skinpose off";
+        }
+        if (v == "clear") {
+            for (auto& b : g_skin_bones) b = SkinBone{};
+            return "skinpose cleared";
+        }
+        if (v == "bind" || v == "belt" || v == "squash") {
+            // bind: the posed drawable's skeleton (its +0x18, laid out as the player's): each bone's name, parent, rest place.
+            // belt <a> <b> <dir> <s0>: every bone bent round the ellipse (bend_strap). squash <i> <sx sy sz>: bone i's
+            // matrix (as set) scaled about its own rest joint, in the prop's axes (the holster's bone flattened)
+            const uintptr_t dr = g_skin_pose.load();
+            uintptr_t data = 0, bones = 0, locals = 0;
+            uint16_t count = 0;
+            if (!dr || !rd(dr + 0x18, &data) || !data || !rd(data, &bones) || !rd(data + 0x20, &locals) || !rd(data + 0x30, &count) || !bones ||
+                !locals || count == 0 || count > 64 || !readable(locals, static_cast<size_t>(count) * 0x40))
+                return "skinpose " + v + ": no skeleton";
+            std::vector<float> grot(static_cast<size_t>(count) * 9), gt(static_cast<size_t>(count) * 3);
+            std::string r = "skinpose bind: " + std::to_string(count) + " bones";
+            const float* L = reinterpret_cast<const float*>(locals);
+            for (int i = 0; i < count; ++i) {  // as build_rig: the locals chained down from the root
+                const float* l = L + i * 16;
+                float rl[9];
+                for (int a = 0; a < 3; ++a)
+                    for (int c = 0; c < 3; ++c) rl[a * 3 + c] = l[c * 4 + a];
+                uintptr_t par = 0, name = 0;
+                rd(bones + i * 0x110 + 0x20, &par);
+                rd(bones + i * 0x110, &name);
+                const int pi = par && par >= bones ? static_cast<int>((par - bones) / 0x110) : -1;
+                float* gr = &grot[static_cast<size_t>(i) * 9];
+                float* g = &gt[static_cast<size_t>(i) * 3];
+                if (pi < 0 || pi >= i) {
+                    std::memcpy(gr, rl, sizeof(rl));
+                    for (int k = 0; k < 3; ++k) g[k] = l[12 + k];
+                } else {
+                    const float* pr = &grot[static_cast<size_t>(pi) * 9];
+                    const float* pt = &gt[static_cast<size_t>(pi) * 3];
+                    mul3(pr, rl, gr);
+                    for (int k = 0; k < 3; ++k) g[k] = pr[k * 3] * l[12] + pr[k * 3 + 1] * l[13] + pr[k * 3 + 2] * l[14] + pt[k];
+                }
+                char s[40] = {};
+                for (int k = 0; k < 39 && name; ++k)
+                    if (!rd(name + k, &s[k]) || !s[k]) break;
+                char b[200];
+                std::snprintf(b, sizeof(b), "\n  [%d] %s parent %d at (%.4f %.4f %.4f) local (%.4f %.4f %.4f)", i, s, pi, g[0], g[1], g[2], l[12], l[13], l[14]);
+                r += b;
+            }
+            if (v == "belt") {
+                float a = 0.18f, bb = 0.13f, dir = 1.0f, s0 = 0.0f;
+                in >> a >> bb >> dir >> s0;
+                if (!(a > 0.02f && a < 1.0f && bb > 0.02f && bb < 1.0f)) return "skinpose belt: a and b 0.02-1 m";
+                bend_strap(gt.data(), count, a, bb, dir < 0 ? -1.0f : 1.0f, s0, 0, g_skin_bones);
+                char o[160];
+                std::snprintf(o, sizeof(o), "skinpose belt: %d bones round a %.3f x %.3f m ellipse, dir %+.0f, from %.3f m", static_cast<int>(count), a, bb,
+                              dir < 0 ? -1.0f : 1.0f, s0);
+                return o;
+            }
+            if (v == "squash") {
+                int i = -1;
+                float sx = 1, sy = 1, sz = 1;
+                in >> i >> sx >> sy >> sz;
+                if (i < 0 || i >= count) return "skinpose squash: bone 0-" + std::to_string(count - 1);
+                SkinBone& sb = g_skin_bones[i];
+                if (!sb.on) {  // the rest pose: the identity
+                    const float id[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+                    std::memcpy(sb.m, id, sizeof(id));
+                    sb.on = true;
+                }
+                // M'(v) = M(p + S (v - p)): the columns scaled, the translation plus M's 3x3 times (p - S p)
+                const float S[3] = {sx, sy, sz}, * p = &gt[static_cast<size_t>(i) * 3];
+                const float d[3] = {p[0] - sx * p[0], p[1] - sy * p[1], p[2] - sz * p[2]};
+                for (int rr = 0; rr < 3; ++rr) {
+                    float* row = sb.m + rr * 4;
+                    row[3] += row[0] * d[0] + row[1] * d[1] + row[2] * d[2];
+                    for (int c = 0; c < 3; ++c) row[c] *= S[c];
+                }
+                char o[120];
+                std::snprintf(o, sizeof(o), "skinpose squash: bone %d scaled (%.2f %.2f %.2f) about (%.3f %.3f %.3f)", i, sx, sy, sz, p[0], p[1], p[2]);
+                return o;
+            }
+            return r;
+        }
+        if (v == "bone") {
+            int i = -1;
+            float x = 0, y = 0, z = 0, sc = 1.0f;
+            in >> i >> x >> y >> z;
+            if (!(in >> sc)) sc = 1.0f;
+            if (i < 0 || i >= 64) return "skinpose: bone 0-63";
+            SkinBone& b = g_skin_bones[i];
+            const float m[12] = {sc, 0, 0, x, 0, sc, 0, y, 0, 0, sc, z};
+            std::memcpy(b.m, m, sizeof(m));
+            b.on = true;
+            char o[120];
+            std::snprintf(o, sizeof(o), "skinpose bone %d at (%.3f %.3f %.3f) scale %.3f", i, x, y, z, sc);
+            return o;
+        }
+        if (!v.empty()) {
+            g_skin_pose.store(static_cast<uintptr_t>(std::strtoull(v.c_str(), nullptr, 16)));
+        }
+        char o[120];
+        std::snprintf(o, sizeof(o), "skinpose drawable %llx, draws posed %llu", static_cast<unsigned long long>(g_skin_pose.load()),
+                      static_cast<unsigned long long>(g_skin_posed.load()));
+        return o;
+    }
+    if (sub == "skinprobe") {  // skel skinprobe on|off|<file>: run 11 item 2 (see g_skin_probe)
+        std::string v;
+        in >> v;
+        if (v == "on") {
+            float at[3];
+            if (!held_prop::last_put(held_prop::kCensusSlot, at)) return "skinprobe: no census prop placed (props show first)";
+            std::lock_guard lock(g_draw_mutex);
+            std::memcpy(g_skin_probe_at, at, sizeof(at));
+            g_skin_probe_got = SkinProbe{};
+            g_skin_probe.store(true);
+            return "skinprobe armed";
+        }
+        if (v == "off") g_skin_probe.store(false);
+        std::lock_guard lock(g_draw_mutex);
+        const SkinProbe& p = g_skin_probe_got;
+        if (!p.have) return std::string("skinprobe: nothing recorded (armed ") + (g_skin_probe.load() ? "1)" : "0)");
+        std::string r;
+        char b[260];
+        std::snprintf(b, sizeof(b), "skinprobe: count %d drawable %llx | record x (%.3f %.3f %.3f) y (%.3f %.3f %.3f) z (%.3f %.3f %.3f) at (%.3f %.3f %.3f) | offset (%.3f %.3f %.3f)",
+                      p.count, static_cast<unsigned long long>(p.drawable), p.rec[0], p.rec[1], p.rec[2], p.rec[4], p.rec[5], p.rec[6], p.rec[8],
+                      p.rec[9], p.rec[10], p.rec[12], p.rec[13], p.rec[14], p.off[0], p.off[1], p.off[2]);
+        r = b;
+        const int nm = p.count < 64 ? p.count : 64;
+        for (int i = 0; i < nm; ++i) {  // each matrix: its world place (the set's place plus the offset) and its x and z axes
+            const float* m = p.m[i];
+            std::snprintf(b, sizeof(b), "\n  [%d] at (%.3f %.3f %.3f) x (%.3f %.3f %.3f) z (%.3f %.3f %.3f)", i, m[3] + p.off[0], m[7] + p.off[1],
+                          m[11] + p.off[2], m[0], m[4], m[8], m[2], m[6], m[10]);
+            r += b;
+        }
+        if (v.size() > 3 && v != "off") {
+            FILE* f = nullptr;
+            if (fopen_s(&f, v.c_str(), "w") == 0 && f) {
+                std::fputs(r.c_str(), f);
+                std::fclose(f);
+                return "written to " + v;
+            }
+        }
+        return r;
     }
     if (sub == "props") {
         // skel props [clear]: the first props matched since the last clear: bone, count, record flags, the set's

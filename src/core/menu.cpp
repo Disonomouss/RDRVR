@@ -1614,9 +1614,31 @@ void page_gestures() {
         gestures::set_melee_by_swing(me);
     bool la = gestures::lasso_by_hand();
     if (check("Lasso by hand", &la,
-              "With the lasso in hand, a forward swing of the gun hand faster than the swing speed throws it; a yank back steps "
+              "With the lasso in hand, its trigger (or a swing toward your aim, as chosen below) throws it; a yank back steps "
               "John back on the rope to pull."))
         gestures::set_lasso_by_hand(la);
+    sub_begin(la);
+    {  // 2026-10-12: [Gestures] LassoThrow, LassoAim
+        int lt = gestures::lasso_throw(), lt0 = lt;
+        ImGui::TextUnformatted("Thrown by:");
+        ImGui::SameLine();
+        if (radio("Trigger", lt == 1, "The lasso hand's trigger: the game's aim held a moment for its lock, then the throw.")) lt = 1;
+        ImGui::SameLine();
+        if (radio("Swing", lt == 0, "A fast swing toward where you aim (overhand, sidearm or straight).")) lt = 0;
+        ImGui::SameLine();
+        if (radio("Either", lt == 2, "A swing or the trigger.")) lt = 2;
+        if (lt != lt0) gestures::set_lasso_throw(lt, true);
+        int am = gestures::lasso_aim(), am0 = am;
+        ImGui::TextUnformatted("Aimed by:");
+        ImGui::SameLine();
+        if (radio("Head", am == 1, "Where you look.")) am = 1;
+        ImGui::SameLine();
+        if (radio("Lasso hand", am == 0, "Where the lasso hand points; held still once a swing starts, so the swing does not turn it.")) am = 0;
+        ImGui::SameLine();
+        if (radio("Other hand", am == 2, "Where your other controller points (point at the target, throw with the lasso hand).")) am = 2;
+        if (am != am0) gestures::set_lasso_aim(am, true);
+    }
+    sub_end();
     sub_begin(me || la);
     if (nudge1("Swing speed", &sw, 0.25f, 1.0f, 8.0f, "%.2f m/s", "How fast a swing must be for a punch or the lasso (a press 0.25 m/s)."))
         gestures::set_tuning(sw, tg, true);
@@ -1743,6 +1765,14 @@ void page_screen() {
         save_float("Screen", "Cutscene3DSeparation", "%.2f", g_set.separation);
     }
     sub_end();
+    bool fpm = camera_lever::first_person_moments();  // 2026-10-12: [Body] FirstPersonMoments
+    if (check("Short scenes in first person", &fpm,
+              "A script's short scenes that show John in third person (a mission's quick shots, looting and skinning, doors, chests, "
+              "beds): the view stays at John's eyes; the scene plays on as the game made it. Not the full cutscenes above. Needs "
+              "first person (the camera anchor)."))  {
+        camera_lever::set_first_person_moments(fpm);
+        config::set("Body", "FirstPersonMoments", fpm ? "1" : "0");
+    }
 }
 
 void page_debug() {

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -165,6 +166,11 @@ std::string execute(const std::vector<std::string>& t) {
         int handle = std::atoi(actor.c_str() + actor.find("int ") + 4);
         return std::string("actor ") + std::to_string(handle) + " " +
                run_native(0x99BD9D6Fu, {static_cast<uint64_t>(static_cast<uint32_t>(handle)), 0}, 2);  // GET_POSITION
+    }
+    if (c == "cam" && t.size() >= 2 && t[1] == "fp") {  // cam fp [on|off|mark|check]: [Body] FirstPersonMoments (the session)
+        if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) camera_lever::set_first_person_moments(t[2] == "on");
+        if (t.size() >= 3 && (t[2] == "mark" || t[2] == "check")) return camera_lever::fp_check(t[2] == "mark");
+        return camera_lever::fp_status();
     }
     if (c == "cam" && t.size() >= 5 && t[1] == "moveramp") {  // cam moveramp dx dy dz: the slide, metres a frame (0 0 0 stops)
         camera_lever::set_move_ramp(std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr));
@@ -476,6 +482,47 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 3 && t[1] == "gate") held_prop::set_gate(std::strtof(t[2].c_str(), nullptr));  // run 10 item 2 (the session)
         if (t.size() >= 3 && t[1] == "puts") held_prop::set_puts(std::atoi(t[2].c_str()));  // 2026-10-12 (the session)
         if (t.size() >= 3 && t[1] == "twins") held_prop::set_twins(t[2] == "on");  // 2026-10-12 (the session)
+        if (t.size() >= 3 && t[1] == "show") {
+            // run 11 item 1 (the props census): props show <fragment|off> [distance m] [height m] [spin deg] [tilt deg]: the
+            // fragment made in the census slot before John (his heading, level), its axes X right, Y forward, Z up turned
+            // by the spin about up and the tilt about right; the object's own angles set too (a prop whose draws are not
+            // matched is drawn where it is placed, in its own turn)
+            // the name kept in one of eight fixed buffers, used in turn: held_prop keeps the pointer (a static string), so
+            // an older name stays valid while the game thread may still read it
+            static char names[8][64];
+            static int next_name = 0;
+            if (t[2] == "off") {
+                held_prop::want(held_prop::kCensusSlot, nullptr, nullptr);
+                held_prop::want_angles(held_prop::kCensusSlot, nullptr);
+                return "census off | " + held_prop::status();
+            }
+            RdrvrActorState st{};
+            if (!api::actor_state(&st)) return "props show: no actor";
+            char* frag = names[next_name];
+            next_name = (next_name + 1) % 8;
+            std::snprintf(frag, sizeof(names[0]), "%s", t[2].c_str());
+            const float dist = t.size() >= 4 ? std::strtof(t[3].c_str(), nullptr) : 1.2f;
+            const float up_m = t.size() >= 5 ? std::strtof(t[4].c_str(), nullptr) : 1.1f;
+            const float spin = t.size() >= 6 ? std::strtof(t[5].c_str(), nullptr) : 0.0f;
+            const float tilt = t.size() >= 7 ? std::strtof(t[6].c_str(), nullptr) : 0.0f;
+            const float h = st.heading_deg * 0.0174532925f, h2 = (st.heading_deg + spin) * 0.0174532925f, tr = tilt * 0.0174532925f;
+            const float f[3] = {-std::sin(h), 0.0f, -std::cos(h)};
+            const float r2[3] = {std::cos(h2), 0.0f, -std::sin(h2)}, f2[3] = {-std::sin(h2), 0.0f, -std::cos(h2)};
+            float pz[12];
+            for (int k = 0; k < 3; ++k) {
+                const float upk = k == 1 ? 1.0f : 0.0f;
+                pz[k] = r2[k];
+                pz[3 + k] = f2[k] * std::cos(tr) + upk * std::sin(tr);
+                pz[6 + k] = upk * std::cos(tr) - f2[k] * std::sin(tr);
+                pz[9 + k] = st.pos[k] + f[k] * dist + upk * up_m;
+            }
+            const float ang[3] = {tilt, st.heading_deg + spin, 0.0f};
+            held_prop::want(held_prop::kCensusSlot, frag, pz);
+            held_prop::want_angles(held_prop::kCensusSlot, ang);
+            char b[200];
+            std::snprintf(b, sizeof(b), "census %s at (%.2f %.2f %.2f), spin %.0f tilt %.0f | ", frag, pz[9], pz[10], pz[11], spin, tilt);
+            return b + held_prop::status();
+        }
         return held_prop::status();
     }
     if (c == "dual") {  // dual [on|off] [begin <slot> [left|right]] [fire] [end]: the second gun (DualWield)
@@ -761,6 +808,28 @@ std::string execute(const std::vector<std::string>& t) {
         char b[32];
         for (int i = 0; i < n; ++i) {
             std::snprintf(b, sizeof(b), "%s%.4f", i ? " " : "", reinterpret_cast<const float*>(p2)[i]);
+            out += b;
+        }
+        return out;
+    }
+    if (c == "peekabs" && t.size() >= 2) {
+        // peekabs <hex address> [n] [q]: n (<= 128) floats (q: 64-bit words in hex) at an absolute address, read only after
+        // VirtualQuery shows them committed and readable (run 11 item 1: a census prop's drawable, for its bounds)
+        uintptr_t a = static_cast<uintptr_t>(std::strtoull(t[1].c_str(), nullptr, 16));
+        int n = t.size() >= 3 ? std::atoi(t[2].c_str()) : 16;
+        if (n < 1 || n > 128) n = 16;
+        const bool q = t.size() >= 4 && t[3] == "q";
+        const size_t bytes = static_cast<size_t>(n) * (q ? 8 : 4);
+        MEMORY_BASIC_INFORMATION mi{};
+        if (!a || !VirtualQuery(reinterpret_cast<void*>(a), &mi, sizeof(mi)) || mi.State != MEM_COMMIT ||
+            !(mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) || (mi.Protect & PAGE_GUARD) ||
+            a + bytes > reinterpret_cast<uintptr_t>(mi.BaseAddress) + mi.RegionSize)
+            return "ERROR not readable";
+        std::string out;
+        char b[32];
+        for (int i = 0; i < n; ++i) {
+            if (q) std::snprintf(b, sizeof(b), "%s%llx", i ? " " : "", static_cast<unsigned long long>(reinterpret_cast<const uint64_t*>(a)[i]));
+            else std::snprintf(b, sizeof(b), "%s%.4g", i ? " " : "", reinterpret_cast<const float*>(a)[i]);
             out += b;
         }
         return out;

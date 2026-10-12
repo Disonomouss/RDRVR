@@ -333,6 +333,7 @@ void on_frame_end(uint64_t) {
 void init() {
     g_anchor = config::get_bool("Body", "CameraAnchor", false);
     g_keep_cam = config::get_bool("Body", "KeepAnchorCamera", true);
+    camera_lever::set_first_person_moments(config::get_bool("Body", "FirstPersonMoments", true));  // 2026-10-12: on (the user's)
     g_height = config::get_float("Body", "EyeHeight", 0.0f);  // 0 = measured from the head bone
     g_auto_height = g_height <= 0;
     if (g_auto_height) g_height = 1.60f;  // until measured

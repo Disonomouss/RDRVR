@@ -490,6 +490,8 @@ bool pad(xinput::PadState* out) {
     // [Gestures] GuardTriggers (2026-10-12): both triggers held with the fists before the face are the guard's, which
     // holds the game's block (LT, RB): RT, the fists' attack, would break it (cycle G1: no block with it held)
     if (gestures::guard_up()) rt = 0.0f;
+    // [Gestures] LassoThrow trigger or both (2026-10-12): the lasso's trigger throw sends the game's aim first, then RT
+    if (gestures::lasso_trigger_owned()) rt = 0.0f;
     const bool on_map = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now() && map_open();  // only in a paused menu
     if (on_map) g_map_frames.fetch_add(1, std::memory_order_relaxed);
     const bool menu_mode = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now() && !on_map;

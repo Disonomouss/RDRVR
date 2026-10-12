@@ -35,6 +35,16 @@ void set_xr_pose(bool on);
 // Round 1 check 12: with the XR pose on in a double frame, the visibility build culls for the head (the centre eye,
 // both eyes' FOV + 4 degrees) instead of the game camera. [XR] HeadCover=1; "cover head on|off".
 void set_head_cover(bool on);
+// [Body] FirstPersonMoments (2026-10-12, the user: the "mini cutscenes in which John is seen in third person": a
+// mission's short shots, looting and skinning, doors, chests and beds): in gameplay stereo with the camera anchor on,
+// while a script's camera holds the channel (the anchor's left current for the script), the eyes, the culling and the
+// shadows are drawn from the anchor's camera at John's head (its last matrix turned by the view's heading since, at the
+// place the plugin put it this tick) instead of the script's. The script keeps its camera. On by default (the user's
+// choice after their headset round: skinning stayed first person)
+void set_first_person_moments(bool on);
+bool first_person_moments();
+std::string fp_status();  // "cam fp": on, frames drawn so, the reference's check against the real camera
+std::string fp_check(bool mark);  // "cam fp mark|check" (a test)
 // Round 2: with the XR pose on in a double frame, the distant tree billboards face the centre eye, level (head yaw
 // only) instead of the game camera. [XR] LevelBillboards=1; "billboards level|game".
 void set_level_billboards(bool on);
@@ -63,6 +73,9 @@ void set_xr_head_position(bool on, float separation);
 // G-B: the head's yaw relative to the recentred forward (degrees, positive to the left), from the latest XR views;
 // false before any view or recentre.
 bool head_yaw_deg(float* out);
+// Where the head looks (world, unit): the centre eye's forward from the frame's camera and the head pose; false before
+// the first frame or without the head pose ([Gestures] LassoAim=head)
+bool head_forward(float d[3]);
 // The centre eye's position since recentre, in the recentred frame (metres: x right, y up, z back); false before.
 bool head_offset(float out[3]);
 // The neck's offset since recentre, in the recentred frame (metres: x right, y up, z back): a pivot 0.10 m below and

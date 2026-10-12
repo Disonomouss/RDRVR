@@ -11,6 +11,7 @@
 #include <mutex>
 
 #include "core/anchors.h"
+#include "core/api.h"
 #include "core/diag.h"
 #include "core/dual_pass.h"
 #include "core/frame_probe.h"
@@ -122,6 +123,59 @@ void yaw_rows(float* m, float deg) {
     }
 }
 std::atomic<uint64_t> g_double_frames{0};
+
+// [Body] FirstPersonMoments (camera_lever.h): the anchor's camera matrix kept while it is current (the reference, with
+// the view's heading then); while a script's camera holds the channel, the frame's camera is the reference turned by
+// the heading since (yaw_rows: about the camera's up, level) at the place the plugin put the anchor's camera this tick
+std::atomic<bool> g_fpm{false};
+std::mutex g_fp_mutex;
+alignas(16) float g_fp_ref[16];  // under g_fp_mutex
+float g_fp_ref_heading = 0.0f;
+bool g_fp_ref_ok = false, g_fp_was = false;
+alignas(16) float g_fp_mark[16];  // "cam fp mark": a reference kept for the check ("cam fp check")
+float g_fp_mark_heading = 0.0f;
+bool g_fp_mark_ok = false;
+thread_local alignas(16) float t_fp_cam[16];
+std::atomic<uint64_t> g_fp_frames{0}, g_fp_moments{0};
+void fp_build(const float* ref, float ref_heading, const RdrvrActorState& st, float heading, float* out) {
+    std::memcpy(out, ref, 64);
+    yaw_rows(out, heading - ref_heading);
+    for (int k = 0; k < 3; ++k) out[12 + k] = st.camera_pos[k];
+}
+// the frame's camera for the scene and the culling: the game's, or (a first-person moment) the anchor's
+const float* fp_cam(const float* cam) {
+    if (!cam || !g_fpm.load(std::memory_order_relaxed) || !pose::anchor_active()) return cam;
+    RdrvrActorState st{};
+    if (!api::actor_state(&st) || !st.camera) return cam;
+    const float hd = pose::body_heading_deg();
+    std::lock_guard lock(g_fp_mutex);
+    if (!(st.flags & RDRVR_ACTOR_CAM_AWAY)) {  // ours current: the reference
+        // taken only from the anchor's own camera (at the place the plugin put it, level: a script's camera a frame
+        // early is neither) with the heading still (the matrix lags the heading by a tick: after a turn, three frames)
+        static float last_hd = 0.0f;
+        static int still = 0;
+        still = std::fabs(hd - last_hd) < 0.5f ? still + 1 : 0;
+        last_hd = hd;
+        const float dx = cam[12] - st.camera_pos[0], dy = cam[13] - st.camera_pos[1], dz = cam[14] - st.camera_pos[2];
+        if (still >= 3 && dx * dx + dy * dy + dz * dz < 0.3f * 0.3f && cam[5] > 0.95f) {
+            std::memcpy(g_fp_ref, cam, 64);
+            g_fp_ref_heading = hd;
+            g_fp_ref_ok = true;
+        }
+        if (g_fp_was) log::info("[cam] first-person moment over: the anchor's camera current again");
+        g_fp_was = false;
+        return cam;
+    }
+    if (!g_fp_ref_ok) return cam;
+    if (!g_fp_was) {
+        g_fp_moments.fetch_add(1, std::memory_order_relaxed);
+        log::info("[cam] first-person moment: a script's camera holds the channel; the eyes kept at John's head");
+    }
+    g_fp_was = true;
+    fp_build(g_fp_ref, g_fp_ref_heading, st, hd, t_fp_cam);
+    g_fp_frames.fetch_add(1, std::memory_order_relaxed);
+    return t_fp_cam;
+}
 std::atomic<uint64_t> g_scene_us{0}, g_scene_timed{0};  // the time in SceneRender (the perf status)
 std::atomic<bool> g_findcam{false};
 
@@ -301,7 +355,8 @@ bool build_union_vp(void* vp, const float* cam_in);
 std::atomic<float> g_scene_near{0}, g_scene_far{0};
 thread_local float t_frame_yaw = 0.0f;  // the test yaw latched once a frame: both passes and the union see the same
 
-void hk_SceneRender(void* renderer, void* vp, const float* cam, void* a4) {
+void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
+    const float* cam = fp_cam(cam_game);  // [Body] FirstPersonMoments: the anchor's camera while a script's holds the channel
     if (const float st = g_yaw_step.load(std::memory_order_relaxed); st != 0.0f) {  // the test's ramp, once a frame
         float y = g_yaw.load(std::memory_order_relaxed) + st;
         if (y > 180.0f) y -= 360.0f;
@@ -506,7 +561,14 @@ void hk_SetCamera(void* vp, const float* cam) {
 
 alignas(16) float g_cover_cam[16];  // the yawed camera handed to the visibility build (it may keep the pointer)
 
-void hk_VisibilityBuild(void* renderer, void* vp, void* cam, void* a4) {
+void hk_VisibilityBuild(void* renderer, void* vp, void* cam_game, void* a4) {
+    // [Body] FirstPersonMoments: culled for the anchor's camera too (its copy: the build may keep the pointer)
+    void* cam = cam_game;
+    if (const float* fc = fp_cam(static_cast<const float*>(cam_game)); fc != cam_game) {
+        static alignas(16) float vis_cam[16];
+        std::memcpy(vis_cam, fc, sizeof(vis_cam));
+        cam = vis_cam;
+    }
     body::on_visibility_build();  // the item in hand's game matrix, for its draws (body.cpp)
     if (vp && cam && g_head_cover.load(std::memory_order_relaxed) && g_xr_pose.load(std::memory_order_relaxed) &&
         g_double.load(std::memory_order_relaxed)) {
@@ -828,6 +890,46 @@ void set_head_cover(bool on) {
     log::info("[cam] head cover %s", on ? "on" : "off (cull for the game camera)");
 }
 
+void set_first_person_moments(bool on) {
+    if (g_fpm.exchange(on) != on) log::info("[cam] first-person moments (a script's camera: the eyes kept at John's head) %s", on ? "on" : "off");
+}
+bool first_person_moments() { return g_fpm.load(); }
+std::string fp_status() {
+    std::lock_guard lock(g_fp_mutex);
+    char b[200];
+    std::snprintf(b, sizeof(b), "first-person moments %d: moments %llu, frames drawn %llu, now %d, reference %d (heading %.1f)", g_fpm.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_fp_moments.load()), static_cast<unsigned long long>(g_fp_frames.load()), g_fp_was ? 1 : 0,
+                  g_fp_ref_ok ? 1 : 0, g_fp_ref_heading);
+    return b;
+}
+// "cam fp mark" / "cam fp check": the reference kept, then (the view turned meanwhile, our camera current) the camera
+// built from it against the game's real one: the rows' and the place's largest differences (the yaw's sign, the layout)
+std::string fp_check(bool mark) {
+    RdrvrActorState st{};
+    api::actor_state(&st);
+    const float hd = pose::body_heading_deg();
+    if (!g_game_cam_valid) return "fp: no game camera yet";
+    std::lock_guard lock(g_fp_mutex);
+    if (mark) {
+        std::memcpy(g_fp_mark, g_game_cam, 64);
+        g_fp_mark_heading = hd;
+        g_fp_mark_ok = true;
+        char b[160];
+        std::snprintf(b, sizeof(b), "fp marked: heading %.1f, camera at (%.3f %.3f %.3f), the anchor's put at (%.3f %.3f %.3f)", hd, g_game_cam[12],
+                      g_game_cam[13], g_game_cam[14], st.camera_pos[0], st.camera_pos[1], st.camera_pos[2]);
+        return b;
+    }
+    if (!g_fp_mark_ok) return "fp: no mark";
+    float built[16];
+    fp_build(g_fp_mark, g_fp_mark_heading, st, hd, built);
+    float rows = 0, place = 0;
+    for (int k = 0; k < 12; ++k) rows = std::fmax(rows, std::fabs(built[k] - g_game_cam[k]));
+    for (int k = 12; k < 15; ++k) place = std::fmax(place, std::fabs(built[k] - g_game_cam[k]));
+    char b[200];
+    std::snprintf(b, sizeof(b), "fp check: heading %.1f -> %.1f, rows off by %.4f, place off by %.4f m%s", g_fp_mark_heading, hd, rows, place,
+                  (st.flags & RDRVR_ACTOR_CAM_AWAY) ? " (our camera not current: no check)" : "");
+    return b;
+}
 void set_xr_head_position(bool on, float separation) {
     bool was = g_xr_head_position.exchange(on);
     g_xr_separation = separation;
@@ -840,6 +942,16 @@ void scene_time(uint64_t* us, uint64_t* frames) {
     *us = g_scene_us.load(std::memory_order_relaxed);
 }
 
+bool head_forward(float d[3]) {
+    if (!g_game_cam_valid.load(std::memory_order_relaxed) || !g_xr_pose.load(std::memory_order_relaxed)) return false;
+    float cam[16], c[16];
+    std::memcpy(cam, g_game_cam, sizeof(cam));
+    if (!xr_eye_camera(cam, 2, c, true)) return false;
+    const float n = std::sqrt(c[8] * c[8] + c[9] * c[9] + c[10] * c[10]);
+    if (n < 1e-4f) return false;
+    for (int k = 0; k < 3; ++k) d[k] = -c[8 + k] / n;  // the camera looks along -c
+    return true;
+}
 bool head_yaw_deg(float* out) {
     xr::EyeView v[2];
     // a peek: read by frame-end listeners (pose, gestures), not a scene pass; counted as drawn with, it made the pose

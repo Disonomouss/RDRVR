@@ -692,6 +692,9 @@ void camera_tick(uint64_t tick) {
     int32_t object = static_cast<int32_t>(invoke(0x4A2063EC, {static_cast<uint64_t>(static_cast<uint32_t>(actor))}));  // GET_OBJECT_FROM_ACTOR
     st.object = object;
     st.flags = flags | (st.flags & RDRVR_ACTOR_VEHICLE);  // run 10 item 3: mount_state's vehicle bit kept (the review's)
+    // 2026-10-12 ([Body] FirstPersonMoments): our camera not current on channel 0 (a script's camera holds it: a mission's
+    // shot, looting, a door): the core draws the eyes from it anyway
+    if ((invoke(0x02BD5362, {static_cast<uint64_t>(g_cam), 0}) & 0xff) == 0) st.flags |= RDRVR_ACTOR_CAM_AWAY;  // IS_CAMERA_ACTIVE_ON_CHANNEL
     st.actor = actor;
     weapon_state(actor, &st);
     if (job.weapons & 1u) weapons_state(actor, tick, &st);

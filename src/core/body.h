@@ -114,6 +114,26 @@ bool locks_torso();          // [Body] LockTorso: the upper body kept over the h
 void set_locks_torso(bool on);
 HandCfg hand_cfg();
 void set_hand_cfg(const HandCfg& c);
+// run 11 item 2, [Holsters] PropBelt: the gun belt prop (p_gen_gunbelt01x, a skinned strap of 17 joints) in held_prop's
+// belt slot, its draws moved exactly onto the slot's pose (holster.cpp: the pelvis's frame) and its strap bent round
+// the hips' ellipse (semi-axes a sideways, b front to back, m), the buckle s0 m round from the front centre (the
+// prop's +y). holster: its holster's bone (5) kept, else collapsed and the strap closed over it (a plain belt). flip:
+// the ring mirrored front to back (the buckle at the back, the strap's faces swapped in and out). hide_geoms: its
+// geometries not drawn (bit i: geometry i; 0 the belt's own revolver, 1 its leather)
+struct PropBelt {
+    bool on = false;
+    float a = 0.19f, b = 0.14f, s0 = 0.0f;
+    bool holster = true, flip = false;
+    uint32_t hide_geoms = 1;
+    bool hide_own = true;  // run 11 item 3, PropBeltHideOwn: John's own belt and holster not drawn while it is
+};
+void set_prop_belt(const PropBelt& c);  // any thread
+// The holsters' update, each frame the props belt is wanted: John's own belt found anew when his drawables change (an
+// outfit change; at most once a second)
+void own_belt_refresh();
+// The props belt's bone i as bent (the skinning matrix, 3 rows of 4, in its model's space) for its current drawable and
+// config; false before its first bent draw. Any thread (run 11 item 5: its holster's place for the gun shown there).
+bool prop_belt_bone(int i, float m[12]);
 std::string command(const std::string& line);
 // The scene render hook, first thing (after the game's update, before its draw lists): the head hide when on.
 void before_scene(const float* cam);  // cam: the frame's game camera matrix (for the controllers' world poses)

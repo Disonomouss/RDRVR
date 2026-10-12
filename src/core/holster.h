@@ -41,6 +41,7 @@ float fire_clip_phase();
 // gun diagonal), hidden while that gun is in a hand; destroyed when off or out of first person.
 // [Holsters] ShowModels: a holster model (the game's prop [Holsters] Model) drawn at each enabled hip holster
 bool show_models();
+bool show_knife();  // run 11 item 6, [Holsters] ShowKnife (the draw hook's cheap test before held_prop::shown)
 void set_show_models(bool on, bool save = true);
 bool show_guns();
 void set_show_guns(bool on, bool save = true);

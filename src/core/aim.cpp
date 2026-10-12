@@ -200,6 +200,11 @@ float* hk_aim_ray(uintptr_t self, float* out, const float* yp) {
             float bt[3] = {0.0f, 0.174f, -0.985f}, d[3], up[3] = {0, 1, 0}, rt[3], u2[3];
             barrel_in_target(bt);
             for (int k = 0; k < 3; ++k) d[k] = bp.target_rot[gj][k * 3] * bt[0] + bp.target_rot[gj][k * 3 + 1] * bt[1] + bp.target_rot[gj][k * 3 + 2] * bt[2];
+            // 2026-10-12 ([Gestures] LassoAim): the lasso's ray along the head, the other hand, or the hand's frozen aim
+            if (st.weapon == 21) {
+                float la[3];
+                if (gestures::lasso_aim_dir(d, la)) std::memcpy(d, la, sizeof(la));
+            }
             rt[0] = d[1] * up[2] - d[2] * up[1];
             rt[1] = d[2] * up[0] - d[0] * up[2];
             rt[2] = d[0] * up[1] - d[1] * up[0];
