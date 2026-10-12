@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.7 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.8 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -74,6 +74,16 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   eyes; the game's own camera for the scene still runs behind it, so the scene plays on as made. The full cutscenes
   are unchanged (the screen or 3D; a cutscene's very first frame may still show from John's eyes). The Screen tab,
   "Short scenes in first person". Not yet tried: looting, a mission's quick shots, a chest, a bed, a door.
+- New in 0.8.8, on by default (used in a Quest 3: "spatial audio is good"): the game's sound is heard from your
+  head. It placed every sound for the way John's body faced, so turning your head moved nothing and you could not tell
+  where things came from; now a voice comes to the front as you face it. And on headphones (any stereo device) the
+  game dropped what it pans behind you to a third of its level, so people behind you sounded far away; that is now
+  folded into your left and right ears at full level (the game's own slight quieting of sounds behind you is kept;
+  a 5.1 or 7.1 device keeps the game's mix). In the ini, `[XR]` `AudioFollowsHead` and `AudioRearFold` (0 = as before).
+- Fixed in 0.8.8 (tried in the developer's simulator only, not yet in a headset): the gun in your hand could smear or
+  trail behind your hand, mostly in fights. With DLSS or the game's TAA, its motion vectors (what carries the image
+  from frame to frame) were the game's own move of its gun, its aim and its recoil, not your hand's. They are now taken
+  from where the gun was drawn the frame before. In the ini, `[Hands] GunMotionVectors` (0 = as before).
 
 **Body**
 - A first-person body (full, forearms and hands, or hands only), upright and facing your view, no head in the way.
@@ -226,7 +236,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.7.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.8.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -368,6 +378,7 @@ The body holsters: how you draw, what they follow, what is shown, and where each
 | **Each holster: Right hip, Back, Belt, Left hip (second sidearm), Back left shoulder, Lower back** | Turns each holster on or off. | On |
 | **Left hip (knife and lasso; off: moved to the lower back)** | The old left-hip knife-and-lasso holster; the knife and lasso now sit at the lower back. | Off |
 | ↳ **Offset / Size arrows** (each holster and the chest) | Move each holster right / up / forward, 5 mm per press, and change its ring's size; saved at once. The chest spot, where you take a round to reload, is always on. Turn on Show the holsters to see them while you move them. | Placed for the release (anew in 0.8.5) |
+| **The belt** (new in 0.8.8, all off; tried in the developer's simulator only) | A gun belt made of the game's own props round John's hips instead of his own belt, with its holster at the right hip; and, each on its own switch, the knife at its holster, a satchel, the lasso's coil and an ammo pouch on it. Each piece has its own place, turn and size rows (the belt: Place, Turn, Width, Depth, Buckle round; each prop: Round the belt, Height, Out, Size, Angle), saved at once. Shown with the whole body only (not with the forearms or hands, nor riding). | Off |
 
 ### Gun in hand
 

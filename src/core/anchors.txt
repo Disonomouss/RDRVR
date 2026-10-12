@@ -266,3 +266,6 @@ ImmCtxVtbl               global 0x1094568  # the immediate context's vtable (the
 # --- run 10 items 8c and 8d: motion blur and the heat haze (research\run10\motionblur-heathaze.md)
 MotionBlurSetter         site   0x5d2ac0 32 # the motion blur option's setter (vt+0x68): PostFx+0x5a4 = (style 2), +0xe1c = (style 1); the bytes prove both offsets
 MiragerDownsample        func   0x678b00 # PostFx vt+0x98 (postfx): the post chain's first downsample, through the Mirager shader when PostFx+0xe48 (the HeatShimmer strength) > 0.15; the first reader of +0xe48 in the chain
+# --- 2026-10-12: the audio listeners (research/run12/audio.md)
+AudioUpdateListeners     func   0xde1e60 # (camMtx: the update side's camera, [[CamManager]+8]+0x1d0): the panning listener 0x142c34bf0 (a copy), the volume one 0x142c34bb0, the environment's position; from the main frame (0x1f5954)
+AudioOutputMatrix        func   0xf6baa0 # (voice, send, out): a voice's XAudio2 output matrix from its send's 8 gains (+0x68 sends, 0x28 each: the voice +0, the gains +8, FL FR C LFE BL BR SL SR); a mono voice keeps only the first dst channels (stereo: FL FR, the rear dropped)

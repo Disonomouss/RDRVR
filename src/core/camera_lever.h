@@ -45,6 +45,14 @@ void set_first_person_moments(bool on);
 bool first_person_moments();
 std::string fp_status();  // "cam fp": on, frames drawn so, the reference's check against the real camera
 std::string fp_check(bool mark);  // "cam fp mark|check" (a test)
+// [XR] AudioFollowsHead: the game's audio listeners (panning and distance) from the centre eye's camera (the head) rather
+// than the game camera (the body's heading in first person); only with the eyes from the XR views. On by default.
+void set_audio_follows_head(bool on);
+bool audio_follows_head();
+// [XR] AudioRearFold: a mono voice's rear, centre and side gains folded into left and right on a stereo device (the
+// game's own fold keeps the rear and the sides at 0.3, -10.5 dB). On by default.
+void set_audio_rear_fold(bool on);
+std::string audio_status();  // "cam audio [on|off] | cam audio fold on|off": both switches and their counters
 // Round 2: with the XR pose on in a double frame, the distant tree billboards face the centre eye, level (head yaw
 // only) instead of the game camera. [XR] LevelBillboards=1; "billboards level|game".
 void set_level_billboards(bool on);

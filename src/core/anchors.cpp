@@ -175,6 +175,8 @@ constexpr Optional kOptional[] = {
     {"HandlePrevWorldVP", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
     {"HandlePrevViewProj", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
     {"HandleViewport", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
+    {"AudioUpdateListeners", "the game's sound is heard from the game camera, not your head ([XR] AudioFollowsHead), on this build"},
+    {"AudioOutputMatrix", "sounds behind you stay as the game mixes them on stereo ([XR] AudioRearFold) on this build"},
 };
 const char* optional_what(const char* name) {
     for (const Optional& o : kOptional)

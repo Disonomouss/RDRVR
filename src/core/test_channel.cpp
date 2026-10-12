@@ -167,6 +167,11 @@ std::string execute(const std::vector<std::string>& t) {
         return std::string("actor ") + std::to_string(handle) + " " +
                run_native(0x99BD9D6Fu, {static_cast<uint64_t>(static_cast<uint32_t>(handle)), 0}, 2);  // GET_POSITION
     }
+    if (c == "cam" && t.size() >= 2 && t[1] == "audio") {  // cam audio [on|off] | fold on|off: AudioFollowsHead, AudioRearFold (the session)
+        if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) camera_lever::set_audio_follows_head(t[2] == "on");
+        if (t.size() >= 4 && t[2] == "fold" && (t[3] == "on" || t[3] == "off")) camera_lever::set_audio_rear_fold(t[3] == "on");
+        return camera_lever::audio_status();
+    }
     if (c == "cam" && t.size() >= 2 && t[1] == "fp") {  // cam fp [on|off|mark|check]: [Body] FirstPersonMoments (the session)
         if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) camera_lever::set_first_person_moments(t[2] == "on");
         if (t.size() >= 3 && (t[2] == "mark" || t[2] == "check")) return camera_lever::fp_check(t[2] == "mark");

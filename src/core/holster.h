@@ -41,7 +41,23 @@ float fire_clip_phase();
 // gun diagonal), hidden while that gun is in a hand; destroyed when off or out of first person.
 // [Holsters] ShowModels: a holster model (the game's prop [Holsters] Model) drawn at each enabled hip holster
 bool show_models();
-bool show_knife();  // run 11 item 6, [Holsters] ShowKnife (the draw hook's cheap test before held_prop::shown)
+bool show_knife();  // run 11 item 6, [Holsters] ShowKnife
+bool knife_wanted();  // the knife shown at its holster this frame (the draw hook hides the game's own knife meanwhile)
+// run 11 item 8 (the user: "The aim is for this belt to be configurable by users. So that each piece can be moved to
+// where they prefer"): every piece of the props belt's settings, for the menu's Holsters tab; set: applied at once and,
+// with save, written to the user ini ([Holsters] PropBelt*, ShowKnife, Knife*, Show<X>, <X>Around/Height/Out/Size/Turn)
+struct BeltMenu {
+    body::PropBelt belt;
+    float off[3], turn[3];
+    bool knife;
+    float knife_off[3], knife_turn[3];
+    bool att_on[3];
+    float att_place[3][3];  // round the belt (deg), height (m), out (m)
+    float att_turn[3][3], att_size[3];
+};
+BeltMenu belt_menu();
+void set_belt_menu(const BeltMenu& m, bool save);
+const char* attach_name(int i);  // the satchel, the lasso's coil, the ammo pouch
 void set_show_models(bool on, bool save = true);
 bool show_guns();
 void set_show_guns(bool on, bool save = true);

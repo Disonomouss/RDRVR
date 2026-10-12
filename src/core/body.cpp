@@ -1323,6 +1323,84 @@ float g_snap_miss = -1.0f;  // the drawn front wrist from the snap target (m), t
 std::atomic<uint64_t> g_snaps{0}, g_grip_learns{0};
 std::vector<PropBone> g_prop_bones;
 uint64_t g_body_frame = 0;
+// [Hands] GunMotionVectors (the user's log, 2026-10-12: the gun in hand lagging, in combat, never the second gun): a
+// draw's sets and records carry last frame's matrices too (the previous half: the motion vectors only), and the gun in
+// hand had this frame's correction put on the game's last pose there, so its motion vectors were the game's own swing
+// of the gun (its aim, its recoil: a shot moves it 0.2-0.3 m in the hand) and never the hand's: DLSS and TAA pulled
+// its history from the wrong place. Now the previous half is where the gun was drawn last frame (each hand and drawable:
+// its drawn world matrices, the frame's first draw made with the frame's correction). Under g_draw_mutex.
+struct GunPrev {
+    uintptr_t key = 0;  // the drawable
+    int hand = -1, count = 0, prev_count = 0;  // count: the set's matrices (0: a rigid draw's record, 16 floats)
+    uint64_t frame = ~0ull, prev_frame = ~0ull;
+    float cur[8 * 12] = {}, prev[8 * 12] = {};
+};
+GunPrev g_gun_prev[8];
+std::atomic<bool> g_gun_mv{true};
+struct GunMvStats {
+    uint64_t fixed = 0, none = 0, cut = 0, n = 0;  // draws given last frame's drawn gun; none to give; a jump; measured
+    double sum = 0.0;                              // the game's previous half off it (mm), at the root
+    float max = 0.0f;
+};
+GunMvStats g_gun_mv_log, g_gun_mv_cmd;  // the [lag] line's (since the last line) and "skel gunmv"'s (since its reset)
+// the draw's previous half (`prev`: `count` matrices of 12 floats, the world less `off_prev`; count 0: one 4x4 record,
+// the world) set to last frame's drawn gun of that hand and drawable; this frame's drawn (`cur`, with `off_cur`) kept
+void gun_prev_fix(int hand, uintptr_t key, const float* cur, float* prev, int count, const float* off_cur, const float* off_prev) {
+    if (hand < 0 || hand > 1 || !key || count < 0 || g_corr_frame != g_body_frame) return;  // (a stale draw: as it was)
+    if (count > 8) {  // (the review: a gun of more matrices than the table keeps: counted, left as the game's)
+        ++g_gun_mv_log.none;
+        ++g_gun_mv_cmd.none;
+        return;
+    }
+    GunPrev* g = nullptr;
+    for (GunPrev& e : g_gun_prev)
+        if (e.key == key && e.hand == hand) g = &e;
+    if (!g) {  // a new one: the slot seen longest ago
+        g = &g_gun_prev[0];
+        for (GunPrev& e : g_gun_prev)
+            if (e.frame == ~0ull || (g->frame != ~0ull && e.frame < g->frame)) g = &e;
+        *g = GunPrev{};
+        g->key = key;
+        g->hand = hand;
+    }
+    const int nf = count ? count * 12 : 16;
+    const int t[3] = {3, 7, 11}, tr[3] = {12, 13, 14};
+    if (g->frame != g_body_frame) {  // the frame's first draw of it: last frame's becomes the previous
+        g->prev_frame = g->frame;
+        g->prev_count = g->count;
+        std::memcpy(g->prev, g->cur, sizeof(g->prev));
+        g->frame = g_body_frame;
+        g->count = count;
+        std::memcpy(g->cur, cur, sizeof(float) * nf);
+        for (int j = 0; count && j < count; ++j)
+            for (int k = 0; k < 3; ++k) g->cur[j * 12 + t[k]] += off_cur[k];
+    }
+    GunMvStats* st[2] = {&g_gun_mv_log, &g_gun_mv_cmd};
+    if (g->prev_frame == ~0ull || g->prev_frame + 1 != g_body_frame || g->prev_count != count) {
+        for (GunMvStats* x : st) ++x->none;
+        return;
+    }
+    float d2 = 0.0f;  // the root's previous place, the game's against the drawn
+    for (int k = 0; k < 3; ++k) {
+        const float a = count ? prev[t[k]] + off_prev[k] : prev[tr[k]], b = count ? g->prev[t[k]] : g->prev[tr[k]];
+        d2 += (a - b) * (a - b);
+    }
+    const float mm = std::sqrt(d2) * 1000.0f;
+    if (mm > 1000.0f) {  // a jump (a teleport, the gun moved to the other hand): the game's own
+        for (GunMvStats* x : st) ++x->cut;
+        return;
+    }
+    for (GunMvStats* x : st) {
+        x->max = std::fmax(x->max, mm);
+        x->sum += mm;
+        ++x->n;
+    }
+    if (!g_gun_mv.load(std::memory_order_relaxed)) return;
+    std::memcpy(prev, g->prev, sizeof(float) * nf);
+    for (int j = 0; count && j < count; ++j)
+        for (int k = 0; k < 3; ++k) prev[j * 12 + t[k]] -= off_prev[k];
+    for (GunMvStats* x : st) ++x->fixed;
+}
 uint64_t g_pub_frame = ~0ull;  // the frame g_hand_seq's data was last published for (the render thread's)
 std::vector<Corr> g_corr_set;    // the latest current set's, in the set's own space (the world less its offset)
 float g_ik_diag[2][20];          // per hand: S, E, W, T (set space), l1, l2, d, the world target's y, the wrist as drawn, the stretch
@@ -1383,6 +1461,12 @@ struct BeltGeom {  // the belt's geometries as drawn (its first draw's): index, 
 BeltGeom g_belt_geoms[16];  // written by the render thread only (a test's readout)
 thread_local bool t_belt_draw = false;  // around the belt's o_DrawVisEntity: hk_draw_geom's geometry skip
 std::atomic<uint32_t> g_belt_geom_hide{0};
+std::atomic<int> g_shown_part{0};  // the frame's [Body] Show (with AutoShow): body::shown_part
+std::atomic<bool> g_belt_wanted{false};  // holster.cpp: the props belt wanted this frame (body::set_prop_belt_wanted)
+// 3 (the review): each player drawable's last draw (body frames), so an outfit's old drawables age out of the list
+std::atomic<uint64_t> g_player_drawn_at[8] = {};
+float g_pelvis_R[9] = {};           // under g_draw_mutex: the drawn pelvis's skinning 3x3 (body::pelvis_drawn)
+bool g_pelvis_R_ok = false;
 // run 11 item 3, [Holsters] PropBeltHideOwn: John's own belt and holster (his outfit's geometries chosen by their bones:
 // own_belt_scan) not drawn while the props belt is (first person only: the props belt is made there alone). The list
 // published by count (entries written before it); the render thread skips a geometry of the player's draw found in it
@@ -1623,9 +1707,10 @@ std::string own_belt_scan(bool apply) {
     std::vector<Pick> picks;
     std::string o = "own belt:";
     char b[300];
-    for (const auto& slot_d : g_player_drawables) {
-        const uintptr_t d = slot_d.load();
-        if (!d) continue;
+    const uint64_t frame_now = g_body_frame;
+    for (int si = 0; si < 8; ++si) {
+        const uintptr_t d = g_player_drawables[si].load();
+        if (!d || frame_now - g_player_drawn_at[si].load() > 120) continue;  // drawn in the last 120 frames only
         uintptr_t list = 0, models = 0;
         uint16_t nm = 0;
         if (!rd(d + 0x20 + 0x30, &list) || !list || !rd(list, &models) || !rd(list + 8, &nm)) continue;
@@ -4640,7 +4725,7 @@ std::atomic<uint64_t> g_skin_posed{0};
 // y (the strap's +y side outward or inward). drop: bones collapsed to their joint's place (bit i: bone i; the holster's
 // 5 for a plain belt), the strap after each closed up over its span and the whole stretched along itself to go round
 // (with 3 cm over at the buckle). The skinning matrices (rows: R S, then q - R S p) into out[0..count)
-void bend_strap(const float* p, int count, float a, float b, float dir, float s0, uint64_t drop, SkinBone* out) {
+__declspec(noinline) void bend_strap(const float* p, int count, float a, float b, float dir, float s0, uint64_t drop, SkinBone* out) {
     constexpr int kSteps = 1024;
     float len[kSteps + 1];  // the arc length to each step's angle
     auto pt = [&](float f, float* o) {
@@ -4708,7 +4793,7 @@ std::atomic<uint64_t> g_belt_draws{0}, g_belt_census{0}, g_belt_norec{0}, g_belt
 
 // the gun belt's skeleton (its drawable's +0x18, laid out as the player's), each joint's rest place; SEH reads only
 // (the render thread). 0: none
-int strap_bind(uintptr_t dr, float* gt, int max) {
+__declspec(noinline) int strap_bind(uintptr_t dr, float* gt, int max) {
     uintptr_t data = 0, bones = 0, locals = 0;
     uint16_t count = 0;
     if (!dr || !raw(dr + 0x18, &data, 8) || !data || !raw(data, &bones, 8) || !raw(data + 0x20, &locals, 8) || !raw(data + 0x30, &count, 2) ||
@@ -5066,16 +5151,33 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 g_player_drawable.store(reinterpret_cast<uintptr_t>(rec[0x10]), std::memory_order_relaxed);
                 {  // each distinct one, up to eight (lock-free: the first empty slot taken)
                     const uintptr_t dr = reinterpret_cast<uintptr_t>(rec[0x10]);
-                    for (auto& slot_d : g_player_drawables) {
+                    bool known = false;
+                    for (int si = 0; si < 8 && !known; ++si) {
+                        auto& slot_d = g_player_drawables[si];
                         uintptr_t cur_d = slot_d.load(std::memory_order_relaxed);
-                        if (cur_d == dr) break;
-                        if (!cur_d && slot_d.compare_exchange_strong(cur_d, dr)) break;
+                        if (cur_d == dr) {
+                            g_player_drawn_at[si].store(g_body_frame, std::memory_order_relaxed);
+                            known = true;
+                        } else if (!cur_d && slot_d.compare_exchange_strong(cur_d, dr)) {
+                            g_player_drawn_at[si].store(g_body_frame, std::memory_order_relaxed);
+                            known = true;
+                        }
+                    }
+                    for (int si = 0; si < 8 && !known; ++si) {  // full: an entry not drawn for 600 frames (an old outfit's) replaced
+                        uintptr_t cur_d = g_player_drawables[si].load(std::memory_order_relaxed);
+                        if (g_body_frame - g_player_drawn_at[si].load(std::memory_order_relaxed) > 600 &&
+                            g_player_drawables[si].compare_exchange_strong(cur_d, dr)) {
+                            g_player_drawn_at[si].store(g_body_frame, std::memory_order_relaxed);
+                            known = true;
+                        }
                     }
                 }
                 if (g_frame.show && o_draw_geom && g_geom_mode.load(std::memory_order_relaxed) != 0) cull_show = g_frame.show;
                 // run 11 item 3: the props belt drawn within the last three body frames: John's own not drawn
+                // while the props belt is wanted and was drawn bent once (the review: by its draws in the last three frames,
+                // the game's culling of it with the head level brought his own belt and gun back)
                 own_hide = o_draw_geom && g_own_hide_on.load(std::memory_order_relaxed) && g_belt_on.load(std::memory_order_relaxed) &&
-                           g_own_n.load(std::memory_order_relaxed) > 0 && g_body_frame - g_belt_frame <= 3;
+                           g_belt_wanted.load(std::memory_order_relaxed) && g_belt_frame != 0 && g_own_n.load(std::memory_order_relaxed) > 0;
                 std::lock_guard lock(g_draw_mutex);
                 save.assign(sm, sm + n);
                 set_at = sm;
@@ -5084,6 +5186,12 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 const float* off_cur = reinterpret_cast<const float*>(mset + 0x10);
                 const float* off_prev = reinterpret_cast<const float*>(mset + 0x20);
                 transform_set(sm, count, 0, g_frame, off_cur);
+                if (g_rig.pelvis >= 0 && g_rig.pelvis < count) {  // run 11 item 9: the drawn pelvis's turn (under g_draw_mutex here)
+                    const float* pm = sm + g_rig.pelvis * 12;
+                    for (int r = 0; r < 3; ++r)
+                        for (int c = 0; c < 3; ++c) g_pelvis_R[r * 3 + c] = pm[r * 4 + c];
+                    g_pelvis_R_ok = true;
+                }
                 transform_set(sm + count * 12, count, 1, g_frame, off_prev);  // the previous frame's (motion vectors)
                 for (int h = 0; h < 2; ++h) {  // [Reload] LeverParts: each wrist as drawn (the held gun kept in it)
                     Steady& sd = g_steady[h];
@@ -5163,7 +5271,10 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 const bool belt_hp = g_belt_on.load(std::memory_order_relaxed) && count <= 64 &&
                                      held_prop::match(dr, draw_instance(rec), rr + 12, bp, &bs) &&
                                      (bs == held_prop::kCensusSlot || (bs >= held_prop::kBeltSlot && bs < held_prop::kBeltSlot + held_prop::kBeltSlots));
-                std::lock_guard lock(g_draw_mutex);
+                // the lock only for the belt's draws, the posed drawable or an armed probe (the review: not every NPC's)
+                std::unique_lock<std::mutex> lock(g_draw_mutex, std::defer_lock);
+                if (belt_hp || g_skin_probe.load(std::memory_order_relaxed) || (dr && dr == g_skin_pose.load(std::memory_order_relaxed))) lock.lock();
+                if (lock.owns_lock()) {  // (unlocked: nothing of this draw's to do)
                 if (belt_hp && !rec_m) g_belt_norec.fetch_add(1, std::memory_order_relaxed);
                 if (belt_hp && rec_m) {
                     std::memcpy(rec_save, rr, sizeof(rec_save));
@@ -5181,7 +5292,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                         float t[3] = {rm[12], rm[13], rm[14]};
                         for (int k = 0; k < 3; ++k) rm[12 + k] = c.A[k * 3] * t[0] + c.A[k * 3 + 1] * t[1] + c.A[k * 3 + 2] * t[2] + c.a[k];
                     }
-                    if (bs == held_prop::kCensusSlot) {
+                    if (bs != held_prop::kBeltSlot) {
                         g_belt_census.fetch_add(1, std::memory_order_relaxed);
                     } else {
                         BeltBones& bb = g_belt_bones;
@@ -5239,6 +5350,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     p.have = raw(mset + 0x10, p.off, sizeof(p.off)) && raw(reinterpret_cast<uintptr_t>(sm), p.m, static_cast<size_t>(nm) * 48);
                     if (p.have) g_skin_probe.store(false, std::memory_order_relaxed);  // one draw recorded: done
                 }
+                }  // (the lock taken)
             } else if (count >= 1 && count <= 8) {
                 // a prop on the player (the hat, the guns, the knife, the rifle on the back): a small draw whose
                 // record matrix (+0x00, the drawn one; the translation at +0x30) is within 15 cm of one of the
@@ -5333,10 +5445,11 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 // run 11 item 5: John's own holster hidden for the props belt's, a gun shown at the right hip: the game's
                 // own holstered gun (on the pistol bone, at his hidden holster) not drawn either (cycle H2: at the thigh)
                 own_gun_gone = best >= 0 && !belt_twin && g_own_hide_on.load(std::memory_order_relaxed) &&
-                                          g_belt_on.load(std::memory_order_relaxed) && g_body_frame - g_belt_frame <= 3 &&
+                                          g_belt_on.load(std::memory_order_relaxed) && g_belt_wanted.load(std::memory_order_relaxed) && g_belt_frame != 0 &&
                                           held_prop::shown(held_prop::kHolsterSlot);
                 // run 11 item 6, [Holsters] ShowKnife: the knife shown at its holster: the game's own on the melee bone not drawn
-                knife_gone = best >= 0 && !belt_twin && holster::show_knife() && held_prop::shown(held_prop::kBeltSlot + 1);
+                // (wanted, not by its draws: the game culls the hips' props with the head level, and the game's knife came back)
+                knife_gone = best >= 0 && !belt_twin && holster::knife_wanted();
                 {
                     std::lock_guard lock(g_draw_mutex);
                     const bool head_5cm = g_frame.held_fix;  // [Body] HeldPropFix: also this rule
@@ -5608,6 +5721,9 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                                 g_steady_misses.fetch_add(1, std::memory_order_relaxed);
                             }
                         }
+                        if (hi >= 0 && !rec_matrix)  // [Hands] GunMotionVectors: the previous half where it was drawn last frame
+                            gun_prev_fix(held, reinterpret_cast<uintptr_t>(rec[0x10]), sm, sm + static_cast<size_t>(count) * 12, count,
+                                         reinterpret_cast<const float*>(mset + 0x10), reinterpret_cast<const float*>(mset + 0x20));
                         if (hi >= 0 && !rec_matrix) {  // run 6 item 1, "skel follow": the gun in hand's root as drawn (world)
                             const float* po = reinterpret_cast<const float*>(mset + 0x10);
                             float m[12];
@@ -5762,6 +5878,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     float t[3] = {rm[12], rm[13], rm[14]};
                     for (int k = 0; k < 3; ++k) rm[12 + k] = c.A[k * 3] * t[0] + c.A[k * 3 + 1] * t[1] + c.A[k * 3 + 2] * t[2] + c.a[k];
                 }
+                if (hi >= 0) gun_prev_fix(held, reinterpret_cast<uintptr_t>(rec[0x10]), rc, rc + 16, 0, nullptr, nullptr);  // GunMotionVectors
                 if (hi >= 0 && copy_maps(*hsm, c, &cj.Tw, &cj.Ts)) {
                     cj.kind = 1;
                     cj.rc = rc;
@@ -5843,6 +5960,14 @@ void dump_bones(const std::string& file, std::string* out) {
 
 }  // namespace
 
+int shown_part() { return g_shown_part.load(std::memory_order_relaxed); }
+void set_prop_belt_wanted(bool on) { g_belt_wanted.store(on, std::memory_order_relaxed); }
+bool pelvis_drawn(float R[9]) {
+    std::lock_guard lock(g_draw_mutex);
+    if (!g_pelvis_R_ok) return false;
+    std::memcpy(R, g_pelvis_R, sizeof(g_pelvis_R));
+    return true;
+}
 void set_prop_belt(const PropBelt& c) {
     {
         std::lock_guard lock(g_belt_cfg_mutex);
@@ -5866,7 +5991,8 @@ void own_belt_refresh() {
     static uintptr_t last = 0;
     static double last_ms = -1e9;
     uintptr_t fp = 0;
-    for (const auto& d : g_player_drawables) fp = fp * 31 + d.load(std::memory_order_relaxed);
+    for (int si = 0; si < 8; ++si)  // the recently drawn ones (an outfit change: its new drawables)
+        if (g_body_frame - g_player_drawn_at[si].load(std::memory_order_relaxed) <= 120) fp = fp * 31 + g_player_drawables[si].load(std::memory_order_relaxed);
     const double now = log::now_ms();
     if (!fp || (fp == last && g_own_scans.load(std::memory_order_relaxed) > 0) || now - last_ms < 1000.0) return;
     last = fp;
@@ -6171,6 +6297,7 @@ bool install() {
         g_pin_cfg = config::get_bool("Hands", "TransplantPin", true);
         g_mirror_cfg = config::get_bool("Hands", "TransplantMirror", true);
         g_own_follow = config::get_bool("Hands", "OwnModelFollow", true);
+        g_gun_mv = config::get_bool("Hands", "GunMotionVectors", true);
         g_fixed_grip = config::get_bool("Hands", "FixedGunGrip", false);
         g_fixed_sidearm = config::get_bool("Hands", "FixedSidearmGrip", false);
         g_follow_auto = config::get_bool("Debug", "FollowLog", true);
@@ -6448,6 +6575,7 @@ void before_scene(const float* cam) {
     f.show = hc.show;
     if (auto_show && (flags & (RDRVR_ACTOR_CROUCHING | RDRVR_ACTOR_IN_COVER | RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING)) && f.show < 1)
         f.show = 1;
+    g_shown_part.store(f.show, std::memory_order_relaxed);
     f.stretch_max = hc.stretch ? hc.stretch_max : 1.0f;
     {
         RdrvrActorState ws{};
@@ -6723,16 +6851,26 @@ void before_scene(const float* cam) {
                     g_follow_rec = true;
                 }
             }
+            GunMvStats mv;  // [Hands] GunMotionVectors, since the last line
+            {
+                std::lock_guard lock(g_draw_mutex);
+                mv = g_gun_mv_log;
+                g_gun_mv_log = GunMvStats{};
+            }
+            const float mv_mean = mv.n ? static_cast<float>(mv.sum / static_cast<double>(mv.n)) : 0.0f;
             if (frames != frames0 || ob[1] != o0[1] || cp != cp0 || cr != cr0)
                 log::info("[lag] 10 s: held draws by pass 0/1/3 %u/%u/%u, stale %u/%u/%u | the second gun or own model %u/%u/%u, stale %u/%u/%u | "
                           "matched the newest %llu, an older sample %llu | frames in hand %llu, without a draw %llu | the copy: placed %llu, refused "
-                          "%llu (why %d), unmatched %llu, draws by pass 0/1/3 %u/%u/%u, stale %u/%u/%u",
+                          "%llu (why %d), unmatched %llu, draws by pass 0/1/3 %u/%u/%u, stale %u/%u/%u | the motion vectors: the game's last frame "
+                          "of the gun off where it was drawn mean %.1f max %.1f mm, drawn from last frame's %llu%s, none %llu, jumps %llu",
                           hb[0] - h0[0], hb[1] - h0[1], hb[3] - h0[3], sb[0] - s0[0], sb[1] - s0[1], sb[3] - s0[3], ob[0] - o0[0], ob[1] - o0[1], ob[3] - o0[3],
                           osb[0] - os0[0], osb[1] - os0[1], osb[3] - os0[3], static_cast<unsigned long long>(newest - newest0),
                           static_cast<unsigned long long>(older - older0), static_cast<unsigned long long>(frames - frames0),
                           static_cast<unsigned long long>(missed - missed0), static_cast<unsigned long long>(cp - cp0),
                           static_cast<unsigned long long>(cr - cr0), g_copy_why.load(), static_cast<unsigned long long>(cn - cn0), cb[0] - c0[0],
-                          cb[1] - c0[1], cb[3] - c0[3], csb[0] - cs0[0], csb[1] - cs0[1], csb[3] - cs0[3]);
+                          cb[1] - c0[1], cb[3] - c0[3], csb[0] - cs0[0], csb[1] - cs0[1], csb[3] - cs0[3], mv_mean, mv.max,
+                          static_cast<unsigned long long>(mv.fixed), g_gun_mv.load(std::memory_order_relaxed) ? "" : " (off: the game's kept)",
+                          static_cast<unsigned long long>(mv.none), static_cast<unsigned long long>(mv.cut));
             std::memcpy(c0, cb, sizeof(c0));
             std::memcpy(cs0, csb, sizeof(cs0));
             cp0 = cp, cr0 = cr, cn0 = cn;
@@ -6939,6 +7077,21 @@ std::string command(const std::string& line) {
         if (w < 0 || w >= kGripW) return "frontpose: no gun in hand";
         set_front_pose(w, v == "lowered" ? 1 : v == "aiming" ? 2 : 0, false);
         return std::string("frontpose: weapon ") + std::to_string(w) + " " + (front_pose(w) == 1 ? "lowered" : front_pose(w) == 2 ? "aiming" : "automatic");
+    }
+    if (sub == "gunmv") {  // skel gunmv [on|off] [reset]: [Hands] GunMotionVectors (the session) and its counters
+        std::string x, y;
+        in >> x >> y;
+        if (x == "on" || x == "off") g_gun_mv = x == "on";
+        char b[320];
+        std::lock_guard lock(g_draw_mutex);
+        const GunMvStats& m = g_gun_mv_cmd;
+        std::snprintf(b, sizeof(b),
+                      "gunmv %d: the game's last frame of the gun off where it was drawn mean %.1f max %.1f mm (%llu draws), drawn from last "
+                      "frame's %llu, none %llu, jumps %llu",
+                      g_gun_mv.load() ? 1 : 0, m.n ? static_cast<float>(m.sum / static_cast<double>(m.n)) : 0.0f, m.max, static_cast<unsigned long long>(m.n),
+                      static_cast<unsigned long long>(m.fixed), static_cast<unsigned long long>(m.none), static_cast<unsigned long long>(m.cut));
+        if (x == "reset" || y == "reset") g_gun_mv_cmd = GunMvStats{};
+        return b;
     }
     if (sub == "lag") {  // skel lag [two|ik] [reset]: the held gun against its bones; two-handed; the wrists and near misses
         std::string x, y;
@@ -7855,7 +8008,9 @@ std::string command(const std::string& line) {
         in >> v;
         if (v == "on") {
             float at[3];
-            if (!held_prop::last_put(held_prop::kCensusSlot, at)) return "skinprobe: no census prop placed (props show first)";
+            int ps = held_prop::kCensusSlot;  // "skel skinprobe on <slot>": about that slot's last put (the belt's: 9)
+            if (!(in >> ps) || ps < 0 || ps >= held_prop::kSlots) ps = held_prop::kCensusSlot;
+            if (!held_prop::last_put(ps, at)) return "skinprobe: that slot has no put";
             std::lock_guard lock(g_draw_mutex);
             std::memcpy(g_skin_probe_at, at, sizeof(at));
             g_skin_probe_got = SkinProbe{};

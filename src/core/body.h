@@ -103,6 +103,13 @@ int hidden_geometry();
 void set_hidden_geometry(int mode);  // also written to the user ini
 const char* grip_source_name();  // the foregrip's grip now: "the weapon's", "<gun>'s (borrowed)", "the template", "built-in"
 bool auto_shows();           // [Body] AutoShow: forearms and hands while crouching, in cover, riding or driving
+// The body's drawn part this frame (any thread): 0 the whole body, 1 the forearms and hands, 2 the hands only (the
+// setting, or AutoShow's while crouching, in cover, riding or driving). Run 11 item 9: the props belt shows only at 0
+int shown_part();
+// The drawn pelvis's turn (run 11 item 9): its skinning matrix's 3x3 (rows; the bind pose's frame to the world) from
+// the latest drawn player set; false before one. Any thread
+bool pelvis_drawn(float R[9]);
+void set_prop_belt_wanted(bool on);  // holster.cpp each frame: the props belt wanted (John's own belt hidden while it is)
 void set_auto_shows(bool on);
 // [Weapon.<Gun>] FrontHandPose: a long gun's front hand: 0 automatic (the game's state), 1 the lowered hold, 2 the
 // aiming hold (each with its own fingers); front_pose_seen: bit 0/1 the lowered/aiming hold learned this session, bit

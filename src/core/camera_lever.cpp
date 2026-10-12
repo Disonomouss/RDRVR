@@ -725,8 +725,109 @@ void hk_BillboardDispatch(void* a1, void* vp) {
     o_BillboardDispatch(a1, vp);
 }
 
+// [XR] AudioFollowsHead (the user, 2026-10-12: "npcs behind you sound far away ... can't tell where things are coming
+// from"): the game's audio listeners, the panning one (0x142c34bf0, a copy) and the volume's (0x142c34bb0, its
+// distance), are taken each frame from the update side's camera matrix (AudioUpdateListeners, the main thread, rows
+// right, up, back, position; research/run12/audio.md). In first person that camera faces the body's heading, so every
+// sound was placed for the body and not the head, and the rear's loss (3 dB from 45 to 135 deg off its forward) fell on
+// what the face looked at. With the eyes from the XR views the listeners get the centre eye's camera of that camera
+// (its orientation, and its position when the head's position is tracked), as the eyes are drawn.
+using AudioListeners_t = void (*)(const float* cam);
+AudioListeners_t o_AudioListeners = nullptr;
+std::atomic<bool> g_audio_head{true};
+std::atomic<uint64_t> g_audio_calls{0}, g_audio_from_head{0};
+std::atomic<float> g_audio_turn{0.0f};  // the last listener's yaw from the camera's (deg, positive: turned left)
+void hk_AudioListeners(const float* cam) {
+    g_audio_calls.fetch_add(1, std::memory_order_relaxed);
+    if (cam && g_audio_head.load(std::memory_order_relaxed) && g_xr_pose.load(std::memory_order_relaxed) &&
+        g_double.load(std::memory_order_relaxed)) {  // (the review: as the eyes, from the XR views in a double frame)
+        alignas(16) float c[16];
+        if (xr_eye_camera(cam, 2, c, true)) {
+            bool ok = true;
+            for (float v : c) ok = ok && std::isfinite(v);
+            if (ok) {
+                // the turn about the world's up: the back rows' angle in the horizontal plane
+                const float a = std::atan2(cam[8], cam[10]), b = std::atan2(c[8], c[10]);
+                g_audio_turn.store(std::remainder(b - a, 6.2831853f) * 57.29578f, std::memory_order_relaxed);
+                g_audio_from_head.fetch_add(1, std::memory_order_relaxed);
+                o_AudioListeners(c);
+                return;
+            }
+        }
+    }
+    o_AudioListeners(cam);
+}
+
+// [XR] AudioRearFold (the same report: "npcs behind you sound far away"): the engine pans every positioned sound over
+// eight speakers (FL FR C LFE BL BR SL SR; the four corners at +-45 deg front and rear). Each mono voice goes to an
+// 8-channel submix and that to the device (AudioOutputMatrix, 0x140f6baa0, builds both matrices; cycle AP1: 1 -> 8 and
+// 8 -> 2); on a stereo device the submix's fold is the game's d11 table (0x1410921c0: L = FL + 0.68 C + 0.3 LFE
+// + 0.3 BL + 0.3 SL), the rear at 0.3 (-10.5 dB), with the rear rule's 3 dB: measured 14-20 dB under the same sound in
+// front. With the device stereo (the 8-channel voice that feeds it built to 2), a mono voice's matrix gets each side's
+// power in its front pair, L = sqrt(FL^2 + BL^2 + SL^2 + C^2/2) and R likewise, the rest 0 (LFE kept): a sound in front
+// as before, one behind as loud as in front but for the game's own 3 dB rear rule (cycle AU6: -8.6 -> -3.1 dB), one to
+// the side 3 dB up (both its speakers now). A 5.1 or 7.1 device keeps the game's.
+// Any audio thread: atomics only.
+using AudioMatrix_t = void (*)(char* voice, int send, float* out);
+AudioMatrix_t o_AudioMatrix = nullptr;
+std::atomic<bool> g_audio_fold{true};
+std::atomic<uint64_t> g_fold_calls{0}, g_fold_done{0};
+std::atomic<bool> g_master_stereo{false};  // an 8-channel voice seen built to 2 channels (the device stereo)
+std::atomic<uint64_t> g_fold_pairs[10][10] = {};  // the matrices built, by the voice's +0x2c and its destination's +0x2c
+bool audio_rd(uintptr_t a, void* o, size_t n) {  // a guarded read (the voice's destination's sends)
+    __try {
+        std::memcpy(o, reinterpret_cast<const void*>(a), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+void hk_AudioMatrix(char* voice, int send, float* out) {
+    o_AudioMatrix(voice, send, out);
+    g_fold_calls.fetch_add(1, std::memory_order_relaxed);
+    if (!voice || !out || send < 0 || !g_audio_fold.load(std::memory_order_relaxed)) return;
+    const uint32_t src = *reinterpret_cast<const uint32_t*>(voice + 0x2c);
+    char* sends = *reinterpret_cast<char**>(voice + 0x68);
+    if (!sends) return;
+    char* s = sends + static_cast<ptrdiff_t>(send) * 0x28;
+    const char* dst = *reinterpret_cast<char**>(s);
+    const uint32_t dch = dst ? *reinterpret_cast<const uint32_t*>(dst + 0x2c) : 0;
+    g_fold_pairs[src < 9 ? src : 9][dch < 9 ? dch : 9].fetch_add(1, std::memory_order_relaxed);  // "cam audio": the pairs seen
+    // an 8-channel voice (the submix) to a 2-channel one (the device): the game's own fold (its d11 table, the rear and
+    // the sides at 0.3) follows, so the output is stereo; to more channels it is not
+    if (src == 8) {  // (the review: only the voice that feeds the device, a destination with no sends of its own, decides)
+        uintptr_t b = 0, e = 1;
+        if (audio_rd(reinterpret_cast<uintptr_t>(dst) + 0x68, &b, sizeof(b)) && audio_rd(reinterpret_cast<uintptr_t>(dst) + 0x70, &e, sizeof(e)) && b == e)
+            g_master_stereo.store(dch == 2, std::memory_order_relaxed);
+        return;
+    }
+    // a mono voice (cycle AP1: every positioned sound) to the submix (8) or to the device (2), with the device stereo:
+    // each side's power from all its speakers into the front pair (FL FR, which the table passes at 1)
+    if (src != 1 || !(dch == 2 || (dch == 8 && g_master_stereo.load(std::memory_order_relaxed)))) return;
+    const float* g = reinterpret_cast<const float*>(s + 8);  // FL FR C LFE BL BR SL SR
+    const float l = g[0] * g[0] + g[4] * g[4] + g[6] * g[6] + 0.5f * g[2] * g[2];
+    const float r = g[1] * g[1] + g[5] * g[5] + g[7] * g[7] + 0.5f * g[2] * g[2];
+    if (!(l >= 0.0f && r >= 0.0f && l < 64.0f && r < 64.0f)) return;  // (finite and sane)
+    out[0] = std::sqrt(l);
+    out[1] = std::sqrt(r);
+    if (dch == 8) out[2] = out[4] = out[5] = out[6] = out[7] = 0.0f;  // (LFE, out[3], kept)
+    g_fold_done.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool install() {
     if (anchors::stand_down()) return false;
+    g_audio_head = config::get_bool("XR", "AudioFollowsHead", true);
+    g_audio_fold = config::get_bool("XR", "AudioRearFold", true);
+    // (the review: each hook installed only with its switch on in the ini, so 0 is a real off; "cam audio" then changes
+    // nothing; both anchors optional: a build without them keeps the game's sound)
+    if (g_audio_fold.load() && anchors::present(anchors::Id::AudioOutputMatrix) &&
+        !hooks::install("RDR audio output matrix", reinterpret_cast<void*>(anchors::addr(anchors::Id::AudioOutputMatrix)), hk_AudioMatrix,
+                        &o_AudioMatrix))
+        log::warn("[cam] the audio output matrix's hook not installed: the sounds behind you as the game mixes them");
+    if (g_audio_head.load() && anchors::present(anchors::Id::AudioUpdateListeners) &&
+        !hooks::install("RDR audio listeners", reinterpret_cast<void*>(anchors::addr(anchors::Id::AudioUpdateListeners)), hk_AudioListeners,
+                        &o_AudioListeners))
+        log::warn("[cam] the audio listeners' hook not installed: the game's own (the body's heading)");
     g_regenerate = reinterpret_cast<Regenerate_t>(anchors::addr(anchors::Id::ViewportRegenerate));
     g_perspective = reinterpret_cast<Perspective_t>(anchors::addr(anchors::Id::ViewportPerspective));
     g_head_cover = config::get_bool("XR", "HeadCover", true);
@@ -890,6 +991,28 @@ void set_head_cover(bool on) {
     log::info("[cam] head cover %s", on ? "on" : "off (cull for the game camera)");
 }
 
+void set_audio_follows_head(bool on) {
+    if (g_audio_head.exchange(on) != on) log::info("[cam] the audio listeners %s", on ? "at the head (the centre eye)" : "at the game camera (the body's heading)");
+}
+bool audio_follows_head() { return g_audio_head.load(); }
+void set_audio_rear_fold(bool on) {
+    if (g_audio_fold.exchange(on) != on) log::info("[cam] the audio's rear on stereo %s", on ? "folded into left and right" : "dropped (the game's)");
+}
+std::string audio_status() {
+    char b[320];
+    std::snprintf(b, sizeof(b),
+                  "audio follows head %d: listener updates %llu, from the head %llu, the last turned %+.1f deg from the game camera's | rear "
+                  "fold %d (stereo out %d): output matrices %llu, folded (mono to stereo) %llu",
+                  g_audio_head.load() ? 1 : 0, static_cast<unsigned long long>(g_audio_calls.load()),
+                  static_cast<unsigned long long>(g_audio_from_head.load()), g_audio_turn.load(), g_audio_fold.load() ? 1 : 0, g_master_stereo.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_fold_calls.load()), static_cast<unsigned long long>(g_fold_done.load()));
+    std::string o = b;
+    o += " | pairs (voice+0x2c, dst+0x2c):";
+    for (int x = 0; x < 10; ++x)
+        for (int y = 0; y < 10; ++y)
+            if (const uint64_t n = g_fold_pairs[x][y].load(std::memory_order_relaxed)) o += " " + std::to_string(x) + "/" + std::to_string(y) + "=" + std::to_string(n);
+    return o;
+}
 void set_first_person_moments(bool on) {
     if (g_fpm.exchange(on) != on) log::info("[cam] first-person moments (a script's camera: the eyes kept at John's head) %s", on ? "on" : "off");
 }

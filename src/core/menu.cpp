@@ -1238,6 +1238,58 @@ void page_holsters() {
     }
     sub_end();
 
+    {  // run 11 item 8 (the user: "The aim is for this belt to be configurable by users. So that each piece can be moved
+       // to where they prefer"): the props belt and each piece on it, saved at once
+        heading("The belt (new; tried in the simulator only)");
+        holster::BeltMenu bm = holster::belt_menu();
+        bool ch = false;
+        static const char* const kTurnAxis[3] = {"turn", "tilt", "lean"};
+        static const char* const kGunAxis[3] = {"tilt", "turn", "lean"};
+        ch |= check("A belt of the game's props", &bm.belt.on,
+                    "The game's own gun belt worn round John's hips (first person), its strap bent round them, its holster at the "
+                    "right hip with your shown gun in it; John's own belt hidden while it shows. It turns with John's hips; shown only with "
+                    "the whole body drawn (not with the forearms or the hands only, nor riding).");
+        sub_begin(bm.belt.on);
+        ch |= check("Its holster##belt holster", &bm.belt.holster, "The belt's own holster at the right hip. Off: a plain belt.");
+        ch |= check("John's own belt hidden##belt own", &bm.belt.hide_own, "His outfit's belt, holster and pouch not drawn under it.");
+        ch |= nudge3("Place##belt place", bm.off, 0.005f, 0.3f, "The whole belt moved right, up or forward from the hips (m).");
+        ch |= nudge3("Turn##belt turn", bm.turn, 2.5f, 90.0f, "The whole belt turned (deg): about up, about the side, about the front.",
+                     kTurnAxis, "%s %+.1f");
+        ch |= nudge1("Width##belt width", &bm.belt.a, 0.005f, 0.08f, 0.40f, "%.3f m", "Half the hips' width the belt goes round (m).");
+        ch |= nudge1("Depth##belt depth", &bm.belt.b, 0.005f, 0.06f, 0.40f, "%.3f m", "Half the hips' depth, front to back (m).");
+        ch |= nudge1("Buckle round##belt buckle", &bm.belt.s0, 0.01f, -1.0f, 1.0f, "%+.2f m",
+                     "The belt slid round the hips (m), the buckle and the holster with it.");
+        sub_end();
+        ch |= check("The knife at its holster", &bm.knife, "The knife shown at its holster (the left hip's or the lower back's), blade down; "
+                    "hidden while in hand.");
+        sub_begin(bm.knife);
+        ch |= nudge3("Place##knife place", bm.knife_off, 0.005f, 0.3f, "The knife moved right, up or forward (m).");
+        ch |= nudge3("Angle##knife angle", bm.knife_turn, 2.5f, 90.0f, "The knife turned (deg).", kGunAxis, "%s %+.1f");
+        sub_end();
+        static const char* const kAk[3] = {"satchel", "coil", "pouch"};  // each one's rows tracked by its own name (tests)
+        for (int i = 0; i < 3; ++i) {
+            ImGui::PushID(200 + i);
+            ch |= check(holster::attach_name(i), &bm.att_on[i],
+                        i == 0 ? "A satchel hanging from the belt." : i == 1 ? "The lasso's coil hanging from the belt; hidden while the lasso is in hand."
+                               : "A small pouch on the belt.");
+            sub_begin(bm.att_on[i]);
+            float* pl = bm.att_place[i];
+            if (nudge1((std::string("Round the belt##") + kAk[i] + " around").c_str(), &pl[0], 5.0f, -360.0f, 360.0f, "%+.0f deg",
+                       "Where on the belt (deg from the front: 90 the right hip, 180 the back, -90 the left hip).")) {
+                if (pl[0] > 180.0f) pl[0] -= 360.0f;
+                if (pl[0] < -180.0f) pl[0] += 360.0f;
+                ch = true;
+            }
+            ch |= nudge1((std::string("Height##") + kAk[i] + " height").c_str(), &pl[1], 0.005f, -0.5f, 0.3f, "%+.3f m", "Up or down from the strap (m).");
+            ch |= nudge1((std::string("Out##") + kAk[i] + " out").c_str(), &pl[2], 0.005f, -0.1f, 0.3f, "%+.3f m", "Out from the strap (m).");
+            ch |= nudge1((std::string("Size##") + kAk[i] + " size").c_str(), &bm.att_size[i], 0.05f, 0.3f, 2.0f, "%.2f", "Its size (1.00: the game's own).");
+            ch |= nudge3((std::string("Angle##") + kAk[i] + " angle").c_str(), bm.att_turn[i], 2.5f, 90.0f, "It turned about its place (deg).", kGunAxis, "%s %+.1f");
+            sub_end();
+            ImGui::PopID();
+        }
+        if (ch) holster::set_belt_menu(bm, true);
+    }
+
     heading("Each holster (m, a press 5 mm)");
     note("Each holster's offset right / up / forward from the drawn holster, and its size (its ring's radius).");
     for (int z = 0; z < holster::zone_count(); ++z) {
