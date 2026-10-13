@@ -372,7 +372,20 @@ uintptr_t hk_window(uintptr_t a1, uintptr_t fullscreen, uintptr_t a3, uintptr_t 
            // game's size replaced before the window create
             static char tw[16], th[16];
             unsigned aw = 0, ah = 0;
-            if (sscanf_s(config::get_string("Debug", "RenderResolutionTestArgs", "").c_str(), "%ux%u", &aw, &ah) == 2 && aw >= 640 && ah >= 480) {
+            const std::string ta = config::get_string("Debug", "RenderResolutionTestArgs", "");
+            if (ta == "relaunch") {  // 2026-10-13: as the real relaunch (-rebootToMenu): the strings null, the game's size its options'
+                const auto* o = at<uint8_t>(Id::GraphicsOptions);
+                const int ow = *reinterpret_cast<const int*>(o + 4), oh = *reinterpret_cast<const int*>(o + 8);
+                if (ow >= 640 && oh >= 480 && ow <= 16384 && oh <= 16384) {
+                    *at<const char*>(Id::SysParamWidth) = nullptr;
+                    *at<const char*>(Id::SysParamHeight) = nullptr;
+                    *at<int>(Id::ScreenWidth) = ow;
+                    *at<int>(Id::ScreenHeight) = oh;
+                    *at<int>(Id::ScreenWidthRT) = ow;  // (the device init's parse of the null strings sets these too)
+                    *at<int>(Id::ScreenHeightRT) = oh;
+                    log::info("[renderres] [Debug] RenderResolutionTestArgs=relaunch: the strings null, the game's size %dx%d (its options)", ow, oh);
+                }
+            } else if (sscanf_s(ta.c_str(), "%ux%u", &aw, &ah) == 2 && aw >= 640 && ah >= 480) {
                 std::snprintf(tw, sizeof(tw), "%u", aw);
                 std::snprintf(th, sizeof(th), "%u", ah);
                 *at<const char*>(Id::SysParamWidth) = tw;
@@ -394,6 +407,11 @@ uintptr_t hk_window(uintptr_t a1, uintptr_t fullscreen, uintptr_t a3, uintptr_t 
                       "(the game had %ux%u)", pw ? pw : "?", ph ? ph : "?", g_w, g_h, sw, sh);
             *at<int>(Id::ScreenWidth) = static_cast<int>(g_w);
             *at<int>(Id::ScreenHeight) = static_cast<int>(g_h);
+            // 2026-10-13 (the user's crash on returning to the menu): the device init makes the swapchain from the
+            // render-thread copies (FUN_14012e420 after the window create: on its own thread ScreenWidthRT/HeightRT), which the null strings had
+            // left at the options' 2560x1440 while the targets took these: the first bind faulted in the driver. Both put back
+            *at<int>(Id::ScreenWidthRT) = static_cast<int>(g_w);
+            *at<int>(Id::ScreenHeightRT) = static_cast<int>(g_h);
             sw = g_w;
             sh = g_h;
             g_over_args = true;
@@ -547,18 +565,6 @@ bool arm(bool early) {
         std::snprintf(g_why, sizeof(g_why), "too late this start (the game had made its device: %s)", early ? "early" : "after the anchors' check");
         return false;
     }
-    char blocked[64], want[32];
-    std::snprintf(blocked, sizeof(blocked), "%s", state_get(boot_section(), "Blocked").c_str());
-    std::snprintf(want, sizeof(want), "%ux%u", g_w, g_h);
-    if (blocked[0] && std::strcmp(blocked, want) != 0) {  // another size chosen since: the old block no longer applies
-        state_set(boot_section(), "Blocked", nullptr);
-        blocked[0] = 0;
-    }
-    if (blocked[0]) {
-        std::snprintf(g_why, sizeof(g_why), "a start at %s ended within two minutes (not by quitting): choose it again in the menu to retry",
-                      blocked);
-        return false;
-    }
     char why[160];
     if (!vram_allows(g_w, g_h, why, sizeof(why))) {
         std::snprintf(g_why, sizeof(g_why), "%s", why);
@@ -580,9 +586,6 @@ bool arm(bool early) {
         return false;
     }
     d3d::add_frame_end_listener(frame_end);
-    char pending[32];
-    std::snprintf(pending, sizeof(pending), "%ux%u", g_w, g_h);
-    state_set(boot_section(), "Pending", pending);
     std::snprintf(g_wstr, sizeof(g_wstr), "%u", g_w);
     std::snprintf(g_hstr, sizeof(g_hstr), "%u", g_h);
     g_armed = true;
@@ -650,13 +653,13 @@ void early_arm() {
         if (cl) WideCharToMultiByte(CP_UTF8, 0, cl, -1, b, static_cast<int>(sizeof(b)) - 1, nullptr, nullptr);
         log::info("[renderres] the command line: %s", b);
     }
-    // the boot sentinel: a start that armed a size and did not reach its frame count blocks that size
-    const std::string pending = state_get(boot_section(), "Pending");
-    if (!pending.empty()) {
-        state_set(boot_section(), "Blocked", pending.c_str());
+    // 2026-10-13 (the user: "Remove the this size may crash thing, let people pick whatever resolution they want"): no
+    // size is blocked any more after a start that ended early; an older build's marks are cleared
+    if (!state_get(boot_section(), "Pending").empty() || !state_get(boot_section(), "Blocked").empty()) {
+        log::info("[renderres] an older build's start marks (%s, blocked %s) cleared: no size is blocked", state_get(boot_section(), "Pending").c_str(),
+                  state_get(boot_section(), "Blocked").c_str());
         state_set(boot_section(), "Pending", nullptr);
-        log::warn("[renderres] the last start at %s ended within two minutes, not by quitting: that size is blocked until it is chosen again",
-                  pending.c_str());
+        state_set(boot_section(), "Blocked", nullptr);
     }
     char why[160];
     if (!size_of(g_choice, g_scale, g_custom_w, g_custom_h, &g_w, &g_h, why, sizeof(why))) {
@@ -696,6 +699,18 @@ void record_runtime(const char* runtime, uint32_t rec_w, uint32_t rec_h, uint32_
     state_set(sec, "Largest", v);
     log::info("[renderres] runtime %s (%s): recommended %ux%u, largest image %ux%u (kept for Automatic)", runtime ? runtime : "?", g_runtime_key,
               rec_w, rec_h, cap_w, cap_h);
+}
+
+// 2026-10-13 (the user: "Game crashed when I tried to return to the menu"): returning to the menu relaunches the game
+// (-rebootToMenu=<the old window>); in that start the size strings are null and the game's swapchain took the graphics
+// options' size (2560x1440) while the window create's put-back gave the targets the armed one (4808x2704): the first
+// frame binding them faulted in the driver (OMSetRenderTargets). After a put-back the swapchain is made, and resized, at
+// the armed size too: the state of a normal start (the buffers stretched into the player's window).
+bool relaunch_swap_size(uint32_t* w, uint32_t* h) {
+    if (!g_over_args || !g_took.load()) return false;
+    *w = g_w;
+    *h = g_h;
+    return true;
 }
 
 bool active(uint32_t* w, uint32_t* h) {

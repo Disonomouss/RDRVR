@@ -58,6 +58,15 @@ struct PsoInfo {
 };
 std::unordered_map<void*, PsoInfo> g_info;  // under g_mutex
 thread_local PsoInfo t_info;
+// run 12 item 12a, "pso ps reset|dump <file>" (single-pass stereo's reader census, a test's): every pixel shader drawn
+// since the reset, by its hash (fnv of its bytecode, as the corpus's blobs hash offline), with its draws, a vertex
+// shader it drew with and what it writes; per scene, joined offline to the corpus's screen-target samplers
+struct PsAcc {
+    uint64_t draws = 0, vs = 0;
+    uint32_t writes = 0;
+};
+std::unordered_map<uint64_t, PsAcc> g_ps_acc;  // under g_mutex
+std::atomic<bool> g_ps_acc_on{false};
 
 uint64_t fnv(const void* p, size_t n) {
     const uint8_t* b = static_cast<const uint8_t*>(p);
@@ -423,6 +432,13 @@ void install_list_hooks(ID3D12GraphicsCommandList* cl) {
 bool on_draw(ID3D12GraphicsCommandList* cl) {
     if (!g_census.load(std::memory_order_relaxed)) return false;
     uint64_t h = cl == t_cl ? t_vs : 0;
+    if (cl == t_cl && t_info.ps && g_ps_acc_on.load(std::memory_order_relaxed)) {
+        std::lock_guard lock(g_mutex);
+        PsAcc& e = g_ps_acc[t_info.ps];
+        ++e.draws;
+        e.vs = h;
+        e.writes = t_info.writes;
+    }
     if (h) {
         std::lock_guard lock(g_mutex);
         ++g_draws[h];
@@ -475,6 +491,37 @@ std::string command(const std::string& line) {
         }
         g_skip_any = !g_skip_set.empty();
         return "skip set " + std::to_string(g_skip_set.size()) + " vertex shaders";
+    }
+    if (sub == "ps") {  // pso ps reset | pso ps dump <file> | pso ps off (run 12 item 12a)
+        std::string file;
+        in >> file;
+        if (arg == "reset") {
+            {
+                std::lock_guard lock(g_mutex);
+                g_ps_acc.clear();
+            }
+            g_ps_acc_on = true;
+            return "pixel shader tally reset (on)";
+        }
+        if (arg == "off") {
+            g_ps_acc_on = false;
+            return "pixel shader tally off";
+        }
+        if (arg == "dump" && !file.empty()) {
+            FILE* f = nullptr;
+            if (fopen_s(&f, file.c_str(), "w") != 0 || !f) return "ERROR cannot write " + file;
+            std::lock_guard lock(g_mutex);
+            uint64_t total = 0;
+            for (auto& [h2, e] : g_ps_acc) {
+                std::fprintf(f, "%016llx %016llx %03x %llu\n", static_cast<unsigned long long>(h2), static_cast<unsigned long long>(e.vs), e.writes,
+                             static_cast<unsigned long long>(e.draws));
+                total += e.draws;
+            }
+            std::fclose(f);
+            return "dumped " + std::to_string(g_ps_acc.size()) + " pixel shaders (" + std::to_string(total) + " draws)";
+        }
+        std::lock_guard lock(g_mutex);
+        return "pixel shader tally " + std::string(g_ps_acc_on.load() ? "on" : "off") + ", " + std::to_string(g_ps_acc.size()) + " pixel shaders";
     }
     if (sub == "list") {
         // all vertex shaders that drew last frame, comma separated

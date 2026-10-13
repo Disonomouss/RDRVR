@@ -36,6 +36,9 @@ void record_runtime(const char* runtime, uint32_t rec_w, uint32_t rec_h, uint32_
 
 // This start's override, once the game took it (the frame is w x h); false: the game's own size.
 bool active(uint32_t* w = nullptr, uint32_t* h = nullptr);
+// A relaunch (back to the menu) whose size the window create put back: the size the swapchain must be made and resized
+// at (the armed one); false otherwise.
+bool relaunch_swap_size(uint32_t* w, uint32_t* h);
 // The process's clean exit (exit_guard): the boot sentinel cleared (as are two minutes at the size).
 void on_exit();
 

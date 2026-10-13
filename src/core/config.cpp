@@ -1,5 +1,7 @@
 #include "core/config.h"
 
+#include <cstring>
+
 #include <windows.h>
 #include <shlobj.h>
 
@@ -24,6 +26,7 @@ struct Value {
 
 SRWLOCK g_lock = SRWLOCK_INIT;
 std::map<std::string, Value> g_values;  // "section.key" (lower case) -> value
+std::map<std::string, std::string> g_shipped;  // the shipped RDRVR.ini's own values (a reset to the defaults)
 std::set<std::string> g_echoed;
 wchar_t g_user_path[MAX_PATH] = {};
 
@@ -61,6 +64,7 @@ void parse_file(const wchar_t* path, const char* source) {
         std::string val = trim(s.substr(eq + 1));
         if (size_t sc = val.find(" ;"); sc != std::string::npos) val = trim(val.substr(0, sc));
         g_values[section + "." + key] = {val, source};
+        if (!std::strcmp(source, "ini")) g_shipped[section + "." + key] = val;
         ++keys;
     }
     std::fclose(f);
@@ -149,7 +153,8 @@ bool set(const char* section, const char* key, const std::string& value) {
     FILE* f = nullptr;
     if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0 || !f) return false;
     if (lines.empty() || trim(lines.front()).rfind(";", 0) != 0)
-        std::fputs("; RDRVR user settings, written by the in-headset menu. Never replaced by a release or a test.\r\n", f);
+        std::fputs("; RDRVR user settings, written by the in-headset menu. A release that resets the settings keeps this file "
+                   "as RDRVR.user.ini.before-<version>.bak.\r\n", f);
     for (const auto& l : lines) {
         std::fputs(l.c_str(), f);
         std::fputs("\r\n", f);
@@ -180,10 +185,46 @@ void load() {
 
     AcquireSRWLockExclusive(&g_lock);
     g_values.clear();
+    g_shipped.clear();
     g_echoed.clear();  // re-echo after a reload so the log shows what the new values are
     parse_file(ini, "ini");
     if (g_user_path[0]) parse_file(g_user_path, "user");
     ReleaseSRWLockExclusive(&g_lock);
+    // 2026-10-13 (the user: "For the next release, can you have my current ini settings overwrite the users. I worry
+    // there are people who have played since an early version whose old settings keep on carrying over"): a release
+    // whose shipped ini names a [Compat] SettingsReset tag starts each player from its defaults once: a user file not
+    // made under that tag is moved aside (kept as RDRVR.user.ini.before-<tag>.bak) and a new one records the tag. The
+    // repo's own ini leaves it empty, so a developer's deploy never resets.
+    std::string tag, mine;
+    {
+        AcquireSRWLockShared(&g_lock);
+        auto it = g_shipped.find("compat.settingsreset");
+        if (it != g_shipped.end()) tag = it->second;
+        auto mt = g_values.find("compat.settingsreset");
+        if (mt != g_values.end() && !std::strcmp(mt->second.source, "user")) mine = mt->second.text;
+        ReleaseSRWLockShared(&g_lock);
+    }
+    if (tag.empty() || !g_user_path[0] || mine == tag) return;
+    if (GetFileAttributesW(g_user_path) != INVALID_FILE_ATTRIBUTES) {
+        const std::wstring wtag(tag.begin(), tag.end());
+        std::wstring bak = std::wstring(g_user_path) + L".before-" + wtag + L".bak";
+        for (int n = 1; GetFileAttributesW(bak.c_str()) != INVALID_FILE_ATTRIBUTES && n < 100; ++n)
+            bak = std::wstring(g_user_path) + L".before-" + wtag + L"." + std::to_wstring(n) + L".bak";
+        if (!MoveFileExW(g_user_path, bak.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            log::warn("[cfg] the settings reset of %s: %ls not moved aside (error %lu): the old settings kept", tag.c_str(), g_user_path,
+                      GetLastError());
+            return;
+        }
+        log::info("[cfg] the settings reset of %s: the old user settings kept as %ls; this release's defaults from now on", tag.c_str(),
+                  bak.c_str());
+        AcquireSRWLockExclusive(&g_lock);
+        g_values.clear();
+        g_shipped.clear();
+        g_echoed.clear();
+        parse_file(ini, "ini");
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+    set("Compat", "SettingsReset", tag);  // (a new user file: this tag's, so the reset is done once)
 }
 
 bool get_bool(const char* section, const char* key, bool def) {
@@ -224,6 +265,14 @@ std::string get_string(const char* section, const char* key, const char* def) {
     std::string r = def;
     if (lookup(section, key, v, src)) r = v;
     echo(section, key, r, src);
+    return r;
+}
+std::string get_shipped(const char* section, const char* key, const char* def) {
+    const std::string k = lower(section) + "." + lower(key);
+    AcquireSRWLockShared(&g_lock);
+    auto it = g_shipped.find(k);
+    std::string r = it != g_shipped.end() ? it->second : std::string(def);
+    ReleaseSRWLockShared(&g_lock);
     return r;
 }
 

@@ -41,23 +41,6 @@ float fire_clip_phase();
 // gun diagonal), hidden while that gun is in a hand; destroyed when off or out of first person.
 // [Holsters] ShowModels: a holster model (the game's prop [Holsters] Model) drawn at each enabled hip holster
 bool show_models();
-bool show_knife();  // run 11 item 6, [Holsters] ShowKnife
-bool knife_wanted();  // the knife shown at its holster this frame (the draw hook hides the game's own knife meanwhile)
-// run 11 item 8 (the user: "The aim is for this belt to be configurable by users. So that each piece can be moved to
-// where they prefer"): every piece of the props belt's settings, for the menu's Holsters tab; set: applied at once and,
-// with save, written to the user ini ([Holsters] PropBelt*, ShowKnife, Knife*, Show<X>, <X>Around/Height/Out/Size/Turn)
-struct BeltMenu {
-    body::PropBelt belt;
-    float off[3], turn[3];
-    bool knife;
-    float knife_off[3], knife_turn[3];
-    bool att_on[3];
-    float att_place[3][3];  // round the belt (deg), height (m), out (m)
-    float att_turn[3][3], att_size[3];
-};
-BeltMenu belt_menu();
-void set_belt_menu(const BeltMenu& m, bool save);
-const char* attach_name(int i);  // the satchel, the lasso's coil, the ammo pouch
 void set_show_models(bool on, bool save = true);
 bool show_guns();
 void set_show_guns(bool on, bool save = true);
@@ -151,7 +134,9 @@ void set_any_weapon(bool on);
 constexpr int kRounds = 38;  // kWeapons (an eWeapon past the last)
 int zone_weapon(int z);           // -1: automatic
 void set_zone_weapon(int z, int w, bool save);
-bool zone_takes_weapons(int z);   // not the chest (with AnyWeapon on, the chest too)
+bool zone_takes_weapons(int z);   // not the chest (its rounds)
+bool zone_any(int z);             // a gun holster (the hips, the backs): AnyWeapon's (2026-10-13)
+int zone_piece(int z);            // its belt piece (body::Piece index; body::kPieces the mirrored left holster), -1 none
 bool zone_fits(int z, int equip_slot);
 struct Arsenal {
     bool valid;
@@ -167,6 +152,26 @@ void set_show_zones(bool on);  // also written to the user ini
 // moves that holster with the hand, letting go saves its offset
 bool placing();
 void set_placing(bool on);
+// [Holsters] RingsFollowHolsters (2026-10-13): a moved belt piece's ring at the same spot on it (gripping the ring moves
+// the piece), or each moved on its own
+bool rings_follow();
+// a piece (body::kPieces the mirrored left holster) or a ring set as the menu's arrows do: with RingsFollowHolsters the
+// other moved the same way
+void set_piece_linked(int pc, const body::Piece& p, bool save);
+void set_zone_linked(int z, const float off[3], float radius, bool save);
+void reset_rings();  // every ring's place and size back to the shipped defaults (saved)
+// "Customize John's belt" turned on or off: with RingsFollowHolsters the linked rings moved with the pieces
+void set_own_pieces_linked(bool on, bool save);
+int link_piece(int z);  // the piece a ring is linked to (-1 none, or RingsFollowHolsters off)
+void link_piece_moved(int pc, const float dw[3], int except);  // its rings shifted by a world move (but `except`)
+void link_zone_moved(int z, const float dw[3]);  // a ring moved: its piece and the piece's other rings the same way
+void link_save(int pc, int except);  // the piece and its rings saved
+void set_rings_follow(bool on, bool save);
+// Run 12 item 3: placing John's belt's pieces by hand (the session; turns [Holsters] OwnBelt on): a grip within 10 cm of
+// a piece takes it, it follows the hand's move and turn, letting go saves it. "holster pieces [place on|off]"
+bool placing_pieces();
+void set_placing_pieces(bool on);
+std::string pieces_status();
 bool zones_near();
 void set_zones_near(bool on, bool save = true);
 // [Holsters] SteadyZones: a hand stays in its holster until 3 cm past its radius; another takes it when 3 cm nearer

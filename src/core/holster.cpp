@@ -98,11 +98,21 @@ std::atomic<bool> g_unarmed{true};        // [Holsters] UnarmedAfterHolster
 std::atomic<bool> g_show_zones{false};    // [Holsters] ShowZones: the holster rings (run 8 item 5b: those only)
 std::atomic<bool> g_zones_near{false};    // [Holsters] ZonesNear (2026-10-09): a ring only with a hand near it
 std::atomic<float> g_near_dist{0.25f};    // [Holsters] ZonesNearDistance: how near (m, past the ring's radius)
-std::atomic<bool> g_steady_zones{false};  // [Holsters] SteadyZones (2026-10-09): the zones' edges with hysteresis
+std::atomic<bool> g_steady_zones{true};  // [Holsters] SteadyZones (2026-10-09): the zones' edges with hysteresis
 constexpr float kZoneExit = 0.03f, kZoneSticky = 0.03f;  // SteadyZones: past the radius to leave; nearer to change
 std::atomic<bool> g_place{false};  // placing the holsters by hand (the menu; the session only)
+std::atomic<bool> g_piece_place{false};  // run 12 item 3: placing John's belt's pieces by hand (the menu; the session only)
+std::atomic<uint64_t> g_pieces_placed{0};
+std::atomic<int> g_piece_held[2] = {-1, -1};  // the piece each hand holds while placing (-1 none)
 std::atomic<uint64_t> g_placed{0};  // holsters moved by hand and saved
 void save_zone(int i);              // (below) a zone's offset and radius into the user ini
+// the shown guns of the last update (kShowZones order: the weapon, -1 none) and when ("Place them by hand" takes them)
+int g_shown_last[4] = {-1, -1, -1, -1};
+double g_shown_ms = 0.0;
+// the frame the zones' offsets are moved in by hand (the update's: right and forward, and the left-handed mirror),
+// for a world move put on an offset (under g_zone_mutex)
+float g_link_rgt[3] = {1.0f, 0.0f, 0.0f}, g_link_fwd[3] = {0.0f, 0.0f, -1.0f};
+bool g_link_lefty = false;
 std::atomic<bool> g_ring_gun_axes{true};
 std::atomic<bool> g_steady_ring{true};  // [Reload] SteadyRing (run 8 item 2): the ring's place on the gun locked after the draw
 std::atomic<uint64_t> g_ring_locks{0};  // [Reload] RingInGunAxes (run 8 item 2): the ring's offset along the drawn gun's axes
@@ -278,18 +288,34 @@ struct Zone {
     // left twins mirror their partner's unless set
     float gun_turn[3] = {0.0f, 0.0f, 0.0f};
     float gun_off[3] = {0.0f, 0.0f, 0.0f};
+    // [Holsters] LeftHipRingOffset (2026-10-13): the LeftHip's own offset from the mirrored left holster while it is drawn
+    // (OwnBeltLeftHolster); LeftHipOffset stays the one without it
+    float off_copy[3] = {0.0f, 0.0f, 0.0f};
 };
+// the LeftHip (the right hip's twin) on the mirrored left holster: its own offset then (Zone::off_copy)
+// the gun holsters (the hips and the backs): AnyWeapon's
+bool gun_zone(const Zone& z) { return z.bone == 0 || z.bone == 1; }
+bool zone_on_copy(const Zone& z) { return z.mirror && z.bone == 0 && body::left_holster(); }
+float* zone_off(Zone& z) { return zone_on_copy(z) ? z.off_copy : z.off; }
+// [Holsters] RingsFollowHolsters (2026-10-13): 1 a moved belt piece's ring goes with it and gripping the ring moves the
+// piece (always at the same spot); 0 each moved on its own
+std::atomic<bool> g_rings_follow{true};
 Zone g_zones[kZones] = {
-    {"RightHip", "Right hip (sidearm)", 0, {1, -1, -1}, {0.0f, 0.0f, 0.0f}, 0.15f, -1},
-    {"Back", "Back (long gun)", 1, {5, 6, 4}, {0.0f, 0.05f, 0.0f}, 0.25f, -1},
-    {"Belt", "Belt (thrown)", 2, {2, -1, -1}, {0.0f, 0.0f, 0.0f}, 0.12f, -1},
-    {"Knife", "Left hip (knife and lasso; off: moved to the lower back)", 3, {0, 3, -1}, {0.0f, 0.0f, 0.0f}, 0.12f, -1, false, -1, false},
-    {"Ammo", "Chest (a round to reload; the gun hand squeezed here reloads)", 4, {-1, -1, -1}, {0.0f, 0.0f, 0.15f}, 0.15f, -1},
+    // (2026-10-13, the user: "Right hip holster - primary side arm, Left hip holster - secondary side arm, Right back
+    // holster - primary long gun, Left back holster - secondary long gun, Knife holster - knife, Satchel - throwables,
+    // Lasso - Lasso. Ammo holster will just have to be wherevern the user decides": each holster its belt piece's)
+    {"RightHip", "Right hip (primary sidearm)", 0, {1, -1, -1}, {0.0f, 0.0f, 0.0f}, 0.15f, -1},
+    {"Back", "Right back (primary long gun)", 1, {5, 6, 4}, {0.0f, 0.05f, 0.0f}, 0.25f, -1},
+    {"Belt", "Satchel (throwables)", 2, {2, -1, -1}, {0.0f, 0.0f, 0.0f}, 0.12f, -1},
+    {"Knife", "Knife", 3, {0, -1, -1}, {0.0f, 0.0f, 0.0f}, 0.12f, -1},
+    {"Ammo", "Ammo (a round to reload; the gun hand squeezed here reloads)", 4, {-1, -1, -1}, {0.0f, 0.0f, 0.15f}, 0.15f, -1},
     // round 8: "another long holster behind the left shoulder, another pistol holster on the left hip, move the melee
     // holster to the lower back". The twins mirror the right hip's and the back's bone and offset (unless set).
-    {"LeftHip", "Left hip (a second sidearm)", 0, {1, -1, -1}, {0.0f, 0.0f, 0.0f}, 0.15f, -1, true, 0, true},
-    {"LeftShoulder", "Back, left shoulder (a second long gun)", 1, {5, 6, 4}, {0.0f, 0.05f, 0.0f}, 0.25f, -1, true, 1, true},
-    {"LowerBack", "Lower back (knife and lasso)", 5, {0, 3, -1}, {0.0f, 0.05f, -0.12f}, 0.16f, -1},
+    {"LeftHip", "Left hip (secondary sidearm)", 0, {1, -1, -1}, {0.0f, 0.0f, 0.0f}, 0.15f, -1, true, 0, true},
+    {"LeftShoulder", "Left back (secondary long gun)", 1, {5, 6, 4}, {0.0f, 0.05f, 0.0f}, 0.25f, -1, true, 1, true},
+    // (2026-10-13: the lasso's own, at John's lasso (its rope bone); it replaced the lower back's knife and lasso holster:
+    // the knife's sheath moves where it is wanted now)
+    {"Lasso", "Lasso", 6, {3, -1, -1}, {0.0f, 0.0f, 0.0f}, 0.10f, -1},
 };
 // eWeapon order (WeaponModel 0..37): the ini's tokens and the menu's labels
 const char* const kWeaponToken[kWeapons] = {"Volcanic", "SemiAutoPistol", "HighPower", "Mauser", "Cattleman", "Schofield", "DoubleAction", "LeMat", "Carbine", "Winchester", "Henry", "Evans", "Springfield", "BoltAction", "Buffalo", "SawedOff", "DoubleBarrel", "PumpAction", "SemiAutoShotgun", "RollingBlock", "Carcano", "Lasso", "Knife", "FireBottle", "Dynamite", "ThrowingKnife", "Gatling", "Browning", "Cannon", "Tomahawk", "Bow", "ExplosiveRifle", "ZombieSpit", "Torch", "Blunderbuss", "HolyWater", "ZombieBait", "BoomBait"};
@@ -324,101 +350,7 @@ char g_model_name[64] = "p_gen_gunbelt01x";
 float g_model_off[3] = {0, 0, 0}, g_model_rot[3] = {90, 90, 0};  // under g_zone_mutex
 float g_model_raw[3] = {0, 0, 0};  // "holster model raw a b c": the native's angles as given (the axes' test)
 bool g_model_raw_on = false;       // under g_zone_mutex
-// run 11 item 2, [Holsters] PropBelt: the gun belt prop round the hips (held_prop kBeltSlot; body.cpp bends its strap
-// and moves its draws exactly): centred at the drawn pelvis moved by PropBeltOffset (m: right, up, forward of the
-// body's heading), its axes X the body's left, Y its front, Z down (the model's holster hangs toward its +z: the
-// buckle at the front, the holster at the right hip hanging; cycle P2's captures),
-// turned by PropBeltTurn (degrees about up, right, forward); PropBeltSize the hips' ellipse (m: half the width, half
-// the depth), PropBeltBuckle the buckle's place round it (m from the front centre), PropBeltHolster its holster kept,
-// PropBeltFlip the ring mirrored front to back, PropBeltHide its geometries hidden (a hex mask)
-std::atomic<bool> g_prop_belt{false};
-body::PropBelt g_belt;                                  // under g_zone_mutex
-float g_belt_off[3] = {0, 0, 0}, g_belt_turn[3] = {0, 0, 0};  // under g_zone_mutex
-float g_belt_want_rel[3] = {0, 0, 0};  // under g_zone_mutex: the last wanted place less its anchor (the drawn error's reference)
-// run 11 item 9: the hips' turn against the belt (the drawn right hip's bone about the pelvis, against the body's
-// heading the belt keeps: deg) and the pelvis's height over the root, their ranges since "holster belt sway reset"
-float g_sway_min = 1e9f, g_sway_max = -1e9f, g_pel_min = 1e9f, g_pel_max = -1e9f;  // under g_zone_mutex
-uint64_t g_sway_n = 0;
-double g_belt_want_ms = 0;
-const char* const kBeltFragment = "p_gen_gunbelt01x";
-// run 11 item 4: the zones on the props belt (RightHip, Belt, Knife, Ammo, LeftHip, LowerBack), out from its strap by
-const int kBeltZones[6] = {0, 2, 3, 4, 5, 7};
-constexpr float kBeltZoneOut = 0.04f;  // m (the loops and a hand's clearance)
-// run 11 item 5: the gun belt's own revolver's grip in its model's rest space ("skel propbelt scan": geometry 0, all on
-// bone 5, its box (-0.385 0.013 -0.067)..(-0.253 0.075 0.229): it hangs along +z, the grip at the top), where the right
-// hip's shown gun is seated while the belt's holster is shown
-const float kBeltGrip[3] = {-0.28f, 0.0f, 0.04f};  // (cycle H2: at z -0.02 the cylinder stood 6 cm out of the mouth; H6: at x -0.32 y 0.045 beside it)
-constexpr int kBeltHolsterBone = 5;
-std::atomic<uint64_t> g_belt_seated{0};
-// run 11 item 6, [Holsters] ShowKnife (off by default): the knife's model (KnifeModel, the held one's fragment) shown at
-// its holster (the Knife zone, else the LowerBack) while it is owned and not in a hand: blade down, its flat facing out
-// from the body, the guard at the zone (on the props belt: 2 cm from the strap); turned and moved by KnifePropTurn (deg:
-// tilt, turn, lean as GunTurn) and KnifePropOffset (m: right, up, forward; 0.8.8: not KnifeOffset, the Knife zone's own offset). No prop of the census reads as a sheath: the
-// knife alone (run 11 item 1, props.md). held_prop slot kBeltSlot + 1
-std::atomic<bool> g_show_knife{false};
-char g_knife_model[64] = "melee_knife01x";
-float g_knife_turn[3] = {0, 0, 0}, g_knife_off[3] = {0, 0, 0};  // under g_zone_mutex
-constexpr int kKnifeWeapon = 22, kKnifeSlot = held_prop::kBeltSlot + 1;
-std::atomic<int> g_knife_zone{-1};  // the zone the knife was last shown at (-1 none)
-// run 11 item 7: the belt's other props, each behind its own switch (off by default), each at its own place round the
-// belt (the user: "The aim is for this belt to be configurable by users. So that each piece can be moved to where they
-// prefer"): <Key>Around (deg round the belt from the front centre, + to the right: 90 the right hip, 180 the back, -90
-// the left hip), <Key>Height (m over the strap), <Key>Out (m out from it), <Key>Turn (deg: tilt, turn, lean as GunTurn).
-// The ring is the props belt's (PropBeltSize, PropBeltOffset, PropBeltTurn round the drawn pelvis), so a piece stays on
-// the belt as it moves (cycle AT1: placed by a holster zone's angle, it followed the head's anchor round the hips).
-//  - [Holsters] ShowSatchel: the satchel (p_gen_satchel01x, 0.40 x 0.29 x 0.24 m), by default at the back left;
-//  - ShowLassoCoil: the lasso's coil (melee_lasso01x, the held one) at the left hip, while the lasso is owned and not in hand;
-//  - ShowAmmoPouch: a small pouch for the rounds (p_gen_moneybag01x, 9 x 16 x 9 cm: the census's only one small enough;
-//    the belt's own loops carry the cartridges), by default at the front left.
-// The model's axes from its census bounds (run 11 item 1, props.md): the satchel upright (its z up: on its back, cycle
-// AT3, its flap faced out), its back (y 0) against the strap, its corner origin moved half its width along the belt; it
-// is a deep bag (0.29 m out from the hip): <Key>Size scales each prop (its draws are moved exactly by the pose, so its
-// axes' length is its size; 0.75 the satchel's default); the coil and the pouch hang (the coil spans -y, so its y up;
-// the pouch spans +y, so its y down), their x out from the belt. held_prop slots kBeltSlot + 2 .. + 4
-struct BeltAttach {
-    const char* key;   // the ini's prefix (ShowX, XAround, XHeight, XOut, XTurn)
-    const char* frag;
-    int y_up;          // 1: the model's y up, -1: its y down, 2: upright (its z up, its y out)
-    float half_x;      // half its width along the belt (the satchel's corner origin), m
-    float below;       // its origin this far below its place (the satchel's top over its origin), m
-    float def_size;    // the default size (1: the model's own)
-    float def[3];      // the defaults: round the belt (deg), the height (m), out (m)
-};
-const BeltAttach kAttach[3] = {
-    {"Satchel", "p_gen_satchel01x", 2, 0.198f, 0.038f, 0.75f, {-150.0f, -0.03f, 0.0f}},
-    {"LassoCoil", "melee_lasso01x", 1, 0.0f, 0.0f, 1.0f, {-95.0f, -0.03f, 0.03f}},
-    {"AmmoPouch", "p_gen_moneybag01x", -1, 0.0f, 0.0f, 1.0f, {-35.0f, -0.03f, 0.03f}},
-};
-std::atomic<bool> g_attach_on[3] = {false, false, false};
-float g_attach_place[3][3] = {}, g_attach_turn[3][3] = {};  // under g_zone_mutex: round (deg), height, out; the turn
-float g_attach_size[3] = {1.0f, 1.0f, 1.0f};               // under g_zone_mutex
-constexpr int kAttachSlot = held_prop::kBeltSlot + 2;
-std::atomic<uint64_t> g_belt_zoned{0};  // zone placements on the belt (a test's readback)
-float g_belt_zone_rel[8][3] = {}, g_belt_zone_loc[8][3] = {};  // under g_zone_mutex: each zone less the pelvis; its ring point less the belt's centre
 void turn_about(float* v, const float* ax, float rad);  // (below)
-bool belt_holster_shown();  // (below: after g_zone_mutex)
-// the belt's pose (12 floats: X, Y, Z columns, then the position) at the pelvis point `at`
-void belt_pose(const float* at, const float* rgt, const float* up, const float* fwd, const float* off, const float* turn, float* pz) {
-    float X[3], Y[3], Z[3], P[3];
-    for (int k = 0; k < 3; ++k) {
-        X[k] = -rgt[k];
-        Y[k] = fwd[k];
-        Z[k] = -up[k];
-        P[k] = at[k] + rgt[k] * off[0] + up[k] * off[1] + fwd[k] * off[2];
-    }
-    const float r = 0.0174532925f;
-    float ax[3];
-    std::memcpy(ax, up, sizeof(ax));  // the turn about up, then about right, then about forward
-    turn_about(X, ax, turn[0] * r), turn_about(Y, ax, turn[0] * r), turn_about(Z, ax, turn[0] * r);
-    std::memcpy(ax, rgt, sizeof(ax));
-    turn_about(X, ax, turn[1] * r), turn_about(Y, ax, turn[1] * r), turn_about(Z, ax, turn[1] * r);
-    std::memcpy(ax, fwd, sizeof(ax));
-    turn_about(X, ax, turn[2] * r), turn_about(Y, ax, turn[2] * r), turn_about(Z, ax, turn[2] * r);
-    std::memcpy(pz, X, sizeof(X));
-    std::memcpy(pz + 3, Y, sizeof(Y));
-    std::memcpy(pz + 6, Z, sizeof(Z));
-    std::memcpy(pz + 9, P, sizeof(P));
-}
 // The model's pose at a hip (12 floats: X, Y, Z columns, then the position): the holster's frame (X right, Y forward,
 // Z up) turned by the model's turn, at the zone moved by its offset
 void model_pose(int i, const float* at, const float* rgt, const float* up, const float* fwd, const float* off, const float* rot, float* pz) {
@@ -543,6 +475,10 @@ struct HolsterDiag {
     int in_zone[2] = {-1, -1};
     int cur_slot = -1;
     bool in_hand = false;
+    float cam[3] = {};  // the frame camera's position in the same update (run 12: the tests' zone against the camera)
+    bool cam_ok = false;
+    float base[kZones][3] = {};  // each zone's base (its bone without a belt piece's move, a twin's mirrored) ("holster bases")
+    float root[3] = {}, right[3] = {};  // the twins' mirror: the root and the body's right
 };
 HolsterDiag g_hdiag;
 std::mutex g_hdiag_mutex;
@@ -557,10 +493,6 @@ const uint32_t kPutItemAway = 0x13A63AA7;      // ACTOR_PUT_ITEM_AWAY(actor)
 // draw into the hand clears it (FUN_14033d6d0, FUN_140341430).
 const uint32_t kMeleeModeSelected = 0xAC1285A3;
 
-bool belt_holster_shown() {  // the props belt shows its own holster (PropBeltHolster)
-    std::lock_guard lock(g_zone_mutex);
-    return g_belt.holster;
-}
 void holster_frame() {
     static bool grip_down[2] = {false, false}, pending[2] = {false, false};
     static int zone_in[2] = {-1, -1}, press_zone[2] = {-1, -1};
@@ -611,7 +543,6 @@ void holster_frame() {
         held_prop::want(1, nullptr, nullptr);  // and the copy's own model
         for (int i = 0; i < 4; ++i) held_prop::want(held_prop::kHolsterSlot + i, nullptr, nullptr);  // and the holsters' guns
         for (int i = 0; i < 2; ++i) held_prop::want(held_prop::kModelSlot + i, nullptr, nullptr);    // and their models
-        for (int i = 0; i < held_prop::kBeltSlots; ++i) held_prop::want(held_prop::kBeltSlot + i, nullptr, nullptr);  // run 11: the belt's props
         held_prop::frame(0);
         std::lock_guard lock(g_hdiag_mutex);
         g_hdiag.valid = false;
@@ -623,54 +554,61 @@ void holster_frame() {
         std::lock_guard lock(g_zone_mutex);
         std::memcpy(zones, g_zones, sizeof(zones));
     }
-    // run 10 item 10: a zone holding the rounds (the chest by default; with AnyWeapon on, any zone chosen so, the chest
-    // only while automatic or chosen so)
+    // run 10 item 10, AnyWeapon; 2026-10-13 (the user: "change the option to have any weapon in any holster to only apply
+    // to the gun holsters"): the hips and the backs take any weapon; the knife's, the satchel's and the lasso's their own
+    // items, the chest the rounds
     const bool any_item = g_any_weapon.load(std::memory_order_relaxed);
-    if (!any_item) zones[kAmmoZone].weapon = -1;  // the chest's choice only with AnyWeapon on (the review's)
-    auto zone_rounds = [&](int z) {
-        if (z < 0 || z >= kZones) return false;
-        if (!any_item) return z == kAmmoZone;
-        return zones[z].weapon == kRounds || (z == kAmmoZone && zones[z].weapon == -1);
-    };
+    zones[kAmmoZone].weapon = -1;
+    for (Zone& z : zones) {
+        if (z.weapon == kRounds) z.weapon = -1;  // (an older AnyWeapon choice: the rounds are the chest's)
+        // (an older choice of another kind at the knife's, the satchel's or the lasso's: their own items only)
+        if (z.weapon >= 0 && z.weapon < kWeapons && !(any_item && gun_zone(z))) {
+            bool fits = false;
+            for (int s : z.slots) fits = fits || (s >= 0 && st.equip_slot[z.weapon] == s);
+            if (!fits && st.owned_tick) z.weapon = -1;
+        }
+    }
+    auto zone_rounds = [&](int z) { return z == kAmmoZone; };
+    auto any_here = [&](int z) { return any_item && z >= 0 && z < kZones && gun_zone(zones[z]); };
     const bool lefty = controls::left_handed();
     const float hd = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's, not the ride's turned view
     const float fwd[3] = {-std::sin(hd), 0.0f, -std::cos(hd)}, right[3] = {std::cos(hd), 0.0f, -std::sin(hd)}, up[3] = {0, 1, 0};
     // the holsters' own frame: the body's, or turned with the headset ([Holsters] TurnWithHead, below)
     float hr[3] = {right[0], right[1], right[2]}, hf[3] = {fwd[0], fwd[1], fwd[2]};
-    // run 11 item 9: the props belt's frame turned with the drawn pelvis (its bind side through its skinning 3x3 against
-    // the body's right; cycle ST1: 0 deg with the still and the upright stances, 48 deg of swing walking with the
-    // game's: 16 cm at the hips under a belt that kept the body's heading)
-    float b_right[3] = {right[0], right[1], right[2]}, b_fwd[3] = {fwd[0], fwd[1], fwd[2]};
-    if (g_prop_belt.load(std::memory_order_relaxed) || g_show_knife.load(std::memory_order_relaxed) || g_attach_on[0].load(std::memory_order_relaxed) ||
-        g_attach_on[1].load(std::memory_order_relaxed) || g_attach_on[2].load(std::memory_order_relaxed)) {  // (the review: no lock with all off)
-        float PR[9];
-        if (body::pelvis_drawn(PR)) {
-            const float sx = PR[0], sz = PR[6];
-            const float pa = std::atan2(sx * fwd[0] + sz * fwd[2], sx * right[0] + sz * right[2]);
-            if (std::fabs(pa) < 1.5f) {
-                const float c = std::cos(pa), sn = std::sin(pa);
-                for (int k = 0; k < 3; ++k) {
-                    b_right[k] = right[k] * c + fwd[k] * sn;
-                    b_fwd[k] = fwd[k] * c - right[k] * sn;
-                }
-            }
-        }
-    }
     float zp[kZones][3], bases[kZones][3];
     bool zok[kZones];
+    // 2026-10-13 (the user: the left ring "still moves around. When I move the ring, the holster moves. When I move the
+    // holster, the ring moves"; "Two options should be selectable. One for the visual holster and the holster ring to
+    // always be at the same spot. One for them to be moved seperately"): every zone starts from its bone as the game
+    // hangs it, without a belt piece's move (the drawn bone has it); [Holsters] RingsFollowHolsters then puts the move on
+    // the zones of moved pieces (below). The LeftHip with the mirrored left holster has its own offset (LeftHipRingOffset):
+    // it was the RightHip's mirrored, so the right ring's and the right holster's moves moved it
+    static const int kBonePiece[body::kHolsterBones] = {0, 4, 2, 1, -1, -1, 3};  // pistol, rifle, thrower, melee, the chest, the lower back, the lasso
+    auto zoff = [&](int z, int k) { return zone_on_copy(zones[z]) ? zones[z].off_copy[k] : zones[z].off[k]; };
+    // the twins' mirror (and the left-handed layout's) through the pelvis as drawn: the root bone sways against the body
+    // (r12_twinbase: 6 cm sideways standing still), and a twin mirrored through it went twice that (the user's "Left
+    // sidearm ring still moves around")
+    const float* mid = bp.bone_ok[body::kPelvisPoint] ? bp.bone[body::kPelvisPoint] : bp.root;
     for (int z = 0; z < kZones; ++z) {
         // the wheel mode (run 8 item 5): no holster draws or put-aways, the chest's rounds kept
         zok[z] = zones[z].enabled && bp.bone_ok[zones[z].bone] && (zone_rounds(z) || !wheel::wheel_mode());
         float base[3] = {bp.bone[zones[z].bone][0], bp.bone[zones[z].bone][1], bp.bone[zones[z].bone][2]};
+        if (body::own_pieces() && zones[z].bone >= 0 && zones[z].bone < body::kHolsterBones && kBonePiece[zones[z].bone] >= 0) {
+            float piv[3], want[3], Rw[9];  // the drawn bone p = want + Rw (p0 - piv): p0 = piv + Rw^T (p - want)
+            if (body::piece_rigid(kBonePiece[zones[z].bone], piv, want, Rw)) {
+                const float q[3] = {base[0] - want[0], base[1] - want[1], base[2] - want[2]};
+                for (int r = 0; r < 3; ++r) base[r] = piv[r] + Rw[r] * q[0] + Rw[3 + r] * q[1] + Rw[6 + r] * q[2];
+            }
+        }
         if (zones[z].mirror) {  // the twin's bone: mirrored across the body's middle
-            const float d = (base[0] - bp.root[0]) * right[0] + (base[2] - bp.root[2]) * right[2];
+            const float d = (base[0] - mid[0]) * right[0] + (base[2] - mid[2]) * right[2];
             for (int k = 0; k < 3; ++k) base[k] -= 2.0f * d * right[k];
         }
         std::memcpy(bases[z], base, sizeof(base));
         for (int k = 0; k < 3; ++k)
-            zp[z][k] = base[k] + right[k] * zones[z].off[0] + up[k] * zones[z].off[1] + fwd[k] * zones[z].off[2];
+            zp[z][k] = base[k] + right[k] * zoff(z, 0) + up[k] * zoff(z, 1) + fwd[k] * zoff(z, 2);
         if (lefty) {  // the whole layout mirrored across the body's middle: the sidearm on the left hip
-            const float d = (zp[z][0] - bp.root[0]) * right[0] + (zp[z][2] - bp.root[2]) * right[2];
+            const float d = (zp[z][0] - mid[0]) * right[0] + (zp[z][2] - mid[2]) * right[2];
             for (int k = 0; k < 3; ++k) zp[z][k] -= 2.0f * d * right[k];
         }
     }
@@ -745,6 +683,8 @@ void holster_frame() {
             if (rel_n >= 0 && rel_n < 30 && !settled) g_place_waits.fetch_add(1, std::memory_order_relaxed);
             if (rel_n >= 0 && rel_n < 30 && standing && settled) {
                 for (int z = 0; z < kZones; ++z) {
+                    // (2026-10-13: the bases without the belt pieces' moves, above: taken with them, the move counted
+                    // twice, the user's "Everytime I load in, the holster positions are way off")
                     const float d[3] = {bases[z][0] - cp[0], bases[z][1] - cp[1], bases[z][2] - cp[2]};
                     acc[z][0] += d[0] * right[0] + d[2] * right[2];
                     acc[z][1] += d[1];
@@ -812,8 +752,8 @@ void holster_frame() {
             if (rel_ok) {
                 for (int z = 0; z < kZones; ++z) {
                     for (int k = 0; k < 3; ++k)
-                        zp[z][k] = cp[k] + hr[k] * (rel[z][0] + zones[z].off[0]) + up[k] * (rel[z][1] + zones[z].off[1]) +
-                                   hf[k] * (rel[z][2] + zones[z].off[2]);
+                        zp[z][k] = cp[k] + hr[k] * (rel[z][0] + zoff(z, 0)) + up[k] * (rel[z][1] + zoff(z, 1)) +
+                                   hf[k] * (rel[z][2] + zoff(z, 2));
                     if (lefty) {  // mirrored across the camera's middle (the body's, as the body mode's)
                         const float d = (zp[z][0] - cp[0]) * hr[0] + (zp[z][2] - cp[2]) * hr[2];
                         for (int k = 0; k < 3; ++k) zp[z][k] -= 2.0f * d * hr[k];
@@ -866,44 +806,16 @@ void holster_frame() {
         std::memcpy(hr, tr, sizeof(hr));
         std::memcpy(hf, tf, sizeof(hf));
     }
-    // run 11 item 4: with the props belt on (on foot), the belt's zones (the hips, the thrown, the knife, the ammo, the
-    // lower back) on the drawn belt: each at the ring's point at the angle of its own place about the belt's centre (so
-    // its offset and the menu's arrows move it round the belt), out from the strap by kBeltZoneOut, its height over the
-    // belt kept within -0.25..+0.10 m
-    if (g_prop_belt.load(std::memory_order_relaxed) && bp.bone_ok[body::kPelvisPoint] && body::shown_part() == 0 &&
-        !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_VEHICLE))) {
-        float bo[3], bt[3], a, b;
-        {
-            std::lock_guard lock(g_zone_mutex);
-            std::memcpy(bo, g_belt_off, sizeof(bo));
-            std::memcpy(bt, g_belt_turn, sizeof(bt));
-            a = g_belt.a;
-            b = g_belt.b;
-        }
-        float pz[12];
-        belt_pose(bp.bone[body::kPelvisPoint], b_right, up, b_fwd, bo, bt, pz);
-        const float* X = pz;
-        const float* Y = pz + 3;
-        const float* Z = pz + 6;  // down
-        const float* P = pz + 9;
-        for (int z : kBeltZones) {
-            const float d[3] = {zp[z][0] - P[0], zp[z][1] - P[1], zp[z][2] - P[2]};
-            const float lx = d[0] * X[0] + d[1] * X[1] + d[2] * X[2], ly = d[0] * Y[0] + d[1] * Y[1] + d[2] * Y[2];
-            const float lz = std::fmin(0.25f, std::fmax(-0.10f, d[0] * Z[0] + d[1] * Z[1] + d[2] * Z[2]));  // (Z down)
-            const float f = std::atan2(-lx / a, ly / b);  // the ring (body.cpp bend_strap, dir -1): (-a sin f, b cos f)
-            const float qx = -a * std::sin(f), qy = b * std::cos(f);
-            float nx = qx / (a * a), ny = qy / (b * b);  // the outward normal
-            const float nl = std::sqrt(nx * nx + ny * ny);
-            nx /= nl, ny /= nl;
-            const float ox = qx + nx * kBeltZoneOut, oy = qy + ny * kBeltZoneOut;
-            for (int k = 0; k < 3; ++k) zp[z][k] = P[k] + X[k] * ox + Y[k] * oy + Z[k] * lz;
-            g_belt_zoned.fetch_add(1, std::memory_order_relaxed);
-            std::lock_guard lock(g_zone_mutex);
-            for (int k = 0; k < 3; ++k) {
-                g_belt_zone_rel[z][k] = zp[z][k] - bp.bone[body::kPelvisPoint][k];
-                g_belt_zone_loc[z][k] = X[k] * ox + Y[k] * oy + Z[k] * lz;
-            }
-        }
+    // run 12 item 4, [Holsters] OwnBelt, RingsFollowHolsters: each ring where it is put, from its bone as the game hangs
+    // it. (2026-10-13, the user: "Change the option ... to mean that they hold their position relative to eachother.
+    // Moving one should move the other the same way": the link is kept by the moves, link_piece_moved / link_zone_moved,
+    // so turning it on or off moves nothing; before, a ring took its piece's whole move here, and the rings the user had
+    // placed with it off jumped when it was turned on)
+    {
+        std::lock_guard lock(g_zone_mutex);
+        std::memcpy(g_link_rgt, hr, sizeof(g_link_rgt));
+        std::memcpy(g_link_fwd, hf, sizeof(g_link_fwd));
+        g_link_lefty = lefty;
     }
     // the weapon manager (actor +0x70): +0x80 the item in hand, +0x448 the current slot, +0xa8 + s * 0x70 the slots
     uintptr_t wmgr = 0, in_hand = 0;
@@ -972,15 +884,14 @@ void holster_frame() {
         // run 10 item 10 (AnyWeapon): an automatic holster takes the item in hand unless another item was put there (its
         // game slots' guns do not stop it: cycle D5, the Back's long guns made the Schofield draw the Bolt Action)
         const int w = st.weapon >= 0 && st.weapon < kWeapons ? st.weapon : -1;
-        return any_item && !any_exact && zones[zi].weapon == -1 && w >= 0 && (zone_item[zi] == w || zone_item[zi] < 0);
+        return any_here(zi) && !any_exact && zones[zi].weapon == -1 && w >= 0 && (zone_item[zi] == w || zone_item[zi] < 0);
     };
     // the weapon a zone draws: its choice; else for a twin, another owned weapon of its slots than the partner's (another
     // kind first: a rifle against a shotgun); else -1 (the slots in order, the game's)
     auto draw_weapon = [&](int zi) -> int {
         const Zone& z = zones[zi];
         if (owns(z.weapon)) return z.weapon;
-        if (any_item && z.weapon == -1 && owns(zone_item[zi]) && !(in_hand && st.weapon == zone_item[zi])) return zone_item[zi];  // what was put there
-        if (any_item && z.slots[0] < 0) return -1;  // the chest holding an item: only what was put there
+        if (any_here(zi) && z.weapon == -1 && owns(zone_item[zi]) && !(in_hand && st.weapon == zone_item[zi])) return zone_item[zi];  // what was put there
         const int zl = zone_last[zi];
         if (choosing && zl >= 0 && zl < kWeapons && owns(zl)) {  // its own last gun, while owned and of its slots
             bool fits = false;
@@ -1223,37 +1134,202 @@ void holster_frame() {
         }
         const bool down = grip_down[h], pressed = down && !was_down[h], released = !down && was_down[h];
         was_down[h] = down;
+        {  // run 12 item 3: John's belt's pieces placed by hand: a grip within 10 cm of a piece's joint takes it; while held
+           // it follows the hand's move and turn since the grip (body::piece_grab); letting go keeps it (saved). 2026-10-13
+           // (the user: "Need to be able to rotate guns by hand too, so they better fit the holsters"): a gun shown at its
+           // holster too, within 12 cm of it: it follows the hand rigidly; let go: its GunTurn and GunOffset saved
+            static int grab_p[2] = {-1, -1};
+            static int grab_g[2] = {-1, -1};  // the shown gun held (its kShowZones index)
+            static float h0[2][3], R0[2][9], G0[2][12];
+            static body::Piece p0[2];
+            if (!g_piece_place.load(std::memory_order_relaxed)) {
+                grab_p[h] = -1;
+                grab_g[h] = -1;
+            } else {
+                auto gun_pose = [&](int i, float* gp, bool adjusted) {  // a shown gun's pose this frame (12 floats)
+                    const int zi = kShowZones[i];
+                    show_pose(zi, zp[zi], hr, up, hf, bp.root, gp);
+                    if (adjusted) {
+                        float tn[3], go[3];
+                        {
+                            std::lock_guard lock(g_zone_mutex);
+                            std::memcpy(tn, g_zones[zi].gun_turn, sizeof(tn));
+                            std::memcpy(go, g_zones[zi].gun_off, sizeof(go));
+                        }
+                        adjust_pose(tn, go, zp[zi], hr, up, hf, gp);
+                    }
+                };
+                if (pressed && bp.hand_ok[jh]) {
+                    int bi = -1;
+                    float bd = 0.10f * 0.10f;
+                    for (int i = 0; i <= body::kPieces; ++i) {  // (kPieces: the mirrored left holster, 2026-10-13)
+                        float j[3];
+                        if (i == body::kPieces ? !body::left_holster_where(j) : !body::piece_where(i, j)) continue;
+                        const float dx = j[0] - gb[jh][0], dy = j[1] - gb[jh][1], dz = j[2] - gb[jh][2];
+                        if (dx * dx + dy * dy + dz * dz < bd) bd = dx * dx + dy * dy + dz * dz, bi = i;
+                    }
+                    int gi = -1;
+                    float gd = 0.12f * 0.12f;
+                    if (log::now_ms() - g_shown_ms < 250.0)
+                        for (int i = 0; i < 4; ++i) {
+                            if (g_shown_last[i] < 0 || !zok[kShowZones[i]]) continue;
+                            float gp[12];
+                            gun_pose(i, gp, true);
+                            const float dx = gp[9] - gb[jh][0], dy = gp[10] - gb[jh][1], dz = gp[11] - gb[jh][2];
+                            if (dx * dx + dy * dy + dz * dz < gd) gd = dx * dx + dy * dy + dz * dz, gi = i;
+                        }
+                    if (gi >= 0 && (bi < 0 || gd < bd)) {
+                        grab_g[h] = gi;
+                        std::memcpy(h0[h], gb[jh], sizeof(h0[h]));
+                        std::memcpy(R0[h], bp.target_rot[jh], sizeof(R0[h]));
+                        gun_pose(gi, G0[h], true);
+                        controllers::pulse(h, 0.5f, 30);
+                        log::info("[holster] placing the %s's gun by hand (the %s hand)", zones[kShowZones[gi]].key, h ? "right" : "left");
+                    } else if (bi >= 0) {
+                        grab_p[h] = bi;
+                        std::memcpy(h0[h], gb[jh], sizeof(h0[h]));
+                        std::memcpy(R0[h], bp.target_rot[jh], sizeof(R0[h]));
+                        p0[h] = bi == body::kPieces ? body::left_holster_piece() : body::piece(bi);
+                        controllers::pulse(h, 0.5f, 30);
+                        log::info("[holster] placing John's %s by hand (the %s hand)", bi == body::kPieces ? "left holster" : body::piece_key(bi),
+                                  h ? "right" : "left");
+                    }
+                }
+                float Rd[9];  // the hand's turn since the grip: R_now R0^T (the columns its axes)
+                {
+                    const float* Rn = bp.target_rot[jh];
+                    for (int r = 0; r < 3; ++r)
+                        for (int c = 0; c < 3; ++c)
+                            Rd[r * 3 + c] = Rn[r * 3] * R0[h][c * 3] + Rn[r * 3 + 1] * R0[h][c * 3 + 1] + Rn[r * 3 + 2] * R0[h][c * 3 + 2];
+                }
+                const int gg = grab_g[h];
+                if (gg >= 0 && down && bp.hand_ok[jh]) {
+                    // the gun rigid with the hand: its axes turned by Rd, its point carried; then the zone's GunTurn (in the
+                    // holster's axes: x right, y up, z back, a right-handed frame: Ry(turn) Rx(tilt) Rz(-lean), as
+                    // adjust_pose turns it) and GunOffset (right, up, forward) solved against this frame's plain pose
+                    const int zi = kShowZones[gg];
+                    float G[9], P[3], B[12];
+                    for (int a = 0; a < 3; ++a)
+                        for (int k = 0; k < 3; ++k) G[a * 3 + k] = Rd[k * 3] * G0[h][a * 3] + Rd[k * 3 + 1] * G0[h][a * 3 + 1] + Rd[k * 3 + 2] * G0[h][a * 3 + 2];
+                    {
+                        const float q[3] = {G0[h][9] - h0[h][0], G0[h][10] - h0[h][1], G0[h][11] - h0[h][2]};
+                        for (int k = 0; k < 3; ++k) P[k] = Rd[k * 3] * q[0] + Rd[k * 3 + 1] * q[1] + Rd[k * 3 + 2] * q[2] + gb[jh][k];
+                    }
+                    gun_pose(gg, B, false);
+                    float M[9];  // world: the plain pose's axes onto the held ones (M = sum over the axes of g b^T)
+                    for (int r = 0; r < 3; ++r)
+                        for (int c = 0; c < 3; ++c) M[r * 3 + c] = G[r] * B[c] + G[3 + r] * B[3 + c] + G[6 + r] * B[6 + c];
+                    const float* F[3] = {hr, up, nullptr};
+                    const float back[3] = {-hf[0], -hf[1], -hf[2]};
+                    F[2] = back;
+                    float Ml[9];  // F^T M F
+                    for (int a = 0; a < 3; ++a)
+                        for (int b = 0; b < 3; ++b) {
+                            float v = 0.0f;
+                            for (int r = 0; r < 3; ++r)
+                                for (int c = 0; c < 3; ++c) v += F[a][r] * M[r * 3 + c] * F[b][c];
+                            Ml[a * 3 + b] = v;
+                        }
+                    const float sa = std::fmax(-1.0f, std::fmin(1.0f, -Ml[5]));
+                    float tn[3] = {std::asin(sa) * 57.29578f, std::atan2(Ml[2], Ml[8]) * 57.29578f, -std::atan2(Ml[3], Ml[4]) * 57.29578f};
+                    const float* at = zp[zi];
+                    const float rel[3] = {B[9] - at[0], B[10] - at[1], B[11] - at[2]};
+                    float v[3];
+                    for (int k = 0; k < 3; ++k) v[k] = P[k] - at[k] - (M[k * 3] * rel[0] + M[k * 3 + 1] * rel[1] + M[k * 3 + 2] * rel[2]);
+                    float go[3] = {v[0] * hr[0] + v[1] * hr[1] + v[2] * hr[2], v[0] * up[0] + v[1] * up[1] + v[2] * up[2],
+                                   v[0] * hf[0] + v[1] * hf[1] + v[2] * hf[2]};
+                    set_zone_gun(zi, tn, go, false);
+                }
+                if (gg >= 0 && !down) {
+                    const int zi = kShowZones[gg];
+                    float tn[3], go[3];
+                    zone_gun(zi, tn, go);
+                    set_zone_gun(zi, tn, go, true);
+                    controllers::pulse(h, 0.3f, 20);
+                    log::info("[holster] the %s's gun placed by hand: angle (%.1f %.1f %.1f) place (%.3f %.3f %.3f)", zones[zi].key, tn[0], tn[1], tn[2], go[0],
+                              go[1], go[2]);
+                    grab_g[h] = -1;
+                }
+                const int gp = grab_p[h];
+                if (gp >= 0 && down && bp.hand_ok[jh]) {
+                    body::Piece np;
+                    const body::Piece was = gp == body::kPieces ? body::left_holster_piece() : body::piece(gp);
+                    const bool ok = gp == body::kPieces ? body::left_holster_grab(Rd, h0[h], gb[jh], p0[h], &np) : body::piece_grab(gp, Rd, h0[h], gb[jh], p0[h], &np);
+                    if (ok) {
+                        float dw[3];  // RingsFollowHolsters: its rings moved with it, the same way
+                        if (g_rings_follow.load(std::memory_order_relaxed) && body::piece_shift_world(was, np, dw)) link_piece_moved(gp, dw, -1);
+                        if (gp == body::kPieces) body::set_left_holster_piece(np, false);
+                        else body::set_piece(gp, np, false);
+                    }
+                }
+                if (gp >= 0 && !down) {
+                    body::Piece p;
+                    if (gp == body::kPieces) {
+                        body::save_left_holster_piece();
+                        p = body::left_holster_piece();
+                    } else {
+                        body::save_piece(gp);
+                        p = body::piece(gp);
+                    }
+                    if (g_rings_follow.load(std::memory_order_relaxed)) link_save(gp, -1);
+                    g_pieces_placed.fetch_add(1, std::memory_order_relaxed);
+                    controllers::pulse(h, 0.3f, 20);
+                    log::info("[holster] John's %s placed by hand: offset (%.3f %.3f %.3f) turn (%.1f %.1f %.1f)",
+                              gp == body::kPieces ? "left holster" : body::piece_key(gp), p.d[0], p.d[1], p.d[2], p.turn[0], p.turn[1], p.turn[2]);
+                    grab_p[h] = -1;
+                }
+                g_piece_held[h].store(grab_p[h], std::memory_order_relaxed);
+                if (grab_p[h] >= 0 || grab_g[h] >= 0) {
+                    g_consumed[h] = true;
+                    press_zone[h] = -1;
+                    pending[h] = false;
+                    continue;  // no draws, put-aways or rounds while holding a piece or a gun
+                }
+            }
+        }
         {  // placing the holsters by hand: a grip in a ring takes that holster, the hand's move moves it, letting go keeps it
             static int place_z[2] = {-1, -1};
             if (!g_place.load(std::memory_order_relaxed)) {
                 place_z[h] = -1;
             } else {
+                static int ring_piece[2] = {-1, -1};  // RingsFollowHolsters: the piece moved with the ring (kPieces: the left holster)
                 if (pressed && in_z[h] >= 0) {
                     place_z[h] = in_z[h];
                     controllers::pulse(h, 0.5f, 30);
-                    log::info("[holster] placing the %s by hand (the %s hand)", zones[in_z[h]].key, h ? "right" : "left");
+                    ring_piece[h] = link_piece(in_z[h]);
+                    log::info("[holster] placing the %s by hand (the %s hand)%s", zones[in_z[h]].key, h ? "right" : "left",
+                              ring_piece[h] >= 0 ? ": its holster with it (RingsFollowHolsters)" : "");
                 }
                 const int pz = place_z[h];
                 if (pz >= 0 && down && bp.hand_ok[jh]) {
                     // this frame's zone at zp with its offset; the hand at gb: the offset moved by the difference, in the
-                    // holster's frame (right, up, forward; mirrored when left-handed)
+                    // holster's frame (right, up, forward; mirrored when left-handed); with RingsFollowHolsters its piece
+                    // (and the piece's other rings) moved the same way
                     const float d[3] = {gb[jh][0] - zp[pz][0], gb[jh][1] - zp[pz][1], gb[jh][2] - zp[pz][2]};
                     float loc[3] = {d[0] * hr[0] + d[2] * hr[2], d[1], d[0] * hf[0] + d[2] * hf[2]};
                     if (lefty) loc[0] = -loc[0];
-                    std::lock_guard lock(g_zone_mutex);
-                    for (int k = 0; k < 3; ++k) g_zones[pz].off[k] = std::fmin(0.8f, std::fmax(-0.8f, g_zones[pz].off[k] + loc[k]));
+                    {
+                        std::lock_guard lock(g_zone_mutex);
+                        float* zo = zone_off(g_zones[pz]);
+                        for (int k = 0; k < 3; ++k) zo[k] = std::fmin(0.8f, std::fmax(-0.8f, zo[k] + loc[k]));
+                    }
+                    if (ring_piece[h] >= 0) link_zone_moved(pz, d);
                 }
                 if (pz >= 0 && !down) {
                     save_zone(pz);
+                    if (ring_piece[h] >= 0) link_save(ring_piece[h], pz);
                     g_placed.fetch_add(1, std::memory_order_relaxed);
                     controllers::pulse(h, 0.3f, 20);
                     float o[3];
                     {
                         std::lock_guard lock(g_zone_mutex);
-                        std::memcpy(o, g_zones[pz].off, sizeof(o));
+                        std::memcpy(o, zone_off(g_zones[pz]), sizeof(o));
                     }
-                    log::info("[holster] the %s placed by hand: offset (%.3f %.3f %.3f)", zones[pz].key, o[0], o[1], o[2]);
+                    log::info("[holster] the %s placed by hand: offset (%.3f %.3f %.3f)%s%s", zones[pz].key, o[0], o[1], o[2],
+                              zone_on_copy(zones[pz]) ? " (LeftHipRingOffset: on the left holster)" : "",
+                              ring_piece[h] >= 0 ? " with its holster" : "");
                     place_z[h] = -1;
+                    ring_piece[h] = -1;
                 }
                 g_consumed[h] = place_z[h] >= 0;
                 press_zone[h] = place_z[h];
@@ -1567,7 +1643,7 @@ void holster_frame() {
                 g_puts.fetch_add(1, std::memory_order_relaxed);
                 if (st.weapon >= 0 && st.weapon < kWeapons) {
                     put_zone_of[st.weapon] = in_z[h];  // item 1b: where it was put away
-                    if (any_item) {  // run 10 item 10: that zone holds it now (and no other does)
+                    if (any_here(in_z[h])) {  // run 10 item 10: that zone holds it now (and no other does)
                         for (int& zi : zone_item)
                             if (zi == st.weapon) zi = -1;
                         zone_item[in_z[h]] = st.weapon;
@@ -1698,74 +1774,7 @@ void holster_frame() {
             float gp[12];
             if (frag) {
                 show_pose(zi, zp[zi], hr, up, hf, bp.root, gp);
-                // run 11 item 5: the props belt's holster shown (the right hip, on foot): the gun's grip at the belt
-                // revolver's grip, through its holster bone as bent; its GunTurn kept about there, not its offset
-                float m5[12];
-                const bool seat = zi == 0 && g_prop_belt.load(std::memory_order_relaxed) && belt_holster_shown() && bp.bone_ok[body::kPelvisPoint] &&
-                                  body::shown_part() == 0 &&
-                                  !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_VEHICLE)) &&
-                                  body::prop_belt_bone(kBeltHolsterBone, m5);
-                if (seat) {
-                    float bo[3], bt[3], pz[12];
-                    {
-                        std::lock_guard lock(g_zone_mutex);
-                        std::memcpy(bo, g_belt_off, sizeof(bo));
-                        std::memcpy(bt, g_belt_turn, sizeof(bt));
-                    }
-                    belt_pose(bp.bone[body::kPelvisPoint], b_right, up, b_fwd, bo, bt, pz);
-                    float q[3];
-                    for (int r = 0; r < 3; ++r) q[r] = m5[r * 4] * kBeltGrip[0] + m5[r * 4 + 1] * kBeltGrip[1] + m5[r * 4 + 2] * kBeltGrip[2] + m5[r * 4 + 3];
-                    float g[3];
-                    for (int k = 0; k < 3; ++k) g[k] = pz[9 + k] + pz[k] * q[0] + pz[3 + k] * q[1] + pz[6 + k] * q[2];
-                    std::memcpy(gp + 9, g, sizeof(g));
-                    // its axes the holster's (cycle H3: the hip's tilted pose stood out of the straight holster): Z along
-                    // the holster bone's +z (down, as the belt's revolver hangs), X the body's back made square to it
-                    float Zg[3], Xg[3], Yg[3];
-                    for (int k = 0; k < 3; ++k) Zg[k] = -(pz[k] * m5[2] + pz[3 + k] * m5[6] + pz[6 + k] * m5[10]);  // (H4/H5: +z put the barrel up)
-                    float zl = std::sqrt(Zg[0] * Zg[0] + Zg[1] * Zg[1] + Zg[2] * Zg[2]);
-                    if (zl < 1e-4f) zl = 1.0f, Zg[0] = up[0], Zg[1] = up[1], Zg[2] = up[2];  // (the review: a collapsed bone 5)
-                    for (int k = 0; k < 3; ++k) Zg[k] /= zl;
-                    const float bd = -(fwd[0] * Zg[0] + fwd[1] * Zg[1] + fwd[2] * Zg[2]);
-                    for (int k = 0; k < 3; ++k) Xg[k] = -fwd[k] - bd * Zg[k];
-                    zl = std::sqrt(Xg[0] * Xg[0] + Xg[1] * Xg[1] + Xg[2] * Xg[2]);
-                    if (zl < 1e-4f) {  // the belt tilted 90 deg (its down along forward): the right as the reference instead
-                        const float br = right[0] * Zg[0] + right[1] * Zg[1] + right[2] * Zg[2];
-                        for (int k = 0; k < 3; ++k) Xg[k] = right[k] - br * Zg[k];
-                        zl = std::sqrt(Xg[0] * Xg[0] + Xg[1] * Xg[1] + Xg[2] * Xg[2]);
-                        if (zl < 1e-4f) zl = 1.0f;
-                    }
-                    for (int k = 0; k < 3; ++k) Xg[k] /= zl;
-                    Yg[0] = Zg[1] * Xg[2] - Zg[2] * Xg[1];  // Y = Z x X (show_pose's right-handed frame)
-                    Yg[1] = Zg[2] * Xg[0] - Zg[0] * Xg[2];
-                    Yg[2] = Zg[0] * Xg[1] - Zg[1] * Xg[0];
-                    std::memcpy(gp, Xg, sizeof(Xg));
-                    std::memcpy(gp + 3, Yg, sizeof(Yg));
-                    std::memcpy(gp + 6, Zg, sizeof(Zg));
-                    const float zero[3] = {0, 0, 0};
-                    adjust_pose(zones[zi].gun_turn, zero, g, hr, up, hf, gp);
-                    g_belt_seated.fetch_add(1, std::memory_order_relaxed);
-                } else if (zi == 5 && g_prop_belt.load(std::memory_order_relaxed) && bp.bone_ok[body::kPelvisPoint] &&
-                           !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_VEHICLE))) {
-                    // the left hip on the props belt (no leather there): the gun hung at the strap as the right hip's is
-                    // in its holster (its axes the same: barrel down, grip back), at its zone's ring point less the 4 cm
-                    // out and 4 cm down; its GunTurn about there (cycle H7: the hip's own pose dropped it to the thigh)
-                    const float dn[3] = {-up[0], -up[1], -up[2]};
-                    float o[3] = {zp[zi][0] - bp.bone[body::kPelvisPoint][0], 0.0f, zp[zi][2] - bp.bone[body::kPelvisPoint][2]};
-                    const float ol = std::sqrt(o[0] * o[0] + o[2] * o[2]);
-                    if (ol > 1e-4f) o[0] /= ol, o[2] /= ol;
-                    float g[3];
-                    for (int k = 0; k < 3; ++k) g[k] = zp[zi][k] - o[k] * kBeltZoneOut + dn[k] * 0.04f;
-                    const float Xg[3] = {-fwd[0], -fwd[1], -fwd[2]}, Zg[3] = {up[0], up[1], up[2]};
-                    const float Yg[3] = {Zg[1] * Xg[2] - Zg[2] * Xg[1], Zg[2] * Xg[0] - Zg[0] * Xg[2], Zg[0] * Xg[1] - Zg[1] * Xg[0]};
-                    std::memcpy(gp, Xg, sizeof(Xg));
-                    std::memcpy(gp + 3, Yg, sizeof(Yg));
-                    std::memcpy(gp + 6, Zg, sizeof(Zg));
-                    std::memcpy(gp + 9, g, sizeof(g));
-                    const float zero[3] = {0, 0, 0};
-                    adjust_pose(zones[zi].gun_turn, zero, g, hr, up, hf, gp);
-                } else {
-                    adjust_pose(zones[zi].gun_turn, zones[zi].gun_off, zp[zi], hr, up, hf, gp);
-                }
+                adjust_pose(zones[zi].gun_turn, zones[zi].gun_off, zp[zi], hr, up, hf, gp);
                 float dp[3], rel[3];
                 double dms = 0;
                 uint64_t gated = 0;
@@ -1784,6 +1793,8 @@ void holster_frame() {
                 }
             }
             sd.weapon[i] = frag ? gw : -1;
+            g_shown_last[i] = frag ? gw : -1;
+            g_shown_ms = log::now_ms();
             held_prop::want(held_prop::kHolsterSlot + i, frag, frag ? gp : nullptr, anc);
         }
         {  // [Holsters] ShowModels: the holster models at the hips (each enabled hip's, drawn or not)
@@ -1812,143 +1823,8 @@ void holster_frame() {
                 held_prop::want_angles(held_prop::kModelSlot + i, raw_on ? raw : ang);
             }
         }
-        for (int ai = 0; ai < 3; ++ai) {  // run 11 item 7: the satchel, the lasso's coil, the ammo pouch
-            const BeltAttach& at = kAttach[ai];
-            float pl[3], atn[3], bo[3], bt[3], ea, eb, sz;
-            {
-                std::lock_guard lock(g_zone_mutex);
-                sz = g_attach_size[ai];
-                std::memcpy(pl, g_attach_place[ai], sizeof(pl));
-                std::memcpy(atn, g_attach_turn[ai], sizeof(atn));
-                std::memcpy(bo, g_belt_off, sizeof(bo));
-                std::memcpy(bt, g_belt_turn, sizeof(bt));
-                ea = g_belt.a;
-                eb = g_belt.b;
-            }
-            bool want = g_attach_on[ai].load(std::memory_order_relaxed) && bp.bone_ok[body::kPelvisPoint] && body::shown_part() == 0 &&
-                        !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_VEHICLE));
-            if (ai == 1) want = want && (st.owned >> 21 & 1) && st.weapon != 21 && !(ds.on && ds.weapon == 21);  // the lasso: owned, not in hand
-            float pz[12];
-            if (want) {
-                // the ring's point (body.cpp bend_strap's: (-a sin f, b cos f) in the belt's x (its left), y (its front))
-                float bz[12];
-                belt_pose(bp.bone[body::kPelvisPoint], b_right, up, b_fwd, bo, bt, bz);
-                const float* BX = bz;
-                const float* BY = bz + 3;
-                const float* BZ = bz + 6;  // down
-                const float f = pl[0] * 0.0174532925f;
-                const float qx = -ea * std::sin(f), qy = eb * std::cos(f);
-                float nx = qx / (ea * ea), ny = qy / (eb * eb);
-                const float nl = std::sqrt(nx * nx + ny * ny);
-                nx /= nl, ny /= nl;
-                float o[3], at_p[3];
-                for (int k = 0; k < 3; ++k) {
-                    o[k] = BX[k] * nx + BY[k] * ny;  // out from the belt
-                    at_p[k] = bz[9 + k] + BX[k] * (qx + nx * pl[2]) + BY[k] * (qy + ny * pl[2]) - BZ[k] * pl[1];
-                }
-                float X[3], Y[3], Z[3];
-                for (int k = 0; k < 3; ++k) {
-                    if (at.y_up == 2) {  // upright: its z up, its y out (its back on the strap), x = y x z
-                        Z[k] = up[k];
-                        Y[k] = o[k];
-                    } else {  // hanging: its x out, its y up or down, z = x x y
-                        X[k] = o[k];
-                        Y[k] = at.y_up > 0 ? up[k] : -up[k];
-                    }
-                }
-                if (at.y_up == 2) {
-                    X[0] = Y[1] * Z[2] - Y[2] * Z[1], X[1] = Y[2] * Z[0] - Y[0] * Z[2], X[2] = Y[0] * Z[1] - Y[1] * Z[0];
-                } else {
-                    Z[0] = X[1] * Y[2] - X[2] * Y[1], Z[1] = X[2] * Y[0] - X[0] * Y[2], Z[2] = X[0] * Y[1] - X[1] * Y[0];
-                }
-                std::memcpy(pz, X, 12);
-                std::memcpy(pz + 3, Y, 12);
-                std::memcpy(pz + 6, Z, 12);
-                for (int k = 0; k < 3; ++k) pz[9 + k] = at_p[k] - (X[k] * at.half_x + up[k] * at.below) * sz;
-                const float zero[3] = {0, 0, 0};
-                adjust_pose(atn, zero, at_p, b_right, up, b_fwd, pz);  // turned about its place on the belt (the hips' axes)
-                for (int k = 0; k < 9; ++k) pz[k] *= sz;           // its size: the axes' length (the draw moved exactly by them)
-            }
-            held_prop::want(kAttachSlot + ai, want ? at.frag : nullptr, want ? pz : nullptr, anc);
-        }
-        {  // run 11 item 6, [Holsters] ShowKnife: the knife at its holster
-            float kt[3], ko[3];
-            {
-                std::lock_guard lock(g_zone_mutex);
-                std::memcpy(kt, g_knife_turn, sizeof(kt));
-                std::memcpy(ko, g_knife_off, sizeof(ko));
-            }
-            const int kz = zones[3].enabled ? 3 : 7;  // the Knife zone, else the lower back's
-            const bool knife = g_show_knife.load(std::memory_order_relaxed) && zok[kz] && (st.owned >> kKnifeWeapon & 1) && body::shown_part() == 0 &&
-                               st.weapon != kKnifeWeapon && !(ds.on && ds.weapon == kKnifeWeapon) &&
-                               !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_VEHICLE));
-            float kp[12];
-            if (knife) {
-                float o[3] = {zp[kz][0] - bp.root[0], 0.0f, zp[kz][2] - bp.root[2]};  // out from the body (horizontal)
-                const float ol = std::sqrt(o[0] * o[0] + o[2] * o[2]);
-                if (ol > 1e-4f) o[0] /= ol, o[2] /= ol;
-                const float Y[3] = {-up[0], -up[1], -up[2]};  // the blade (the model's +y) down
-                const float* X = o;                            // its flat facing out
-                const float Z[3] = {X[1] * Y[2] - X[2] * Y[1], X[2] * Y[0] - X[0] * Y[2], X[0] * Y[1] - X[1] * Y[0]};  // Z = X x Y
-                const float in = g_prop_belt.load(std::memory_order_relaxed) ? kBeltZoneOut - 0.02f : 0.0f;
-                std::memcpy(kp, X, 12);
-                std::memcpy(kp + 3, Y, 12);
-                std::memcpy(kp + 6, Z, 12);
-                for (int k = 0; k < 3; ++k) kp[9 + k] = zp[kz][k] - o[k] * in;
-                if (g_prop_belt.load(std::memory_order_relaxed) && bp.bone_ok[body::kPelvisPoint]) {
-                    // on the props belt: the guard just under the strap (cycle K2: at the zone's own height it hung at the
-                    // thigh, the blade 30 cm below the belt)
-                    float bo[3], bt[3], bz[12];
-                    {
-                        std::lock_guard lock(g_zone_mutex);
-                        std::memcpy(bo, g_belt_off, sizeof(bo));
-                        std::memcpy(bt, g_belt_turn, sizeof(bt));
-                    }
-                    belt_pose(bp.bone[body::kPelvisPoint], b_right, up, b_fwd, bo, bt, bz);
-                    const float h = (kp[9] - bz[9]) * up[0] + (kp[10] - bz[10]) * up[1] + (kp[11] - bz[11]) * up[2];
-                    for (int k = 0; k < 3; ++k) kp[9 + k] -= up[k] * (h + 0.03f);
-                }
-                float at[3];
-                std::memcpy(at, kp + 9, sizeof(at));
-                adjust_pose(kt, ko, at, right, up, fwd, kp);
-            }
-            held_prop::want(kKnifeSlot, knife ? g_knife_model : nullptr, knife ? kp : nullptr, anc);
-            g_knife_zone.store(knife ? kz : -1, std::memory_order_relaxed);
-        }
-        {  // run 11 item 2, [Holsters] PropBelt: the gun belt round the hips
-            float bo[3], bt[3];
-            {
-                std::lock_guard lock(g_zone_mutex);
-                std::memcpy(bo, g_belt_off, sizeof(bo));
-                std::memcpy(bt, g_belt_turn, sizeof(bt));
-            }
-            // run 11 item 9: shown with the whole body only (as John's own belt: the arms' and the hands' modes hide it)
-            const bool belt = g_prop_belt.load(std::memory_order_relaxed) && bp.bone_ok[body::kPelvisPoint] && body::shown_part() == 0 &&
-                              !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_VEHICLE));  // (the review: riding too)
-            body::set_prop_belt_wanted(belt);
-            float pz[12];
-            if (belt) {
-                belt_pose(bp.bone[body::kPelvisPoint], b_right, up, b_fwd, bo, bt, pz);
-                const float* pv = bp.bone[body::kPelvisPoint];
-                // the drawn pelvis's side (its bind frame's x through its skinning 3x3: a column) against the body's
-                // right: its turn under the belt, which keeps the body's heading (cycle ST1: the hip bone swung with the leg)
-                float PR[9];
-                const bool pr_ok = body::pelvis_drawn(PR);
-                const float sx = PR[0], sz = PR[6];
-                const float yaw = pr_ok ? std::atan2(sx * fwd[0] + sz * fwd[2], sx * right[0] + sz * right[2]) * 57.29578f : 0.0f;
-                const float ph = pv[1] - bp.root[1];
-                std::lock_guard lock(g_zone_mutex);
-                if (pr_ok) {
-                    g_sway_min = std::fmin(g_sway_min, yaw), g_sway_max = std::fmax(g_sway_max, yaw);
-                    g_pel_min = std::fmin(g_pel_min, ph), g_pel_max = std::fmax(g_pel_max, ph);
-                    ++g_sway_n;
-                }
-                for (int k = 0; k < 3; ++k) g_belt_want_rel[k] = pz[9 + k] - anc[k];
-                g_belt_want_ms = now_ms;
-            }
-            held_prop::want(held_prop::kBeltSlot, belt ? kBeltFragment : nullptr, belt ? pz : nullptr, anc);
-            if (belt) body::own_belt_refresh();  // run 11 item 3: John's own belt found (hidden while the props belt is drawn)
-        }
+        if (body::left_holster()) body::left_holster_refresh();  // run 12 item 5: the holster's geometry for its left copy
+        if (body::own_pieces()) body::pieces_geom_refresh();    // [Holsters] OwnBeltRigid: the pieces' geometries
         ++sd.frames;
         {
             std::lock_guard lock(g_zone_mutex);
@@ -1960,6 +1836,9 @@ void holster_frame() {
     g_hdiag.valid = true;
     std::memcpy(g_hdiag.zone, zp, sizeof(zp));
     std::memcpy(g_hdiag.zone_ok, zok, sizeof(zok));
+    std::memcpy(g_hdiag.base, bases, sizeof(bases));
+    std::memcpy(g_hdiag.root, bp.bone_ok[body::kPelvisPoint] ? bp.bone[body::kPelvisPoint] : bp.root, sizeof(g_hdiag.root));  // (the mirror's)
+    std::memcpy(g_hdiag.right, right, sizeof(g_hdiag.right));
     for (int h = 0; h < 2; ++h) {
         const int jh = bp.ctrl[0] == h ? 0 : 1;
         g_hdiag.hand_ok[h] = bp.hand_ok[jh];
@@ -1968,6 +1847,8 @@ void holster_frame() {
     }
     g_hdiag.cur_slot = cur;
     g_hdiag.in_hand = in_hand != 0;
+    g_hdiag.cam_ok = bp.cam_ok;
+    if (bp.cam_ok) std::memcpy(g_hdiag.cam, bp.cam + 12, sizeof(g_hdiag.cam));
     g_markers_valid = false;
     float hint_pos[3] = {};
     const int ahint = gun ? actions::hint(hint_pos) : 0;  // [Reload] ActionHints
@@ -2036,8 +1917,14 @@ void holster_frame() {
     }
 }
 
+Zone g_zone_defaults[kZones];  // the table as built in (before any ini): a ring's default without a shipped key
+bool g_zone_defaults_ok = false;
 void load_zones() {
     std::lock_guard lock(g_zone_mutex);
+    if (!g_zone_defaults_ok) {
+        for (int i = 0; i < kZones; ++i) g_zone_defaults[i] = g_zones[i];
+        g_zone_defaults_ok = true;
+    }
     for (Zone& z : g_zones) {
         if (z.mirror && z.partner >= 0) {  // a twin: the partner's offset and size mirrored (the partner is loaded first)
             const Zone& p = g_zones[z.partner];
@@ -2055,6 +1942,15 @@ void load_zones() {
         std::string o = config::get_string("Holsters", (std::string(z.key) + "Offset").c_str(), "");
         float v[3];
         if (!o.empty() && sscanf_s(o.c_str(), "%f %f %f", &v[0], &v[1], &v[2]) == 3) std::memcpy(z.off, v, sizeof(v));
+        if (z.mirror && z.bone == 0 && z.partner >= 0) {  // LeftHipRingOffset: unset, the right hip's mirrored (as the copy is)
+            const Zone& p = g_zones[z.partner];
+            z.off_copy[0] = -p.off[0];
+            z.off_copy[1] = p.off[1];
+            z.off_copy[2] = p.off[2];
+            o = config::get_string("Holsters", (std::string(z.key) + "RingOffset").c_str(), "");
+            if (!o.empty() && sscanf_s(o.c_str(), "%f %f %f", &v[0], &v[1], &v[2]) == 3)
+                for (int k = 0; k < 3; ++k) z.off_copy[k] = std::isfinite(v[k]) ? std::fmin(0.8f, std::fmax(-0.8f, v[k])) : 0.0f;
+        }
         o = config::get_string("Holsters", (std::string(z.key) + "GunTurn").c_str(), "");
         if (!o.empty() && sscanf_s(o.c_str(), "%f %f %f", &v[0], &v[1], &v[2]) == 3)
             for (int k = 0; k < 3; ++k) z.gun_turn[k] = std::isfinite(v[k]) ? std::fmin(180.0f, std::fmax(-180.0f, v[k])) : 0.0f;
@@ -2066,8 +1962,7 @@ void load_zones() {
             z.weapon = weapon_from_token(config::get_string("Holsters", "AmmoWeapon", "auto"));
         } else if (z.slots[0] >= 0) {
             // the lower back takes the old knife holster's choice unless it has its own
-            const std::string def = !std::strcmp(z.key, "LowerBack") ? config::get_string("Holsters", "KnifeWeapon", "auto") : "auto";
-            z.weapon = weapon_from_token(config::get_string("Holsters", (std::string(z.key) + "Weapon").c_str(), def.c_str()));
+            z.weapon = weapon_from_token(config::get_string("Holsters", (std::string(z.key) + "Weapon").c_str(), "auto"));
             z.enabled = config::get_bool("Holsters", (std::string(z.key) + "Enabled").c_str(), z.enabled);
         }
     }
@@ -2080,10 +1975,75 @@ void save_zone(int i) {
         z = g_zones[i];
     }
     char b[64];
-    std::snprintf(b, sizeof(b), "%.3f %.3f %.3f", z.off[0], z.off[1], z.off[2]);
-    config::set("Holsters", (std::string(z.key) + "Offset").c_str(), b);
+    // (2026-10-13: the LeftHip on the mirrored left holster, its own offset unset, is the right hip's mirrored: kept
+    // where it is before the right one moves, or the settings' reload moved it with it)
+    for (const Zone& t : g_zones)
+        if (t.mirror && t.bone == 0 && t.partner == i && zone_on_copy(t) &&
+            config::get_string("Holsters", (std::string(t.key) + "RingOffset").c_str(), "").empty()) {
+            float tc[3];
+            {
+                std::lock_guard lock(g_zone_mutex);
+                std::memcpy(tc, t.off_copy, sizeof(tc));
+            }
+            std::snprintf(b, sizeof(b), "%.3f %.3f %.3f", tc[0], tc[1], tc[2]);
+            config::set("Holsters", (std::string(t.key) + "RingOffset").c_str(), b);
+        }
+    const float* o = zone_off(z);
+    std::snprintf(b, sizeof(b), "%.3f %.3f %.3f", o[0], o[1], o[2]);
+    config::set("Holsters", (std::string(z.key) + (zone_on_copy(z) ? "RingOffset" : "Offset")).c_str(), b);
     std::snprintf(b, sizeof(b), "%.3f", z.radius);
     config::set("Holsters", (std::string(z.key) + "Radius").c_str(), b);
+}
+// 2026-10-13 (the user: "Can you add an option to reset the belt to game default positions?"): every ring's place and
+// size back to the shipped RDRVR.ini's (else the built-in table's; a left twin without its own, its partner's mirrored),
+// written to the user ini as the menu writes them (the LeftHip's on the mirrored left holster too)
+void reset_rings_now() {
+    auto shipped3 = [](const std::string& key, float* v) {
+        const std::string o = config::get_shipped("Holsters", key.c_str(), "");
+        float t[3];
+        if (o.empty() || sscanf_s(o.c_str(), "%f %f %f", &t[0], &t[1], &t[2]) != 3) return false;
+        std::memcpy(v, t, sizeof(t));
+        return true;
+    };
+    float off[kZones][3], copy[kZones][3], rad[kZones];
+    for (int i = 0; i < kZones; ++i) {
+        const Zone& d = g_zone_defaults_ok ? g_zone_defaults[i] : g_zones[i];
+        std::memcpy(off[i], d.off, sizeof(off[i]));
+        if (!shipped3(std::string(d.key) + "Offset", off[i]) && d.mirror && d.partner >= 0 && d.partner < i) {
+            off[i][0] = -off[d.partner][0];
+            off[i][1] = off[d.partner][1];
+            off[i][2] = off[d.partner][2];
+        }
+        const std::string r = config::get_shipped("Holsters", (std::string(d.key) + "Radius").c_str(), "");
+        rad[i] = r.empty() ? (d.mirror && d.partner >= 0 && d.partner < i ? rad[d.partner] : d.radius) : static_cast<float>(std::atof(r.c_str()));
+        std::memcpy(copy[i], off[i], sizeof(copy[i]));
+        if (d.mirror && d.bone == 0 && d.partner >= 0 && d.partner < i && !shipped3(std::string(d.key) + "RingOffset", copy[i])) {
+            copy[i][0] = -off[d.partner][0];  // (on the copy: the right hip's mirrored, as an unset LeftHipRingOffset)
+            copy[i][1] = off[d.partner][1];
+            copy[i][2] = off[d.partner][2];
+        }
+    }
+    {
+        std::lock_guard lock(g_zone_mutex);
+        for (int i = 0; i < kZones; ++i) {
+            std::memcpy(g_zones[i].off, off[i], sizeof(off[i]));
+            std::memcpy(g_zones[i].off_copy, copy[i], sizeof(copy[i]));
+            g_zones[i].radius = rad[i];
+        }
+    }
+    char b[64];
+    for (int i = 0; i < kZones; ++i) {
+        const std::string k = g_zones[i].key;
+        std::snprintf(b, sizeof(b), "%.3f %.3f %.3f", off[i][0], off[i][1], off[i][2]);
+        config::set("Holsters", (k + "Offset").c_str(), b);
+        if (g_zones[i].mirror && g_zones[i].bone == 0) {
+            std::snprintf(b, sizeof(b), "%.3f %.3f %.3f", copy[i][0], copy[i][1], copy[i][2]);
+            config::set("Holsters", (k + "RingOffset").c_str(), b);
+        }
+        std::snprintf(b, sizeof(b), "%.3f", rad[i]);
+        config::set("Holsters", (k + "Radius").c_str(), b);
+    }
+    log::info("[holster] every ring back to its default place and size");
 }
 void save_zone_gun(int i) {
     Zone z;
@@ -2257,7 +2217,7 @@ void init() {
     g_show_zones = config::get_bool("Holsters", "ShowZones", false);
     g_zones_near = config::get_bool("Holsters", "ZonesNear", false);
     g_near_dist = std::fmin(1.0f, std::fmax(0.05f, config::get_float("Holsters", "ZonesNearDistance", 0.25f)));
-    g_steady_zones = config::get_bool("Holsters", "SteadyZones", false);
+    g_steady_zones = config::get_bool("Holsters", "SteadyZones", true);  // (2026-10-13: on by default, its menu row gone)
     g_show_dots = config::get_bool("Holsters", "ShowHandDots", g_show_zones.load());
     g_ring_gun_axes = config::get_bool("Reload", "RingInGunAxes", true);
     g_steady_ring = config::get_bool("Reload", "SteadyRing", true);
@@ -2309,6 +2269,7 @@ void init() {
         g_turn_head = config::get_bool("Holsters", "TurnWithHead", false);
         g_turn_hands = config::get_bool("Holsters", "TurnByHands", false);
         g_lean_steady = config::get_bool("Holsters", "LeanSteady", false);
+        g_rings_follow = config::get_bool("Holsters", "RingsFollowHolsters", true);
         g_torso_len = std::fmin(0.9f, std::fmax(0.3f, config::get_float("Holsters", "TorsoLength", 0.55f)));
         g_show_models = config::get_bool("Holsters", "ShowModels", false);
         {
@@ -2320,61 +2281,6 @@ void init() {
             std::lock_guard lock(g_zone_mutex);
             std::memcpy(g_model_off, o, sizeof(o));
             std::memcpy(g_model_rot, r, sizeof(r));
-        }
-        {  // run 11 item 2: [Holsters] PropBelt
-            body::PropBelt b;
-            b.on = config::get_bool("Holsters", "PropBelt", false);
-            float o[3] = {0, 0, 0}, t[3] = {0, 0, 0}, sz[2] = {0.19f, 0.14f};
-            sscanf_s(config::get_string("Holsters", "PropBeltOffset", "0 0 0").c_str(), "%f %f %f", &o[0], &o[1], &o[2]);
-            sscanf_s(config::get_string("Holsters", "PropBeltTurn", "0 0 0").c_str(), "%f %f %f", &t[0], &t[1], &t[2]);
-            sscanf_s(config::get_string("Holsters", "PropBeltSize", "0.19 0.14").c_str(), "%f %f", &sz[0], &sz[1]);
-            b.a = std::fmin(0.4f, std::fmax(0.08f, sz[0]));
-            b.b = std::fmin(0.4f, std::fmax(0.06f, sz[1]));
-            b.s0 = config::get_float("Holsters", "PropBeltBuckle", 0.0f);
-            if (!(b.s0 >= -1.0f && b.s0 <= 1.0f)) b.s0 = 0.0f;  // (the review: a NaN or a far value)
-            b.holster = config::get_bool("Holsters", "PropBeltHolster", true);
-            b.flip = config::get_bool("Holsters", "PropBeltFlip", false);
-            b.hide_own = config::get_bool("Holsters", "PropBeltHideOwn", true);  // run 11 item 3
-            // geometry 0 the belt's own revolver, 1 its leather (cycle P2): the revolver hidden by default (the holster's
-            // shown gun is the player's own)
-            b.hide_geoms = static_cast<uint32_t>(std::strtoul(config::get_string("Holsters", "PropBeltHide", "1").c_str(), nullptr, 16));
-            {
-                std::lock_guard lock(g_zone_mutex);
-                g_belt = b;
-                std::memcpy(g_belt_off, o, sizeof(o));
-                std::memcpy(g_belt_turn, t, sizeof(t));
-            }
-            g_prop_belt = b.on;
-            body::set_prop_belt(b);
-            for (int ai = 0; ai < 3; ++ai) {  // run 11 item 7: the satchel, the lasso's coil, the ammo pouch
-                const std::string k = kAttach[ai].key;
-                g_attach_on[ai] = config::get_bool("Holsters", ("Show" + k).c_str(), false);
-                const float* d = kAttach[ai].def;
-                const float pl[3] = {config::get_float("Holsters", (k + "Around").c_str(), d[0]), config::get_float("Holsters", (k + "Height").c_str(), d[1]),
-                                     config::get_float("Holsters", (k + "Out").c_str(), d[2])};
-                float t[3] = {0, 0, 0};
-                sscanf_s(config::get_string("Holsters", (k + "Turn").c_str(), "0 0 0").c_str(), "%f %f %f", &t[0], &t[1], &t[2]);
-                const float size = std::fmin(2.0f, std::fmax(0.3f, config::get_float("Holsters", (k + "Size").c_str(), kAttach[ai].def_size)));
-                std::lock_guard lock(g_zone_mutex);
-                std::memcpy(g_attach_place[ai], pl, sizeof(pl));
-                std::memcpy(g_attach_turn[ai], t, sizeof(t));
-                g_attach_size[ai] = size;
-            }
-            {  // run 11 item 6: [Holsters] ShowKnife
-                g_show_knife = config::get_bool("Holsters", "ShowKnife", false);
-                const std::string km = config::get_string("Holsters", "KnifeModel", "melee_knife01x");
-                float kt[3] = {0, 0, 0}, ko[3] = {0, 0, 0};
-                sscanf_s(config::get_string("Holsters", "KnifePropTurn", "0 0 0").c_str(), "%f %f %f", &kt[0], &kt[1], &kt[2]);
-                sscanf_s(config::get_string("Holsters", "KnifePropOffset", "0 0 0").c_str(), "%f %f %f", &ko[0], &ko[1], &ko[2]);
-                std::lock_guard lock(g_zone_mutex);
-                std::snprintf(g_knife_model, sizeof(g_knife_model), "%s", km.c_str());
-                std::memcpy(g_knife_turn, kt, sizeof(kt));
-                std::memcpy(g_knife_off, ko, sizeof(ko));
-            }
-            if (b.on)
-                log::info("[holster] the props belt: %s round the hips %.2f x %.2f m, the buckle %.2f m round, its holster %d, flipped %d, hidden %x, "
-                          "offset (%.3f %.3f %.3f) turn (%.0f %.0f %.0f)", kBeltFragment, 2 * b.a, 2 * b.b, b.s0, b.holster ? 1 : 0, b.flip ? 1 : 0,
-                          b.hide_geoms, o[0], o[1], o[2], t[0], t[1], t[2]);
         }
         g_turn_dead = std::fmin(90.0f, std::fmax(0.0f, config::get_float("Holsters", "TurnDeadZone", 0.0f)));
         log::info("[holster] the loading point moved (%.3f %.3f %.3f) m, radius %.2f m; a round goes in on touch %d", lo[0], lo[1], lo[2], g_load_radius,
@@ -2603,7 +2509,7 @@ int zone_weapon(int z) {
 }
 void set_zone_weapon(int z, int w, bool save) {
     if (z < 0 || z >= kZones || !zone_takes_weapons(z)) return;
-    if (w < -1 || w > kRounds) w = -1;
+    if (w < -1 || w >= kRounds) w = -1;  // (2026-10-13: the rounds the chest's only)
     const char* key = nullptr;
     {
         std::lock_guard lock(g_zone_mutex);
@@ -2613,7 +2519,137 @@ void set_zone_weapon(int z, int w, bool save) {
     log::info("[holster] the %s draws %s", key, w == kRounds ? "the rounds (a round to reload)" : w >= 0 ? kWeaponLabel[w] : "its slots (automatic)");
     if (save) config::set("Holsters", (std::string(key) + "Weapon").c_str(), token_of(w));
 }
-bool zone_takes_weapons(int z) { return z >= 0 && z < kZones && (g_zones[z].slots[0] >= 0 || (z == kAmmoZone && g_any_weapon.load())); }
+bool zone_takes_weapons(int z) { return z >= 0 && z < kZones && g_zones[z].slots[0] >= 0; }
+bool zone_any(int z) { return z >= 0 && z < kZones && gun_zone(g_zones[z]); }
+// the belt piece a holster is on (RingsFollowHolsters): its body::Piece index, body::kPieces the mirrored left holster
+// (while drawn), -1 none
+int zone_piece(int z) {
+    static const int kBonePieceZ[body::kHolsterBones] = {0, 4, 2, 1, -1, -1, 3};
+    if (z < 0 || z >= kZones) return -1;
+    const Zone& zz = g_zones[z];
+    if (zz.bone < 0 || zz.bone >= body::kHolsterBones) return -1;
+    if (zz.mirror && zz.bone == 0) return body::left_holster() ? body::kPieces : -1;
+    return kBonePieceZ[zz.bone];
+}
+// [Holsters] RingsFollowHolsters (2026-10-13, the user: "they hold their position relative to eachother. Moving one
+// should move the other the same way"): a piece and the rings on it shifted together by every move of either (the hand
+// placings, the menu's arrows); a turn of a piece leaves its rings
+void shift_zone_world(int z, const float dw[3]);  // (below)
+// a piece as the shipped RDRVR.ini places it (the release's belt; the game's place with its OwnBelt off)
+body::Piece shipped_piece(int pc) {
+    body::Piece p;
+    const bool own = config::get_shipped("Holsters", "OwnBelt", "0") == "1";
+    if (!own || (pc == body::kPieces && config::get_shipped("Holsters", "OwnBeltLeftHolster", "0") != "1")) return p;
+    const std::string k = pc == body::kPieces ? std::string("LeftHolster") : std::string(body::piece_key(pc));
+    const std::string o = config::get_shipped("Holsters", ("OwnBelt" + k + "Offset").c_str(), "");
+    const std::string t = config::get_shipped("Holsters", ("OwnBelt" + k + "Turn").c_str(), "");
+    if (!o.empty()) sscanf_s(o.c_str(), "%f %f %f", &p.d[0], &p.d[1], &p.d[2]);
+    if (!t.empty()) sscanf_s(t.c_str(), "%f %f %f", &p.turn[0], &p.turn[1], &p.turn[2]);
+    return p;
+}
+// 2026-10-13 (the release review: the shipped rings are placed for the shipped belt's moved pieces): with
+// RingsFollowHolsters, each linked ring's default is the shipped one moved as its piece now differs from the shipped
+// piece (the belt off: the game's places), so a reset ring sits on its piece as shipped
+void reset_rings() {
+    reset_rings_now();
+    if (!g_rings_follow.load(std::memory_order_relaxed)) return;
+    for (int z = 0; z < kZones; ++z) {
+        const int pc = zone_piece(z);
+        if (pc < 0) continue;
+        const body::Piece cur = !body::own_pieces() ? body::Piece{} : pc == body::kPieces ? body::left_holster_piece() : body::piece(pc);
+        float dw[3];
+        if (!body::piece_shift_world(shipped_piece(pc), cur, dw)) continue;
+        {
+            std::lock_guard lock(g_zone_mutex);
+            shift_zone_world(z, dw);
+        }
+        save_zone(z);
+    }
+}
+// 2026-10-13 (the release review: "Customize John's belt" turned off left the rings where the moved pieces were): with
+// RingsFollowHolsters, the belt turned off moves each linked ring back as its piece goes to the game's place, and on
+// again out with it (the left holster's ring: its own offset, used only while the copy is drawn)
+void set_own_pieces_linked(bool on, bool save) {
+    if (on != body::own_pieces() && g_rings_follow.load(std::memory_order_relaxed)) {
+        for (int z = 0; z < kZones; ++z) {
+            const int pc = zone_piece(z);
+            if (pc < 0 || pc >= body::kPieces) continue;
+            const body::Piece p = body::piece(pc);
+            float dw[3];
+            if (!(on ? body::piece_shift_world(body::Piece{}, p, dw) : body::piece_shift_world(p, body::Piece{}, dw))) continue;
+            {
+                std::lock_guard lock(g_zone_mutex);
+                shift_zone_world(z, dw);
+            }
+            if (save) save_zone(z);
+        }
+    }
+    body::set_own_pieces(on, save);
+}
+int link_piece(int z) {
+    if (!g_rings_follow.load(std::memory_order_relaxed) || !body::own_pieces()) return -1;
+    return zone_piece(z);
+}
+void shift_zone_world(int z, const float dw[3]) {  // (under g_zone_mutex)
+    float loc[3] = {dw[0] * g_link_rgt[0] + dw[2] * g_link_rgt[2], dw[1], dw[0] * g_link_fwd[0] + dw[2] * g_link_fwd[2]};
+    if (g_link_lefty) loc[0] = -loc[0];
+    float* o = zone_off(g_zones[z]);
+    for (int k = 0; k < 3; ++k) o[k] = std::fmin(0.8f, std::fmax(-0.8f, o[k] + loc[k]));
+}
+void link_piece_moved(int pc, const float dw[3], int except) {
+    if (pc < 0) return;
+    std::lock_guard lock(g_zone_mutex);
+    for (int z = 0; z < kZones; ++z)
+        if (z != except && link_piece(z) == pc) shift_zone_world(z, dw);
+}
+void link_zone_moved(int z, const float dw[3]) {
+    const int pc = link_piece(z);
+    if (pc < 0) return;
+    const body::Piece cur = pc == body::kPieces ? body::left_holster_piece() : body::piece(pc);
+    body::Piece np;
+    if (!body::piece_shifted(cur, dw, &np)) return;
+    if (pc == body::kPieces) body::set_left_holster_piece(np, false);
+    else body::set_piece(pc, np, false);
+    link_piece_moved(pc, dw, z);
+}
+void link_save(int pc, int except) {  // (the rings, then the piece)
+    if (pc < 0) return;
+    for (int z = 0; z < kZones; ++z)
+        if (z != except && link_piece(z) == pc) save_zone(z);
+    if (pc == body::kPieces) body::save_left_holster_piece();
+    else body::save_piece(pc);
+}
+void set_piece_linked(int pc, const body::Piece& np, bool save) {
+    const body::Piece cur = pc == body::kPieces ? body::left_holster_piece() : body::piece(pc);
+    float dw[3];
+    const bool linked = g_rings_follow.load(std::memory_order_relaxed) && body::own_pieces() && body::piece_shift_world(cur, np, dw);
+    if (linked) link_piece_moved(pc, dw, -1);
+    if (linked && save)
+        for (int z = 0; z < kZones; ++z)
+            if (link_piece(z) == pc) save_zone(z);
+    if (pc == body::kPieces) body::set_left_holster_piece(np, save);
+    else body::set_piece(pc, np, save);
+}
+void set_zone_linked(int z, const float off[3], float radius, bool save) {
+    if (z < 0 || z >= kZones) return;
+    float o0[3], r0 = 0.0f, rg[3], fw[3];
+    bool lefty = false;
+    zone(z, o0, &r0);
+    {
+        std::lock_guard lock(g_zone_mutex);
+        std::memcpy(rg, g_link_rgt, sizeof(rg));
+        std::memcpy(fw, g_link_fwd, sizeof(fw));
+        lefty = g_link_lefty;
+    }
+    set_zone(z, off, radius, save);
+    const int pc = link_piece(z);
+    if (pc < 0) return;
+    const float dl[3] = {lefty ? -(off[0] - o0[0]) : off[0] - o0[0], off[1] - o0[1], off[2] - o0[2]};
+    const float dw[3] = {rg[0] * dl[0] + fw[0] * dl[2], dl[1], rg[2] * dl[0] + fw[2] * dl[2]};
+    if (dw[0] == 0.0f && dw[1] == 0.0f && dw[2] == 0.0f) return;
+    link_zone_moved(z, dw);
+    if (save) link_save(pc, z);
+}
 bool zone_enabled(int z) {
     std::lock_guard lock(g_zone_mutex);
     return z >= 0 && z < kZones && g_zones[z].enabled;
@@ -2645,6 +2681,23 @@ bool arsenal(Arsenal* out) {
     return true;
 }
 bool placing() { return g_place.load(std::memory_order_relaxed); }
+bool rings_follow() { return g_rings_follow.load(std::memory_order_relaxed); }
+void set_rings_follow(bool on, bool save) {
+    if (g_rings_follow.exchange(on) != on)
+        log::info("[holster] the rings %s", on ? "go with their moved holsters (RingsFollowHolsters)" : "and the holsters moved on their own");
+    if (save) config::set("Holsters", "RingsFollowHolsters", on ? "1" : "0");
+}
+bool placing_pieces() { return g_piece_place.load(std::memory_order_relaxed); }
+void set_placing_pieces(bool on) {
+    if (on) set_own_pieces_linked(true, true);  // (the pieces moved at all: OwnBelt; the linked rings with them)
+    if (g_piece_place.exchange(on) != on) log::info("[holster] placing John's belt's pieces by hand: %s", on ? "on" : "off");
+}
+std::string pieces_status() {
+    char b[160];
+    std::snprintf(b, sizeof(b), "pieces placing %d, placed %llu, held L %d R %d, own pieces %d", g_piece_place.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_pieces_placed.load()), g_piece_held[0].load(), g_piece_held[1].load(), body::own_pieces() ? 1 : 0);
+    return b;
+}
 void set_placing(bool on) {
     if (g_place.exchange(on) != on) log::info("[holster] placing the holsters by hand: %s", on ? "on" : "off");
 }
@@ -2692,97 +2745,6 @@ bool gun_raised() { return g_raised.load(std::memory_order_relaxed); }
 bool fire_ready() { return g_fire_ready.load(std::memory_order_relaxed); }
 float fire_clip_phase() { return g_fire_phase.load(std::memory_order_relaxed); }
 bool show_models() { return g_show_models.load(std::memory_order_relaxed); }
-bool show_knife() { return g_show_knife.load(std::memory_order_relaxed); }
-bool knife_wanted() { return g_knife_zone.load(std::memory_order_relaxed) >= 0; }
-BeltMenu belt_menu() {
-    BeltMenu m{};
-    std::lock_guard lock(g_zone_mutex);
-    m.belt = g_belt;
-    m.belt.on = g_prop_belt.load();
-    std::memcpy(m.off, g_belt_off, sizeof(m.off));
-    std::memcpy(m.turn, g_belt_turn, sizeof(m.turn));
-    m.knife = g_show_knife.load();
-    std::memcpy(m.knife_off, g_knife_off, sizeof(m.knife_off));
-    std::memcpy(m.knife_turn, g_knife_turn, sizeof(m.knife_turn));
-    for (int i = 0; i < 3; ++i) {
-        m.att_on[i] = g_attach_on[i].load();
-        std::memcpy(m.att_place[i], g_attach_place[i], sizeof(m.att_place[i]));
-        std::memcpy(m.att_turn[i], g_attach_turn[i], sizeof(m.att_turn[i]));
-        m.att_size[i] = g_attach_size[i];
-    }
-    return m;
-}
-const char* attach_name(int i) {
-    static const char* const kN[3] = {"The satchel", "The lasso's coil", "An ammo pouch"};
-    return i >= 0 && i < 3 ? kN[i] : "?";
-}
-void set_belt_menu(const BeltMenu& m, bool save) {
-    const BeltMenu was = belt_menu();  // (the review: each press rewrote the ini ~29 times: only the changed keys now)
-    body::PropBelt b = m.belt;
-    b.a = std::fmin(0.4f, std::fmax(0.08f, b.a));
-    b.b = std::fmin(0.4f, std::fmax(0.06f, b.b));
-    {
-        std::lock_guard lock(g_zone_mutex);
-        g_belt = b;
-        std::memcpy(g_belt_off, m.off, sizeof(g_belt_off));
-        std::memcpy(g_belt_turn, m.turn, sizeof(g_belt_turn));
-        std::memcpy(g_knife_off, m.knife_off, sizeof(g_knife_off));
-        std::memcpy(g_knife_turn, m.knife_turn, sizeof(g_knife_turn));
-        for (int i = 0; i < 3; ++i) {
-            std::memcpy(g_attach_place[i], m.att_place[i], sizeof(g_attach_place[i]));
-            std::memcpy(g_attach_turn[i], m.att_turn[i], sizeof(g_attach_turn[i]));
-            g_attach_size[i] = std::fmin(2.0f, std::fmax(0.3f, m.att_size[i]));
-        }
-    }
-    g_prop_belt = b.on;
-    body::set_prop_belt(b);
-    g_show_knife = m.knife;
-    for (int i = 0; i < 3; ++i) g_attach_on[i] = m.att_on[i];
-    if (!save) return;
-    char v[96];
-    auto v3 = [&](const float* f, const char* fmt) {
-        std::snprintf(v, sizeof(v), fmt, f[0], f[1], f[2]);
-        return v;
-    };
-    auto diff3 = [](const float* x, const float* y) { return x[0] != y[0] || x[1] != y[1] || x[2] != y[2]; };
-    if (b.on != was.belt.on) config::set("Holsters", "PropBelt", b.on ? "1" : "0");
-    if (b.holster != was.belt.holster) config::set("Holsters", "PropBeltHolster", b.holster ? "1" : "0");
-    if (b.hide_own != was.belt.hide_own) config::set("Holsters", "PropBeltHideOwn", b.hide_own ? "1" : "0");
-    if (b.a != was.belt.a || b.b != was.belt.b) {
-        std::snprintf(v, sizeof(v), "%.3f %.3f", b.a, b.b);
-        config::set("Holsters", "PropBeltSize", v);
-    }
-    if (b.s0 != was.belt.s0) {
-        std::snprintf(v, sizeof(v), "%.3f", b.s0);
-        config::set("Holsters", "PropBeltBuckle", v);
-    }
-    if (diff3(m.off, was.off)) config::set("Holsters", "PropBeltOffset", v3(m.off, "%.3f %.3f %.3f"));
-    if (diff3(m.turn, was.turn)) config::set("Holsters", "PropBeltTurn", v3(m.turn, "%.1f %.1f %.1f"));
-    if (m.knife != was.knife) config::set("Holsters", "ShowKnife", m.knife ? "1" : "0");
-    if (diff3(m.knife_off, was.knife_off)) config::set("Holsters", "KnifePropOffset", v3(m.knife_off, "%.3f %.3f %.3f"));
-    if (diff3(m.knife_turn, was.knife_turn)) config::set("Holsters", "KnifePropTurn", v3(m.knife_turn, "%.1f %.1f %.1f"));
-    for (int i = 0; i < 3; ++i) {
-        const std::string k = kAttach[i].key;
-        if (m.att_on[i] != was.att_on[i]) config::set("Holsters", ("Show" + k).c_str(), m.att_on[i] ? "1" : "0");
-        if (m.att_place[i][0] != was.att_place[i][0]) {
-            std::snprintf(v, sizeof(v), "%.1f", m.att_place[i][0]);
-            config::set("Holsters", (k + "Around").c_str(), v);
-        }
-        if (m.att_place[i][1] != was.att_place[i][1]) {
-            std::snprintf(v, sizeof(v), "%.3f", m.att_place[i][1]);
-            config::set("Holsters", (k + "Height").c_str(), v);
-        }
-        if (m.att_place[i][2] != was.att_place[i][2]) {
-            std::snprintf(v, sizeof(v), "%.3f", m.att_place[i][2]);
-            config::set("Holsters", (k + "Out").c_str(), v);
-        }
-        if (m.att_size[i] != was.att_size[i]) {
-            std::snprintf(v, sizeof(v), "%.2f", m.att_size[i]);
-            config::set("Holsters", (k + "Size").c_str(), v);
-        }
-        if (diff3(m.att_turn[i], was.att_turn[i])) config::set("Holsters", (k + "Turn").c_str(), v3(m.att_turn[i], "%.1f %.1f %.1f"));
-    }
-}
 
 void set_show_models(bool on, bool save) {
     if (g_show_models.exchange(on) != on) log::info("[holster] the holster models (%s) at the hips: %s", g_model_name, on ? "on" : "off");
@@ -2841,14 +2803,14 @@ const char* zone_label(int i) { return i >= 0 && i < kZones ? g_zones[i].label :
 void zone(int i, float off[3], float* radius) {
     if (i < 0 || i >= kZones) return;
     std::lock_guard lock(g_zone_mutex);
-    std::memcpy(off, g_zones[i].off, sizeof(g_zones[i].off));
+    std::memcpy(off, zone_off(g_zones[i]), sizeof(g_zones[i].off));
     *radius = g_zones[i].radius;
 }
 void set_zone(int i, const float off[3], float radius, bool save) {
     if (i < 0 || i >= kZones) return;
     {
         std::lock_guard lock(g_zone_mutex);
-        std::memcpy(g_zones[i].off, off, sizeof(g_zones[i].off));
+        std::memcpy(zone_off(g_zones[i]), off, sizeof(g_zones[i].off));
         g_zones[i].radius = radius;
     }
     if (save) save_zone(i);
@@ -3196,6 +3158,22 @@ std::string command(const std::string& line) {
         }
         return r;
     }
+    if (v == "bases") {  // holster bases: each zone's base, the root and the right (the twins' mirror)
+        HolsterDiag d;
+        {
+            std::lock_guard lock(g_hdiag_mutex);
+            d = g_hdiag;
+        }
+        if (!d.valid) return "bases: not in first person";
+        std::string o = "bases:";
+        char b[96];
+        for (int z = 0; z < kZones; ++z) {
+            std::snprintf(b, sizeof(b), " %s (%.3f %.3f %.3f)", g_zones[z].key, d.base[z][0], d.base[z][1], d.base[z][2]);
+            o += b;
+        }
+        std::snprintf(b, sizeof(b), " | root (%.3f %.3f %.3f) right (%.3f %.3f %.3f)", d.root[0], d.root[1], d.root[2], d.right[0], d.right[1], d.right[2]);
+        return o + b;
+    }
     if (v == "zones") {
         HolsterDiag d;
         {
@@ -3203,7 +3181,7 @@ std::string command(const std::string& line) {
             d = g_hdiag;
         }
         if (!d.valid) return "zones: not in first person (or no body drawn)";
-        char b[700];
+        char b[800];
         int k = std::snprintf(b, sizeof(b), "slot %d in hand %d | draws %llu puts %llu entries %llu rounds %llu/%llu clicks %llu two %llu (%.2f) |",
                               d.cur_slot, d.in_hand ? 1 : 0, static_cast<unsigned long long>(g_draws.load()),
                               static_cast<unsigned long long>(g_puts.load()), static_cast<unsigned long long>(g_entries.load()),
@@ -3216,128 +3194,26 @@ std::string command(const std::string& line) {
         for (int h = 0; h < 2 && k < static_cast<int>(sizeof(b)) - 60; ++h)
             k += std::snprintf(b + k, sizeof(b) - k, " | %s hand (%.3f %.3f %.3f) in %d%s", h ? "right" : "left", d.hand[h][0], d.hand[h][1],
                                d.hand[h][2], d.in_zone[h], g_consumed[h].load() ? " grip held" : "");
+        if (d.cam_ok && k < static_cast<int>(sizeof(b)) - 50)
+            std::snprintf(b + k, sizeof(b) - k, " | camera (%.3f %.3f %.3f)", d.cam[0], d.cam[1], d.cam[2]);
         return b;
     }
-    if (v == "attach") {
-        // holster attach <satchel|lasso|ammo> [on|off | around <deg> | height <m> | out <m> | turn <tilt turn lean>]: run 11
-        // item 7 (the session; the menu saves)
-        std::string w, x;
-        in >> w >> x;
-        const int ai = w == "satchel" ? 0 : w == "lasso" ? 1 : w == "ammo" ? 2 : -1;
-        if (ai < 0) return "holster attach <satchel|lasso|ammo> [on|off|around deg|height m|out m|turn a b c]";
-        float f[3];
-        if (x == "on" || x == "off") g_attach_on[ai] = x == "on";
-        float pl[3], tn[3];
-        {
-            std::lock_guard lock(g_zone_mutex);
-            if (x == "around" && (in >> f[0])) g_attach_place[ai][0] = f[0];
-            if (x == "height" && (in >> f[0])) g_attach_place[ai][1] = f[0];
-            if (x == "out" && (in >> f[0])) g_attach_place[ai][2] = f[0];
-            if (x == "size" && (in >> f[0])) g_attach_size[ai] = std::fmin(2.0f, std::fmax(0.3f, f[0]));
-            if (x == "turn" && (in >> f[0] >> f[1] >> f[2])) std::memcpy(g_attach_turn[ai], f, sizeof(f));
-            std::memcpy(pl, g_attach_place[ai], sizeof(pl));
-            std::memcpy(tn, g_attach_turn[ai], sizeof(tn));
+    if (v == "pieces") {  // holster pieces [place on|off]: run 12 item 3 (the session)
+        std::string x, y;
+        in >> x >> y;
+        if (x == "place" && (y == "on" || y == "off")) set_placing_pieces(y == "on");
+        if (x == "follow" && (y == "on" || y == "off")) set_rings_follow(y == "on", false);  // holster pieces follow on|off (the session)
+        if (x == "belt" && (y == "on" || y == "off")) set_own_pieces_linked(y == "on", false);  // holster pieces belt on|off: as the menu's Customize
+        if (x == "ringreset") reset_rings();  // holster pieces ringreset: as the menu's Reset the rings (saved)
+        if (x == "set") {  // holster pieces set <piece key|Left> dx dy dz tilt turn lean: as the menu's arrows (the rings linked)
+            body::Piece p;
+            int pc = -1;
+            for (int i = 0; i < body::kPieces; ++i)
+                if (y == body::piece_key(i)) pc = i;
+            if (y == "Left") pc = body::kPieces;
+            if (pc >= 0 && (in >> p.d[0] >> p.d[1] >> p.d[2] >> p.turn[0] >> p.turn[1] >> p.turn[2])) set_piece_linked(pc, p, false);
         }
-        float dp[3] = {}, rel[3] = {};
-        double dms = 0;
-        const bool got = held_prop::last_drawn(kAttachSlot + ai, dp, &dms, rel);
-        char r[260];
-        std::snprintf(r, sizeof(r), "attach %s %d (%s): round %.0f deg, height %.3f, out %.3f, turn (%.0f %.0f %.0f): shown %d, drawn rel (%.3f %.3f %.3f) %.0f ms ago",
-                      kAttach[ai].key, g_attach_on[ai].load() ? 1 : 0, kAttach[ai].frag, pl[0], pl[1], pl[2], tn[0], tn[1], tn[2],
-                      held_prop::shown(kAttachSlot + ai) ? 1 : 0, rel[0], rel[1], rel[2], got ? log::now_ms() - dms : -1.0);
-        return r;
-    }
-    if (v == "knife") {  // holster knife [on|off | turn <tilt turn lean> | offset <x y z>]: [Holsters] ShowKnife for the session
-        std::string x;
-        in >> x;
-        float f[3];
-        if (x == "on" || x == "off") g_show_knife = x == "on";
-        {
-            std::lock_guard lock(g_zone_mutex);
-            if (x == "turn" && (in >> f[0] >> f[1] >> f[2])) std::memcpy(g_knife_turn, f, sizeof(f));
-            if (x == "offset" && (in >> f[0] >> f[1] >> f[2])) std::memcpy(g_knife_off, f, sizeof(f));
-            std::memcpy(f, g_knife_off, sizeof(f));
-        }
-        float dp[3] = {}, rel[3] = {};
-        double dms = 0;
-        const bool got = held_prop::last_drawn(kKnifeSlot, dp, &dms, rel);
-        char r[260];
-        std::snprintf(r, sizeof(r), "knife %d (%s) at the %s, shown %d, drawn rel (%.3f %.3f %.3f) %.0f ms ago | %s", g_show_knife.load() ? 1 : 0, g_knife_model,
-                      g_knife_zone.load() >= 0 ? g_zones[g_knife_zone.load()].key : "-", held_prop::shown(kKnifeSlot) ? 1 : 0, rel[0], rel[1], rel[2],
-                      got ? log::now_ms() - dms : -1.0, held_prop::status().substr(0, 0).c_str());
-        return r;
-    }
-    if (v == "belt") {
-        // holster belt [on|off | size <a> <b> | buckle <m> | holster 0|1 | flip 0|1 | hide <hex> | offset <x y z> | turn <yaw
-        // pitch roll>]: [Holsters] PropBelt for the session (run 11 item 2); the state
-        std::string x;
-        in >> x;
-        body::PropBelt b;
-        float o[3], t[3];
-        {
-            std::lock_guard lock(g_zone_mutex);
-            b = g_belt;
-            if (x == "on" || x == "off") b.on = x == "on";
-            float f1 = 0, f2 = 0, f3 = 0;
-            if (x == "size" && (in >> f1 >> f2)) b.a = std::fmin(0.4f, std::fmax(0.08f, f1)), b.b = std::fmin(0.4f, std::fmax(0.06f, f2));
-            if (x == "buckle" && (in >> f1) && f1 >= -1.0f && f1 <= 1.0f) b.s0 = f1;
-            if (x == "holster" && (in >> f1)) b.holster = f1 != 0;
-            if (x == "flip" && (in >> f1)) b.flip = f1 != 0;
-            if (x == "own" && (in >> f1)) b.hide_own = f1 == 0;  // holster belt own 1: John's own belt shown too
-            if (x == "sway") {  // holster belt sway [reset]: the hips' turn against the belt and the pelvis's height (item 9)
-                std::string y;
-                in >> y;
-                if (y == "reset") g_sway_min = g_pel_min = 1e9f, g_sway_max = g_pel_max = -1e9f, g_sway_n = 0;
-                char sw[200];
-                std::snprintf(sw, sizeof(sw), "belt sway: the drawn pelvis turned %.1f..%.1f deg against the body's heading (range %.1f; the belt turns with it), the pelvis %.3f..%.3f m over the root (range %.3f), %llu frames",
-                              g_sway_min, g_sway_max, g_sway_max - g_sway_min, g_pel_min, g_pel_max, g_pel_max - g_pel_min,
-                              static_cast<unsigned long long>(g_sway_n));
-                return sw;
-            }
-            std::string hx;
-            if (x == "hide" && (in >> hx)) b.hide_geoms = static_cast<uint32_t>(std::strtoul(hx.c_str(), nullptr, 16));
-            if (x == "offset" && (in >> f1 >> f2 >> f3)) g_belt_off[0] = f1, g_belt_off[1] = f2, g_belt_off[2] = f3;
-            if (x == "turn" && (in >> f1 >> f2 >> f3)) g_belt_turn[0] = f1, g_belt_turn[1] = f2, g_belt_turn[2] = f3;
-            g_belt = b;
-            std::memcpy(o, g_belt_off, sizeof(o));
-            std::memcpy(t, g_belt_turn, sizeof(t));
-        }
-        if (!x.empty()) {
-            g_prop_belt = b.on;
-            body::set_prop_belt(b);
-        }
-        float dp[3] = {}, rel[3] = {}, want[3];
-        double dms = 0;
-        const bool got = held_prop::last_drawn(held_prop::kBeltSlot, dp, &dms, rel);
-        {
-            std::lock_guard lock(g_zone_mutex);
-            std::memcpy(want, g_belt_want_rel, sizeof(want));
-        }
-        const float err = std::sqrt((rel[0] - want[0]) * (rel[0] - want[0]) + (rel[1] - want[1]) * (rel[1] - want[1]) + (rel[2] - want[2]) * (rel[2] - want[2]));
-        if (x == "zones") {  // holster belt zones: each belt zone against its ring point on the drawn belt (both less the pelvis)
-            std::string o = "belt zones:";
-            char zb[120];
-            std::lock_guard lock(g_zone_mutex);
-            for (int z : kBeltZones) {
-                float e2 = 0;
-                for (int k = 0; k < 3; ++k) {
-                    const float d = g_belt_zone_rel[z][k] - (rel[k] + g_belt_zone_loc[z][k]);
-                    e2 += d * d;
-                }
-                std::snprintf(zb, sizeof(zb), " %s %.4f (at %.3f %.3f %.3f)", g_zones[z].key, got ? std::sqrt(e2) : -1.0f, g_belt_zone_loc[z][0],
-                              g_belt_zone_loc[z][1], g_belt_zone_loc[z][2]);
-                o += zb;
-            }
-            return o;
-        }
-        char r[360];
-        std::snprintf(r, sizeof(r),
-                      "belt %d (%s) size %.3f %.3f buckle %.3f holster %d flip %d hide %x offset (%.3f %.3f %.3f) turn (%.0f %.0f %.0f) | shown %d, "
-                      "drawn at rel (%.3f %.3f %.3f) %.0f ms ago, off the wanted by %.4f m, zones placed on it %llu",
-                      b.on ? 1 : 0, kBeltFragment, b.a, b.b, b.s0, b.holster ? 1 : 0, b.flip ? 1 : 0, b.hide_geoms, o[0], o[1], o[2], t[0], t[1], t[2],
-                      held_prop::shown(held_prop::kBeltSlot) ? 1 : 0, rel[0], rel[1], rel[2], got ? log::now_ms() - dms : -1.0, got ? err : -1.0f,
-                      static_cast<unsigned long long>(g_belt_zoned.load()));
-        return r;
+        return pieces_status() + (rings_follow() ? ", the rings follow" : ", the rings on their own");
     }
     if (v == "model") {  // holster model [on|off] [offset x y z turn yaw pitch roll]: the session only; the models' state
         std::string x;

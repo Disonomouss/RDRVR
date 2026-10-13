@@ -15,14 +15,12 @@ namespace rdrvr::held_prop {
 
 // 0 the round in hand (the shotgun shell), 1 the other revolver (run 5 item 2), 2-5 the guns at the holsters (run 6
 // item 6: [Holsters] ShowGuns; the right hip, the back, the left hip, the left shoulder), 6-7 the holster models at the
-// right and left hips ([Holsters] ShowModels, 2026-10-09), 8 the props census's (run 11 item 1: "props show"), 9-15 the
-// belt of the game's props (run 11: the belt and what is on it)
+// right and left hips ([Holsters] ShowModels, 2026-10-09), 8 the props census's (run 11 item 1: "props show"), 9-15
+// free (run 11's props belt, retired in run 12)
 constexpr int kSlots = 16;
 constexpr int kHolsterSlot = 2;
 constexpr int kModelSlot = 6;
 constexpr int kCensusSlot = 8;
-constexpr int kBeltSlot = 9;
-constexpr int kBeltSlots = 7;
 
 // Game thread (the holsters' update), every frame: the natives' state machine (requests, polls, creation, moves,
 // destruction) and the results collected.

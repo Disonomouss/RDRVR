@@ -212,6 +212,6 @@ try {
     Say 'or WMR) and make it the active OpenXR runtime before starting the game.'
 }
 $ui = Join-Path $env:LOCALAPPDATA 'RDRVR\RDRVR.user.ini'
-if (Test-Path -LiteralPath $ui) { Say "Your in-game settings are kept: $ui" }
+if (Test-Path -LiteralPath $ui) { Say "Your in-game settings: $ui (a release that starts everyone from new defaults keeps the old file beside it as RDRVR.user.ini.before-<version>.bak on its first start)" }
 Say "To remove it: RDRVR_Uninstall.cmd in the game folder."
 Done 0

@@ -52,7 +52,11 @@ bool audio_follows_head();
 // [XR] AudioRearFold: a mono voice's rear, centre and side gains folded into left and right on a stereo device (the
 // game's own fold keeps the rear and the sides at 0.3, -10.5 dB). On by default.
 void set_audio_rear_fold(bool on);
+bool audio_rear_fold();
 std::string audio_status();  // "cam audio [on|off] | cam audio fold on|off": both switches and their counters
+// "cam audio log on|off|mark <n>|dump <file>" (run 12 item 10, a test's): each listener update, the game camera's and the
+// listener's headings and positions, and why the head's was not used
+std::string audio_log_command(const std::string& v, const std::string& arg);
 // Round 2: with the XR pose on in a double frame, the distant tree billboards face the centre eye, level (head yaw
 // only) instead of the game camera. [XR] LevelBillboards=1; "billboards level|game".
 void set_level_billboards(bool on);

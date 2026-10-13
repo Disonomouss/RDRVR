@@ -19,6 +19,7 @@
 #include "core/frame_probe.h"
 #include "core/hooks.h"
 #include "core/prepass_arrays.h"
+#include "core/render_res.h"
 #include "core/pso.h"
 #include "core/log.h"
 #include "core/ring_probe.h"
@@ -993,6 +994,14 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags
 
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w, UINT h, DXGI_FORMAT f, UINT flags) {
     log::info("[dxgi] ResizeBuffers(count %u, %ux%u, fmt %d, flags %#x)", count, w, h, static_cast<int>(f), flags);
+    {  // a relaunch's put-back size: the buffers at the armed size as the targets (render_res::relaunch_swap_size)
+        uint32_t rw = 0, rh = 0;
+        if (sc == state::swapchain && render_res::relaunch_swap_size(&rw, &rh) && (w != rw || h != rh)) {
+            log::info("[renderres] the relaunch's ResizeBuffers %ux%u made %ux%u (the targets' size)", w, h, rw, rh);
+            w = rw;
+            h = rh;
+        }
+    }
     if (FrameSizeFn fs = g_frame_size.load(std::memory_order_acquire)) fs("ResizeBuffers", w, h);
     HRESULT hr = o_ResizeBuffers(sc, count, w, h, f, flags);
     if (SUCCEEDED(hr)) {
@@ -1053,6 +1062,17 @@ void on_swapchain(IUnknown* device_or_queue, HWND hwnd, IDXGISwapChain* sc) {
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* out,
                                                     IDXGISwapChain1** sc) {
+    DXGI_SWAP_CHAIN_DESC1 d1{};
+    {  // a relaunch's put-back size: the game's swapchain made at the armed size (not the 120x61 probe's)
+        uint32_t rw = 0, rh = 0;
+        if (desc && desc->Width >= 640 && desc->Height >= 480 && render_res::relaunch_swap_size(&rw, &rh) && (desc->Width != rw || desc->Height != rh)) {
+            d1 = *desc;
+            log::info("[renderres] the relaunch's swapchain %ux%u made %ux%u (the targets' size)", d1.Width, d1.Height, rw, rh);
+            d1.Width = rw;
+            d1.Height = rh;
+            desc = &d1;
+        }
+    }
     HRESULT hr = o_CreateSwapChainForHwnd(f, dev, hwnd, desc, fs, out, sc);
     log::info("[dxgi] CreateSwapChainForHwnd(factory %p, queue %p, hwnd %p) -> %#lx", static_cast<void*>(f),
               static_cast<void*>(dev), static_cast<void*>(hwnd), static_cast<unsigned long>(hr));
@@ -1061,6 +1081,18 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForHwnd(IDXGIFactory2* f, IUnknown* 
 }
 
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** sc) {
+    DXGI_SWAP_CHAIN_DESC d0{};
+    {  // (as CreateSwapChainForHwnd's: a relaunch's put-back size)
+        uint32_t rw = 0, rh = 0;
+        if (desc && desc->BufferDesc.Width >= 640 && desc->BufferDesc.Height >= 480 && render_res::relaunch_swap_size(&rw, &rh) &&
+            (desc->BufferDesc.Width != rw || desc->BufferDesc.Height != rh)) {
+            d0 = *desc;
+            log::info("[renderres] the relaunch's swapchain %ux%u made %ux%u (the targets' size)", d0.BufferDesc.Width, d0.BufferDesc.Height, rw, rh);
+            d0.BufferDesc.Width = rw;
+            d0.BufferDesc.Height = rh;
+            desc = &d0;
+        }
+    }
     HRESULT hr = o_CreateSwapChain(f, dev, desc, sc);
     log::info("[dxgi] CreateSwapChain(factory %p, queue %p) -> %#lx", static_cast<void*>(f), static_cast<void*>(dev),
               static_cast<unsigned long>(hr));

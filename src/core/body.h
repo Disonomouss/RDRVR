@@ -62,7 +62,8 @@ void set_transplant_fingers(int mode);  // also written to the user ini
 void on_visibility_build();
 // The drawn body's points for the holsters (world, from the latest corrected player set): each hand's wrist target
 // (where the IK puts the wrist: the controller), the holster bones and the root joint. False when stale (250 ms).
-constexpr int kHolsterBones = 6;  // 0 pistol (right hip), 1 rifle (back), 2 thrower, 3 melee (pelvis), 4 the chest (spine03), 5 the lower back (the pelvis bone)
+// 6 the lasso (its rope bone: the Lasso holster, 2026-10-13)
+constexpr int kHolsterBones = 7;  // 0 pistol (right hip), 1 rifle (back), 2 thrower, 3 melee (pelvis), 4 the chest (spine03), 5 the lower back (the pelvis bone)
 constexpr int kPelvisPoint = 5;   // the pelvis as drawn: the held props' anchor (held_prop::note_root)
 struct BodyPoints {
     double ms = 0;
@@ -103,14 +104,67 @@ int hidden_geometry();
 void set_hidden_geometry(int mode);  // also written to the user ini
 const char* grip_source_name();  // the foregrip's grip now: "the weapon's", "<gun>'s (borrowed)", "the template", "built-in"
 bool auto_shows();           // [Body] AutoShow: forearms and hands while crouching, in cover, riding or driving
-// The body's drawn part this frame (any thread): 0 the whole body, 1 the forearms and hands, 2 the hands only (the
-// setting, or AutoShow's while crouching, in cover, riding or driving). Run 11 item 9: the props belt shows only at 0
-int shown_part();
-// The drawn pelvis's turn (run 11 item 9): its skinning matrix's 3x3 (rows; the bind pose's frame to the world) from
-// the latest drawn player set; false before one. Any thread
-bool pelvis_drawn(float R[9]);
-void set_prop_belt_wanted(bool on);  // holster.cpp each frame: the props belt wanted (John's own belt hidden while it is)
+// Run 12 item 2, [Holsters] OwnBelt: John's own belt's pieces, each on its own bone (the outfit's geometry weighted to
+// it: research/run12/ownbelt/pieces.md), moved and turned in the drawn pelvis's frame about the bone's own joint. The
+// bone and every bone under it take the move in both halves of the player's set, so the piece's vertices, any prop
+// hung on it (the holstered gun, the knife) and its holster point go with it. Off by default.
+constexpr int kPieces = 5;  // 0 the holster (pistol), 1 the knife's sheath (melee), 2 the satchel (thrower), 3 the lasso (rope), 4 the rifle's sling (rifle)
+struct Piece {
+    float d[3] = {};     // m: right, up, forward (the pelvis's frame)
+    float turn[3] = {};  // deg: tilt (about right), turn (about up), lean (about forward)
+};
+const char* piece_key(int i);  // the ini's stem: Holster, Sheath, Satchel, Lasso, Sling
+Piece piece(int i);
+void set_piece(int i, const Piece& p, bool save);  // save: the user ini, only the changed keys
+bool own_pieces();
+// [Holsters] OwnBeltRigid (2026-10-13): a moved piece drawn whole where it was put (its model drawn twice); off by default
+// since the user's body turned translucent with it on
+bool rigid_pieces();
+void set_rigid_pieces(bool on, bool save);
+void set_own_pieces(bool on, bool save);
+// The piece's joint as drawn (world) in the last frames; false when not drawn moved (OwnBelt off) or stale
+bool piece_where(int i, float joint[3]);
+bool piece_delta(int i, float d[3]);  // its joint's move this frame (world: where the move put it less where it was), 0 unmoved
+// its move as a rigid one (world): its joint before (piv), after (want), its turn Rw (a point p on it at want + Rw (p - piv))
+bool piece_rigid(int i, float piv[3], float want[3], float Rw[9]);
+void save_piece(int i);  // its OwnBelt<Key>Offset and Turn written to the user ini as they are now
+// Run 12 item 5, [Holsters] OwnBeltLeftHolster: John's own holster (the outfit's geometry weighted to the pistol bone)
+// drawn a second time at the left hip for the second sidearm: reflected across its own thin plane and across the
+// body's middle (two reflections: a rotation, so its triangles keep their winding), the rest of that geometry (the
+// belt's ring) collapsed to the holster's top; its own place and turn (the Piece's) about its joint. Off by default.
+bool left_holster();
+bool arm_motion_vectors();  // [Body] ArmMotionVectors
+void set_arm_motion_vectors(bool on, bool save);
+void set_left_holster(bool on, bool save);
+Piece left_holster_piece();
+void set_left_holster_piece(const Piece& p, bool save);
+// 2026-10-13: the copy taken by hand: its joint as drawn (world), and its move from the grip's (as piece_grab)
+bool left_holster_where(float j[3]);
+void save_left_holster_piece();  // both its keys written (Offset, Turn)
+bool left_holster_grab(const float Rd[9], const float h0[3], const float h1[3], const Piece& p0, Piece* out);
+bool left_holster_delta(float d[3]);  // its joint's move from the plain mirror of the right one (world), for the LeftHip zone
+bool left_holster_rigid(float piv[3], float want[3], float Rw[9]);  // the copy's own move, as piece_rigid
+bool left_holster_move(float tw[3]);  // the copy's move (world, from the pelvis's frame), drawn or not
+// a piece's (or the left holster's) offset change as a world move (to less from), and a piece shifted by a world move
+bool piece_shift_world(const Piece& from, const Piece& to, float dw[3]);
+bool piece_shifted(const Piece& from, const float dw[3], Piece* to);
+// A point at the right holster (world: the RightHip zone) mirrored onto the copy as the copy is made (its mirror plane,
+// then the copy's own move): the LeftHip zone on it. False when the copy is off or not drawn lately
+bool left_holster_place(const float right[3], float out[3]);
+void left_holster_refresh();
+// [Holsters] OwnBeltRigid (2026-10-13): each moved piece drawn rigid (its geometries found again when the drawables change)
+void pieces_geom_refresh();
+void pieces_geom_scan();          // the holster geometry found again when the player's drawables change (rd: not the draw thread)
+std::string left_holster_status();  // "skel lefthol"
+// Item 3's grab: the piece's move after a hand's move since its grip (the hand turned by Rd about it, from h0 to h1; world)
+// applied to the piece as it was at the grip (p0): the new offset and turn in the pelvis's frame (each offset within 0.6 m)
+bool piece_grab(int i, const float Rd[9], const float h0[3], const float h1[3], const Piece& p0, Piece* out);
 void set_auto_shows(bool on);
+// [Horse] BodyWithCamera (run 12 item 8): riding with Stance=still, the body kept at its standing offset from the camera
+// (only a jump over 1.5 m re-learns it, not 0.3 m; the animation pinned while within 1.5 m, not 0.5 m). On by default;
+// "pose bodycam on|off" for the session
+void set_body_with_camera(bool on, bool save = false);
+bool body_with_camera();
 // [Weapon.<Gun>] FrontHandPose: a long gun's front hand: 0 automatic (the game's state), 1 the lowered hold, 2 the
 // aiming hold (each with its own fingers); front_pose_seen: bit 0/1 the lowered/aiming hold learned this session, bit
 // 2/3 its fingers
@@ -121,26 +175,6 @@ bool locks_torso();          // [Body] LockTorso: the upper body kept over the h
 void set_locks_torso(bool on);
 HandCfg hand_cfg();
 void set_hand_cfg(const HandCfg& c);
-// run 11 item 2, [Holsters] PropBelt: the gun belt prop (p_gen_gunbelt01x, a skinned strap of 17 joints) in held_prop's
-// belt slot, its draws moved exactly onto the slot's pose (holster.cpp: the pelvis's frame) and its strap bent round
-// the hips' ellipse (semi-axes a sideways, b front to back, m), the buckle s0 m round from the front centre (the
-// prop's +y). holster: its holster's bone (5) kept, else collapsed and the strap closed over it (a plain belt). flip:
-// the ring mirrored front to back (the buckle at the back, the strap's faces swapped in and out). hide_geoms: its
-// geometries not drawn (bit i: geometry i; 0 the belt's own revolver, 1 its leather)
-struct PropBelt {
-    bool on = false;
-    float a = 0.19f, b = 0.14f, s0 = 0.0f;
-    bool holster = true, flip = false;
-    uint32_t hide_geoms = 1;
-    bool hide_own = true;  // run 11 item 3, PropBeltHideOwn: John's own belt and holster not drawn while it is
-};
-void set_prop_belt(const PropBelt& c);  // any thread
-// The holsters' update, each frame the props belt is wanted: John's own belt found anew when his drawables change (an
-// outfit change; at most once a second)
-void own_belt_refresh();
-// The props belt's bone i as bent (the skinning matrix, 3 rows of 4, in its model's space) for its current drawable and
-// config; false before its first bent draw. Any thread (run 11 item 5: its holster's place for the gun shown there).
-bool prop_belt_bone(int i, float m[12]);
 std::string command(const std::string& line);
 // The scene render hook, first thing (after the game's update, before its draw lists): the head hide when on.
 void before_scene(const float* cam);  // cam: the frame's game camera matrix (for the controllers' world poses)

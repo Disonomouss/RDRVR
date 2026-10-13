@@ -14,6 +14,8 @@ bool get_bool(const char* section, const char* key, bool def);
 int get_int(const char* section, const char* key, int def);
 float get_float(const char* section, const char* key, float def);
 std::string get_string(const char* section, const char* key, const char* def);
+// the shipped RDRVR.ini's value whatever the user file says (2026-10-13: the menu's resets to the defaults)
+std::string get_shipped(const char* section, const char* key, const char* def);
 
 const wchar_t* user_ini_path();
 // The menu's write: `key` = `value` in the user file (created on first use; only that key's line changes, every

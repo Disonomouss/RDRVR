@@ -167,6 +167,8 @@ std::string execute(const std::vector<std::string>& t) {
         return std::string("actor ") + std::to_string(handle) + " " +
                run_native(0x99BD9D6Fu, {static_cast<uint64_t>(static_cast<uint32_t>(handle)), 0}, 2);  // GET_POSITION
     }
+    if (c == "cam" && t.size() >= 3 && t[1] == "audio" && t[2] == "log")  // cam audio log on|off|mark <n>|dump <file> (run 12 item 10)
+        return camera_lever::audio_log_command(t.size() >= 4 ? t[3] : "", t.size() >= 5 ? t[4] : "");
     if (c == "cam" && t.size() >= 2 && t[1] == "audio") {  // cam audio [on|off] | fold on|off: AudioFollowsHead, AudioRearFold (the session)
         if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) camera_lever::set_audio_follows_head(t[2] == "on");
         if (t.size() >= 4 && t[2] == "fold" && (t[3] == "on" || t[3] == "off")) camera_lever::set_audio_rear_fold(t[3] == "on");
@@ -432,6 +434,10 @@ std::string execute(const std::vector<std::string>& t) {
         else if (t.size() >= 3 && t[1] == "saddle")
             pose::set_saddle(t[2] == "on", t.size() >= 4 ? std::strtof(t[3].c_str(), nullptr) : pose::saddle_smoothing(), false);
         if (t.size() >= 3 && t[1] == "trace") return pose::trace_command(t[2], t.size() >= 4 ? t[3] : "");  // pose trace on|off|reset|dump <file>
+        if (t.size() >= 2 && t[1] == "bodycam") {  // pose bodycam [on|off]: [Horse] BodyWithCamera for the session (run 12 item 8)
+            if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) body::set_body_with_camera(t[2] == "on");
+            return std::string("body with camera ") + (body::body_with_camera() ? "on" : "off");
+        }
         if (t.size() >= 3 && t[1] == "horse") pose::set_steer_by_head(t[2] == "head");
         if (t.size() >= 3 && t[1] == "jitter") pose::reset_ride_jitter();
         if (t.size() >= 3 && t[1] == "keepcam") pose::set_keep_camera(t[2] == "on");

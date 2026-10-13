@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -737,24 +738,58 @@ AudioListeners_t o_AudioListeners = nullptr;
 std::atomic<bool> g_audio_head{true};
 std::atomic<uint64_t> g_audio_calls{0}, g_audio_from_head{0};
 std::atomic<float> g_audio_turn{0.0f};  // the last listener's yaw from the camera's (deg, positive: turned left)
+// run 12 item 10, "cam audio log on|off|mark <n>|dump <file>" (a test's): each listener update in a ring, the game
+// camera's and the listener's headings and positions and why the head's was not used (cycle AU7's sound all in the left
+// ear with the turn read right). The main thread writes, the command thread dumps (under g_alog_mutex).
+struct AudioLogRow {
+    double ms;
+    float game_h, out_h, game_p[3], out_p[3];
+    int why;  // 0 the head's, 1 the switch off, 2 no XR pose, 3 not a double frame, 4 no eye camera, 5 not finite, 9 a mark
+};
+std::mutex g_alog_mutex;
+AudioLogRow g_alog[8192];  // under g_alog_mutex
+size_t g_alog_n = 0;
+std::atomic<bool> g_alog_on{false};
+void audio_log(const float* cam, const float* out, int why) {
+    if (!g_alog_on.load(std::memory_order_relaxed)) return;
+    AudioLogRow r{};
+    r.ms = log::now_ms();
+    r.why = why;
+    if (cam) {
+        r.game_h = std::atan2(cam[8], cam[10]) * 57.29578f;
+        for (int k = 0; k < 3; ++k) r.game_p[k] = cam[12 + k];
+    }
+    if (out) {
+        r.out_h = std::atan2(out[8], out[10]) * 57.29578f;
+        for (int k = 0; k < 3; ++k) r.out_p[k] = out[12 + k];
+    }
+    std::lock_guard lock(g_alog_mutex);
+    g_alog[g_alog_n % 8192] = r;
+    ++g_alog_n;
+}
 void hk_AudioListeners(const float* cam) {
     g_audio_calls.fetch_add(1, std::memory_order_relaxed);
-    if (cam && g_audio_head.load(std::memory_order_relaxed) && g_xr_pose.load(std::memory_order_relaxed) &&
-        g_double.load(std::memory_order_relaxed)) {  // (the review: as the eyes, from the XR views in a double frame)
+    int why = !cam ? 5 : !g_audio_head.load(std::memory_order_relaxed) ? 1 : !g_xr_pose.load(std::memory_order_relaxed) ? 2
+                                                                         : !g_double.load(std::memory_order_relaxed) ? 3 : 0;
+    if (why == 0) {  // (the review: as the eyes, from the XR views in a double frame)
         alignas(16) float c[16];
+        why = 4;
         if (xr_eye_camera(cam, 2, c, true)) {
             bool ok = true;
             for (float v : c) ok = ok && std::isfinite(v);
+            why = 5;
             if (ok) {
                 // the turn about the world's up: the back rows' angle in the horizontal plane
                 const float a = std::atan2(cam[8], cam[10]), b = std::atan2(c[8], c[10]);
                 g_audio_turn.store(std::remainder(b - a, 6.2831853f) * 57.29578f, std::memory_order_relaxed);
                 g_audio_from_head.fetch_add(1, std::memory_order_relaxed);
+                audio_log(cam, c, 0);
                 o_AudioListeners(c);
                 return;
             }
         }
     }
+    audio_log(cam, cam, why);
     o_AudioListeners(cam);
 }
 
@@ -995,8 +1030,44 @@ void set_audio_follows_head(bool on) {
     if (g_audio_head.exchange(on) != on) log::info("[cam] the audio listeners %s", on ? "at the head (the centre eye)" : "at the game camera (the body's heading)");
 }
 bool audio_follows_head() { return g_audio_head.load(); }
+bool audio_rear_fold() { return g_audio_fold.load(); }
 void set_audio_rear_fold(bool on) {
     if (g_audio_fold.exchange(on) != on) log::info("[cam] the audio's rear on stereo %s", on ? "folded into left and right" : "dropped (the game's)");
+}
+std::string audio_log_command(const std::string& v, const std::string& arg) {
+    if (v == "on" || v == "off") {
+        if (v == "on") {
+            std::lock_guard lock(g_alog_mutex);
+            g_alog_n = 0;
+        }
+        g_alog_on = v == "on";
+        return "audio log " + v;
+    }
+    if (v == "mark") {  // a row marking a test's block (its number in the heading's place)
+        std::lock_guard lock(g_alog_mutex);
+        AudioLogRow r{};
+        r.ms = log::now_ms();
+        r.why = 9;
+        r.game_h = static_cast<float>(std::atof(arg.c_str()));
+        g_alog[g_alog_n % 8192] = r;
+        ++g_alog_n;
+        return "audio log mark " + arg;
+    }
+    if (v == "dump" && !arg.empty()) {
+        FILE* f = std::fopen(arg.c_str(), "w");
+        if (!f) return "ERROR cannot write " + arg;
+        std::lock_guard lock(g_alog_mutex);
+        std::fprintf(f, "ms,why,game_h,out_h,game_x,game_y,game_z,out_x,out_y,out_z\n");
+        const size_t n = g_alog_n < 8192 ? g_alog_n : 8192, first = g_alog_n - n;
+        for (size_t i = 0; i < n; ++i) {
+            const AudioLogRow& r = g_alog[(first + i) % 8192];
+            std::fprintf(f, "%.1f,%d,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", r.ms, r.why, r.game_h, r.out_h, r.game_p[0], r.game_p[1], r.game_p[2],
+                         r.out_p[0], r.out_p[1], r.out_p[2]);
+        }
+        std::fclose(f);
+        return "audio log dumped " + std::to_string(n) + " rows (of " + std::to_string(g_alog_n) + "), now " + std::to_string(log::now_ms());
+    }
+    return "audio log " + std::string(g_alog_on.load() ? "on" : "off") + ", " + std::to_string(g_alog_n) + " rows";
 }
 std::string audio_status() {
     char b[320];
