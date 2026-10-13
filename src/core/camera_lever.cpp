@@ -189,6 +189,14 @@ std::mutex g_recentre_mutex;
 bool g_recentred = false;
 std::atomic<uint32_t> g_recentre_gen{0};
 float g_q0[4] = {0, 0, 0, 1}, g_p0[3] = {0, 0, 0};  // recentre: yaw-only orientation and position (LOCAL)
+// [Comfort] WorldScale (2026-10-13, the user: "Did we add a world scale setting at any point?"): every headset-space
+// position put into the game (the eyes, so their separation too, the head's and the neck's moves, the hands) divided
+// by it: above 1 the world looks bigger (you smaller), below 1 smaller. 1 = true scale. The game's world is unchanged
+std::atomic<float> g_world_scale{1.0f};
+float ws_inv() {
+    const float s = g_world_scale.load(std::memory_order_relaxed);
+    return s > 0.01f ? 1.0f / s : 1.0f;
+}
 std::atomic<uint64_t> g_xr_pose_passes{0};
 
 void quat_mul(const float* a, const float* b, float* o) {  // o = a * b, (x, y, z, w)
@@ -238,9 +246,10 @@ bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false) {
     quat_mul(q0c, v[eye].orientation, qrel);
     quat_matrix(q0c, r0);
     if (g_xr_head_position.load(std::memory_order_relaxed)) {
-        for (int k = 0; k < 3; ++k) d[k] = v[eye].position[k] - p0[k];
+        const float wi = ws_inv();
+        for (int k = 0; k < 3; ++k) d[k] = (v[eye].position[k] - p0[k]) * wi;
     } else {  // the eye's offset from the head's centre only
-        float s = g_xr_separation.load(std::memory_order_relaxed);
+        float s = g_xr_separation.load(std::memory_order_relaxed) * ws_inv();  // (the world scale: the separation too)
         for (int k = 0; k < 3; ++k) d[k] = s * (v[eye].position[k] - 0.5f * (v[0].position[k] + v[1].position[k]));
         if (peek) d[0] = d[1] = d[2] = 0;  // the cover: the centre
     }
@@ -852,6 +861,10 @@ void hk_AudioMatrix(char* voice, int send, float* out) {
 bool install() {
     if (anchors::stand_down()) return false;
     g_audio_head = config::get_bool("XR", "AudioFollowsHead", true);
+    {  // [Comfort] WorldScale (2026-10-13)
+        const float ws = config::get_float("Comfort", "WorldScale", 1.0f);
+        g_world_scale = std::fmin(2.0f, std::fmax(0.5f, ws));
+    }
     g_audio_fold = config::get_bool("XR", "AudioRearFold", true);
     // (the review: each hook installed only with its switch on in the ini, so 0 is a real off; "cam audio" then changes
     // nothing; both anchors optional: a build without them keeps the game's sound)
@@ -1177,7 +1190,7 @@ bool head_offset(float out[3]) {
     }
     float q0c[4] = {-q0[0], -q0[1], -q0[2], q0[3]}, r0[9], d[3];
     quat_matrix(q0c, r0);
-    for (int k = 0; k < 3; ++k) d[k] = 0.5f * (v[0].position[k] + v[1].position[k]) - p0[k];
+    for (int k = 0; k < 3; ++k) d[k] = (0.5f * (v[0].position[k] + v[1].position[k]) - p0[k]) * ws_inv();
     for (int r = 0; r < 3; ++r) out[r] = r0[r * 3 + 0] * d[0] + r0[r * 3 + 1] * d[1] + r0[r * 3 + 2] * d[2];
     return true;
 }
@@ -1199,7 +1212,8 @@ bool neck_offset(float out[3]) {
     quat_matrix(v[0].orientation, rh);
     quat_matrix(q0c, r0);
     for (int k = 0; k < 3; ++k)
-        d[k] = 0.5f * (v[0].position[k] + v[1].position[k]) + rh[k * 3 + 0] * kNeck[0] + rh[k * 3 + 1] * kNeck[1] + rh[k * 3 + 2] * kNeck[2] - p0[k];
+        d[k] = (0.5f * (v[0].position[k] + v[1].position[k]) + rh[k * 3 + 0] * kNeck[0] + rh[k * 3 + 1] * kNeck[1] + rh[k * 3 + 2] * kNeck[2] - p0[k]) *
+               ws_inv();
     for (int r = 0; r < 3; ++r) out[r] = r0[r * 3 + 0] * d[0] + r0[r * 3 + 1] * d[1] + r0[r * 3 + 2] * d[2] - kNeck[r];
     return true;
 }
@@ -1215,7 +1229,7 @@ bool local_to_world(const float* cam, const float* pos, const float* rot, float*
     }
     float q0c[4] = {-q0[0], -q0[1], -q0[2], q0[3]}, r0[9], d[3], prel[3];
     quat_matrix(q0c, r0);
-    for (int k = 0; k < 3; ++k) d[k] = pos[k] - p0[k];
+    for (int k = 0; k < 3; ++k) d[k] = (pos[k] - p0[k]) * ws_inv();
     for (int r = 0; r < 3; ++r) prel[r] = r0[r * 3 + 0] * d[0] + r0[r * 3 + 1] * d[1] + r0[r * 3 + 2] * d[2];
     const float *a = cam, *b = cam + 4, *c = cam + 8;
     for (int k = 0; k < 3; ++k) wpos[k] = cam[12 + k] + prel[0] * a[k] + prel[1] * b[k] + prel[2] * c[k];
@@ -1239,7 +1253,8 @@ bool world_to_local(const float* cam, const float* wpos, float* lpos) {
         std::memcpy(p0, g_p0, sizeof(p0));
     }
     // local_to_world: w = d + N prel (N's columns the rows a, b, c), prel = R0^T (local - p0); so prel = N^-1 (w - d)
-    // (N^-1's rows b x c, c x a, a x b over a . (b x c)) and local = p0 + R0 prel
+    // (N^-1's rows b x c, c x a, a x b over a . (b x c)) and local = p0 + R0 prel (times the world scale: local_to_world's
+    // inverse, so the rings, the reticle and the gestures' points stay where the scaled view draws them)
     const float *a = cam, *b = cam + 4, *c = cam + 8;
     const float bc[3] = {b[1] * c[2] - b[2] * c[1], b[2] * c[0] - b[0] * c[2], b[0] * c[1] - b[1] * c[0]};
     const float ca[3] = {c[1] * a[2] - c[2] * a[1], c[2] * a[0] - c[0] * a[2], c[0] * a[1] - c[1] * a[0]};
@@ -1247,8 +1262,9 @@ bool world_to_local(const float* cam, const float* wpos, float* lpos) {
     const float det = a[0] * bc[0] + a[1] * bc[1] + a[2] * bc[2];
     if (std::fabs(det) < 1e-6f) return false;
     const float v[3] = {wpos[0] - cam[12], wpos[1] - cam[13], wpos[2] - cam[14]};
-    const float prel[3] = {(bc[0] * v[0] + bc[1] * v[1] + bc[2] * v[2]) / det, (ca[0] * v[0] + ca[1] * v[1] + ca[2] * v[2]) / det,
-                           (ab[0] * v[0] + ab[1] * v[1] + ab[2] * v[2]) / det};
+    const float sc = det * ws_inv();  // (prel = N^-1 (w - d), then times the scale)
+    const float prel[3] = {(bc[0] * v[0] + bc[1] * v[1] + bc[2] * v[2]) / sc, (ca[0] * v[0] + ca[1] * v[1] + ca[2] * v[2]) / sc,
+                           (ab[0] * v[0] + ab[1] * v[1] + ab[2] * v[2]) / sc};
     float r0[9];
     quat_matrix(q0, r0);
     for (int r = 0; r < 3; ++r) lpos[r] = p0[r] + r0[r * 3] * prel[0] + r0[r * 3 + 1] * prel[1] + r0[r * 3 + 2] * prel[2];
@@ -1262,6 +1278,16 @@ bool eyes_follow_head() {
 
 bool xr_double() { return g_xr_pose.load(std::memory_order_relaxed) && g_double.load(std::memory_order_relaxed); }
 
+float world_scale() { return g_world_scale.load(std::memory_order_relaxed); }
+void set_world_scale(float s, bool save) {
+    s = std::fmin(2.0f, std::fmax(0.5f, s));
+    if (std::fabs(g_world_scale.exchange(s) - s) > 1e-4f) log::info("[cam] world scale %.2f (the headset's positions divided by it)", s);
+    if (save) {
+        char b[16];
+        std::snprintf(b, sizeof(b), "%.2f", s);
+        config::set("Comfort", "WorldScale", b);
+    }
+}
 bool local_rel(const float* pos, float* prel) {
     float q0[4], p0[3];
     {
@@ -1272,7 +1298,7 @@ bool local_rel(const float* pos, float* prel) {
     }
     float q0c[4] = {-q0[0], -q0[1], -q0[2], q0[3]}, r0[9], d[3];
     quat_matrix(q0c, r0);
-    for (int k = 0; k < 3; ++k) d[k] = pos[k] - p0[k];
+    for (int k = 0; k < 3; ++k) d[k] = (pos[k] - p0[k]) * ws_inv();
     for (int r = 0; r < 3; ++r) prel[r] = r0[r * 3 + 0] * d[0] + r0[r * 3 + 1] * d[1] + r0[r * 3 + 2] * d[2];
     return true;
 }

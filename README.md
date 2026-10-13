@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.9 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.10 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -245,6 +245,15 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   the mod once marked as risky after an early quit is no longer blocked: every render resolution can be chosen.
 - Fixed in 0.8.9 (used in the developer's Quest 3): on horseback, John's body and holsters stay under you at a gallop
   (they slid about 45 cm back; `[Horse] BodyWithCamera`, on).
+- Fixed in 0.8.10 (tried in the developer's simulator): in fist fights, other men's hats popped in and out of view
+  (a hat near John's head was taken for his own and hidden); John's own hat could also show briefly after a mounted gun.
+- Fixed in 0.8.10 (used in the developer's Quest 3): on a mounted gun (the Gatling, the Browning, the cannon) John and
+  the gun spun around with no way to stop. The game's own camera and aim now take over while you use one.
+- New in 0.8.10, experimental and off (tried in the developer's simulator only, which cannot put John behind a mounted
+  gun): **Mounted guns in first person** (the Guns tab) keeps first person on a mounted gun and turns the gun toward
+  where your gun hand points (it learns the gun's barrel from your first shot). While it is on, the right stick no
+  longer turns the gun: if the gun does not follow your hand, turn it off.
+- New in 0.8.10 (tried in the developer's simulator only): **World scale** (the Comfort tab), how big the world looks.
 
 ## Requirements
 
@@ -262,7 +271,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.9.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.10.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -272,8 +281,8 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 To uninstall, run `RDRVR_Uninstall.cmd` in the game folder (your settings stay in `%LOCALAPPDATA%\RDRVR`).
 
-**Upgrading from an earlier version (0.8.9):** this release starts everyone from its new defaults once. On its first
-start your old settings file is renamed to `%LOCALAPPDATA%\RDRVR\RDRVR.user.ini.before-0.8.9.bak` (or `.1.bak`
+**Upgrading from 0.8.9:** your settings are kept. **From an older version:** your settings are reset to the new
+defaults once. On the first start your old settings file is renamed to `%LOCALAPPDATA%\RDRVR\RDRVR.user.ini.before-0.8.9.bak` (or `.1.bak`
 and so on if that name is taken; nothing is deleted) and a fresh one is begun, so settings carried over from early versions no longer get in the way. To bring an
 old value back, copy its line from the `.bak` file into `RDRVR.user.ini`, or set it again in the menu.
 
@@ -335,6 +344,7 @@ How you see and move: the first-person view, stick turning and riding.
 | **Recentre** | Puts the view, John's facing, the cinema screen and the HUD back in front of you. | – (button) |
 | **First person** | The view from John's eyes, moved by your head. Off gives the game's own camera turned by your head. | On |
 | **Eye height** | Raises or lowers your view, 1 cm per press (-0.20 to +0.30 m). | +0.09 m |
+| **World scale** (new in 0.8.10) | How big the world looks: above 1 bigger (you feel smaller), below 1 smaller, 0.05 per press (0.50 to 2.00). Your eyes, head movement and hands are scaled; the game's world, aiming and holsters are not. | 1.00 |
 | **Smooth turning / Snap turning** | How the right stick turns you. | Smooth turning |
 | ↳ **Turn speed** | Smooth turning speed with the stick pushed all the way, 10°/s per press (30 to 360). | 90°/s |
 | ↳ **Snap angle** | The size of each snap turn, 5° per press (10 to 90). | 30° |
@@ -409,6 +419,7 @@ The gun in your hand: the reticle, how it fires, dual wielding, two-handed long 
 | ↳ **Ring and dot / Dot only** | The reticle's look. | Dot only |
 | **Keep the gun drawn** | A drawn gun stays in your hand until you put it away, instead of being holstered 3 seconds after your last shot. | On |
 | **Executions up close** (was "No executions up close" before 0.8.9) | Pulling the trigger close to someone can start the game's third-person execution, pistol whip or butt strike. Off: it just fires. | Off |
+| **Mounted guns in first person** (experimental; new in 0.8.10, not yet tried on a real mounted gun) | The Gatling, the Browning and the cannon: first person kept, John's hands on the gun, and the gun turned toward where your gun hand points (it learns the gun's barrel from your first shot). While on, the right stick no longer turns the gun: if the gun does not follow your hand, turn it off. Off: the game's own camera and aim while you use one. | Off |
 | **Shoot past the arm block** | Lets you fire when the game thinks John's shoulder-to-gun line hits a wall; a friendly in the way still blocks the shot. | On |
 | **Perfect accuracy** | Every shot goes exactly along the barrel, with no random spread. Other characters keep the game's spread. | On |
 | **Shotgun pellets spread** | Pellets spread in the game's cone; off puts them all on one line. | On |

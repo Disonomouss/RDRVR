@@ -121,11 +121,35 @@ int16_t stick(float v) {
     return static_cast<int16_t>(v * 32767.0f);
 }
 
+std::atomic<bool> g_mounted_fp{false};             // 2026-10-13 (the Gatling probe): first person kept on a mounted gun
+std::atomic<bool> g_on_mounted_gun_shared{false};  // a mounted gun in use now (or fired within 1.5 s)
+std::atomic<bool> g_mounted_held_shared{false};    // one in hand now (the actor state's weapon 26-28)
 void on_frame_end(uint64_t) {
     // the controllers mapped onto the game's pad (every frame: the menu button and the recentre combo are watched there)
     xinput::PadState pad;
     bool controllers = controls::pad(&pad);
     bool want = g_anchor.load(std::memory_order_relaxed) && xr::submitting() && vr_mode::gameplay_stereo();
+    // 2026-10-13 (the user: "a mission in which you control a gatling gun. While holding it johns body and the gun were
+    // spinning around with no way to stop"): a mounted gun (the Gatling 26, the Browning 27, the cannon 28: the game's
+    // turret, its own Gatling_Camera, aimed by the right stick) is not a gun in John's hands: while one is in use the
+    // anchor stands down (the game's camera, body and aim, in stereo, as with First person off), and every hand rule
+    // with it (they all wait on anchor_active: the arms, the gun's place in the hand, the shots along its barrel)
+    static bool was_mounted = false;
+    {
+        RdrvrActorState ms{};
+        const bool held = api::actor_state(&ms) && ms.weapon >= 26 && ms.weapon <= 28;
+        const bool mounted = held || aim::mounted_gun_fired(1500.0);
+        g_mounted_held_shared.store(held, std::memory_order_relaxed);
+        if (mounted != was_mounted) {
+            was_mounted = mounted;
+            log::info("[pose] %s", mounted ? "a mounted gun in use (the Gatling, the Browning or the cannon): the game's own camera and aim until it is left"
+                                           : "the mounted gun left: first person again");
+        }
+        g_on_mounted_gun_shared.store(mounted, std::memory_order_relaxed);
+        // (the Gatling probe: first person kept only while the turret drive can read the gun; else the game's own camera,
+        // so the right stick still turns it: the review of 0.8.10)
+        if (mounted && !(g_mounted_fp.load(std::memory_order_relaxed) && held && holster::turret_ready())) want = false;
+    }
     if (want != g_active) {
         g_active = want;
         g_active_shared = want;
@@ -333,6 +357,7 @@ void on_frame_end(uint64_t) {
 void init() {
     g_anchor = config::get_bool("Body", "CameraAnchor", false);
     g_keep_cam = config::get_bool("Body", "KeepAnchorCamera", true);
+    g_mounted_fp = config::get_bool("Hands", "MountedGunFirstPerson", false);  // 2026-10-13: experimental, off
     camera_lever::set_first_person_moments(config::get_bool("Body", "FirstPersonMoments", true));  // 2026-10-12: on (the user's)
     g_height = config::get_float("Body", "EyeHeight", 0.0f);  // 0 = measured from the head bone
     g_auto_height = g_height <= 0;
@@ -450,6 +475,13 @@ void set_saddle(bool on, float tau, bool save) {
 }
 
 bool anchor_active() { return g_active_shared.load(std::memory_order_relaxed); }
+bool on_mounted_gun() { return g_on_mounted_gun_shared.load(std::memory_order_relaxed); }
+bool mounted_gun_held() { return g_mounted_held_shared.load(std::memory_order_relaxed); }
+bool mounted_first_person() { return g_mounted_fp.load(std::memory_order_relaxed); }
+void set_mounted_first_person(bool on, bool save) {
+    if (g_mounted_fp.exchange(on) != on) log::info("[pose] a mounted gun: first person %s", on ? "kept (the motion aim)" : "left to the game");
+    if (save) config::set("Hands", "MountedGunFirstPerson", on ? "1" : "0");
+}
 bool anchor_enabled() { return g_anchor.load(std::memory_order_relaxed); }
 float body_heading_deg() { return g_heading_shared.load(std::memory_order_relaxed); }
 float eye_lift() { return g_lift; }

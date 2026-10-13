@@ -858,6 +858,11 @@ void page_comfort() {
         pose::set_eye_lift(lift);
         save_float("Body", "SeatedLift", "%.2f", lift);
     }
+    float ws = camera_lever::world_scale();  // 2026-10-13: [Comfort] WorldScale
+    if (nudge1("World scale", &ws, 0.05f, 0.5f, 2.0f, "%.2fx",
+               "How big the world looks: above 1 bigger (you feel smaller), below 1 smaller. 1.00 is true scale. Only your view and "
+               "hands change: the game's world, aiming and holsters stay the same (a press 0.05)."))
+        camera_lever::set_world_scale(ws, true);
 
     heading("Turning on the right stick");
     int turn = pose::snap_turning() ? 1 : 0;
@@ -1340,6 +1345,11 @@ void page_guns() {
     } else {
         note("Perfect accuracy: not available on this game build.");
     }
+    bool mfp = pose::mounted_first_person();  // 2026-10-13: [Hands] MountedGunFirstPerson
+    if (check("Mounted guns in first person (experimental)##Mounted guns in first person", &mfp,
+              "The Gatling, the Browning and the cannon: first person kept, John's hands on the gun, and the gun turned toward where your "
+              "gun hand points (it learns the gun's barrel from your first shot). Off: the game's own camera and aim while you use one."))
+        pose::set_mounted_first_person(mfp, true);
 
     heading("Dual wield");
     bool dw = dual::enabled();

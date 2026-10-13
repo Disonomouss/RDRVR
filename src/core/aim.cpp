@@ -416,6 +416,10 @@ thread_local double t_sec_first = -1.0, t_sec_max = -1.0;
 thread_local float t_sec_start[3] = {}, t_sec_dir[3] = {}, t_sec_speed = 0.0f;
 std::atomic<uint64_t> g_sec_shots{0};
 std::atomic<float> g_sec_err{-1.0f};
+// (2026-10-13) a mounted gun's last round (mounted_shot)
+std::mutex g_mounted_mutex;
+float g_mounted_dir[3] = {0.0f, 0.0f, 0.0f};  // its last round's direction (world), under g_mounted_mutex
+double g_mounted_dir_ms = -1e12;
 void hk_launch(uintptr_t p, const float* mtx, int wtype, const float* vel, uint32_t owner, const float* launch, uint32_t flags, char c8,
                float f9, const float* voff) {
     uintptr_t info = 0;
@@ -441,6 +445,16 @@ void hk_launch(uintptr_t p, const float* mtx, int wtype, const float* vel, uint3
             return;
         }
         log::info("[aim] thrown weapon %d: the game's throw (%.1f m/s)", wtype, std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]));
+        o_launch(p, mtx, wtype, vel, owner, launch, flags, c8, f9, voff);
+        return;
+    }
+    if (wtype >= 26 && wtype <= 28) {  // (2026-10-13) a mounted gun's round: the game's, its direction kept (mounted_shot)
+        const float vl = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (vl > 1e-3f) {
+            std::lock_guard lock(g_mounted_mutex);
+            for (int k = 0; k < 3; ++k) g_mounted_dir[k] = v[k] / vl;
+            g_mounted_dir_ms = log::now_ms();
+        }
         o_launch(p, mtx, wtype, vel, owner, launch, flags, c8, f9, voff);
         return;
     }
@@ -540,6 +554,7 @@ using Spawn_t = void (*)(uintptr_t W, uintptr_t proj, int32_t count, const float
                          uint32_t seed, uint8_t turret);
 Spawn_t o_spawn = nullptr;
 
+std::atomic<double> g_mounted_shot_ms{-1e12};  // the player's last mounted gun shot (mounted_gun_fired)
 void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, float speed, uint32_t u6, uint8_t no_bloom, uint32_t seed,
               uint8_t turret) {
     g_spawns.fetch_add(1, std::memory_order_relaxed);
@@ -569,6 +584,11 @@ void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, 
         return;
     }
     g_player_spawns.fetch_add(1, std::memory_order_relaxed);
+    if (wtype >= 26 && wtype <= 28) {  // (2026-10-13) a mounted gun's shot: the game's own, and the anchor stands down (pose.cpp)
+        g_mounted_shot_ms.store(log::now_ms(), std::memory_order_relaxed);
+        o_spawn(W, proj, count, pellets, speed, u6, no_bloom, seed, turret);
+        return;
+    }
     float s0 = 0.0f, s1 = 0.0f;  // the game's bloom state, for the log
     rd(W + 0x1d0, &s0);
     rd(W + 0x1d4, &s1);
@@ -1079,6 +1099,16 @@ bool grip_throw_wanted(int ctrl) {
     return api::actor_state(&st) && gestures::is_thrown(st.weapon);
 }
 bool grip_throw() { return g_grip_throw.load(std::memory_order_relaxed); }
+// 2026-10-13 (the user: the Gatling "spinning around with no way to stop"): the player shot a mounted gun (the Gatling,
+// the Browning, the cannon) within `ms`: the turret is the game's (GET_WEAPON_IN_HAND may not name it)
+bool mounted_gun_fired(double ms) { return log::now_ms() - g_mounted_shot_ms.load(std::memory_order_relaxed) < ms; }
+bool mounted_shot(float d[3], double* ms) {
+    std::lock_guard lock(g_mounted_mutex);
+    if (g_mounted_dir_ms < 0.0) return false;
+    std::memcpy(d, g_mounted_dir, sizeof(g_mounted_dir));
+    *ms = g_mounted_dir_ms;
+    return true;
+}
 bool knife_tip(int* axis, float pivot[3]) {
     const int f = g_tip_force.load(std::memory_order_relaxed);
     const bool on = f > 0 || (f == 0 && g_knife_tip.load(std::memory_order_relaxed) && g_grip_throw.load(std::memory_order_relaxed) &&

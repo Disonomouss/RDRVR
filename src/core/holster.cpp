@@ -13,6 +13,7 @@
 
 #include "core/actions.h"
 #include "core/aim.h"
+#include "core/xinput.h"
 #include "core/anchors.h"
 #include "core/api.h"
 #include "core/audio.h"
@@ -188,6 +189,129 @@ bool wr(uintptr_t a, T v) {
 // The player's actor (the object's +0xb0 handle in the actor pool), as body.cpp finds it.
 uintptr_t player_actor();
 uintptr_t holster_player_actor() { return player_actor(); }
+std::atomic<double> g_turret_ready_ms{-1e12};  // the mounted gun's matrices last read (pose keeps first person on it only then)
+bool turret_ready_now() { return log::now_ms() - g_turret_ready_ms.load(std::memory_order_relaxed) < 500.0; }
+// [Hands] MountedGunFirstPerson (2026-10-13, experimental; the user: "Can we attempt to make the gatling gun controllable
+// in first person with motion controls?"): on a mounted gun with first person kept, the turret (the game's: the right
+// stick turns it) is turned toward the gun hand's ray by the right stick put to the game (xinput's override): the
+// stick's push from the yaw and pitch between the ray and the barrel, full at 20 degrees, none within 1. The barrel is
+// one of the firing object's matrices' axes (W +0x80, the gun's, and +0xd0, the shoot-from's: for a turret its barrels
+// bone): the gun's -c until a round shows which axis it leaves along. The stick's sense in each direction is learnt:
+// pushed one way, the barrel turning the other way flips it. The simulator has no mounted gun to try it on.
+struct TurretState {
+    int axis = 2 * 2 + 1;  // the barrel's axis: (matrix * 3 + row) * 2 + negated: the gun's c negated
+    double cal_ms = -1.0;  // the round it was taken from
+    float sx = 1.0f, sy = 1.0f;  // the stick's learnt sense (1: as guessed, -1: flipped)
+    double win_ms = 0.0;  // the learning window's start, the barrel's yaw and pitch then, the push held through it
+    float win_yaw = 0.0f, win_pitch = 0.0f, win_rx = 0.0f, win_ry = 0.0f;
+    bool active = false;
+    double log_ms = 0.0;
+    double flip_ms[2] = {0.0, 0.0};  // the last flip of each sense; three each and the learning stops (no steady answer)
+    int flips[2] = {0, 0};
+};
+TurretState g_turret;
+void turret_drive(const body::BodyPoints* bp, uintptr_t actor, double now) {
+    TurretState& T = g_turret;
+    // the gun read whether or not the anchor is on (pose waits on it: turret_ready); driven only with the anchor on, a
+    // mounted gun in hand now (not a shot's 1.5 s after) and the gun hand tracked
+    const bool want = actor && pose::mounted_gun_held() && pose::mounted_first_person();
+    uintptr_t wmgr = 0, item = 0, W = 0;
+    float M[2][16];
+    const bool readable = want && rd(actor + 0x70, &wmgr) && wmgr && rd(wmgr + 0x80, &item) && item && rd(item + 0xa0, &W) && W &&
+                          rd(W + 0x80, &M[0]) && rd(W + 0xd0, &M[1]);
+    if (readable) g_turret_ready_ms.store(now, std::memory_order_relaxed);
+    bool tracked = false;
+    if (bp) {
+        const float* Rg = bp->target_rot[bp->gun];
+        float n = 0.0f;
+        for (int k = 0; k < 9; ++k) n += Rg[k] * Rg[k];
+        tracked = n > 1.5f;  // (a rotation's 3; a frame without the controller all zeros)
+    }
+    if (!(readable && tracked && pose::anchor_active())) {
+        if (T.active) {
+            xinput::set_override(0, false, 0.0f, 0.0f, 0);
+            T.active = false;
+            T.flips[0] = T.flips[1] = 0;  // (the next gun's senses may flip again; its axis and senses start from this one's)
+            log::info("[turret] the motion aim off (%s)", !want ? "the mounted gun left" : !readable ? "the gun not read" : !tracked ? "the gun hand not tracked" : "first person off");
+        }
+        return;
+    }
+    auto axis_of = [&](int ax, float out[3]) {
+        const int m = ax / 6, r = (ax / 2) % 3;
+        const float sg = (ax & 1) ? -1.0f : 1.0f;
+        float l = 0.0f;
+        for (int k = 0; k < 3; ++k) out[k] = sg * M[m][r * 4 + k], l += out[k] * out[k];
+        l = std::sqrt(l);
+        if (l < 1e-4f) return false;
+        for (int k = 0; k < 3; ++k) out[k] /= l;
+        return true;
+    };
+    {  // a new round: the axis it left along (the best of the twelve, within 15 degrees)
+        float d[3];
+        double ms = 0.0;
+        if (aim::mounted_shot(d, &ms) && ms > T.cal_ms) {
+            T.cal_ms = ms;
+            int best = -1;
+            float bd = 0.966f;
+            for (int ax = 0; ax < 12; ++ax) {
+                float a[3];
+                if (!axis_of(ax, a)) continue;
+                const float dt = a[0] * d[0] + a[1] * d[1] + a[2] * d[2];
+                if (dt > bd) bd = dt, best = ax;
+            }
+            if (best >= 0 && best != T.axis) {
+                log::info("[turret] the barrel is the %s matrix's %c%c (a round along it within %.1f deg; was %d)", best / 6 ? "shoot-from" : "gun",
+                          (best & 1) ? '-' : '+', "abc"[(best / 2) % 3], std::acos(std::fmin(1.0f, bd)) * 57.29578f, T.axis);
+                T.axis = best;
+            }
+        }
+    }
+    float b[3];
+    if (!axis_of(T.axis, b)) return;
+    // the gun hand's ray (the barrel in the controller's target axes, as the reticle's)
+    float bt[3] = {0.0f, 0.174f, -0.985f}, u[3];
+    aim::barrel_in_target(bt);
+    const float* Rg = bp->target_rot[bp->gun];
+    for (int k = 0; k < 3; ++k) u[k] = Rg[k * 3] * bt[0] + Rg[k * 3 + 1] * bt[1] + Rg[k * 3 + 2] * bt[2];
+    auto yaw_of = [](const float* v) { return std::atan2(-v[0], -v[2]) * 57.29578f; };  // (the heading's sense: left positive)
+    auto pitch_of = [](const float* v) { return std::asin(std::fmax(-1.0f, std::fmin(1.0f, v[1]))) * 57.29578f; };
+    const float by = yaw_of(b), bpitch = pitch_of(b);
+    const float ey = std::remainder(yaw_of(u) - by, 360.0f), ep = pitch_of(u) - bpitch;
+    auto push = [](float e) { return std::fabs(e) < 1.0f ? 0.0f : std::fmax(-1.0f, std::fmin(1.0f, e / 20.0f)); };
+    const float rx = -push(ey) * T.sx, ry = push(ep) * T.sy;  // (the guess: the stick right turns it right, up tilts it up)
+    xinput::set_override(0, true, rx, ry, 150);
+    if (!T.active) {
+        T.active = true;
+        T.win_ms = now, T.win_yaw = by, T.win_pitch = bpitch, T.win_rx = rx, T.win_ry = ry;
+        log::info("[turret] the motion aim on (the barrel the %s matrix's axis %d)", T.axis / 6 ? "shoot-from" : "gun", T.axis);
+    }
+    // learning the sense: a push held a third of a second; the barrel turned against it flips it
+    const bool held_x = std::fabs(T.win_rx) > 0.4f && std::fabs(rx) > 0.4f && (rx > 0) == (T.win_rx > 0);
+    const bool held_y = std::fabs(T.win_ry) > 0.4f && std::fabs(ry) > 0.4f && (ry > 0) == (T.win_ry > 0);
+    if (now - T.win_ms > 330.0) {
+        const float dy = std::remainder(by - T.win_yaw, 360.0f), dp = bpitch - T.win_pitch;
+        auto may_flip = [&](int i) {
+            if (T.flips[i] >= 3 || now - T.flip_ms[i] < 1000.0) return false;
+            T.flip_ms[i] = now;
+            if (++T.flips[i] == 3) log::info("[turret] the %s sense flipped three times: no steady answer to the stick, its learning stopped", i ? "up-down" : "left-right");
+            return true;
+        };
+        if (held_x && std::fabs(dy) > 2.0f && (dy > 0) != (-T.win_rx * T.sx > 0) && may_flip(0)) {  // wanted: the yaw's change along -rx
+            T.sx = -T.sx;
+            log::info("[turret] the stick's left-right sense flipped (the barrel turned %.1f deg against the push)", dy);
+        }
+        if (held_y && std::fabs(dp) > 2.0f && (dp > 0) != (T.win_ry * T.sy > 0) && may_flip(1)) {
+            T.sy = -T.sy;
+            log::info("[turret] the stick's up-down sense flipped (the barrel tilted %.1f deg against the push)", dp);
+        }
+        T.win_ms = now, T.win_yaw = by, T.win_pitch = bpitch, T.win_rx = rx, T.win_ry = ry;
+    }
+    if (now - T.log_ms > 1000.0) {
+        T.log_ms = now;
+        log::info("[turret] the ray yaw %.1f pitch %.1f, the barrel yaw %.1f pitch %.1f (off %.1f %.1f), the stick %.2f %.2f (senses %+.0f %+.0f)",
+                  yaw_of(u), pitch_of(u), by, bpitch, ey, ep, rx, ry, T.sx, T.sy);
+    }
+}
 uintptr_t player_actor() {
     RdrvrActorState st{};
     if (!api::actor_state(&st) || !st.object) return 0;
@@ -523,6 +647,7 @@ void holster_frame() {
     const bool on = g_holsters.load(std::memory_order_relaxed) && pose::anchor_active();
     const bool pts = on && body::body_points(&bp);
     if (pts) points_ms = now_ms;
+    turret_drive(pts ? &bp : nullptr, actor, now_ms);  // [Hands] MountedGunFirstPerson (experimental)
     if (on && !pts && now_ms - points_ms < 100.0) return;  // a missed read: everything kept as it was for this frame
     if (!pts || !api::actor_state(&st) || !st.actor || !actor) {
         for (int h = 0; h < 2; ++h) {
@@ -2492,6 +2617,7 @@ void set_foregrip_snap(bool on, bool save) {
 }
 const char* weapon_label(int w) { return w >= 0 && w < kWeapons ? kWeaponLabel[w] : ""; }
 const char* weapon_token(int w) { return w >= 0 && w < kWeapons ? kWeaponToken[w] : ""; }
+bool turret_ready() { return turret_ready_now(); }  // [Hands] MountedGunFirstPerson: the mounted gun read within 0.5 s
 bool weapon_choice() { return g_weapon_choice.load(); }
 void set_weapon_choice(bool on) {
     g_weapon_choice = on;
@@ -3157,6 +3283,31 @@ std::string command(const std::string& line) {
             r += b;
         }
         return r;
+    }
+    if (v == "turret") {  // holster turret (2026-10-13, the Gatling probe): the item in hand's firing object W: its eWeapon,
+        // its game gun matrix (W +0x80, the barrel -row c) and its shoot-from matrix (W +0xd0; for a turret its barrels bone)
+        std::string x;
+        in >> x;
+        if (x == "keep") {  // holster turret keep on|off: first person kept on a mounted gun (the session)
+            std::string y;
+            in >> y;
+            pose::set_mounted_first_person(y == "on");
+        }
+        const uintptr_t actor = player_actor();
+        uintptr_t wmgr = 0, item = 0, W = 0, info = 0;
+        int16_t wt = -1;
+        if (!actor || !rd(actor + 0x70, &wmgr) || !wmgr || !rd(wmgr + 0x80, &item) || !item || !rd(item + 0xa0, &W) || !W) return "turret: no item in hand";
+        if (rd(W + 0x28, &info) && info) rd(info + 8, &wt);
+        float g[16] = {}, f[16] = {};
+        rd(W + 0x80, &g);
+        rd(W + 0xd0, &f);
+        char b[600];
+        std::snprintf(b, sizeof(b),
+                      "turret: weapon %d | gun a (%.3f %.3f %.3f) b (%.3f %.3f %.3f) c (%.3f %.3f %.3f) at (%.2f %.2f %.2f) | shoot-from a (%.3f %.3f "
+                      "%.3f) b (%.3f %.3f %.3f) c (%.3f %.3f %.3f) at (%.2f %.2f %.2f)",
+                      wt, g[0], g[1], g[2], g[4], g[5], g[6], g[8], g[9], g[10], g[12], g[13], g[14], f[0], f[1], f[2], f[4], f[5], f[6], f[8], f[9],
+                      f[10], f[12], f[13], f[14]);
+        return b;
     }
     if (v == "bases") {  // holster bases: each zone's base, the root and the right (the twins' mirror)
         HolsterDiag d;

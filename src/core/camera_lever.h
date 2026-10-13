@@ -53,6 +53,9 @@ bool audio_follows_head();
 // game's own fold keeps the rear and the sides at 0.3, -10.5 dB). On by default.
 void set_audio_rear_fold(bool on);
 bool audio_rear_fold();
+// [Comfort] WorldScale: the headset's positions (the eyes, the head, the hands) divided by it (0.5-2; 1 true scale)
+float world_scale();
+void set_world_scale(float s, bool save);
 std::string audio_status();  // "cam audio [on|off] | cam audio fold on|off": both switches and their counters
 // "cam audio log on|off|mark <n>|dump <file>" (run 12 item 10, a test's): each listener update, the game camera's and the
 // listener's headings and positions, and why the head's was not used

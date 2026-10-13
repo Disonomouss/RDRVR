@@ -59,6 +59,8 @@ bool gameplay_camera_current();
 // gun hand with a throwable in it), not the game's button
 bool grip_throw_wanted(int ctrl);
 bool grip_throw();
+bool mounted_gun_fired(double ms);  // the player shot a mounted gun (the Gatling, the Browning, the cannon) within ms
+bool mounted_shot(float d[3], double* ms);  // a mounted gun's last round: its direction (world) and when
 void on_exit();  // the process exit: others' shots since the last log line
 // the pad's triggers (the pad's thread): the trigger with the grip holding a throwable arms it (the game's LT, then its
 // RT after a lead), LT kept through the held throw and its tail

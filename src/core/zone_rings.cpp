@@ -266,13 +266,15 @@ int frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLa
     const float eye[3] = {0.5f * (views[0].pose.position.x + views[1].pose.position.x), 0.5f * (views[0].pose.position.y + views[1].pose.position.y),
                           0.5f * (views[0].pose.position.z + views[1].pose.position.z)};
     int n = 0;
+    const float ws = camera_lever::world_scale();  // a ring's size in the headset's metres (world_to_local's positions)
     for (int i = 0; i < mk.n && n < max; ++i) {
         const holster::Marker& m = mk.m[i];
+        const float radius = m.radius * ws;
         float l[3];
         if (!camera_lever::world_to_local(mk.cam, m.pos, l)) break;  // not recentred yet
         float d[3] = {eye[0] - l[0], eye[1] - l[1], eye[2] - l[2]};
         const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-        if (dl < m.radius * 1.2f + 0.05f) continue;  // the eyes in or at it: it would fill the view
+        if (dl < radius * 1.2f + 0.05f) continue;  // the eyes in or at it: it would fill the view
         for (float& c : d) c /= dl;
         const int cell = m.kind == holster::kDot ? (m.state == holster::kHandIn ? kDotIn : kDotIdle)
                          : m.state == holster::kHandIn ? kRingIn
@@ -280,7 +282,7 @@ int frame(const XrView* views, XrSession session, XrSpace space, XrCompositionLa
                          : m.state == holster::kGunIdle ? kRingGun
                          : m.state == holster::kNear    ? kRingNear
                                                         : kRingIdle;
-        const float s = 2.0f * m.radius * (kCell * 0.5f) / kEdge;  // the drawn outer edge at the radius
+        const float s = 2.0f * radius * (kCell * 0.5f) / kEdge;  // the drawn outer edge at the radius
         XrCompositionLayerQuad& q = out[n++];
         q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
         q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied, like the UI quad

@@ -18,7 +18,11 @@ namespace rdrvr::pose {
 void init();  // frame-end listener
 void set_keep_camera(bool on);  // [Body] KeepAnchorCamera for the session ("pose keepcam on|off")
 void set_anchor(bool on);    // the switch ([Body] CameraAnchor, the menu, "pose anchor on|off")
-bool anchor_active();        // the camera anchor is placing the view this frame (first person)
+bool anchor_active();   // the camera anchor is placing the view this frame (first person)
+bool on_mounted_gun();  // a mounted gun (the Gatling, the Browning, the cannon) in use now, or fired within 1.5 s
+bool mounted_gun_held();  // one in hand now
+bool mounted_first_person();
+void set_mounted_first_person(bool on, bool save = false);
 bool anchor_enabled();
 // Riding ([Horse], the menu's Body tab): steering by the head (the stick turned by the head's yaw, as on foot) or by
 // the stick (the view faces the horse); the saddle anchor (the camera above the horse's root, not the rider's bouncing

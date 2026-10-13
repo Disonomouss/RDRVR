@@ -125,6 +125,7 @@ void set_foregrip_snap(bool on, bool save);
 constexpr int kWeapons = 38;
 const char* weapon_label(int w);  // "Cattleman Revolver"; "" out of range
 const char* weapon_token(int w);  // "Cattleman" (the ini's token); "" out of range
+bool turret_ready();  // [Hands] MountedGunFirstPerson: the turret drive read the mounted gun within 0.5 s (pose keeps first person only then)
 bool weapon_choice();
 void set_weapon_choice(bool on);  // also written to the user ini
 bool any_weapon();

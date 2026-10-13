@@ -1054,6 +1054,12 @@ struct PropBone {
     int bone;
     uint64_t frame;
     bool head;  // matched within 5 cm of a head bone (the hat): from then on it stays a head prop
+    // 2026-10-13 (the user: "In fist fights, npc hats pop in and out"): the draw's instance (draw_instance) the prop was
+    // first matched with: another copy of the same model is never this prop (0: none; John's props have none, r13_propowner)
+    uintptr_t inst;
+    // and a head prop's facing (its matrix's first axis) at its last match: John's hat turns with his head a few degrees
+    // a frame, an NPC's hat of the same model in a fist fight faces him; by the model alone it was hidden as his
+    float ax[3] = {0.0f, 0.0f, 0.0f};
 };
 // The item in hand, known by its game matrix (round 7: "the gun in hand turns invisible for a bit now and then"; the
 // nearest attachment bone in the game's pose was often a holster, the hip or the head, hidden with the body in the
@@ -1158,6 +1164,11 @@ float g_cuts[3][3] = {};  // "skel cuts" (under g_draw_mutex): the show mode's c
 bool g_cuts_ok = false;
 float g_sec_near_d = 1e9f, g_sec_near_x = 0.0f;  // the nearest one's distance (m) and its first row's difference
 std::atomic<uint64_t> g_held_draws{0}, g_held_frames{0}, g_held_missed{0}, g_held_frame_draws{0}, g_head_refused{0};
+// 2026-10-13 (the user: "In fist fights, npc hats pop in and out"): the props matched to the player's bones, by their
+// draw's instance owner: the player's skeleton or another (a diagnostic: "skel body")
+std::atomic<uint64_t> g_prop_own_skel{0}, g_prop_other_owner{0}, g_prop_head_own{0}, g_prop_head_other{0};
+std::atomic<uint64_t> g_head_foreign{0};  // draws of John's hat's model facing away from it (another's hat): left alone
+std::atomic<uint64_t> g_head_lost{0};     // draws of John's hat's model facing as it does but matched to no bone (shown)
 // run 12 item 11 (reg2's flaky "every frame in hand has the gun drawn"): the missed frames by their place in the hold
 // (the frames since the item came into hand: 1st, 2nd, 3rd, 4th-10th, later), and the last few's indices
 std::atomic<uint64_t> g_held_miss_at[5] = {};
@@ -5738,17 +5749,51 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     g_hprop_draws.fetch_add(1, std::memory_order_relaxed);
                 } else if (in_box(g_frame.attach_box, rc)) {  // within 0.5 m of an attachment bone
                 for (size_t i = 0; i * 3 + 2 < ap.size(); ++i) {
+                    // (2026-10-13: not John's hands' attachments: the item in a hand has its own match above, and a prop
+                    // near his fists is someone else's: an NPC's hat mid-punch took the hand's correction, "npc hats pop")
+                    const int ab = g_rig.attach[i];
+                    if (ab >= 0 && ab < static_cast<int>(g_rig.in_wrist.size()) && g_rig.in_wrist[ab]) continue;
                     float dx = rc[12] - ap[i * 3], dy = rc[13] - ap[i * 3 + 1], dz = rc[14] - ap[i * 3 + 2];
                     float d = dx * dx + dy * dy + dz * dz;
                     if (d < best_d) {
                         best_d = d;
-                        best = g_rig.attach[i];
+                        best = ab;
                     }
                 }
                 const uintptr_t drawable = reinterpret_cast<uintptr_t>(rec[0x10]);
+                const uintptr_t inst = draw_instance(rec);
+                float axn[3] = {rc[0], rc[1], rc[2]};  // this draw's facing (its first axis, made unit)
+                {
+                    const float l = std::sqrt(axn[0] * axn[0] + axn[1] * axn[1] + axn[2] * axn[2]);
+                    if (l > 1e-6f)
+                        for (float& x : axn) x /= l;
+                }
+                // the same prop: its model, its instance if known, and a head prop facing within 45 degrees of its last
+                // (only a facing seen within the last 10 frames: 2026-10-13, the user: "after using the gatling gun I could
+                // breifly see my hat": the body off on the gun, John turned with it, and his hat's old facing took it for
+                // another's until the memory ran out, 450 frames)
+                auto same = [&](const PropBone& pb) {
+                    if (pb.drawable != drawable || (pb.inst && inst && pb.inst != inst)) return false;
+                    if (!pb.head || (pb.ax[0] == 0.0f && pb.ax[1] == 0.0f && pb.ax[2] == 0.0f) || g_body_frame - pb.frame > 10) return true;
+                    return pb.ax[0] * axn[0] + pb.ax[1] * axn[1] + pb.ax[2] * axn[2] > 0.7f;
+                };
+                // a model known as a head prop, drawn facing away from it: another's (an NPC's hat of John's model):
+                // left alone, never matched to another of John's bones either
+                bool foreign_head = false;
                 belt_twin = best >= 0 && held_prop::shown_at_holster(drawable);  // before the draw lock (held_prop's own)
                 {
                     std::lock_guard lock(g_draw_mutex);
+                    for (const PropBone& pb : g_prop_bones)
+                        if (pb.drawable == drawable && pb.head && !same(pb)) foreign_head = true;
+                    for (const PropBone& pb : g_prop_bones)
+                        if (same(pb) && pb.head) foreign_head = false;  // (one of its matches fits: John's)
+                    // (on John's head, within 5 cm of a head bone: his, whatever its facing)
+                    if (best >= 0 && best < static_cast<int>(g_rig.in_head.size()) && g_rig.in_head[best] && best_d <= 0.05f * 0.05f)
+                        foreign_head = false;
+                    if (foreign_head) {
+                        best = -1;
+                        g_head_foreign.fetch_add(1, std::memory_order_relaxed);
+                    }
                     const bool head_5cm = g_frame.held_fix;  // [Body] HeldPropFix: also this rule
                     if (head_5cm && best >= 0 && g_rig.in_head[best]) {
                         // a head prop is one first matched within 5 cm of a head bone (the hat: 0-1 cm); anything else
@@ -5756,7 +5801,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                         // hidden with it
                         bool known_head = false;
                         for (const PropBone& pb : g_prop_bones)
-                            if (pb.drawable == drawable && pb.head) known_head = true;
+                            if (same(pb) && pb.head) known_head = true;
                         if (!known_head && best_d > 0.05f * 0.05f) {
                             best = -1;
                             g_head_refused.fetch_add(1, std::memory_order_relaxed);
@@ -5765,32 +5810,48 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     if (best >= 0) {
                         bool found = false;
                         for (PropBone& pb : g_prop_bones)
-                            if (pb.drawable == drawable) {
+                            if (same(pb)) {
                                 // a prop once on the head stays a head prop: the hat bobs between head_Attachment and
                                 // the nearer neck_Attachment while sprinting (round 5c: it flickered)
                                 if ((head_5cm ? pb.head : g_rig.in_head[pb.bone] != 0) && !g_rig.in_head[best]) best = pb.bone;
                                 else if (g_rig.in_head[best] && best_d <= 0.05f * 0.05f) pb.head = true;
                                 pb.bone = best;
                                 pb.frame = g_body_frame;
+                                std::memcpy(pb.ax, axn, sizeof(pb.ax));
                                 found = true;
                             }
                         if (!found && drawable)
-                            g_prop_bones.push_back({drawable, best, g_body_frame, g_rig.in_head[best] && (!head_5cm || best_d <= 0.05f * 0.05f)});
-                    } else if (drawable) {
+                            g_prop_bones.push_back({drawable, best, g_body_frame, g_rig.in_head[best] && (!head_5cm || best_d <= 0.05f * 0.05f), inst,
+                                                    {axn[0], axn[1], axn[2]}});
+                    } else if (drawable && !foreign_head) {
                         for (PropBone& pb : g_prop_bones) {
-                            if (pb.drawable != drawable) continue;
+                            if (!same(pb)) continue;
+                            // (a head prop kept within 25 cm of its bone: a frame's lag at a gallop; 0.5 m took an NPC's hat)
+                            const float keep = pb.head ? 0.25f : 0.5f;
                             for (size_t i = 0; i * 3 + 2 < ap.size(); ++i) {
                                 if (g_rig.attach[i] != pb.bone) continue;
                                 float dx = rc[12] - ap[i * 3], dy = rc[13] - ap[i * 3 + 1], dz = rc[14] - ap[i * 3 + 2];
-                                if (dx * dx + dy * dy + dz * dz < 0.5f * 0.5f) {
+                                if (dx * dx + dy * dy + dz * dz < keep * keep) {
                                     best = pb.bone;
                                     pb.frame = g_body_frame;
+                                    if (pb.head) std::memcpy(pb.ax, axn, sizeof(pb.ax));
                                 }
                             }
                         }
                     }
+                    if (best < 0 && !foreign_head)  // (the diagnostic: his hat's model, its facing his, not kept)
+                        for (const PropBone& pb : g_prop_bones)
+                            if (pb.head && same(pb)) {
+                                g_head_lost.fetch_add(1, std::memory_order_relaxed);
+                                break;
+                            }
                 }
                 }  // not the held item
+                if (best >= 0 && hi < 0 && si < 0 && !hp) {  // (the diagnostic: whose the prop's instance is)
+                    const bool own_skel = draw_instance(rec) == g_frame.skel;
+                    (own_skel ? g_prop_own_skel : g_prop_other_owner).fetch_add(1, std::memory_order_relaxed);
+                    if (g_rig.in_head[best]) (own_skel ? g_prop_head_own : g_prop_head_other).fetch_add(1, std::memory_order_relaxed);
+                }
                 if (best >= 0) {
                     std::lock_guard lock(g_draw_mutex);
                     if (g_nprop_diag < 8) {
@@ -7332,7 +7393,7 @@ void before_scene(const float* cam) {
         local(g_rig.arm[hh], f.arm_local[hh]);
         local(g_rig.elbow[hh], f.elbow_local[hh]);
         local(g_rig.wrist[hh], f.wrist_local[hh]);
-        f.ik[hh] = true;
+        f.ik[hh] = !pose::on_mounted_gun();  // (2026-10-13: a mounted gun: the targets kept for its aim, the arms left on its handles)
         if (hh == 1 && g_ik_test.load()) {  // along the actor's forward (the root bone's -z), level
             float fx = -w[8], fz = -w[10], fl = std::sqrt(fx * fx + fz * fz);
             if (fl > 1e-3f) {
@@ -7457,14 +7518,17 @@ void before_scene(const float* cam) {
         }
     }
     f.held_fix = g_held_fix_cfg.load(std::memory_order_relaxed);
-    if (seq_copy(g_held_seq, f.held, g_held_ring, sizeof(f.held))) {  // the held item's samples
+    // 2026-10-13 ([Hands] MountedGunFirstPerson): on a mounted gun the gun is the game's turret: no held item's place
+    // in the hand, no second gun, and John's arms left on its handles (the IK below off)
+    const bool on_turret = pose::on_mounted_gun();
+    if (!on_turret && seq_copy(g_held_seq, f.held, g_held_ring, sizeof(f.held))) {  // the held item's samples
         for (const HeldSample& hs : f.held) f.held_any |= hs.valid;
     } else {
         for (HeldSample& hs : f.held) hs.valid = false;
     }
     for (int i = 0; i < kHeldRing; ++i)
         if (f.held[i].build && (f.held_new < 0 || f.held[i].build > f.held[f.held_new].build)) f.held_new = i;
-    if (seq_copy(g_sec_ring_seq, f.sec, g_sec_ring, sizeof(f.sec))) {  // [Hands] DualWield: the second gun's samples
+    if (!on_turret && seq_copy(g_sec_ring_seq, f.sec, g_sec_ring, sizeof(f.sec))) {  // [Hands] DualWield: the second gun's samples
         for (const HeldSample& hs : f.sec) f.sec_any |= hs.valid;
     } else {
         for (HeldSample& hs : f.sec) hs.valid = false;
@@ -8846,16 +8910,31 @@ std::string command(const std::string& line) {
             in >> s;
             set_hide_enabled(s == "on");
         }
-        char out[400];
+        char out[600];
         std::snprintf(out, sizeof(out),
                       "body %s (override %d), posture flags %u (auto show %s), head hide %s, stance %d, back %.2f m, follows head %s, "
-                      "upright bone %d, skeleton %p, sets %llu, hat hides %llu, props moved %llu, rigid props %llu",
+                      "upright bone %d, skeleton %p, sets %llu, hat hides %llu, props moved %llu, rigid props %llu | props owned by the "
+                      "player's skeleton %llu, by another %llu (on the head %llu / %llu), foreign hats left %llu, his hat not kept %llu",
                       g_active.load() ? "on" : "off", g_override.load(), g_actor_flags.load(), auto_shows() ? "on" : "off",
                       hide_enabled() ? "on" : "off", stance(), body_back(),
                       follows_head() ? "on" : "off", g_rig.up, reinterpret_cast<void*>(player_skeleton()),
                       static_cast<unsigned long long>(g_sets.load()), static_cast<unsigned long long>(g_hat_hides.load()),
-                      static_cast<unsigned long long>(g_props.load()), static_cast<unsigned long long>(g_rigid_props.load()));
-        return out;
+                      static_cast<unsigned long long>(g_props.load()), static_cast<unsigned long long>(g_rigid_props.load()),
+                      static_cast<unsigned long long>(g_prop_own_skel.load()), static_cast<unsigned long long>(g_prop_other_owner.load()),
+                      static_cast<unsigned long long>(g_prop_head_own.load()), static_cast<unsigned long long>(g_prop_head_other.load()),
+                      static_cast<unsigned long long>(g_head_foreign.load()), static_cast<unsigned long long>(g_head_lost.load()));
+        std::string o = out;
+        {  // the remembered props: each one's bone, head, and instance (whose they are)
+            std::lock_guard lock(g_draw_mutex);
+            o += " | remembered props:";
+            char b[96];
+            for (size_t i = 0; i < g_prop_bones.size() && i < 12; ++i) {
+                std::snprintf(b, sizeof(b), " %llx/b%d%s/i%llx", static_cast<unsigned long long>(g_prop_bones[i].drawable & 0xffffff), g_prop_bones[i].bone,
+                              g_prop_bones[i].head ? "h" : "", static_cast<unsigned long long>(g_prop_bones[i].inst));
+                o += b;
+            }
+        }
+        return o;
     }
     return "ERROR usage: skel q|f|s <addr> [n] | skel bones <file> | skel ik | skel stretch | skel body [on|off|auto|stance upright|lean|still|game|back <m>|follow on|off|hidehead on|off|stretch on|off|<max>]";
 }
