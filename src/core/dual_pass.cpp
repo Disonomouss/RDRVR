@@ -18,6 +18,7 @@
 #include "core/frame_probe.h"
 #include "core/ring_probe.h"
 #include "core/hooks.h"
+#include "core/prepass_arrays.h"
 #include "core/taa.h"
 #include "core/log.h"
 
@@ -234,9 +235,11 @@ void hk_ForestDraw(void* forest, char mode) {
     const float level[8] = {bz, 0, -bx, saved[3], 0, 1, 0, saved[7]};
     auto push = reinterpret_cast<PushGlobals_t>(anchors::addr(Id::ViewportPushGlobals));
     std::memcpy(vi, level, sizeof(level));
+    prepass::eye2_level(level);  // ([Stereo] PrepassViews=2, pass 1: eye 2's rows levelled too; test only)
     push(vp, 1);
     forest_draw(forest, mode);
     std::memcpy(vi, saved, sizeof(saved));
+    prepass::eye2_unlevel();
     push(vp, 1);
     if (g_grass_level_draws.fetch_add(1, std::memory_order_relaxed) == 0)
         log::info("[dual] forest/grass billboards drawn upright (level camera rows)");

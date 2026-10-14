@@ -16,6 +16,7 @@
 #include "core/d3d_hooks.h"
 #include "core/hooks.h"
 #include "core/log.h"
+#include "core/prepass_arrays.h"
 #include "core/ring_probe.h"
 
 namespace rdrvr::pso {
@@ -58,6 +59,13 @@ struct PsoInfo {
 };
 std::unordered_map<void*, PsoInfo> g_info;  // under g_mutex
 thread_local PsoInfo t_info;
+
+// ---- [Stereo] InstancedShaders (2026-10-14, test only): the view-instanced twins (pso.h twin_of)
+std::unordered_map<uint64_t, std::vector<uint8_t>> g_vi_vs;  // vertex shader hash -> its rewrite (read-only after load)
+std::unordered_set<std::string> g_vi_pairs;                  // "vs ps" (16 hex each) allowed a twin (read-only after load)
+std::unordered_map<void*, ID3D12PipelineState*> g_twin;      // the game's pipeline -> its twin, under g_mutex
+std::atomic<uint64_t> g_twins_made{0}, g_twins_failed{0}, g_twins_skipped{0};
+std::atomic<int64_t> g_twin_ms_max{0};
 // run 12 item 12a, "pso ps reset|dump <file>" (single-pass stereo's reader census, a test's): every pixel shader drawn
 // since the reset, by its hash (fnv of its bytecode, as the corpus's blobs hash offline), with its draws, a vertex
 // shader it drew with and what it writes; per scene, joined offline to the corpus's screen-target samplers
@@ -119,6 +127,121 @@ const std::vector<uint8_t>* swap_for(const D3D12_SHADER_BYTECODE& vs) {
     if (g_swap.empty() || !vs.pShaderBytecode || !vs.BytecodeLength) return nullptr;
     auto it = g_swap.find(fnv(vs.pShaderBytecode, vs.BytecodeLength));
     return it == g_swap.end() ? nullptr : &it->second;
+}
+
+void load_twin_sources() {
+    const std::string dir = config::get_string("Stereo", "InstancedShaders", "");
+    if (dir.empty()) return;
+    WIN32_FIND_DATAA fd{};
+    HANDLE h = FindFirstFileA((dir + "\\vs_*.dxil").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            const std::string name = fd.cFileName;  // vs_<16 hex>.dxil
+            if (name.size() != 3 + 16 + 5) continue;
+            const uint64_t hash = std::strtoull(name.substr(3, 16).c_str(), nullptr, 16);
+            FILE* f = nullptr;
+            if (!hash || fopen_s(&f, (dir + "\\" + name).c_str(), "rb") != 0 || !f) continue;
+            std::vector<uint8_t> b(fd.nFileSizeLow);
+            const size_t got = fread(b.data(), 1, b.size(), f);
+            fclose(f);
+            if (got == b.size() && b.size() > 32 && std::memcmp(b.data(), "DXBC", 4) == 0) g_vi_vs.emplace(hash, std::move(b));
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    FILE* f = nullptr;
+    if (fopen_s(&f, (dir + "\\twins.txt").c_str(), "r") == 0 && f) {
+        char line[256], a[64] = {}, b[64] = {};
+        while (std::fgets(line, sizeof(line), f))  // "vs ps" per line; '#' lines and anything else skipped
+            if (line[0] != '#' && sscanf_s(line, "%63s %63s", a, static_cast<unsigned>(sizeof(a)), b, static_cast<unsigned>(sizeof(b))) == 2 &&
+                std::strlen(a) == 16 && std::strlen(b) == 16)
+                g_vi_pairs.insert(std::string(a) + " " + b);
+        fclose(f);
+    }
+    log::info("[pso] InstancedShaders: %zu rewritten vertex shaders and %zu twin pairs from %s (test only: twins made, not drawn with)",
+              g_vi_vs.size(), g_vi_pairs.size(), dir.c_str());
+}
+
+// a stream subobject, as research\sps\tools\vi\psotest.cpp builds it (its 441 twins made offline): the type at an
+// 8-aligned offset, the value at +8 when it holds pointers (else +4), the whole rounded to 8
+template <typename T>
+void push_sub(std::vector<uint8_t>& s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const T& v, bool ptr) {
+    const size_t off = (s.size() + 7) & ~size_t(7);
+    s.resize(off, 0);
+    const size_t inner = ptr ? 8 : 4;
+    s.resize(off + ((inner + sizeof(T) + 7) & ~size_t(7)), 0);
+    std::memcpy(s.data() + off, &type, 4);
+    std::memcpy(s.data() + off + inner, &v, sizeof(T));
+}
+
+// A pipeline made at an address a released one had: its old twin forgotten (leaked, as the GPU may still use it), so
+// twin_of never hands back another pipeline's twin (2026-10-14, the review).
+void forget_twin(void* game) {
+    if (g_vi_vs.empty() || !game) return;
+    std::lock_guard lock(g_mutex);
+    g_twin.erase(game);
+}
+void make_twin(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, ID3D12PipelineState* game) {
+    if (g_vi_vs.empty() || !d->VS.pShaderBytecode || !d->VS.BytecodeLength || !d->pRootSignature) return;
+    const uint64_t vs = fnv(d->VS.pShaderBytecode, d->VS.BytecodeLength);
+    const uint64_t ps = d->PS.pShaderBytecode && d->PS.BytecodeLength ? fnv(d->PS.pShaderBytecode, d->PS.BytecodeLength) : 0;
+    auto it = g_vi_vs.find(vs);
+    if (it == g_vi_vs.end()) return;
+    char key[40];
+    std::snprintf(key, sizeof(key), "%016llx %016llx", static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps));
+    if (!g_vi_pairs.count(key)) {
+        g_twins_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (d->StreamOutput.NumEntries || d->DS.BytecodeLength || d->HS.BytecodeLength || d->GS.BytecodeLength) {
+        g_twins_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    ID3D12Device2* d2 = nullptr;
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&d2))) || !d2) return;
+    std::vector<uint8_t> st;
+    ID3D12RootSignature* rs = d->pRootSignature;
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, rs, true);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE{it->second.data(), it->second.size()}, true);
+    if (ps) push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, d->PS, true);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, d->BlendState, false);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, d->SampleMask, false);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, d->RasterizerState, false);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, d->DepthStencilState, false);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, d->InputLayout, true);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, d->IBStripCutValue, false);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, d->PrimitiveTopologyType, false);
+    D3D12_RT_FORMAT_ARRAY fa{};
+    fa.NumRenderTargets = d->NumRenderTargets;
+    for (int k = 0; k < 8; ++k) fa.RTFormats[k] = d->RTVFormats[k];
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, fa, false);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, d->DSVFormat, false);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, d->SampleDesc, false);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, d->NodeMask, false);
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, d->Flags, false);
+    static const D3D12_VIEW_INSTANCE_LOCATION kLoc[2] = {{0, 0}, {0, 1}};  // (viewport 0, slices 0 and 1: psotest's array0)
+    const D3D12_VIEW_INSTANCING_DESC vi{2, kLoc, D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING};
+    push_sub(st, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, vi, true);
+    const D3D12_PIPELINE_STATE_STREAM_DESC sd{st.size(), st.data()};
+    ID3D12PipelineState* twin = nullptr;
+    const DWORD t0 = GetTickCount();
+    // the original stream creation (not the hook: no ShaderSwap, no census of the twin)
+    const HRESULT hr = o_CreateStream ? o_CreateStream(d2, &sd, IID_PPV_ARGS(&twin)) : d2->CreatePipelineState(&sd, IID_PPV_ARGS(&twin));
+    const int64_t ms = static_cast<int64_t>(GetTickCount() - t0);
+    d2->Release();
+    if (ms > g_twin_ms_max.load()) g_twin_ms_max = ms;
+    if (FAILED(hr) || !twin) {
+        g_twins_failed.fetch_add(1, std::memory_order_relaxed);
+        log::warn("[pso] twin of vs %016llx ps %016llx refused (%#lx): that pipeline stays single", static_cast<unsigned long long>(vs),
+                  static_cast<unsigned long long>(ps), static_cast<unsigned long>(hr));
+        return;
+    }
+    {
+        std::lock_guard lock(g_mutex);
+        g_twin.insert_or_assign(game, twin);  // (an old entry, if any, leaked: see forget_twin)
+    }
+    if (g_twins_made.fetch_add(1, std::memory_order_relaxed) < 3)
+        log::info("[pso] twin made: vs %016llx ps %016llx (%lld ms)", static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps),
+                  static_cast<long long>(ms));
 }
 
 // [Debug] PsoDump=<folder> (single-pass stereo step 5, milestone 1, test only): every graphics pipeline the game makes
@@ -215,6 +338,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
             d2.VS = {r->data(), r->size()};
             const HRESULT hs = o_CreateGraphics(dev, &d2, riid, out);
             if (SUCCEEDED(hs) && *out) {
+                forget_twin(*out);
                 g_swaps.fetch_add(1, std::memory_order_relaxed);
                 g_graphics.fetch_add(1, std::memory_order_relaxed);
                 record(*out, d->VS);  // counted under the game's own hash
@@ -231,6 +355,10 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
         g_graphics.fetch_add(1, std::memory_order_relaxed);
         record(*out, d->VS);
         record_info(*out, d);
+        if (!g_vi_vs.empty()) {  // [Stereo] InstancedShaders
+            forget_twin(*out);
+            make_twin(dev, d, static_cast<ID3D12PipelineState*>(*out));
+        }
     }
     return hr;
 }
@@ -281,6 +409,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateStream(ID3D12Device* dev, const D3D12_PIPELIN
             D3D12_PIPELINE_STATE_STREAM_DESC d2{copy.size(), copy.data()};
             const HRESULT hs = o_CreateStream(dev, &d2, riid, out);
             if (SUCCEEDED(hs) && *out) {
+                forget_twin(*out);
                 g_swaps.fetch_add(1, std::memory_order_relaxed);
                 g_stream.fetch_add(1, std::memory_order_relaxed);
                 record(*out, orig);
@@ -292,6 +421,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateStream(ID3D12Device* dev, const D3D12_PIPELIN
     }
     HRESULT hr = o_CreateStream(dev, d, riid, out);
     if (SUCCEEDED(hr) && d && out && *out && d->pPipelineStateSubobjectStream) {
+        forget_twin(*out);
         g_stream.fetch_add(1, std::memory_order_relaxed);
         const uint8_t* p = static_cast<const uint8_t*>(d->pPipelineStateSubobjectStream);
         const uint8_t* end = p + d->SizeInBytes;
@@ -315,6 +445,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateStream(ID3D12Device* dev, const D3D12_PIPELIN
 }
 
 void STDMETHODCALLTYPE hk_SetPipelineState(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
+    if (prepass::active()) prepass::note_pipeline(cl, ps);  // ([Stereo] PrepassInstanced: the game's pipeline in a region)
     if (!g_census.load(std::memory_order_relaxed)) return o_SetPipelineState(cl, ps);
     uint64_t h = 0;
     PsoInfo in;
@@ -376,6 +507,7 @@ void install_device_hooks(ID3D12Device* dev) {
     if (!loaded) {
         loaded = true;
         load_swaps();
+        load_twin_sources();
         if (config::get_bool("Debug", "PsoCensus", false)) g_census = true;
         g_dump_dir = config::get_string("Debug", "PsoDump", "");
         if (!g_dump_dir.empty()) {
@@ -455,10 +587,31 @@ bool on_draw(ID3D12GraphicsCommandList* cl) {
     return false;
 }
 
+uint64_t twins_made() { return g_twins_made.load(std::memory_order_relaxed); }
+void set_raw(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
+    if (o_SetPipelineState) o_SetPipelineState(cl, ps);
+    else cl->SetPipelineState(ps);
+}
+ID3D12PipelineState* twin_of(ID3D12PipelineState* game) {
+    if (g_twins_made.load(std::memory_order_relaxed) == 0) return nullptr;
+    std::lock_guard lock(g_mutex);
+    auto it = g_twin.find(game);
+    return it == g_twin.end() ? nullptr : it->second;
+}
+std::string twins_status() {
+    char b[300];
+    std::snprintf(b, sizeof(b), "twins %s: %zu rewritten VS, %zu pairs listed; made %llu, refused %llu, not listed %llu; slowest %lld ms",
+                  g_vi_vs.empty() ? "off" : "on", g_vi_vs.size(), g_vi_pairs.size(), static_cast<unsigned long long>(g_twins_made.load()),
+                  static_cast<unsigned long long>(g_twins_failed.load()), static_cast<unsigned long long>(g_twins_skipped.load()),
+                  static_cast<long long>(g_twin_ms_max.load()));
+    return b;
+}
+
 std::string command(const std::string& line) {
     std::istringstream in(line);
     std::string word, sub, arg;
     in >> word >> sub >> arg;
+    if (sub == "twins") return twins_status();  // pso twins ([Stereo] InstancedShaders; before the census is armed)
     char buf[256];
     if (!g_census.exchange(true)) {
         Sleep(250);  // a few frames counted (a pipeline set before now counts from its next set)

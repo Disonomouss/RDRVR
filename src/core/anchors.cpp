@@ -170,6 +170,8 @@ constexpr Optional kOptional[] = {
     {"MotionBlurSetter", "motion blur is not forced off on this build ([Render] MotionBlur: the game's setting)"},
     {"MiragerDownsample", "the heat haze toggle ([Render] HeatHaze) is off on this build"},
     {"PrepassLetterboxCall", "the pre-pass arrays ([Stereo] PrepassArrays, test only) are off on this build"},
+    {"PrepassPreWalk", "the pre-pass union cull ([Stereo] PrepassUnionCull, test only) is off on this build"},
+    {"PrepassPreWalkCall", "the pre-pass union cull ([Stereo] PrepassUnionCull, test only) is off on this build"},
     {"HandleWorldView", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
     {"HandleViewInverse", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
     {"HandlePrevWorldVP", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},

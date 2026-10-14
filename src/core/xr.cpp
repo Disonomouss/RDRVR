@@ -1305,6 +1305,7 @@ void end_open_frame() {
     ei.layerCount = cinema ? nquad : (full ? nlayers : 0);
     ei.layers = cinema ? quad_layers : layers;
     if (cinema) g_cinema_frames.fetch_add(1, std::memory_order_relaxed);
+    if (!cinema && full) controllers::submit_probe(g_space, ei.displayTime);  // [handlag]: how late the drawn hands are
     XrResult r = xrEndFrame(g_session, &ei);
     if (XR_FAILED(r)) log::limited("xr.endframe", 8, "[xr] xrEndFrame -> %s", result_name(g_inst, r));
     if (g_open_ms > 0) {  // the timing window: how long this XR frame was open, and its wait

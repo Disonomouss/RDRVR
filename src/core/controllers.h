@@ -49,6 +49,11 @@ void on_profile_changed();
 // aim and grip poses located again for the same predicted display time (the buttons and values stay the sync's), so
 // the hands, like the head's late latch, use the runtime's latest prediction rather than the one from the frame's start.
 void relocate(XrSpace base, XrTime time);
+// 2026-10-14 (the user: the gun "follows the hand late", indoors): at the frame's submit, each controller located again
+// for the display time the frame is submitted for, against the pose the late latch gave this frame's draws: how far the
+// controller moved (the runtime's newer prediction) between the draw's pose and the submit, and the time between them.
+// Logged every 10 s as "[handlag]"; a hand still (under 2 mm) counted apart.
+void submit_probe(XrSpace base, XrTime time);
 // "controllers": the profile, both hands' state, syncs and haptic pulses.
 void status_text(char* out, size_t len);
 bool active();  // created, synced, and at least one hand tracked in the last sync

@@ -408,7 +408,8 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
         if (g_xr_pose.load(std::memory_order_relaxed)) xr::late_latch();
         int first = g_swap.load(std::memory_order_relaxed) ? 1 : 0;
         std::memcpy(g_saved_vp, vp, kViewportSize);
-        g_union_ok = dual_pass::shadows_wanted() && g_xr_pose.load(std::memory_order_relaxed) && build_union_vp(vp, cam);
+        g_union_ok = (dual_pass::shadows_wanted() || prepass::union_cull_wanted()) && g_xr_pose.load(std::memory_order_relaxed) &&
+                     build_union_vp(vp, cam);
         dual_pass::begin_frame(renderer);
         const double t1 = probe ? log::now_ms() : 0;
         if (probe) frame_probe::set_phase(frame_probe::kPhasePass1);

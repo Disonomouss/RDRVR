@@ -12,11 +12,13 @@
 #include <vector>
 
 #include "core/anchors.h"
+#include "core/camera_lever.h"
 #include "core/config.h"
 #include "core/hooks.h"
 #include "core/d3d_hooks.h"
 #include "core/dual_pass.h"
 #include "core/log.h"
+#include "core/pso.h"
 #include "core/state.h"
 
 namespace rdrvr::prepass {
@@ -41,7 +43,7 @@ struct Arr {
     DXGI_FORMAT res_fmt = DXGI_FORMAT_UNKNOWN, view_fmt = DXGI_FORMAT_UNKNOWN;
     ID3D12Resource* arr = nullptr;  // 2 slices
     UINT planes = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE view[2]{};
+    D3D12_CPU_DESCRIPTOR_HANDLE view[3]{};  // slice 0, slice 1, both (the instanced region's)
 };
 Arr g_arr[kKinds];
 struct Retired {
@@ -50,14 +52,21 @@ struct Retired {
 };
 std::vector<Retired> g_retired;
 ID3D12Device* g_dev = nullptr;
-ID3D12DescriptorHeap* g_rtv_heap = nullptr;  // 2 per colour kind
-ID3D12DescriptorHeap* g_dsv_heap = nullptr;  // 2
+ID3D12DescriptorHeap* g_rtv_heap = nullptr;  // 3 per colour kind
+ID3D12DescriptorHeap* g_dsv_heap = nullptr;  // 3
 UINT g_rtv_inc = 0, g_dsv_inc = 0;
 
 // the open region (the playback thread only)
 struct Region {
     ID3D12GraphicsCommandList* cl = nullptr;
     int slice = 0;
+    bool inst = false, drop = false;  // [Stereo] PrepassInstanced: pass 1's region drawing both slices, pass 2's dropping
+    bool all_six = false;             // the last bind's targets all among the six (the twins' rule, both passes)
+    bool started = false;             // the walk-start marker played back: twins (pass 1) and drops (pass 2) only after it
+    bool no_twins = false;            // pass 1's walk not ready for instancing this frame (its marker said so)
+    ID3D12PipelineState* game_pso = nullptr;  // the game's last pipeline in the region, and the one set on the list
+    ID3D12PipelineState* set_pso = nullptr;
+    ID3D12PipelineState* game_twin = nullptr;  // game_pso's twin (looked up once, at the game's set)
     unsigned touched = 0, known = 0;   // bit (kind * 2 + plane): that plane's state known
     D3D12_RESOURCE_STATES state[kKinds][2]{};  // per plane (the depth's two: the game moves them one at a time)
 } g_r;
@@ -81,7 +90,9 @@ struct LastBind {  // the list's last bind outside a region (the playback thread
 bool is_depth(int k) { return k == kDepth; }
 D3D12_RESOURCE_STATES write_state(int k) { return is_depth(k) ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET; }
 
+void on_fail();  // (below: the instanced region's state)
 void fail(const char* why) {
+    on_fail();
     if (!g_failed.exchange(true)) {
         std::snprintf(g_fail_reason, sizeof(g_fail_reason), "%s", why);
         log::warn("[prepass] stood down: %s (the game's own targets from now on)", why);
@@ -111,10 +122,10 @@ int kind_of_resource(const ID3D12Resource* res) {
 
 bool heaps() {
     if (g_rtv_heap && g_dsv_heap) return true;
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2 * kKinds, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kKinds, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rtv_heap)))) return false;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    hd.NumDescriptors = 2;
+    hd.NumDescriptors = 3;
     if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_dsv_heap)))) return false;
     g_rtv_inc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     g_dsv_inc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
@@ -155,12 +166,13 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     }
     D3D12_FEATURE_DATA_FORMAT_INFO fi{d.Format, 0};
     a.planes = SUCCEEDED(g_dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &fi, sizeof(fi))) && fi.PlaneCount ? fi.PlaneCount : 1;
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < 3; ++s) {  // (s 2: both slices)
+        const UINT first = s < 2 ? static_cast<UINT>(s) : 0u, count = s < 2 ? 1u : 2u;
         if (is_depth(k)) {
             D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
             dv.Format = vf;
             dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
-            dv.Texture2DArray = {0, static_cast<UINT>(s), 1};
+            dv.Texture2DArray = {0, first, count};
             a.view[s] = g_dsv_heap->GetCPUDescriptorHandleForHeapStart();
             a.view[s].ptr += static_cast<SIZE_T>(s) * g_dsv_inc;
             g_dev->CreateDepthStencilView(arr, &dv, a.view[s]);
@@ -168,9 +180,9 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
             D3D12_RENDER_TARGET_VIEW_DESC rv{};
             rv.Format = vf;
             rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
-            rv.Texture2DArray = {0, static_cast<UINT>(s), 1, 0};
+            rv.Texture2DArray = {0, first, count, 0};
             a.view[s] = g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-            a.view[s].ptr += static_cast<SIZE_T>(k * 2 + s) * g_rtv_inc;
+            a.view[s].ptr += static_cast<SIZE_T>(k * 3 + s) * g_rtv_inc;
             g_dev->CreateRenderTargetView(arr, &rv, a.view[s]);
         }
     }
@@ -207,10 +219,50 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from,
     return b;
 }
 
+// ---- [Stereo] PrepassInstanced (the playback thread)
+std::atomic<bool> g_inst_hooked{false}, g_inst_on{false}, g_pred_off{false};
+bool g_frame_inst = false;  // this frame's pass 1 region was instanced (pass 2's drops follow it)
+unsigned g_frame_cleared = 0;  // the kinds pass 1's instanced region cleared on both slices (pass 2 skips only those)
+thread_local bool t_skip_clear = false;
+std::atomic<uint64_t> g_starts_ok{0}, g_starts_plain{0};
+void on_fail() {  // a stand-down: the instancing off, the open region ended at its list's next call
+    g_inst_on = false;
+    g_pred_off = false;
+    g_frame_inst = false;
+    if (g_active.load()) g_end_pending.store(true, std::memory_order_release);
+}
+// the walk-start markers (op-0x4a callbacks recorded by hk_prewalk): pass 1 ready for instancing (the walk widened to
+// both eyes, eye 2's rows written this frame) or not; pass 2's plain one marks where its drops may begin
+void walk_start_ok_cb(void*) {
+    if (!g_active.load()) return;
+    g_r.started = true;
+    g_starts_ok.fetch_add(1, std::memory_order_relaxed);
+}
+void walk_start_plain_cb(void*) {
+    if (!g_active.load()) return;
+    g_r.started = true;
+    if (g_r.inst) {  // pass 1 not ready: no twins this frame, and pass 2 drops nothing
+        g_r.no_twins = true;
+        g_frame_inst = false;
+    }
+    g_starts_plain.fetch_add(1, std::memory_order_relaxed);
+}
+std::atomic<uint64_t> g_inst_regions{0}, g_drop_regions{0}, g_twin_draws{0}, g_single_draws{0}, g_dropped{0}, g_drawn{0},
+    g_skipped_clears{0}, g_pso_restores{0};
+int view_index() { return g_r.inst ? 2 : g_r.slice; }
+void restore_pso(ID3D12GraphicsCommandList* cl) {  // the game's pipeline back on the list if a twin is set
+    if (g_r.game_pso && g_r.set_pso && g_r.set_pso != g_r.game_pso) {
+        pso::set_raw(cl, g_r.game_pso);
+        g_pso_restores.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_r.set_pso = g_r.game_pso;
+}
+
 // The region's end: each touched target's slice copied into the game's target, from the states seen (per plane).
 void end_region(ID3D12GraphicsCommandList* cl) {
     g_active = false;
     g_end_pending = false;
+    if (g_r.inst) restore_pso(cl);
     unsigned need = 0;
     for (int k = 0; k < kKinds; ++k)
         if (g_r.touched & (1u << k)) need |= plane_bits(k);
@@ -351,6 +403,7 @@ Grown g_b1, g_pp;           // rage_matrices, rage_prev_proj
 int g_grow_state = 0;       // 0 not tried, 1 grown, -1 refused
 char g_grow_why[160] = "";
 uint64_t g_written = 0, g_kept = 0, g_lost = 0;
+uint64_t g_written_frame = ~0ull;  // the frame eye 2's rows were last written (write_eye2)
 float g_written_wv[16], g_written_vi[16], g_written_pp[16];
 
 bool grow(Grown& g, uintptr_t cb, uint32_t declared, uint32_t grown, uint32_t alloc) {
@@ -444,6 +497,7 @@ void write_eye2(const float* wv, const float* vi, const float* pvp) {
     if (!write_raw(g_b1.block + 0x110, wv, 64) || !write_raw(g_b1.block + 0x190, vi, 64) || !write_raw(g_pp.block + 0x40, pp, 64)) return;
     wr<int>(g_b1.cb + 0x24, -1);  // (re-uploaded at its next commit)
     wr<int>(g_pp.cb + 0x24, -1);
+    g_written_frame = state::presents.load();
     std::memcpy(g_written_wv, wv, 64);
     std::memcpy(g_written_vi, vi, 64);
     std::memcpy(g_written_pp, pp, 64);
@@ -523,21 +577,103 @@ void observe_after_walk() {
     }
 }
 
+// ---- [Stereo] PrepassUnionCull (2026-10-14, the render thread; stageVI-prepass.md milestone 4): the draw-time culls in
+// the eye's pre-pass walk read the current viewport's side planes: grmModel's per-model culler (0x142cb0 calls
+// DAT_142272378, statically 0x142b00: the model's box against +0x2c0..+0x2fc, which SetWorldMtx 0x1348e0 makes from the
+// side-plane matrix at +0x3f0..+0x42f) and IsSphereVisible 0x130030 (types 1 and 2: the near plane +0x3d0, the side
+// planes +0x390..+0x3cf). ViewportCullPlanes (from Perspective) writes both blocks; SetCurrent does not touch them. So
+// in pass 1, from the walk's start (FUN_14065a990's return to 0x5cc2b3) to its end (the letterbox clear's call), those
+// two blocks are the union viewport's (camera_lever's, the centre eye with both eyes' tangents plus 3 deg); the near and
+// far planes stay the eye's. Wider culling only adds draws the GPU clips.
+using PreWalk_t = void (*)(void* obj);
+PreWalk_t o_prewalk = nullptr;
+std::atomic<bool> g_cull_hooked{false}, g_cull_on{false};
+uintptr_t g_cull_vp = 0;  // the viewport whose side planes are the union's now (0: none)
+uint64_t g_cull_frame = 0;
+alignas(16) unsigned char g_cull_saved[2][0x40];
+std::atomic<uint64_t> g_cull_begins{0}, g_cull_ends{0}, g_cull_nounion{0}, g_cull_stale{0};
+float g_cull_widen = 0.0f;  // the last swap: the largest change of a side plane's normal (for the status)
+
+void cull_end(bool at_walk_end) {
+    if (!g_cull_vp) return;
+    uintptr_t cur = 0;
+    if (at_walk_end && dual_pass::pass() == 1 && g_cull_frame == state::presents.load() &&
+        rd(anchors::addr(anchors::Id::ViewportCurrent), &cur) && cur == g_cull_vp) {
+        write_raw(g_cull_vp + 0x390, g_cull_saved[0], 0x40);
+        write_raw(g_cull_vp + 0x3f0, g_cull_saved[1], 0x40);
+        g_cull_ends.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_cull_stale.fetch_add(1, std::memory_order_relaxed);  // (pass 2 starts from the saved viewport anyway)
+    }
+    g_cull_vp = 0;
+}
+void cull_begin() {
+    cull_end(false);  // (a walk that never ended: dropped, nothing written back)
+    uintptr_t vp = 0;
+    const uintptr_t u = reinterpret_cast<uintptr_t>(camera_lever::shadow_union_vp());
+    if (!rd(anchors::addr(anchors::Id::ViewportCurrent), &vp) || !vp) return;
+    if (!u || u == vp) {
+        g_cull_nounion.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!read_raw(vp + 0x390, g_cull_saved[0], 0x40) || !read_raw(vp + 0x3f0, g_cull_saved[1], 0x40)) return;
+    float un[16];
+    if (!read_raw(u + 0x390, un, sizeof(un))) return;
+    float w = 0.0f;
+    const float* mine = reinterpret_cast<const float*>(g_cull_saved[0]);
+    for (int p = 0; p < 4; ++p) {
+        float d = 0.0f;
+        for (int k = 0; k < 3; ++k) d += un[p * 4 + k] * mine[p * 4 + k];
+        w = std::fmax(w, std::acos(std::fmax(-1.0f, std::fmin(1.0f, d))) * 57.29578f);
+    }
+    if (!write_raw(vp + 0x390, reinterpret_cast<const void*>(u + 0x390), 0x40) || !write_raw(vp + 0x3f0, reinterpret_cast<const void*>(u + 0x3f0), 0x40)) {
+        write_raw(vp + 0x390, g_cull_saved[0], 0x40);
+        write_raw(vp + 0x3f0, g_cull_saved[1], 0x40);
+        return;
+    }
+    g_cull_widen = w;
+    g_cull_vp = vp;
+    g_cull_frame = state::presents.load();
+    g_cull_begins.fetch_add(1, std::memory_order_relaxed);
+}
+bool append_marker(void (*fn)(void*)) {  // an op-0x4a callback at this point of the render thread's stream
+    uintptr_t dev = 0, hrec = 0, rec = 0, vt = 0;
+    if (!rd(anchors::addr(anchors::Id::D3dDeviceSingleton), &dev) || !rd(dev + 0x58, &hrec) || !rd(hrec + 0x128, &rec) || !rd(rec, &vt) ||
+        vt != anchors::addr(anchors::Id::RecorderVtbl))
+        return false;
+    reinterpret_cast<Append_t>(anchors::addr(anchors::Id::DeferredAppend))(reinterpret_cast<void*>(rec), reinterpret_cast<void*>(fn), nullptr, 0);
+    return true;
+}
+bool rows_ready() {  // eye 2's rows written this frame into the grown buffers, uploaded at their grown sizes
+    uintptr_t layout = 0;
+    uint32_t size = 0;
+    return g_written_frame == state::presents.load() && still_grown(g_b1) && still_grown(g_pp) && rd(g_b1.cb + 0x08, &layout) &&
+           rd(layout + 0x14, &size) && size == g_b1.grown;
+}
+std::atomic<bool> g_inst_markers{false};  // [Stereo] PrepassInstanced at start: the walk-start markers recorded
+void hk_prewalk(void* obj) {
+    o_prewalk(obj);
+    if (reinterpret_cast<uintptr_t>(_ReturnAddress()) != anchors::addr(anchors::Id::PrepassPreWalkCall) + 5) return;
+    const int pass = dual_pass::pass();
+    if (pass == 1 && g_cull_on.load(std::memory_order_relaxed)) cull_begin();
+    if (g_inst_markers.load(std::memory_order_relaxed) && (pass == 1 || pass == 2)) {
+        const bool ok = pass == 1 && g_cull_vp && g_cull_frame == state::presents.load() && rows_ready();
+        append_marker(ok ? &walk_start_ok_cb : &walk_start_plain_cb);
+    }
+}
+
 void hk_letterbox(void* renderer) {
+    if (g_cull_vp && reinterpret_cast<uintptr_t>(_ReturnAddress()) == anchors::addr(anchors::Id::PrepassLetterboxCall) + 5) cull_end(true);
     if (g_views.load(std::memory_order_relaxed) &&
         reinterpret_cast<uintptr_t>(_ReturnAddress()) == anchors::addr(anchors::Id::PrepassLetterboxCall) + 5)
         observe_after_walk();
-    if (g_on.load(std::memory_order_relaxed) && !g_failed.load(std::memory_order_relaxed) &&
+    // (2026-10-14, the review: recorded whenever the arrays may run, not only while on and not stood down: a region the
+    // playback thread opened before "prepass off" or a stand-down still gets its end)
+    if (g_hooked.load(std::memory_order_relaxed) && (g_on.load(std::memory_order_relaxed) || g_failed.load(std::memory_order_relaxed) ||
+                                                     g_active.load(std::memory_order_relaxed) || g_inst_markers.load(std::memory_order_relaxed)) &&
         reinterpret_cast<uintptr_t>(_ReturnAddress()) == anchors::addr(anchors::Id::PrepassLetterboxCall) + 5) {
-        uintptr_t dev = 0, hrec = 0, rec = 0, vt = 0;
-        if (rd(anchors::addr(anchors::Id::D3dDeviceSingleton), &dev) && rd(dev + 0x58, &hrec) && rd(hrec + 0x128, &rec) && rd(rec, &vt) &&
-            vt == anchors::addr(anchors::Id::RecorderVtbl)) {
-            reinterpret_cast<Append_t>(anchors::addr(anchors::Id::DeferredAppend))(reinterpret_cast<void*>(rec),
-                                                                                    reinterpret_cast<void*>(&walk_end_cb), nullptr, 0);
-            g_markers.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            log::limited("prepass.norec", 5, "[prepass] the walk's end: the recorder not found (no marker)");
-        }
+        if (append_marker(&walk_end_cb)) g_markers.fetch_add(1, std::memory_order_relaxed);
+        else log::limited("prepass.norec", 5, "[prepass] the walk's end: the recorder not found (no marker)");
     }
     o_letterbox(renderer);
 }
@@ -549,7 +685,9 @@ void init() {
 }
 void install() {
     const bool arrays = config::get_bool("Stereo", "PrepassArrays", false), views = config::get_int("Stereo", "PrepassViews", 0) >= 1;
-    if ((!arrays && !views) || anchors::stand_down()) return;
+    const bool ucull = config::get_bool("Stereo", "PrepassUnionCull", false);
+    const bool inst = config::get_bool("Stereo", "PrepassInstanced", false) && arrays && config::get_int("Stereo", "PrepassViews", 0) >= 2;
+    if ((!arrays && !views && !ucull) || anchors::stand_down()) return;
     using anchors::Id;
     if (!anchors::present(Id::LetterboxClear) || !anchors::present(Id::PrepassLetterboxCall) || !anchors::addr(Id::DeferredAppend)) {
         log::warn("[prepass] not installed: this build of RDR.exe has no LetterboxClear/PrepassLetterboxCall");
@@ -560,6 +698,25 @@ void install() {
         return;
     g_hooked = true;
     g_on = arrays;
+    if ((ucull || inst) && anchors::present(Id::PrepassPreWalk) && anchors::present(Id::PrepassPreWalkCall) &&
+        hooks::install("RDR pre-pass walk's start (FUN_14065a990, PrepassUnionCull/Instanced)", reinterpret_cast<void*>(anchors::addr(Id::PrepassPreWalk)),
+                       reinterpret_cast<void*>(&hk_prewalk), reinterpret_cast<void**>(&o_prewalk))) {
+        g_cull_hooked = true;
+        g_cull_on = ucull;
+        if (ucull) log::info("[prepass] [Stereo] PrepassUnionCull on (test only: pass 1's pre-pass walk culls against both eyes' union)");
+    } else if (ucull || inst) {
+        log::warn("[prepass] the walk's start hook not installed (no PrepassPreWalk anchors on this build, or the hook failed): no union cull, no instancing");
+    }
+    if (config::get_bool("Stereo", "PrepassInstanced", false)) {
+        if (inst && g_cull_hooked.load()) {
+            g_inst_hooked = true;
+            g_inst_on = true;
+            g_inst_markers = true;
+            log::info("[prepass] [Stereo] PrepassInstanced on (test only: pass 1's pre-pass drawn for both eyes by the twins, pass 2 dropping them)");
+        } else {
+            log::warn("[prepass] PrepassInstanced needs PrepassArrays=1, PrepassViews=2 and the walk's start hook: off");
+        }
+    }
     if (arrays) log::info("[prepass] [Stereo] PrepassArrays on (test only: each eye's pre-pass drawn into 2-slice arrays, copied back at the walk's end)");
     if (views && anchors::present(Id::HandleWorldView) && anchors::present(Id::HandleViewInverse) && anchors::present(Id::HandlePrevViewProj) &&
         anchors::present(Id::HandleViewport) && anchors::present(Id::HandlePrevWorldVP)) {
@@ -588,6 +745,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     const uint64_t f = state::presents.load();
     if (g_active.load()) {  // the depth cleared again in a region: the last one never ended
         g_active = false;
+        if (g_r.inst && g_r.cl == cl) restore_pso(cl);
+        g_pred_off = false;
         fail("a pre-pass region did not end before the next pre-pass");
         return h;
     }
@@ -606,6 +765,27 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     g_r.cl = cl;
     g_r.slice = slice;
     g_r.touched = 1u << kDepth;
+    if (slice == 0) {  // [Stereo] PrepassInstanced: pass 1 draws both slices (eye 2's rows written, twins made)
+        g_r.inst = g_inst_on.load(std::memory_order_relaxed) && g_views_write.load(std::memory_order_relaxed) && g_grow_state > 0 &&
+                   pso::twins_made() > 0;
+        g_frame_inst = g_r.inst;
+        g_frame_cleared = g_r.inst ? 1u << kDepth : 0u;
+        g_pred_off = false;
+        if (g_r.inst) {
+            ID3D12GraphicsCommandList1* c1 = nullptr;
+            if (SUCCEEDED(cl->QueryInterface(IID_PPV_ARGS(&c1))) && c1) {
+                c1->SetViewInstanceMask(3);
+                c1->Release();
+                g_inst_regions.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_r.inst = g_frame_inst = false;
+            }
+        }
+    } else if (g_frame_inst) {  // pass 2 after an instanced pass 1: its slice is already cleared and holds the twins' draws
+        g_r.drop = true;
+        g_pred_off = true;
+        g_drop_regions.fetch_add(1, std::memory_order_relaxed);
+    }
     set_state(kDepth, -1, D3D12_RESOURCE_STATE_DEPTH_WRITE);  // (a depth clear needs it)
     g_end_pending = false;
     g_active = true;
@@ -615,7 +795,11 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
         if (bind(cl, g_last.n, g_last.rts, g_last.single, g_last.has_ds ? &g_last.ds : nullptr, r2, &d2))
             d3d::raw_bind(cl, g_last.n, r2, g_last.single, g_last.has_ds ? &d2 : nullptr);
     }
-    return g_arr[kDepth].view[slice];
+    if (g_r.drop && (g_frame_cleared & (1u << kDepth))) {
+        t_skip_clear = true;
+        g_skipped_clears.fetch_add(1, std::memory_order_relaxed);
+    }
+    return g_arr[kDepth].view[view_index()];
 }
 
 void note_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
@@ -644,7 +828,12 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_rtv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     if (k <= kDepth || !ensure(k, res, fmt)) return h;
     g_r.touched |= 1u << k;
     set_state(k, -1, D3D12_RESOURCE_STATE_RENDER_TARGET);  // (a clear needs it)
-    return g_arr[k].view[g_r.slice];
+    if (g_r.inst) g_frame_cleared |= 1u << k;
+    if (g_r.drop && (g_frame_cleared & (1u << k))) {
+        t_skip_clear = true;
+        g_skipped_clears.fetch_add(1, std::memory_order_relaxed);
+    }
+    return g_arr[k].view[view_index()];
 }
 
 bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
@@ -655,6 +844,7 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         return false;
     }
     bool any = false;
+    g_r.all_six = false;
     if (single && n >= 1 && rts) {  // a contiguous range: one handle for all n (not substituted one by one)
         ID3D12Resource* res = nullptr;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
@@ -664,15 +854,19 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         }
         return false;
     }
+    bool six = n > 0 || ds;  // every bound target one of the six (the twins' rule)
     for (unsigned i = 0; i < n && rts; ++i) {
         out_rts[i] = rts[i];
         ID3D12Resource* res = nullptr;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         const int k = kind_of(rts[i], &res, &fmt);
-        if (k <= kDepth || !ensure(k, res, fmt)) continue;
+        if (k <= kDepth || !ensure(k, res, fmt)) {
+            six = false;
+            continue;
+        }
         if (!(g_r.known & (1u << (k * 2)))) set_state(k, -1, D3D12_RESOURCE_STATE_RENDER_TARGET);  // (its barrier before the region)
         g_r.touched |= 1u << k;
-        out_rts[i] = g_arr[k].view[g_r.slice];
+        out_rts[i] = g_arr[k].view[view_index()];
         any = true;
     }
     if (ds) {
@@ -680,10 +874,13 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         ID3D12Resource* res = nullptr;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         if (kind_of(*ds, &res, &fmt) == kDepth && res == g_arr[kDepth].game) {
-            *out_ds = g_arr[kDepth].view[g_r.slice];
+            *out_ds = g_arr[kDepth].view[view_index()];
             any = true;
+        } else {
+            six = false;
         }
     }
+    g_r.all_six = six && any;
     if (any) g_redirects.fetch_add(1, std::memory_order_relaxed);
     return any;
 }
@@ -712,11 +909,90 @@ void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BAR
     }
 }
 
-void before_draw(ID3D12GraphicsCommandList* cl) {
-    if (cl == g_r.cl && g_end_pending.load(std::memory_order_acquire)) end_region(cl);
+bool before_draw(ID3D12GraphicsCommandList* cl) {
+    if (cl != g_r.cl) return false;
+    if (g_end_pending.load(std::memory_order_acquire)) {
+        end_region(cl);
+        return false;
+    }
+    if (!g_r.inst && !g_r.drop) return false;
+    ID3D12PipelineState* twin = g_r.started && !g_r.no_twins && g_r.all_six ? g_r.game_twin : nullptr;
+    if (g_r.drop) {
+        (twin ? g_dropped : g_drawn).fetch_add(1, std::memory_order_relaxed);
+        return twin != nullptr;
+    }
+    ID3D12PipelineState* want = twin ? twin : g_r.game_pso;
+    if (want && want != g_r.set_pso) {
+        pso::set_raw(cl, want);
+        g_r.set_pso = want;
+    }
+    (twin ? g_twin_draws : g_single_draws).fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+void note_pipeline(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
+    if (cl != g_r.cl) return;
+    g_r.game_pso = ps;
+    g_r.set_pso = ps;  // (the hook sets it next)
+    g_r.game_twin = g_r.inst || g_r.drop ? pso::twin_of(ps) : nullptr;
+}
+void before_indirect(ID3D12GraphicsCommandList* cl) {  // an indirect draw in a region: never with a twin, never dropped
+    if (cl == g_r.cl && g_r.inst && g_r.set_pso != g_r.game_pso) restore_pso(cl);
+}
+bool take_skip_clear() {
+    const bool s = t_skip_clear;
+    t_skip_clear = false;
+    return s;
+}
+bool predication_off() { return g_pred_off.load(std::memory_order_relaxed); }
+void set_instanced(bool on) {
+    if (on && !g_inst_hooked.load()) {
+        log::warn("[prepass] instanced not on: start with [Stereo] PrepassInstanced=1, PrepassArrays=1, PrepassViews=2 and InstancedShaders");
+        return;
+    }
+    g_inst_on = on;
+    log::info("[prepass] instanced %s (from the next pass 1)", on ? "on" : "off");
 }
 
 bool views_wanted() { return g_views.load(std::memory_order_relaxed); }
+static float g_e2_rows01[8];
+static bool g_e2_levelled = false;
+static uint64_t g_e2_levels = 0;
+void eye2_level(const float* level8) {
+    g_e2_levelled = false;
+    if (!g_views_write.load(std::memory_order_relaxed) || g_grow_state <= 0 || dual_pass::pass() != 1 || !still_grown(g_b1)) return;
+    if (!read_raw(g_b1.block + 0x190, g_e2_rows01, sizeof(g_e2_rows01))) return;
+    float l[8];
+    std::memcpy(l, level8, sizeof(l));
+    l[3] = g_e2_rows01[3];  // (each eye's own w)
+    l[7] = g_e2_rows01[7];
+    if (!write_raw(g_b1.block + 0x190, l, sizeof(l))) return;
+    wr<int>(g_b1.cb + 0x24, -1);
+    g_e2_levelled = true;
+    ++g_e2_levels;
+}
+void eye2_unlevel() {
+    if (!g_e2_levelled) return;
+    g_e2_levelled = false;
+    if (still_grown(g_b1) && write_raw(g_b1.block + 0x190, g_e2_rows01, sizeof(g_e2_rows01))) wr<int>(g_b1.cb + 0x24, -1);
+}
+bool union_cull_wanted() { return g_cull_on.load(std::memory_order_relaxed); }
+void set_union_cull(bool on) {
+    if (on && !g_cull_hooked.load()) {
+        log::warn("[prepass] union cull not on: start with [Stereo] PrepassUnionCull=1 (the walk's start hook)");
+        return;
+    }
+    g_cull_on = on;
+    log::info("[prepass] union cull %s (from the next pass 1)", on ? "on" : "off");
+}
+std::string cull_status() {
+    char b[320];
+    std::snprintf(b, sizeof(b), "union cull %s%s: walks widened %llu, put back at the walk's end %llu, dropped %llu, no union viewport %llu; last widening %.2f deg",
+                  g_cull_on.load() ? "on" : "off", g_cull_hooked.load() ? "" : " (not hooked)", static_cast<unsigned long long>(g_cull_begins.load()),
+                  static_cast<unsigned long long>(g_cull_ends.load()), static_cast<unsigned long long>(g_cull_stale.load()),
+                  static_cast<unsigned long long>(g_cull_nounion.load()), g_cull_widen);
+    return b;
+}
 void set_eye2(const void* vp2, const void* prev_vp) {
     const char* v = static_cast<const char*>(vp2);
     g_e2_ok = read_raw(reinterpret_cast<uintptr_t>(v + 0xc0), g_e2_wv, 64) && read_raw(reinterpret_cast<uintptr_t>(v + 0x140), g_e2_vi, 64);
@@ -726,10 +1002,11 @@ void set_eye2(const void* vp2, const void* prev_vp) {
 }
 void views_size(bool grown) { g_size_want = grown ? 1 : 0; }
 std::string views_status() {
-    char w[260];
-    std::snprintf(w, sizeof(w), " | written: %s, %llu frames written, after the walk kept %llu, lost %llu%s%s",
+    char w[360];
+    std::snprintf(w, sizeof(w), " | written: %s, %llu frames written, after the walk kept %llu, lost %llu, grass levelled for eye 2 %llu%s%s",
                   g_grow_state > 0 ? "grown" : g_grow_state < 0 ? "refused" : "not yet", static_cast<unsigned long long>(g_written),
-                  static_cast<unsigned long long>(g_kept), static_cast<unsigned long long>(g_lost), g_grow_state < 0 ? ": " : "", g_grow_why);
+                  static_cast<unsigned long long>(g_kept), static_cast<unsigned long long>(g_lost), static_cast<unsigned long long>(g_e2_levels),
+                  g_grow_state < 0 ? ": " : "", g_grow_why);
     return std::string(g_views.load() ? "views on: " : "views off: ") + g_vs_text + (g_views_write.load() ? w : "");
 }
 
@@ -788,14 +1065,25 @@ void trace_clear(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, b
 }
 
 std::string status() {
-    char b[520];
+    char ib[360] = "";
+    if (g_inst_hooked.load())
+        std::snprintf(ib, sizeof(ib),
+                      " | instanced %s: pass 1 regions %llu (twin draws %llu, single %llu), pass 2 regions %llu (dropped %llu, drawn %llu), clears "
+                      "skipped %llu, pipelines put back %llu, predication off %d, walk starts ready %llu not %llu",
+                      g_inst_on.load() ? "on" : "off", static_cast<unsigned long long>(g_inst_regions.load()),
+                      static_cast<unsigned long long>(g_twin_draws.load()), static_cast<unsigned long long>(g_single_draws.load()),
+                      static_cast<unsigned long long>(g_drop_regions.load()), static_cast<unsigned long long>(g_dropped.load()),
+                      static_cast<unsigned long long>(g_drawn.load()), static_cast<unsigned long long>(g_skipped_clears.load()),
+                      static_cast<unsigned long long>(g_pso_restores.load()), g_pred_off.load() ? 1 : 0,
+                      static_cast<unsigned long long>(g_starts_ok.load()), static_cast<unsigned long long>(g_starts_plain.load()));
+    char b[900];
     std::snprintf(b, sizeof(b), "prepass %s%s%s: regions %llu, walk-end markers %llu, ended by them %llu, copies %llu, redirected binds %llu, passes past two %llu%s%s",
                   g_on.load() ? "on" : "off", g_failed.load() ? " (stood down)" : "", g_active.load() ? " (in a region)" : "",
                   static_cast<unsigned long long>(g_regions.load()), static_cast<unsigned long long>(g_markers.load()),
                   static_cast<unsigned long long>(g_marker_ends.load()), static_cast<unsigned long long>(g_copies.load()),
                   static_cast<unsigned long long>(g_redirects.load()), static_cast<unsigned long long>(g_skipped.load()),
                   g_failed.load() ? ": " : "", g_failed.load() ? g_fail_reason : "");
-    return b;
+    return std::string(b) + ib;
 }
 
 }  // namespace rdrvr::prepass

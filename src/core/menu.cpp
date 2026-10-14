@@ -1686,6 +1686,11 @@ void page_gestures() {
     if (check("Whistle for the horse", &wh,
               "A hand at your mouth and its trigger: John whistles for his horse. The gun hand whistles only with no gun in it."))
         whistle::set_enabled(wh, true);
+    bool fb = controls::fists_both_triggers();  // 2026-10-14
+    if (check("Fists on both triggers", &fb,
+              "With nothing in your hands, hold both triggers for the fighting stance and swing a fist to punch while holding them; "
+              "raise both fists before your face to block. A trigger alone does nothing. Off: each trigger as the game has it."))
+        controls::set_fists_both_triggers(fb, true);
     bool guard = gestures::guard();
     if (check("Guard with both fists", &guard,
               "With your fists out, raise both hands before your face and hold both triggers to block. Fists raised without the "

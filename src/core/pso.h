@@ -23,5 +23,15 @@ std::string command(const std::string& line);
 // pixel shaders' hashes and what it writes (bits 0-7 the render targets, bit 8 depth). False: not known (another list).
 void arm_census();
 bool current(const ID3D12GraphicsCommandList* cl, uint64_t* vs, uint64_t* ps, uint32_t* writes);
+// [Stereo] InstancedShaders=<folder> (single-pass stereo, the pre-pass's milestone 4a step 1; test only, off; 2026-10-14):
+// for each game pipeline whose vertex shader has a rewritten vs_<16 hex fnv>.dxil there and whose "vs ps" pair is a line
+// of the folder's twins.txt (research\sps\tools\vi\prepass_twins.py's ready list), a view-instanced twin is made next
+// to it (2 views on viewport 0, render target slices 0 and 1, masking on: psotest's array0 desc, 441 of 441 made offline
+// on the developer's driver). Nothing draws with them yet. nullptr: no twin.
+ID3D12PipelineState* twin_of(ID3D12PipelineState* game);
+std::string twins_status();
+uint64_t twins_made();
+// The list's pipeline set without the census or the pre-pass's notes (the instanced pre-pass swaps twins in and out).
+void set_raw(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps);
 
 }  // namespace rdrvr::pso

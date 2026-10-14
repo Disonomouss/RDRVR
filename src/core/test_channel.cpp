@@ -586,6 +586,10 @@ std::string execute(const std::vector<std::string>& t) {
         }
         if (t.size() >= 3 && t[1] == "lefthanded") controls::set_left_handed(t[2] == "on");
         if (t.size() >= 3 && t[1] == "triggeraims") controls::set_trigger_aims_session(t[2] == "on");  // the session only
+        if (t.size() >= 2 && t[1] == "fists") {  // controls fists [on|off]: [Gestures] FistsBothTriggers (the session only)
+            if (t.size() >= 3) controls::set_fists_both_triggers(t[2] == "on", false);
+            return controls::fists_status();
+        }
         if (t.size() >= 3 && t[1] == "raised") controls::set_aim_when_raised(t[2] == "on", false);  // the session only
         if (t.size() >= 3 && t[1] == "wristsatchel") controls::set_wrist_satchel(t[2] == "on", false);  // the session only
         if (t.size() >= 3 && t[1] == "drawhand") controls::set_draw_to_grabbing_hand(t[2] == "on", false);  // the session only
@@ -723,6 +727,11 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 2 && t[1] == "trace") prepass::trace_start(t.size() >= 3 ? std::atoi(t[2].c_str()) : 2);
         if (t.size() >= 4 && t[1] == "views" && t[2] == "size") prepass::views_size(t[3] == "on");
         if (t.size() >= 2 && t[1] == "views") return prepass::views_status();
+        if (t.size() >= 3 && t[1] == "inst") prepass::set_instanced(t[2] == "on");  // [Stereo] PrepassInstanced (test only)
+        if (t.size() >= 2 && t[1] == "cull") {  // prepass cull [on|off]: [Stereo] PrepassUnionCull (2026-10-14, test only)
+            if (t.size() >= 3) prepass::set_union_cull(t[2] == "on");
+            return prepass::cull_status();
+        }
         return prepass::status();
     }
     if (c == "pso") {

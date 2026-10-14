@@ -26,6 +26,7 @@
 #include "core/dual.h"
 #include "core/hands.h"
 #include "core/held_prop.h"
+#include "core/xr.h"
 #include "core/holster.h"
 #include "core/hooks.h"
 #include "core/log.h"
@@ -1259,6 +1260,17 @@ void note_nearmiss(int path, int count, const void* drawable, const float* rc, c
     g_nearmiss_last = m;  // a diagnostic: a torn read is harmless
 }
 uint64_t g_corr_frame = ~0ull;  // the frame g_corr_world was last computed for (render thread)
+// [Hands] StaleGunFix (2026-10-15, on; the user: the gun "shakes slightly when held still and more dramatically when
+// moved" after being drawn outside and taken indoors): there, every frame one of the gun's draws in the eye's depth
+// pre-pass (pass 0) came before the player's set, so it took last frame's correction: the gun's depth and shadow
+// collector a frame behind the gun drawn after it. Such a draw is now put where the gun was drawn last frame
+// (gun_prev_fix's cache), moved by the wrist target's own move since (this frame's targets are made before the scene:
+// g_frame): stale_place below. (Not last frame's correction on this frame's game pose: that pose already moves with
+// John, and the wrist target too: walking would count twice.)
+std::atomic<bool> g_stale_fix{true};
+std::atomic<uint64_t> g_stale_shifted{0};
+bool g_corr_ik_ok[2] = {false, false};  // the wrist targets the correction was made with (render thread)
+float g_corr_ikt[2][3] = {}, g_corr_ikr[2][9] = {};
 std::atomic<uint64_t> g_held_stale{0};  // held draws made before this frame's first player set (last frame's correction)
 std::atomic<uint32_t> g_held_by_pass[8] = {}, g_stale_by_pass[8] = {};  // by DrawVisEntity's pass argument (& 7)
 // run 6 item 1c: the same for the second gun's draws and the other sidearm's own model (held_prop slot 1)
@@ -1446,6 +1458,54 @@ void gun_prev_fix(int hand, uintptr_t key, const float* cur, float* prev, int co
     for (int j = 0; count && j < count; ++j)
         for (int k = 0; k < 3; ++k) prev[j * 12 + t[k]] -= off_prev[k];
     for (GunMvStats* x : st) ++x->fixed;
+}
+
+// [Hands] StaleGunFix: an early draw of a held gun (before this frame's correction): its current half put at last
+// frame's drawn matrices (the cache: world, the set's offset added) moved by `side`'s wrist target from the targets the
+// correction was made with to this frame's (D = R_now R_then^T, t = T_now - D T_then); its previous half at last frame's
+// drawn ones as they were. `count` 0: a rigid record (16 floats: the axes in rows 0-2, the position at 12-14); else a
+// skinned set's 12-float matrices (rows: the 3x3 and the position column), less off_cur/off_prev. False: left as it was.
+bool stale_place(int side, int hand, uintptr_t key, float* cur, float* prev, int count, const float* off_cur, const float* off_prev) {
+    if (!g_stale_fix.load(std::memory_order_relaxed) || g_corr_frame == g_body_frame || side < 0 || side > 1 || hand < 0 || hand > 1 || !key ||
+        count < 0 || count > 8 || !g_corr_ik_ok[side] || !g_frame.ik[side])
+        return false;
+    const GunPrev* e = nullptr;
+    for (const GunPrev& x : g_gun_prev)
+        if (x.key == key && x.hand == hand) e = &x;
+    if (!e || e->frame == ~0ull || e->frame + 1 != g_body_frame || e->count != count) return false;
+    const float* Rn = g_frame.ik_r[side];
+    const float* Rp = g_corr_ikr[side];
+    const float* tp = g_corr_ikt[side];
+    const float* tn = g_frame.ik_t[side];
+    if ((tn[0] - tp[0]) * (tn[0] - tp[0]) + (tn[1] - tp[1]) * (tn[1] - tp[1]) + (tn[2] - tp[2]) * (tn[2] - tp[2]) > 0.25f) return false;  // (a jump)
+    float D[9], t[3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) D[i * 3 + j] = Rn[i * 3] * Rp[j * 3] + Rn[i * 3 + 1] * Rp[j * 3 + 1] + Rn[i * 3 + 2] * Rp[j * 3 + 2];
+    for (int k = 0; k < 3; ++k) t[k] = tn[k] - (D[k * 3] * tp[0] + D[k * 3 + 1] * tp[1] + D[k * 3 + 2] * tp[2]);
+    if (count == 0) {
+        const float* m = e->cur;
+        for (int ax = 0; ax < 3; ++ax)
+            for (int k = 0; k < 3; ++k) cur[ax * 4 + k] = D[k * 3] * m[ax * 4] + D[k * 3 + 1] * m[ax * 4 + 1] + D[k * 3 + 2] * m[ax * 4 + 2];
+        for (int k = 0; k < 3; ++k) cur[12 + k] = D[k * 3] * m[12] + D[k * 3 + 1] * m[13] + D[k * 3 + 2] * m[14] + t[k];
+        for (int ax = 0; ax < 4; ++ax) cur[ax * 4 + 3] = m[ax * 4 + 3];
+        if (prev) std::memcpy(prev, m, sizeof(float) * 16);
+    } else {
+        for (int j = 0; j < count; ++j) {
+            const float* m = e->cur + j * 12;
+            float* o = cur + j * 12;
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) o[r * 4 + c] = D[r * 3] * m[c] + D[r * 3 + 1] * m[4 + c] + D[r * 3 + 2] * m[8 + c];
+                o[r * 4 + 3] = D[r * 3] * m[3] + D[r * 3 + 1] * m[7] + D[r * 3 + 2] * m[11] + t[r] - off_cur[r];
+            }
+            if (prev) {
+                float* q = prev + j * 12;
+                std::memcpy(q, m, sizeof(float) * 12);
+                for (int r = 0; r < 3; ++r) q[r * 4 + 3] -= off_prev[r];
+            }
+        }
+    }
+    g_stale_shifted.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 // run 12 item 9, [Body] ArmMotionVectors: the player's set's previous half (the motion vectors) from its bones as drawn
 // last frame, as GunMotionVectors does for the gun: transform_set's slot 1 solves the arms to this frame's targets, so a
@@ -4251,6 +4311,11 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         }
         g_corr_world_valid = true;
         g_corr_frame = g_body_frame;
+        for (int h = 0; h < 2; ++h) {  // [Hands] StaleGunFix: the targets it was made with
+            g_corr_ik_ok[h] = f.ik[h];
+            std::memcpy(g_corr_ikt[h], f.ik_t[h], sizeof(g_corr_ikt[h]));
+            std::memcpy(g_corr_ikr[h], f.ik_r[h], sizeof(g_corr_ikr[h]));
+        }
         g_corr_set = g_corr;
         for (int g = 0; g < 2; ++g) {  // for the held item's draws (this thread)
             g_item_set[g] = item[g];
@@ -5333,6 +5398,12 @@ struct FollowObj {  // zero-initialised (the arrays stay in .bss)
     int side;  // John's hand: 0 left, 1 right
     int w;     // the weapon in hand then (the baseline restarts when it changes)
     float m[12];
+    // 2026-10-14 (the user: the gun "shakes slightly when held still and more dramatically when moved", indoors): the
+    // drawn object in the camera it was drawn with (the current viewport's camera matrix +0x140: its rows right, up,
+    // back, then the position), metres along those rows
+    bool cam_ok;
+    float cam_p[3];
+    float cam_r[9];  // its turn in that camera (the camera's rows times the object's 3x3: object to camera)
 };
 struct FollowSample {
     uint64_t frame;
@@ -5340,7 +5411,18 @@ struct FollowSample {
     bool w_ok[2][2];          // [eye][hand]
     float w[2][2][12];
     FollowObj obj[3][2];      // [object][eye]
+    bool hv_ok[2];            // each controller in the head's frame (the latest views, the latched hands): metres
+    float hv[2][3];
+    float hq[2][4];           // and its turn there (x y z w)
 };
+// q* v for a unit quaternion q (x y z w)
+void follow_qrot(const float* q, const float* v, float* o) {
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    const float tx = 2 * (y * v[2] - z * v[1]), ty = 2 * (z * v[0] - x * v[2]), tz = 2 * (x * v[1] - y * v[0]);
+    o[0] = v[0] + w * tx + (y * tz - z * ty);
+    o[1] = v[1] + w * ty + (z * tx - x * tz);
+    o[2] = v[2] + w * tz + (x * ty - y * tx);
+}
 constexpr int kFollowMax = 900;
 FollowSample g_follow[kFollowMax];
 int g_follow_n = 0;
@@ -5359,6 +5441,26 @@ FollowSample* follow_at(uint64_t frame) {
     FollowSample& s = g_follow[g_follow_n++];
     s = FollowSample{};
     s.frame = frame;
+    xr::EyeView v[2];
+    if (xr::eye_views_peek(v)) {  // the controllers in the head's frame (the head: the views' mean position, eye 0's turn)
+        const float hp[3] = {0.5f * (v[0].position[0] + v[1].position[0]), 0.5f * (v[0].position[1] + v[1].position[1]),
+                             0.5f * (v[0].position[2] + v[1].position[2])};
+        const float qc[4] = {-v[0].orientation[0], -v[0].orientation[1], -v[0].orientation[2], v[0].orientation[3]};
+        for (int h = 0; h < 2; ++h) {
+            const hands::Hand hd = hands::get_real(h);
+            if (!hd.valid) continue;
+            const float d[3] = {hd.pos[0] - hp[0], hd.pos[1] - hp[1], hd.pos[2] - hp[2]};
+            follow_qrot(qc, d, s.hv[h]);
+            // conj(head) * hand
+            const float* b = hd.rot;
+            const float* a = qc;
+            s.hq[h][0] = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+            s.hq[h][1] = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+            s.hq[h][2] = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+            s.hq[h][3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+            s.hv_ok[h] = true;
+        }
+    }
     return &s;
 }
 void follow_obj(int which, int side, const float* m) {  // the object's next draw of the recorded pass (under g_draw_mutex)
@@ -5372,13 +5474,26 @@ void follow_obj(int which, int side, const float* m) {  // the object's next dra
     o.w = g_frame.weapon;
     o.stale = g_corr_frame != g_body_frame;
     o.ok = true;
+    o.cam_ok = false;
+    uintptr_t vp = 0;
+    struct M16 {
+        float v[16];
+    } cm{};
+    const float* c = cm.v;
+    if (rd(anchors::addr(anchors::Id::ViewportCurrent), &vp) && vp && rd(vp + 0x140, &cm)) {
+        const float d[3] = {m[3] - c[12], m[7] - c[13], m[11] - c[14]};
+        for (int r = 0; r < 3; ++r) o.cam_p[r] = d[0] * c[r * 4] + d[1] * c[r * 4 + 1] + d[2] * c[r * 4 + 2];
+        for (int r = 0; r < 3; ++r)
+            for (int k = 0; k < 3; ++k) o.cam_r[r * 3 + k] = c[r * 4] * m[0 * 4 + k] + c[r * 4 + 1] * m[1 * 4 + k] + c[r * 4 + 2] * m[2 * 4 + k];
+        o.cam_ok = true;
+    }
 }
 // each object in its wrist's frame (X = W^-1 O) against the first such frame of its gun: the move (mm) and turn (deg);
 // the wrist's own speed (mm a frame), to tell a gun a frame late (its error grows with the speed) from an offset. Under
 // g_draw_mutex; each line logged with `tag`
 std::string follow_report(const char* tag) {
     std::string o;
-    char b[400];
+    char b[900];
     for (int which = 0; which < 6; ++which) {
         const int obj = which / 2, e = which % 2;  // the object, the eye (its k-th draw of the pass)
         const char* name = obj == 0 ? "gun in hand" : obj == 1 ? "own model" : "copy";
@@ -5432,8 +5547,52 @@ std::string follow_report(const char* tag) {
             }
         }
         if (!n) continue;
-        std::snprintf(b, sizeof(b), "\n  %s (weapon %d), eye %d: %d frames (stale %d), worst %.1f mm %.2f deg, rms %.1f mm | the wrist up to %.0f mm a frame; worst at over 20 mm a frame (%d frames) %.1f mm, under 5 mm a frame %.1f mm",
-                      name, wl, e, n, nstale, worst_t, worst_a, std::sqrt(sum2 / n), wsp_max, nfast, fast_t, slow_t);
+        // the shake as seen (2026-10-14): frame to frame, the object's move in the camera it was drawn with against the
+        // controller's in the head's frame (lengths: their frames' axes are not matched); with the controller still
+        // (under 1 mm a frame) the object's whole move is shake
+        int nstill = 0, nmov = 0;
+        float still_max = 0, still2 = 0, mov_max = 0, mov2 = 0;
+        float rs_max = 0, rs2 = 0, rm_max = 0, rm2 = 0;  // the same for the turn (deg a frame)
+        for (int i = 1; i < g_follow_n; ++i) {
+            const FollowSample &a = g_follow[i - 1], &s = g_follow[i];
+            const FollowObj &fa = a.obj[obj][e], &fo = s.obj[obj][e];
+            if (s.frame != a.frame + 1 || !fa.ok || !fo.ok || !fa.cam_ok || !fo.cam_ok || fa.side != fo.side || fa.w != fo.w) continue;
+            const int side = fo.side;
+            if (side < 0 || side > 1 || !a.hv_ok[side] || !s.hv_ok[side]) continue;
+            const float dc = std::sqrt((fo.cam_p[0] - fa.cam_p[0]) * (fo.cam_p[0] - fa.cam_p[0]) + (fo.cam_p[1] - fa.cam_p[1]) * (fo.cam_p[1] - fa.cam_p[1]) +
+                                       (fo.cam_p[2] - fa.cam_p[2]) * (fo.cam_p[2] - fa.cam_p[2])) * 1000.0f;
+            const float dh = std::sqrt((s.hv[side][0] - a.hv[side][0]) * (s.hv[side][0] - a.hv[side][0]) + (s.hv[side][1] - a.hv[side][1]) * (s.hv[side][1] - a.hv[side][1]) +
+                                       (s.hv[side][2] - a.hv[side][2]) * (s.hv[side][2] - a.hv[side][2])) * 1000.0f;
+            // the object's turn between the frames, as seen (A0^T A1), and the controller's in the head's frame
+            float tr = 0.0f;
+            for (int r = 0; r < 3; ++r)
+                for (int k = 0; k < 3; ++k) tr += fa.cam_r[r * 3 + k] * fo.cam_r[r * 3 + k];
+            const float ac = std::acos(std::fmax(-1.0f, std::fmin(1.0f, (tr - 1.0f) * 0.5f))) * 57.2958f;
+            const float* q0 = a.hq[side];
+            const float* q1 = s.hq[side];
+            const float dq = std::fabs(q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3]);
+            const float ah = 2.0f * std::acos(std::fmin(1.0f, dq)) * 57.2958f;
+            if (dh < 1.0f && ah < 0.2f) {
+                ++nstill;
+                still_max = std::fmax(still_max, dc);
+                still2 += dc * dc;
+                rs_max = std::fmax(rs_max, ac);
+                rs2 += ac * ac;
+            } else {
+                const float x = std::fabs(dc - dh), y = std::fabs(ac - ah);
+                ++nmov;
+                mov_max = std::fmax(mov_max, x);
+                mov2 += x * x;
+                rm_max = std::fmax(rm_max, y);
+                rm2 += y * y;
+            }
+        }
+        std::snprintf(b, sizeof(b), "\n  %s (weapon %d), eye %d: %d frames (stale %d), worst %.1f mm %.2f deg, rms %.1f mm | the wrist up to %.0f mm a frame; worst at over 20 mm a frame (%d frames) %.1f mm, under 5 mm a frame %.1f mm"
+                      " | seen from the eye: the controller still %d frames, the object moving rms %.1f max %.1f mm a frame; moving %d frames, off the controller's move rms %.1f max %.1f mm"
+                      " | its turn: still rms %.2f max %.2f deg a frame, moving off the controller's rms %.2f max %.2f deg",
+                      name, wl, e, n, nstale, worst_t, worst_a, std::sqrt(sum2 / n), wsp_max, nfast, fast_t, slow_t, nstill,
+                      nstill ? std::sqrt(still2 / nstill) : 0.0f, still_max, nmov, nmov ? std::sqrt(mov2 / nmov) : 0.0f, mov_max,
+                      nstill ? std::sqrt(rs2 / nstill) : 0.0f, rs_max, nmov ? std::sqrt(rm2 / nmov) : 0.0f, rm_max);
         o += b;
         log::info("[follow]%s %s", tag, b + 3);  // the reply may be cut: each line in the log too
     }
@@ -6077,9 +6236,12 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                                 g_steady_misses.fetch_add(1, std::memory_order_relaxed);
                             }
                         }
-                        if (hi >= 0 && !rec_matrix)  // [Hands] GunMotionVectors: the previous half where it was drawn last frame
+                        if (hi >= 0 && !rec_matrix) {  // [Hands] StaleGunFix (an early draw), then GunMotionVectors
+                            stale_place(xf ? 1 - held : held, held, reinterpret_cast<uintptr_t>(rec[0x10]), sm, sm + static_cast<size_t>(count) * 12,
+                                        count, reinterpret_cast<const float*>(mset + 0x10), reinterpret_cast<const float*>(mset + 0x20));
                             gun_prev_fix(held, reinterpret_cast<uintptr_t>(rec[0x10]), sm, sm + static_cast<size_t>(count) * 12, count,
                                          reinterpret_cast<const float*>(mset + 0x10), reinterpret_cast<const float*>(mset + 0x20));
+                        }
                         if (hi >= 0 && !rec_matrix) {  // run 6 item 1, "skel follow": the gun in hand's root as drawn (world)
                             const float* po = reinterpret_cast<const float*>(mset + 0x10);
                             float m[12];
@@ -6234,7 +6396,10 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     float t[3] = {rm[12], rm[13], rm[14]};
                     for (int k = 0; k < 3; ++k) rm[12 + k] = c.A[k * 3] * t[0] + c.A[k * 3 + 1] * t[1] + c.A[k * 3 + 2] * t[2] + c.a[k];
                 }
-                if (hi >= 0) gun_prev_fix(held, reinterpret_cast<uintptr_t>(rec[0x10]), rc, rc + 16, 0, nullptr, nullptr);  // GunMotionVectors
+                if (hi >= 0) {  // [Hands] StaleGunFix (an early draw), then GunMotionVectors
+                    stale_place(g_item_xfer ? 1 - held : held, held, reinterpret_cast<uintptr_t>(rec[0x10]), rc, rc + 16, 0, nullptr, nullptr);
+                    gun_prev_fix(held, reinterpret_cast<uintptr_t>(rec[0x10]), rc, rc + 16, 0, nullptr, nullptr);
+                }
                 if (hi >= 0 && copy_maps(*hsm, c, &cj.Tw, &cj.Ts)) {
                     cj.kind = 1;
                     cj.rc = rc;
@@ -7011,6 +7176,7 @@ bool install() {
         g_mirror_cfg = config::get_bool("Hands", "TransplantMirror", true);
         g_own_follow = config::get_bool("Hands", "OwnModelFollow", true);
         g_gun_mv = config::get_bool("Hands", "GunMotionVectors", true);
+        g_stale_fix = config::get_bool("Hands", "StaleGunFix", true);
         g_arm_mv = config::get_bool("Body", "ArmMotionVectors", false);  // run 12 item 9
         g_body_with_cam = config::get_bool("Horse", "BodyWithCamera", true);  // run 12 item 8 (on: cycles GL2/GF1 and their captures)
         {  // run 12 item 7: run 11's props belt retired (its keys left in a user ini do nothing)
@@ -7624,7 +7790,8 @@ void before_scene(const float* cam) {
                 log::info("[lag] 10 s: held draws by pass 0/1/3 %u/%u/%u, stale %u/%u/%u | the second gun or own model %u/%u/%u, stale %u/%u/%u | "
                           "matched the newest %llu, an older sample %llu | frames in hand %llu, without a draw %llu | the copy: placed %llu, refused "
                           "%llu (why %d), unmatched %llu, draws by pass 0/1/3 %u/%u/%u, stale %u/%u/%u | the motion vectors: the game's last frame "
-                          "of the gun off where it was drawn mean %.1f max %.1f mm, drawn from last frame's %llu%s, none %llu, jumps %llu",
+                          "of the gun off where it was drawn mean %.1f max %.1f mm, drawn from last frame's %llu%s, none %llu, jumps %llu | early draws moved "
+                          "by the wrist (StaleGunFix %s) %llu since start",
                           hb[0] - h0[0], hb[1] - h0[1], hb[3] - h0[3], sb[0] - s0[0], sb[1] - s0[1], sb[3] - s0[3], ob[0] - o0[0], ob[1] - o0[1], ob[3] - o0[3],
                           osb[0] - os0[0], osb[1] - os0[1], osb[3] - os0[3], static_cast<unsigned long long>(newest - newest0),
                           static_cast<unsigned long long>(older - older0), static_cast<unsigned long long>(frames - frames0),
@@ -7632,7 +7799,8 @@ void before_scene(const float* cam) {
                           static_cast<unsigned long long>(cr - cr0), g_copy_why.load(), static_cast<unsigned long long>(cn - cn0), cb[0] - c0[0],
                           cb[1] - c0[1], cb[3] - c0[3], csb[0] - cs0[0], csb[1] - cs0[1], csb[3] - cs0[3], mv_mean, mv.max,
                           static_cast<unsigned long long>(mv.fixed), g_gun_mv.load(std::memory_order_relaxed) ? "" : " (off: the game's kept)",
-                          static_cast<unsigned long long>(mv.none), static_cast<unsigned long long>(mv.cut));
+                          static_cast<unsigned long long>(mv.none), static_cast<unsigned long long>(mv.cut), g_stale_fix.load() ? "on" : "off",
+                          static_cast<unsigned long long>(g_stale_shifted.load()));
             std::memcpy(c0, cb, sizeof(c0));
             std::memcpy(cs0, csb, sizeof(cs0));
             cp0 = cp, cr0 = cr, cn0 = cn;

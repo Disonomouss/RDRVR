@@ -25,7 +25,18 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_rtv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
 bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
           const D3D12_CPU_DESCRIPTOR_HANDLE* ds, D3D12_CPU_DESCRIPTOR_HANDLE* out_rts, D3D12_CPU_DESCRIPTOR_HANDLE* out_ds);
 void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b);  // before the game's batch
-void before_draw(ID3D12GraphicsCommandList* cl);  // a draw in a region: the walk's end copied first
+// A draw in a region: the walk's end copied first. True: drop it ([Stereo] PrepassInstanced, pass 2: drawn in pass 1).
+bool before_draw(ID3D12GraphicsCommandList* cl);
+// [Stereo] PrepassInstanced (milestone 4a steps 2-4, 2026-10-14; test only, off; needs PrepassArrays=1, PrepassViews=2
+// and the twins, pso.h): pass 1's region binds and clears the six as both slices, sets the view mask to both views and
+// draws a pipeline's twin (pso::twin_of) while every bound target is one of the six; pass 2's region drops those draws
+// (the same rule), skips the six's clears, and from it on to the next pass 1 no draw is predicated (the dropped draws'
+// queries count nothing). The game's pipeline is put back at the region's end. "prepass inst on|off".
+void note_pipeline(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps);  // the game's SetPipelineState in a region
+void before_indirect(ID3D12GraphicsCommandList* cl);  // an ExecuteIndirect in a region: the game's pipeline, not a twin
+bool take_skip_clear();  // after clear_dsv/clear_rtv: true = skip that clear (consumed)
+bool predication_off();
+void set_instanced(bool on);
 // Every game bind while on and outside a region: the game binds the pre-pass's targets before it clears them, so the
 // region's start binds them again with the slices.
 void note_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
@@ -40,7 +51,19 @@ bool views_wanted();
 // (the TAA update's +0x4f0) or nullptr (no jitter)
 void set_eye2(const void* vp2, const void* prev_vp);
 std::string views_status();
-void views_size(bool grown);  // the test's: the two declared sizes grown or as the game's (from the next pass 1)
+void views_size(bool grown);
+// [Stereo] PrepassUnionCull (2026-10-14, milestone 4's culling; test only, off): pass 1's pre-pass walk culls against
+// both eyes (the shadow passes' union viewport's four side planes swapped into the current viewport from the walk's start
+// to its end), so a pre-pass drawn once for both eyes misses nothing eye 2 sees. Extra draws are clipped on the GPU:
+// eye 1's image must not change. "prepass cull on|off" (the session; the hook needs the ini switch at start).
+// [Stereo] PrepassViews=2 and the mod's upright grass (dual_pass hk_ForestDraw, mode 1, pass 1): eye 2's gViewInverse
+// rows 0-1 (b1 rows 25-26) levelled as eye 1's are for the grass draw (the heading's right and up; each eye's own w), and
+// put back after it, so the instanced grass expands its quads the same way in both eyes (2026-10-14, milestone 4).
+void eye2_level(const float* level8);
+void eye2_unlevel();
+bool union_cull_wanted();
+void set_union_cull(bool on);
+std::string cull_status();  // the test's: the two declared sizes grown or as the game's (from the next pass 1)
 // A trace of the frames after "prepass on" (or "prepass trace"): every bind, clear and barrier of the six targets
 // logged with the list's draws so far ([prepass] trace lines), in a region or not. Test only.
 bool tracing();

@@ -376,7 +376,7 @@ void fg_draw(ID3D12GraphicsCommandList* cl) {
 }
 
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
-    if (prepass::active()) prepass::before_draw(cl);
+    if (prepass::active() && prepass::before_draw(cl)) return;  // ([Stereo] PrepassInstanced: drawn in pass 1 for both eyes)
     if (pso::on_draw(cl)) return;
     ++t_draws;
     fg_draw(cl);
@@ -384,7 +384,7 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, U
     o_DrawInstanced(cl, a, b, c, d);
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
-    if (prepass::active()) prepass::before_draw(cl);
+    if (prepass::active() && prepass::before_draw(cl)) return;
     if (pso::on_draw(cl)) return;
     ++t_draws;
     fg_draw(cl);
@@ -398,6 +398,7 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y
 void STDMETHODCALLTYPE hk_ExecuteIndirect(ID3D12GraphicsCommandList* cl, ID3D12CommandSignature* s, UINT n, ID3D12Resource* a,
                                           UINT64 b, ID3D12Resource* c, UINT64 d) {
     fg_count(cl, [](ListLog& l) { ++l.indirect; });
+    if (prepass::active()) prepass::before_indirect(cl);
     o_ExecuteIndirect(cl, s, n, a, b, c, d);
 }
 // ---- barrier watch (d3d::watch_add)
@@ -501,7 +502,10 @@ void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         fg_event(cl, "ClearRTV %s (%.2f %.2f %.2f %.2f)", name.c_str(), c[0], c[1], c[2], c[3]);
     }
     if (prepass::tracing()) prepass::trace_clear(cl, h, false);
-    if (prepass::active()) h = prepass::clear_rtv(cl, h);
+    if (prepass::active()) {
+        h = prepass::clear_rtv(cl, h);
+        if (prepass::take_skip_clear()) return;  // (pass 2's, instanced: its slice was cleared and drawn in pass 1)
+    }
     o_ClearRTV(cl, h, c, n, r);
 }
 void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT d,
@@ -516,7 +520,10 @@ void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         fg_event(cl, "ClearDSV %s depth %.3f", name.c_str(), d);
     }
     if (prepass::tracing()) prepass::trace_clear(cl, h, true);
-    if (prepass::on()) h = prepass::clear_dsv(cl, h);  // (the pre-pass's start: its depth's clear)
+    if (prepass::on()) {
+        h = prepass::clear_dsv(cl, h);  // (the pre-pass's start: its depth's clear)
+        if (prepass::take_skip_clear()) return;
+    }
     o_ClearDSV(cl, h, f, d, s, n, r);
 }
 void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, const void* data, UINT size) {
@@ -530,6 +537,10 @@ void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, c
 }
 void STDMETHODCALLTYPE hk_SetPredication(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, UINT64 off, D3D12_PREDICATION_OP op) {
     fg_count(cl, [](ListLog& l) { ++l.queries; });
+    if (r && prepass::predication_off()) {  // ([Stereo] PrepassInstanced: pass 2's queries count the dropped draws as nothing)
+        r = nullptr;
+        off = 0;
+    }
     o_SetPredication(cl, r, off, op);
 }
 

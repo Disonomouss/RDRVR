@@ -13,6 +13,7 @@
 // ([Controls] MenuChord=1). Both stick clicks held for a second recentre, as on the gamepad. While the RDRVR menu is
 // open nothing goes to the game (the right trigger clicks in the menu). A real gamepad keeps working alongside.
 
+#include <string>
 #include <cstddef>
 
 #include "core/xinput.h"
@@ -72,6 +73,14 @@ bool menu_controls();  // [Controls] MenuControls: in a game menu the triggers a
 void set_menu_controls(bool on, bool save = true);
 bool aim_when_raised();
 void set_aim_when_raised(bool on, bool save = true);
+// [Gestures] FistsBothTriggers (2026-10-14, on; the user: "Holding both triggers activates fighting stance, then continue
+// to hold them while swinging to punch. Holding both and bringing in front of face blocks"): with nothing in hand on
+// foot, both triggers held are the fighting stance (the game's LT; never its RT: the punches are the swings', gestures);
+// either let go ends it; a trigger alone does nothing. The guard's pose takes the triggers as before.
+bool fists_both_triggers();
+bool fist_stance();  // both triggers held now with the fists (the swings punch only then, gestures.cpp)
+void set_fists_both_triggers(bool on, bool save = true);
+std::string fists_status();
 bool jump_drops_aim();  // [Hands] JumpDropsAim (run 7 item 1f): a jump with a gun in hand lets the aim go first
 void set_jump_drops_aim(bool on, bool save = true);
 bool sprint_drops_aim();  // [Hands] SprintDropsAim

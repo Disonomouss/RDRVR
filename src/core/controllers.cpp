@@ -55,6 +55,18 @@ char g_profile[2][96] = {"none", "none"};
 std::atomic<uint64_t> g_syncs{0}, g_not_focused{0}, g_pulses{0};
 std::atomic<uint64_t> g_relocates{0};
 float g_relocate_max_mm = 0.0f, g_relocate_last_mm = 0.0f;  // the latch's move of a hand from the sync's pose (under g_mutex)
+// submit_probe (2026-10-14): the late latch's poses (this frame's draws), and the per-10 s tallies (under g_mutex)
+float g_latched[2][3] = {};
+bool g_latched_ok[2] = {false, false};
+double g_latched_ms = 0.0;
+struct LagTally {
+    uint64_t frames = 0, moving = 0;
+    double sum_mm = 0.0, sum_ms = 0.0;
+    float max_mm = 0.0f, max_ms = 0.0f;
+    uint32_t hist[64] = {};  // 1 mm bins (the last: 63 mm and up), moving frames only
+};
+LagTally g_lag[2];
+double g_lag_since = 0.0;
 // haptics (under g_mutex)
 bool g_haptics = true;
 float g_haptic_gain = 1.0f;
@@ -498,6 +510,8 @@ void relocate(XrSpace base, XrTime time) {
         const bool v = locate(g_aim_space[h], base, time, p, q), gv = locate(g_grip_space[h], base, time, gp, gq);
         if (v) apply_fit(h, p, q);
         if (gv) apply_fit(h, gp, gq);
+        g_latched_ok[h] = v;
+        if (v) std::memcpy(g_latched[h], p, sizeof(p));
         if (v && d.valid) {
             const float dx = p[0] - d.pos[0], dy = p[1] - d.pos[1], dz = p[2] - d.pos[2];
             moved = std::fmax(moved, std::sqrt(dx * dx + dy * dy + dz * dz));
@@ -512,7 +526,56 @@ void relocate(XrSpace base, XrTime time) {
     }
     g_relocate_last_mm = moved * 1000.0f;
     g_relocate_max_mm = std::fmax(g_relocate_max_mm, g_relocate_last_mm);
+    g_latched_ms = log::now_ms();
     g_relocates.fetch_add(1, std::memory_order_relaxed);
+}
+
+void submit_probe(XrSpace base, XrTime time) {
+    std::lock_guard lock(g_mutex);
+    if (!g_ready || base == XR_NULL_HANDLE || !g_any_tracked.load(std::memory_order_relaxed) || g_latched_ms <= 0.0) return;
+    const double now = log::now_ms();
+    if (g_lag_since <= 0.0) g_lag_since = now;
+    const float age = static_cast<float>(now - g_latched_ms);
+    for (int h = 0; h < 2; ++h) {
+        if (!g_latched_ok[h]) continue;
+        float p[3], q[4];
+        if (!locate(g_aim_space[h], base, time, p, q)) continue;
+        apply_fit(h, p, q);
+        const float dx = p[0] - g_latched[h][0], dy = p[1] - g_latched[h][1], dz = p[2] - g_latched[h][2];
+        const float mm = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.0f;
+        LagTally& t = g_lag[h];
+        ++t.frames;
+        t.sum_ms += age;
+        t.max_ms = std::fmax(t.max_ms, age);
+        if (mm >= 2.0f) {
+            ++t.moving;
+            t.sum_mm += mm;
+            t.max_mm = std::fmax(t.max_mm, mm);
+            ++t.hist[mm >= 63.0f ? 63 : static_cast<int>(mm)];
+        }
+    }
+    g_latched_ms = 0.0;  // (one probe per latch)
+    if (now - g_lag_since < 10000.0) return;
+    char b[2][200];
+    for (int h = 0; h < 2; ++h) {
+        const LagTally& t = g_lag[h];
+        uint64_t acc = 0, p95 = 0;
+        for (int i = 0; i < 64; ++i) {
+            acc += t.hist[i];
+            if (acc * 100 >= t.moving * 95) {
+                p95 = static_cast<uint64_t>(i) + 1;
+                break;
+            }
+        }
+        std::snprintf(b[h], sizeof(b[h]), "%s: %llu frames, moving %llu: mean %.1f p95 %llu max %.1f mm, the draw's pose %.1f ms old at the submit (max %.1f)",
+                      h ? "right" : "left", static_cast<unsigned long long>(t.frames), static_cast<unsigned long long>(t.moving),
+                      t.moving ? t.sum_mm / static_cast<double>(t.moving) : 0.0, static_cast<unsigned long long>(t.moving ? p95 : 0), t.max_mm,
+                      t.frames ? t.sum_ms / static_cast<double>(t.frames) : 0.0, t.max_ms);
+    }
+    log::info("[handlag] 10 s: the controller between the draw's pose and the submit (the same display time) | %s | %s", b[0], b[1]);
+    g_lag[0] = LagTally{};
+    g_lag[1] = LagTally{};
+    g_lag_since = now;
 }
 
 bool active() { return g_any_tracked.load(std::memory_order_relaxed); }

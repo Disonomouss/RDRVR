@@ -649,12 +649,16 @@ void frame() {
         if (!velocity(h, now, 60.0, v, &s, nullptr)) continue;  // the latest step or two
         g_last_speed[h] = s;
         if (s > g_peak_speed[h]) g_peak_speed[h] = s;
-        if (!melee && !lasso) continue;
+        const bool stance = st.weapon < 0 && controls::fist_stance();  // [Gestures] FistsBothTriggers: both held
+        if (!melee && !lasso && !stance) continue;
         const float along = v[0] * point[0] + v[1] * point[1] + v[2] * point[2];
         // a punch or a stab: fists (nothing in hand), the knife or the torch; either hand, past the threshold and
         // forward (pulling the hand back after a punch is not another)
         const float fwd_speed = v[0] * fwd_l[0] + v[2] * fwd_l[2];
-        if (melee && (st.weapon < 0 || st.weapon == kKnife || st.weapon == kTorch) && s > g_swing_speed.load(std::memory_order_relaxed) &&
+        // the fists' swing: with FistsBothTriggers only while both triggers are held (the stance), whatever Melee says;
+        // without it as Melee says. The knife and the torch: Melee.
+        const bool fists_ok = st.weapon < 0 && (controls::fists_both_triggers() ? stance : melee);
+        if ((fists_ok || (melee && (st.weapon == kKnife || st.weapon == kTorch))) && s > g_swing_speed.load(std::memory_order_relaxed) &&
             fwd_speed > 0.4f * s && now >= next_ok[h] && !whistle::at_mouth(h)) {  // run 8: a hand to the mouth is no punch
             next_ok[h] = now + 400.0;
             // run 10 item 6 (the user: "moving hand rapidly while on horseback draws last held gun"): riding or driving,

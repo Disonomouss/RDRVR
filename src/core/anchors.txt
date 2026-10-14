@@ -69,6 +69,8 @@ PauseTint                global 0x2c8aca8  # the block's tint alpha
 MapOpen                  global 0x2ac50bb  # byte: the map screen open (1 from rdrMapLayer's OnActivate FUN_140621690 -> FUN_1405fba90 to OnDeactivate FUN_140621aa0 -> FUN_1405fc480; 0 in gameplay, the pause list, the satchel: tests/sim/r13_mapprobe.py)
 LetterboxClear           func   0x5bdd30 16 # (renderer): the letterbox bars' clear (renderer +0x6e0); called by FUN_1405cbfd0 right after the eye's depth pre-pass walk (single-pass stereo, stageVI-prepass.md)
 PrepassLetterboxCall     site   0x5cc32f 5 # that call (after the shadow object's vt+8 walk, before the collector passes): its return address marks the walk's end
+PrepassPreWalk           func   0x65a990 11 # (obj): called by FUN_1405cbfd0 right before the query counter reset and the eye's pre-pass walk (2026-10-14, [Stereo] PrepassUnionCull)
+PrepassPreWalkCall       site   0x5cc2ae 5 # that call: its return address (0x5cc2b3) is the walk's start; next: counter reset, then [shadow obj vt+8](obj, ViewportCurrent, 0, 1)
 HandleWorldView          global 0x2c371e8  # int: the shader global gWorldView's id (resolved by name in SetCurrent 0x130940): ShaderGlobalTable[id] = rage_matrices b1
 HandleViewInverse        global 0x2c371f0  # int: gViewInverse's id (b1)
 HandlePrevWorldVP        global 0x2c371f4  # int: gPrevWorldViewProjSingle's id (rage_prev_world)

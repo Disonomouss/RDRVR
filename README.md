@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.10 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.11 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -254,6 +254,13 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   where your gun hand points (it learns the gun's barrel from your first shot). While it is on, the right stick no
   longer turns the gun: if the gun does not follow your hand, turn it off.
 - New in 0.8.10 (tried in the developer's simulator only): **World scale** (the Comfort tab), how big the world looks.
+- Fixed in 0.8.11 (used in the developer's Quest 3): a gun drawn outside and then taken indoors shimmered when held
+  still and jittered when moved (one of its draws took your hand's place from the frame before; `[Hands] StaleGunFix`,
+  on).
+- New in 0.8.11 (tried in the developer's simulator): **Fists on both triggers** (the Gestures tab, on). With nothing in
+  your hands, hold both triggers for the fighting stance and swing a fist to punch while holding them (whatever "Melee
+  by swing" says); raise both fists before your face to block. A trigger alone does nothing. If something in the game
+  waits for a single trigger with nothing in your hands and does not respond, turn this off.
 
 ## Requirements
 
@@ -271,7 +278,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.10.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.11.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -385,7 +392,7 @@ The body holsters: how you draw, what they follow, placing them by hand, what is
 |---|---|---|
 | **Body holsters** | Reach to a holster and grip to draw; grip and let go there with the weapon to put it away (a short buzz marks a holster). | On |
 | ↳ **Weapons by: The holsters / The weapon wheel** | Draw by reaching to the holsters, or hold a grip to open the game's weapon wheel, move toward a weapon and let go. | The holsters |
-| ↳ **Putting a gun away selects the fists** | Holstering also switches to unarmed, so the left trigger raises your fists instead of drawing again. | On |
+| ↳ **Putting a gun away selects the fists** | Holstering also switches to unarmed, so your fists come up instead of drawing the gun again (since 0.8.11 with both triggers held: "Fists on both triggers"). | On |
 | ↳ **Draw into the hand that grabs the holster** | The gun goes into whichever hand grabbed it, and that hand's trigger fires. | On |
 | ↳ **They follow: John's body / Your headset** | Whether the holsters stay with John's body or move with you (riding and cover always use the body; on horseback they also turn with the right stick's turn of the view). | John's body |
 | ↳ **Turn with the headset** (new in 0.7.0) | The holsters turn around you as you turn your head; off, they face the way John faces. | Off |
@@ -472,7 +479,7 @@ Actions you do with your own hand movements.
 | **Throw by hand** | Dynamite, fire bottles, throwing knives and tomahawks fly with your hand's speed and direction: pull the trigger and swing. | On |
 | ↳ **Throw strength** | How hard throws fly, as a multiple of your hand's speed (0.5× to 4.0×). | 2.0× |
 | ↳ **Throw by letting go of the grip** (new in 0.7.0) | Hold the grip to hold the throwable, pull the trigger to light or ready it, then swing and let go of the grip to throw. A lit one held too long goes off in your hand. | On |
-| **Melee by swing** | A fast swing of either hand punches, stabs with the knife or strikes with the torch. | On |
+| **Melee by swing** | A fast swing of either hand punches, stabs with the knife or strikes with the torch. With "Fists on both triggers" on (0.8.11), the fists punch only while both triggers are held, whatever this says. | On |
 | **Lasso by hand** | With the lasso in hand, its trigger (or a swing, as chosen below) throws it; a yank back pulls. | On |
 | ↳ **Thrown by** (new in 0.8.7) | Trigger, Swing (a fast swing toward the aim), or Either. | Trigger |
 | ↳ **Aimed by** (new in 0.8.7) | Head (where you look), Lasso hand, or Other hand (where your other controller points). | Head |
@@ -480,6 +487,7 @@ Actions you do with your own hand movements.
 | **Gun-butt melee** | Swing the gun in your hand into someone to land the game's knock-out hit (with the usual crime and anger). | On |
 | ↳ **Hit speed** | How fast the gun's swing must be to hit (1.0 to 6.0 m/s). | 1.00 m/s |
 | **Whistle for the horse** | Put a hand at your mouth and pull its trigger to whistle (the gun hand whistles only when it holds no gun). | On |
+| **Fists on both triggers** (new in 0.8.11) | With nothing in your hands, hold both triggers for the fighting stance and swing a fist to punch while holding them; raise both fists before your face to block. A trigger alone does nothing. Off: each trigger as the game has it. | On |
 | **Guard with both fists** (new in 0.8.5) | With your fists out, raise both hands before your face and hold both triggers to block. Fists raised without the triggers stay lowered for the game. Not riding, not in the game's menus. | On |
 | **Tip the hat to greet** (experimental; new in 0.8.5) | Your right hand over your head and its trigger press the game's greet button. Not yet seen to make John greet anyone. | Off |
 | **Hands push loose objects** (experimental) | An empty hand pushes bottles, crates and chairs with the game's physics (never people). | Off |
