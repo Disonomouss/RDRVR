@@ -11,7 +11,9 @@
 
 namespace rdrvr::hands {
 
-enum Button : uint32_t { kA = 1, kB = 2, kMenu = 4, kStick = 8 };
+enum Button : uint32_t { kA = 1, kB = 2, kMenu = 4, kStick = 8,
+    // Steam Frame: the right hand's X / Y, the left hand's D-pad and View (the game's X / Y, D-pad and Back)
+    kX = 16, kY = 32, kDpadUp = 64, kDpadDown = 128, kDpadLeft = 256, kDpadRight = 512, kView = 1024 };
 
 struct Hand {
     bool valid = false;           // the aim pose is tracked

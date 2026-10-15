@@ -498,6 +498,16 @@ bool pad(xinput::PadState* out) {
         else if (t == kPadRT) rt = value[s] > rt ? value[s] : rt;
         else if (t > kNone && t < kTargets && value[s] > 0.5f) p.buttons |= kTargetButton[t];
     }
+    {  // Steam Frame: its own X / Y, D-pad and View, straight onto the pad (either hand: LeftHanded swaps the roles)
+        const uint32_t fb = l.buttons | r.buttons;
+        if (fb & hands::kX) p.buttons |= XINPUT_GAMEPAD_X;
+        if (fb & hands::kY) p.buttons |= XINPUT_GAMEPAD_Y;
+        if (fb & hands::kDpadUp) p.buttons |= XINPUT_GAMEPAD_DPAD_UP;
+        if (fb & hands::kDpadDown) p.buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
+        if (fb & hands::kDpadLeft) p.buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
+        if (fb & hands::kDpadRight) p.buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+        if (fb & hands::kView) p.buttons |= XINPUT_GAMEPAD_BACK;
+    }
     if (actions::fire_blocked()) rt = 0.0f;  // [Reload] ManualActions: the gun's action not worked (open, or not cycled)
     // [Gestures] GuardTriggers (2026-10-12): both triggers held with the fists before the face are the guard's, which
     // holds the game's block (LT, RB): RT, the fists' attack, would break it (cycle G1: no block with it held)

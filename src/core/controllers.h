@@ -27,7 +27,7 @@ namespace rdrvr::controllers {
 inline constexpr const char* kProfileExtensions[] = {
     "XR_BD_controller_interaction",       "XR_EXT_hp_mixed_reality_controller", "XR_HTC_vive_cosmos_controller_interaction",
     "XR_HTC_vive_focus3_controller_interaction", "XR_FB_touch_controller_pro", "XR_META_touch_controller_plus",
-    "XR_EXT_samsung_odyssey_controller"};
+    "XR_EXT_samsung_odyssey_controller", "XR_VALVE_frame_controller_interaction"};
 void note_extension(const char* name);  // xr.cpp: one it enabled
 void note_api(XrVersion v);             // xr.cpp: the instance's API version
 
