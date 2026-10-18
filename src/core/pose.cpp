@@ -16,6 +16,7 @@
 #include "core/holster.h"
 #include "core/log.h"
 #include "core/state.h"
+#include "core/steering.h"
 #include "core/vr_mode.h"
 #include "core/reload.h"
 #include "core/xinput.h"
@@ -209,6 +210,7 @@ void on_frame_end(uint64_t) {
         // (it follows the vehicle's, StickTurn's offset over it), not for the saddle anchor (the driver's bench is not
         // over the vehicle's middle line: the camera stays over John's own root)
         const bool have_st = api::actor_state(&st);
+        const bool driving = have_st && (st.flags & RDRVR_ACTOR_DRIVING);
         const bool vehicle = have_st && st.mount != 0 && (st.flags & RDRVR_ACTOR_VEHICLE);
         const bool riding = have_st && st.mount != 0 && (!vehicle || g_vehicle_heading.load(std::memory_order_relaxed));
         if (riding != g_was_riding) {
@@ -336,8 +338,9 @@ void on_frame_end(uint64_t) {
         // stick steering it is not turned at all
         float yaw = 0;
         if (camera_lever::head_yaw_deg(&yaw)) g_last_head_yaw = yaw;
-        float stick_yaw = stick_steer ? 0.0f : g_last_head_yaw;
-        if (riding && !stick_steer) stick_yaw = std::fmod(g_heading + g_last_head_yaw - st.mount_heading + 540.0f, 360.0f) - 180.0f;
+        // Driver controls stay vehicle-relative even before a mount is available,
+        // with VehicleHeading off, or when the horse preference is head steering.
+        const float stick_yaw = steering::stick_yaw_deg(driving, riding, stick_steer, g_last_head_yaw, g_heading, st.mount_heading);
         // the gamepad's left stick turned by the head's yaw (and its right x kept for turning), and the controllers' too
         xinput::set_pad_turn(true, stick_yaw);
         if (controllers) {

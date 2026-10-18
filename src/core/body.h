@@ -1,4 +1,5 @@
 #pragma once
+#include "core/body_facing.h"
 // The player's body in first person (G-C): the head and hat hidden. The player's skeleton is reached the way the
 // GET_OBJECT_NAMED_BONE_POSITION handler (FUN_140230700) reaches it: the object handle (from the gameplay plugin's
 // GET_OBJECT_FROM_ACTOR) -> the ObjectsPool slot -> the object -> its virtual +0x100 (1) = the skeleton:
@@ -67,6 +68,7 @@ constexpr int kHolsterBones = 7;  // 0 pistol (right hip), 1 rifle (back), 2 thr
 constexpr int kPelvisPoint = 5;   // the pelvis as drawn: the held props' anchor (held_prop::note_root)
 struct BodyPoints {
     double ms = 0;
+    body_facing::Heading facing;  // the facing sample that placed these bones
     bool hand_ok[2] = {false, false};
     float hand[2][3] = {};
     bool bone_ok[kHolsterBones] = {};

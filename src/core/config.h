@@ -9,6 +9,7 @@
 namespace rdrvr::config {
 
 void load();    // (re)reads both files; safe to call again (e.g. from the test channel)
+bool legacy_holsters();  // old LowerBack keys without explicit new Lasso layout keys
 
 bool get_bool(const char* section, const char* key, bool def);
 int get_int(const char* section, const char* key, int def);

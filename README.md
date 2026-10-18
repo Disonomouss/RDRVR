@@ -631,6 +631,34 @@ on another build (or after a game update) the mod looks for each one by its sign
 from `tools/gen_buildsig.py`) and runs on the found addresses only when every one is found and checked; otherwise it
 installs no game hooks.
 
+### Standalone regression tests
+
+From an x64 MSVC developer prompt, with CMake and Ninja available:
+
+```powershell
+cmake -S tests -B out/regression-tests -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build out/regression-tests
+ctest --test-dir out/regression-tests --output-on-failure
+```
+
+These tests use synthetic data and require no game files, headset, OpenXR runtime, vcpkg dependencies or RedHook SDK.
+They cover bounded skeleton reads, physical body/holster facing, carriage input axes, current/previous holster
+draw-record transforms, pelvis-relative holster mirroring and legacy settings compatibility. The settings test
+creates synthetic INIs only inside its build directory and exercises the actual config loader, reset protection,
+profile selection and explicit override precedence. Passing tests does not establish correct headset rendering.
+
+### Keeping an older holster layout
+
+An existing profile with `LowerBackOffset`, `LowerBackRadius`, `LowerBackEnabled` or `LowerBackWeapon`, and no
+explicit `LassoOffset`, `LassoRadius`, `LassoEnabled` or `LassoWeapon`, keeps the old pelvis-relative lower-back
+knife/lasso slot. Its old keys still control placement, enablement and weapon choice. This profile bypasses the
+one-time release settings reset, and keeps the older melee, whistle and lasso controls unless their newer options
+are explicitly set. No settings file is rewritten by this compatibility path.
+
+This is not a general migration from old positions to the new customizable-belt layout. Replacing an old shipped
+INI with one that defines the new Lasso keys selects the newer layout. Keep both existing INIs when preserving an
+older setup; opting into a newer layout requires reviewing its placement and settings.
+
 ## How it works (briefly)
 
 - `dinput8.dll` (the core) loads with the game, hooks its D3D12 renderer to draw the scene once per eye, owns the

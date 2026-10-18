@@ -32,6 +32,8 @@
 #include "core/log.h"
 #include "core/pose.h"
 #include "core/reload.h"
+#include "core/rig_snapshot.h"
+#include "core/holster_record.h"
 
 namespace rdrvr::body {
 namespace {
@@ -173,69 +175,39 @@ struct Rig {
 Rig g_rig;
 std::atomic<uint32_t> g_rig_gen{0};  // build_rig's count: a filter entry is for one rig
 
-int bone_index(uintptr_t bones, int count, const char* name) {
-    size_t n = std::strlen(name);
-    for (int i = 0; i < count; ++i) {
-        uintptr_t p = 0;
-        char s[40] = {};
-        if (!rd(bones + i * 0x110, &p) || !p || !readable(p, n + 1)) continue;
-        std::memcpy(s, reinterpret_cast<const void*>(p), n + 1);
-        if (std::strcmp(s, name) == 0) return i;
-    }
-    return -1;
-}
-
-std::vector<int> subtree(uintptr_t bones, int count, int root) {
-    std::vector<int> out{root};
-    uintptr_t root_rec = bones + static_cast<uintptr_t>(root) * 0x110;
-    for (int i = 0; i < count; ++i) {
-        if (i == root) continue;
-        uintptr_t p = 0;
-        rd(bones + i * 0x110 + 0x20, &p);
-        for (int depth = 0; p && depth < 64; ++depth) {
-            if (p == root_rec) {
-                out.push_back(i);
-                break;
-            }
-            if (!rd(p + 0x20, &p)) break;
-        }
-    }
-    return out;
-}
-
 void mul3(const float* a, const float* b, float* o);
 bool build_rig(uintptr_t data, const std::string& up_name) {
     if (data == g_rig.data && up_name == g_rig.up_name) return g_rig.head >= 0;
-    g_rig = Rig{};
-    g_rig_gen.fetch_add(1, std::memory_order_relaxed);  // the filter's entries are for one rig
-    g_rig.data = data;
-    g_rig.up_name = up_name;
-    uintptr_t bones = 0;
-    uint16_t count = 0;
-    if (!rd(data, &bones) || !rd(data + 0x30, &count) || !bones || count == 0 || count > 512) return false;
-    g_rig.count = count;
+    const double started = log::now_ms();
+    rig_snapshot::Reader reader;
+    rig_snapshot::Snapshot snapshot;
+    if (!snapshot.load(reader, data)) {
+        log::limited("body.rig.snapshot", 8, "[body] rig snapshot rejected (unreadable or invalid metadata); %zu memory-region queries", reader.queries());
+        return false;
+    }
+    Rig rig;
+    rig.data = data;
+    rig.up_name = up_name;
+    const uint16_t count = snapshot.source.count;
+    rig.count = count;
     {
-        uintptr_t locals = 0;
-        g_rig.jbind.assign(static_cast<size_t>(count) * 3, 0.0f);
+        rig.jbind.assign(static_cast<size_t>(count) * 3, 0.0f);
         std::vector<float> grot(static_cast<size_t>(count) * 9, 0.0f);
-        if (rd(data + 0x20, &locals) && locals && readable(locals, static_cast<size_t>(count) * 0x40)) {
-            const float* L = reinterpret_cast<const float*>(locals);
+        if (snapshot.has_locals) {
             for (int i = 0; i < count; ++i) {
-                const float* l = L + i * 16;
+                const float* l = snapshot.locals[i].data();
                 float rl[9];  // column form: the transpose of the stored axis rows
                 for (int r = 0; r < 3; ++r)
                     for (int c = 0; c < 3; ++c) rl[r * 3 + c] = l[c * 4 + r];
-                uintptr_t par = 0;
-                rd(bones + i * 0x110 + 0x20, &par);
-                int pi = par ? static_cast<int>((par - bones) / 0x110) : -1;
+                const int pi = snapshot.parents[i];
                 float* gr = &grot[static_cast<size_t>(i) * 9];
-                float* gt = &g_rig.jbind[static_cast<size_t>(i) * 3];
+                float* gt = &rig.jbind[static_cast<size_t>(i) * 3];
                 if (pi < 0 || pi >= i) {
                     std::memcpy(gr, rl, sizeof(rl));
                     for (int k = 0; k < 3; ++k) gt[k] = l[12 + k];
                 } else {
                     const float* pr = &grot[static_cast<size_t>(pi) * 9];
-                    const float* pt = &g_rig.jbind[static_cast<size_t>(pi) * 3];
+                    const float* pt = &rig.jbind[static_cast<size_t>(pi) * 3];
                     mul3(pr, rl, gr);
                     for (int k = 0; k < 3; ++k) gt[k] = pr[k * 3] * l[12] + pr[k * 3 + 1] * l[13] + pr[k * 3 + 2] * l[14] + pt[k];
                 }
@@ -244,100 +216,96 @@ bool build_rig(uintptr_t data, const std::string& up_name) {
             log::warn("[body] no default local matrices: joints from the skeleton only");
         }
     }
-    g_rig.head = bone_index(bones, count, "head");
-    if (g_rig.head < 0) return false;
-    g_rig.head_set = subtree(bones, count, g_rig.head);
+    rig.head = snapshot.index("head");
+    if (rig.head < 0) return false;
+    rig.head_set = snapshot.subtree(rig.head);
     for (int h = 0; h < 2; ++h) {
         const char* sfx = h ? "_r" : "_l";
-        g_rig.arm[h] = bone_index(bones, count, (std::string("arm") + sfx).c_str());
-        g_rig.elbow[h] = bone_index(bones, count, (std::string("elbow") + sfx).c_str());
-        g_rig.wrist[h] = bone_index(bones, count, (std::string("wrist") + sfx).c_str());
-        g_rig.armroll[h] = bone_index(bones, count, (std::string("armroll") + sfx).c_str());
-        g_rig.wristroll[h] = bone_index(bones, count, (std::string("wristroll") + sfx).c_str());
-        if (g_rig.arm[h] >= 0) g_rig.arm_set[h] = subtree(bones, count, g_rig.arm[h]);
-        if (g_rig.elbow[h] >= 0) g_rig.elbow_set[h] = subtree(bones, count, g_rig.elbow[h]);
-        if (g_rig.wrist[h] >= 0) g_rig.wrist_set[h] = subtree(bones, count, g_rig.wrist[h]);
-        g_rig.att_wrist[h] = bone_index(bones, count, (std::string("wrist") + sfx + "_Attachment").c_str());
-        int cl = bone_index(bones, count, (std::string("clavicle") + sfx).c_str());
-        if (cl >= 0) g_rig.clav_set[h] = subtree(bones, count, cl);
+        rig.arm[h] = snapshot.index((std::string("arm") + sfx).c_str());
+        rig.elbow[h] = snapshot.index((std::string("elbow") + sfx).c_str());
+        rig.wrist[h] = snapshot.index((std::string("wrist") + sfx).c_str());
+        rig.armroll[h] = snapshot.index((std::string("armroll") + sfx).c_str());
+        rig.wristroll[h] = snapshot.index((std::string("wristroll") + sfx).c_str());
+        if (rig.arm[h] >= 0) rig.arm_set[h] = snapshot.subtree(rig.arm[h]);
+        if (rig.elbow[h] >= 0) rig.elbow_set[h] = snapshot.subtree(rig.elbow[h]);
+        if (rig.wrist[h] >= 0) rig.wrist_set[h] = snapshot.subtree(rig.wrist[h]);
+        rig.att_wrist[h] = snapshot.index((std::string("wrist") + sfx + "_Attachment").c_str());
+        int cl = snapshot.index((std::string("clavicle") + sfx).c_str());
+        if (cl >= 0) rig.clav_set[h] = snapshot.subtree(cl);
     }
     {
         const char* const names[4] = {"pistol", "rifle", "thrower", "melee"};
-        for (int i = 0; i < 4; ++i) g_rig.holster[i] = bone_index(bones, count, names[i]);
-        g_rig.holster[6] = bone_index(bones, count, "rope");  // the Lasso holster (2026-10-13)
+        for (int i = 0; i < 4; ++i) rig.holster[i] = snapshot.index(names[i]);
+        rig.holster[6] = snapshot.index("rope");  // the Lasso holster (2026-10-13)
         const char* const pieces[body::kPieces] = {"pistol", "melee", "thrower", "rope", "rifle"};  // run 12 item 2
         for (int i = 0; i < body::kPieces; ++i) {
-            g_rig.piece[i] = bone_index(bones, count, pieces[i]);
-            g_rig.piece_set[i] = g_rig.piece[i] > 0 ? subtree(bones, count, g_rig.piece[i]) : std::vector<int>{};
+            rig.piece[i] = snapshot.index(pieces[i]);
+            rig.piece_set[i] = rig.piece[i] > 0 ? snapshot.subtree(rig.piece[i]) : std::vector<int>{};
         }
         // 2026-10-13 (the user: "When satchel moves, lasso moves. Not the same vice versa"): a piece's bone under another
         // piece's (the rope under the thrower) is that piece's alone: each moved by its own move only
         std::vector<int> own_set[body::kPieces];
         for (int i = 0; i < body::kPieces; ++i) {
-            own_set[i] = g_rig.piece_set[i];
+            own_set[i] = rig.piece_set[i];
             for (int j = 0; j < body::kPieces; ++j) {
-                if (j == i || g_rig.piece[j] <= 0 || g_rig.piece[j] == g_rig.piece[i]) continue;
+                if (j == i || rig.piece[j] <= 0 || rig.piece[j] == rig.piece[i]) continue;
                 bool under = false;
-                for (int x : g_rig.piece_set[i]) under = under || x == g_rig.piece[j];
+                for (int x : rig.piece_set[i]) under = under || x == rig.piece[j];
                 if (!under) continue;
-                log::info("[body] the belt's piece %d (bone %d) hangs under piece %d (bone %d): moved by its own move only", j, g_rig.piece[j], i,
-                          g_rig.piece[i]);
+                log::info("[body] the belt's piece %d (bone %d) hangs under piece %d (bone %d): moved by its own move only", j, rig.piece[j], i,
+                          rig.piece[i]);
                 std::vector<int> kept;
                 for (int x : own_set[i]) {
                     bool theirs = false;
-                    for (int y : g_rig.piece_set[j]) theirs = theirs || x == y;
+                    for (int y : rig.piece_set[j]) theirs = theirs || x == y;
                     if (!theirs) kept.push_back(x);
                 }
                 own_set[i].swap(kept);
             }
         }
-        for (int i = 0; i < body::kPieces; ++i) g_rig.piece_set[i].swap(own_set[i]);
+        for (int i = 0; i < body::kPieces; ++i) rig.piece_set[i].swap(own_set[i]);
     }
-    g_rig.in_elbow.assign(count, 0);
-    g_rig.in_wrist.assign(count, 0);
-    g_rig.side.assign(count, -1);
+    rig.in_elbow.assign(count, 0);
+    rig.in_wrist.assign(count, 0);
+    rig.side.assign(count, -1);
     for (int h = 0; h < 2; ++h) {
-        for (int b : g_rig.elbow_set[h]) g_rig.in_elbow[b] = 1;
-        for (int b : g_rig.wrist_set[h]) g_rig.in_wrist[b] = 1;
+        for (int b : rig.elbow_set[h]) rig.in_elbow[b] = 1;
+        for (int b : rig.wrist_set[h]) rig.in_wrist[b] = 1;
         // the side group: the clavicle's subtree. The torso collapses to the midpoint of the two cut points, so every
         // hidden point lies on the one line between the cuts and the upper chest (both clavicles and the spine) has no
         // area (round 6 had the torso at the root, and a V-shaped sliver until the clavicles went with the torso; round
         // 6c: with the clavicles on the torso, the sleeve's shoulder seam drew a needle from the elbow to the middle).
-        for (int b : g_rig.clav_set[h]) g_rig.side[b] = static_cast<int8_t>(h);
+        for (int b : rig.clav_set[h]) rig.side[b] = static_cast<int8_t>(h);
     }
-    g_rig.pelvis = bone_index(bones, count, "pelvis");
-    if (g_rig.pelvis >= 0) {
-        std::vector<int> all = subtree(bones, count, g_rig.pelvis), legs;
+    rig.pelvis = snapshot.index("pelvis");
+    if (rig.pelvis >= 0) {
+        std::vector<int> all = snapshot.subtree(rig.pelvis), legs;
         for (const char* leg : {"hip_l", "hip_r"}) {
-            int h = bone_index(bones, count, leg);
+            int h = snapshot.index(leg);
             if (h >= 0) {
-                std::vector<int> t = subtree(bones, count, h);
+                std::vector<int> t = snapshot.subtree(h);
                 legs.insert(legs.end(), t.begin(), t.end());
             }
         }
         for (int b : all)
-            if (std::find(legs.begin(), legs.end(), b) == legs.end()) g_rig.pelvis_set.push_back(b);
+            if (std::find(legs.begin(), legs.end(), b) == legs.end()) rig.pelvis_set.push_back(b);
     }
-    g_rig.up = bone_index(bones, count, up_name.c_str());
-    if (g_rig.up >= 0) g_rig.up_set = subtree(bones, count, g_rig.up);
+    rig.up = snapshot.index(up_name.c_str());
+    if (rig.up >= 0) rig.up_set = snapshot.subtree(rig.up);
     // the chain from the upright bone up the spine (spine00 -> spine03 by default): each level takes a share of the
     // turn, so the waist (pelvis -> spine00, partly weighted) does not stretch (headset round 5b)
     {
         int n = 0;
-        int cur = g_rig.up;
+        int cur = rig.up;
         while (cur >= 0 && n < 4) {
-            g_rig.chain[n] = cur;
-            g_rig.chain_set[n] = subtree(bones, count, cur);
+            rig.chain[n] = cur;
+            rig.chain_set[n] = snapshot.subtree(cur);
             ++n;
-            uintptr_t rec = bones + static_cast<uintptr_t>(cur) * 0x110;
             int nx = -1;
             for (int i = 0; i < count; ++i) {  // the spine child: a bone whose parent is cur and whose name starts "spine"
-                uintptr_t par = 0, nmp = 0;
+                if (snapshot.parents[i] != cur) continue;
                 char nm[8] = {};
-                if (!rd(bones + i * 0x110 + 0x20, &par) || par != rec) continue;
-                if (!rd(bones + i * 0x110, &nmp) || !nmp) continue;
-                for (int k = 0; k < 7; ++k)
-                    if (!rd(nmp + k, &nm[k]) || !nm[k]) break;
+                std::memcpy(nm, snapshot.names[i].data(), 7);
                 if (std::strncmp(nm, "spine", 5) == 0 && !std::strstr(nm, "_")) {
                     nx = i;
                     break;
@@ -346,164 +314,161 @@ bool build_rig(uintptr_t data, const std::string& up_name) {
             cur = nx;
         }
     }
-    g_rig.holster[4] = g_rig.chain[3] >= 0 ? g_rig.chain[3] : g_rig.chain[2];  // the chest (the ammo holster)
-    g_rig.holster[5] = g_rig.pelvis >= 0 ? g_rig.pelvis : g_rig.chain[0];       // the lower back (the knife and lasso)
-    g_rig.in_head.assign(count, 0);
-    g_rig.in_up.assign(count, 0);
-    for (int b : g_rig.head_set) g_rig.in_head[b] = 1;
-    for (int b : g_rig.up_set) g_rig.in_up[b] = 1;
+    rig.holster[4] = rig.chain[3] >= 0 ? rig.chain[3] : rig.chain[2];  // the chest (the ammo holster)
+    rig.holster[5] = rig.pelvis >= 0 ? rig.pelvis : rig.chain[0];       // the lower back (the knife and lasso)
+    rig.in_head.assign(count, 0);
+    rig.in_up.assign(count, 0);
+    for (int b : rig.head_set) rig.in_head[b] = 1;
+    for (int b : rig.up_set) rig.in_up[b] = 1;
     for (int i = 0; i < count; ++i) {
-        uintptr_t p = 0;
-        char nm[40] = {};
-        if (!rd(bones + i * 0x110, &p) || !p) continue;
-        for (int k = 0; k < 39; ++k)
-            if (!rd(p + k, &nm[k]) || !nm[k]) break;
+        const char* nm = snapshot.names[i].data();
         if (std::strstr(nm, "Attachment") || !std::strcmp(nm, "pistol") || !std::strcmp(nm, "melee") || !std::strcmp(nm, "rifle") ||
             !std::strcmp(nm, "thrower") || !std::strcmp(nm, "rope"))
-            g_rig.attach.push_back(i);
+            rig.attach.push_back(i);
     }
     {
         std::vector<uint8_t> is_att(count, 0);
-        for (int b : g_rig.attach) is_att[b] = 1;
+        for (int b : rig.attach) is_att[b] = 1;
         for (int h = 0; h < 2; ++h) {
-            for (int b : g_rig.arm_set[h])
-                if (!g_rig.in_elbow[b]) (is_att[b] ? g_rig.seg_att[h][0] : g_rig.seg_def[h][0]).push_back(b);
-            for (int b : g_rig.elbow_set[h])
-                if (!g_rig.in_wrist[b]) (is_att[b] ? g_rig.seg_att[h][1] : g_rig.seg_def[h][1]).push_back(b);
+            for (int b : rig.arm_set[h])
+                if (!rig.in_elbow[b]) (is_att[b] ? rig.seg_att[h][0] : rig.seg_def[h][0]).push_back(b);
+            for (int b : rig.elbow_set[h])
+                if (!rig.in_wrist[b]) (is_att[b] ? rig.seg_att[h][1] : rig.seg_def[h][1]).push_back(b);
         }
         log::info("[body] arm segments (stretch): left %zu+%zu / %zu+%zu, right %zu+%zu / %zu+%zu (deforming+attachment, upper / fore)",
-                  g_rig.seg_def[0][0].size(), g_rig.seg_att[0][0].size(), g_rig.seg_def[0][1].size(), g_rig.seg_att[0][1].size(),
-                  g_rig.seg_def[1][0].size(), g_rig.seg_att[1][0].size(), g_rig.seg_def[1][1].size(), g_rig.seg_att[1][1].size());
+                  rig.seg_def[0][0].size(), rig.seg_att[0][0].size(), rig.seg_def[0][1].size(), rig.seg_att[0][1].size(),
+                  rig.seg_def[1][0].size(), rig.seg_att[1][0].size(), rig.seg_def[1][1].size(), rig.seg_att[1][1].size());
     }
     {  // the fingers, and the rest pose's middle plane from the left/right joint pairs (the finger mirror)
         static const char* const kFinger[15] = {"thumb_01",  "thumb_02",  "thumb_03",  "finger_11", "finger_12", "finger_13", "finger_21", "finger_22",
                                                 "finger_23", "finger_31", "finger_32", "finger_33", "finger_41", "finger_42", "finger_43"};
         for (int h = 0; h < 2; ++h)
-            for (int i = 0; i < 15; ++i) g_rig.finger[h][i] = bone_index(bones, count, (std::string(kFinger[i]) + (h ? "_r" : "_l")).c_str());
+            for (int i = 0; i < 15; ++i) rig.finger[h][i] = snapshot.index((std::string(kFinger[i]) + (h ? "_r" : "_l")).c_str());
         std::vector<std::pair<int, int>> pairs;
         for (int i = 0; i < 15; ++i)
-            if (g_rig.finger[0][i] >= 0 && g_rig.finger[1][i] >= 0) pairs.push_back({g_rig.finger[0][i], g_rig.finger[1][i]});
-        const int jl[4] = {g_rig.wrist[0], g_rig.elbow[0], g_rig.arm[0], g_rig.att_wrist[0]}, jr[4] = {g_rig.wrist[1], g_rig.elbow[1], g_rig.arm[1], g_rig.att_wrist[1]};
+            if (rig.finger[0][i] >= 0 && rig.finger[1][i] >= 0) pairs.push_back({rig.finger[0][i], rig.finger[1][i]});
+        const int jl[4] = {rig.wrist[0], rig.elbow[0], rig.arm[0], rig.att_wrist[0]}, jr[4] = {rig.wrist[1], rig.elbow[1], rig.arm[1], rig.att_wrist[1]};
         for (int i = 0; i < 4; ++i)
             if (jl[i] >= 0 && jr[i] >= 0) pairs.push_back({jl[i], jr[i]});
         float sum[3] = {0, 0, 0};
         for (auto [l, r] : pairs)
-            for (int k = 0; k < 3; ++k) sum[k] += g_rig.jbind[static_cast<size_t>(l) * 3 + k] - g_rig.jbind[static_cast<size_t>(r) * 3 + k];
+            for (int k = 0; k < 3; ++k) sum[k] += rig.jbind[static_cast<size_t>(l) * 3 + k] - rig.jbind[static_cast<size_t>(r) * 3 + k];
         const float sl = std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
         if (sl > 1e-3f && pairs.size() >= 19) {
-            for (int k = 0; k < 3; ++k) g_rig.mir_n[k] = sum[k] / sl;
-            const float* nn = g_rig.mir_n;
+            for (int k = 0; k < 3; ++k) rig.mir_n[k] = sum[k] / sl;
+            const float* nn = rig.mir_n;
             float c = 0;
             for (auto [l, r] : pairs) {
-                const float* a = &g_rig.jbind[static_cast<size_t>(l) * 3];
-                const float* b = &g_rig.jbind[static_cast<size_t>(r) * 3];
+                const float* a = &rig.jbind[static_cast<size_t>(l) * 3];
+                const float* b = &rig.jbind[static_cast<size_t>(r) * 3];
                 c += nn[0] * (a[0] + b[0]) * 0.5f + nn[1] * (a[1] + b[1]) * 0.5f + nn[2] * (a[2] + b[2]) * 0.5f;
             }
-            g_rig.mir_c = c / static_cast<float>(pairs.size());
+            rig.mir_c = c / static_cast<float>(pairs.size());
             float res = 0;
             for (auto [l, r] : pairs) {
-                const float* a = &g_rig.jbind[static_cast<size_t>(l) * 3];
-                const float* b = &g_rig.jbind[static_cast<size_t>(r) * 3];
+                const float* a = &rig.jbind[static_cast<size_t>(l) * 3];
+                const float* b = &rig.jbind[static_cast<size_t>(r) * 3];
                 float d[3] = {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
                 const float dn = d[0] * nn[0] + d[1] * nn[1] + d[2] * nn[2];
                 for (int k = 0; k < 3; ++k) d[k] -= dn * nn[k];
                 res = std::fmax(res, std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]));
                 const float mid = nn[0] * (a[0] + b[0]) * 0.5f + nn[1] * (a[1] + b[1]) * 0.5f + nn[2] * (a[2] + b[2]) * 0.5f;
-                res = std::fmax(res, std::fabs(mid - g_rig.mir_c));
+                res = std::fmax(res, std::fabs(mid - rig.mir_c));
             }
-            g_rig.mir_res = res;
-            g_rig.mirror_ok = res < 0.005f;
+            rig.mir_res = res;
+            rig.mirror_ok = res < 0.005f;
         }
         log::info("[body] hands: attachments %d/%d, %zu left/right pairs, the rest pose's middle plane n (%.3f %.3f %.3f) c %.3f, off by %.4f m: "
                   "the finger mirror %s",
-                  g_rig.att_wrist[0], g_rig.att_wrist[1], pairs.size(), g_rig.mir_n[0], g_rig.mir_n[1], g_rig.mir_n[2], g_rig.mir_c, g_rig.mir_res,
-                  g_rig.mirror_ok ? "on" : "off");
+                  rig.att_wrist[0], rig.att_wrist[1], pairs.size(), rig.mir_n[0], rig.mir_n[1], rig.mir_n[2], rig.mir_c, rig.mir_res,
+                  rig.mirror_ok ? "on" : "off");
     }
     {  // the still stance's parents and pinned bones
-        g_rig.parent.assign(count, -1);
+        rig.parent.assign(count, -1);
         for (int i = 0; i < count; ++i) {
-            uintptr_t par = 0;
-            if (rd(bones + i * 0x110 + 0x20, &par) && par >= bones && (par - bones) % 0x110 == 0) {
-                const int pi = static_cast<int>((par - bones) / 0x110);
-                if (pi >= 0 && pi < i) g_rig.parent[i] = pi;
-            }
+            const int pi = snapshot.parents[i];
+            if (pi >= 0 && pi < i) rig.parent[i] = pi;
         }
-        g_rig.pin.assign(count, 0);
+        rig.pin.assign(count, 0);
         std::vector<uint8_t> skip(count, 0);
         for (int h = 0; h < 2; ++h) {
-            for (int b : g_rig.arm_set[h]) skip[b] = 1;
-            g_rig.clav[h] = bone_index(bones, count, h ? "clavicle_r" : "clavicle_l");
-            g_rig.foot[h] = bone_index(bones, count, h ? "foot_r" : "foot_l");
-            if (g_rig.foot[h] < 0) g_rig.foot[h] = bone_index(bones, count, h ? "ankle_r" : "ankle_l");
-            g_rig.hipj[h] = bone_index(bones, count, h ? "hip_r" : "hip_l");
-            if (g_rig.hipj[h] >= 0) g_rig.leg_set[h][0] = subtree(bones, count, g_rig.hipj[h]);
-            if (g_rig.foot[h] >= 0) g_rig.leg_set[h][2] = subtree(bones, count, g_rig.foot[h]);
+            for (int b : rig.arm_set[h]) skip[b] = 1;
+            rig.clav[h] = snapshot.index(h ? "clavicle_r" : "clavicle_l");
+            rig.foot[h] = snapshot.index(h ? "foot_r" : "foot_l");
+            if (rig.foot[h] < 0) rig.foot[h] = snapshot.index(h ? "ankle_r" : "ankle_l");
+            rig.hipj[h] = snapshot.index(h ? "hip_r" : "hip_l");
+            if (rig.hipj[h] >= 0) rig.leg_set[h][0] = snapshot.subtree(rig.hipj[h]);
+            if (rig.foot[h] >= 0) rig.leg_set[h][2] = snapshot.subtree(rig.foot[h]);
             // the knee: up the foot's parents to the one whose parent is the hip's child (hip -> knee -> ... -> foot)
-            int k = g_rig.foot[h];
+            int k = rig.foot[h];
             for (int d = 0; k >= 0 && d < 6; ++d) {
-                const int pk = g_rig.parent[k];
+                const int pk = rig.parent[k];
                 if (pk < 0) break;
-                if (g_rig.parent[pk] == g_rig.hipj[h] || pk == g_rig.hipj[h]) {
-                    g_rig.knee[h] = pk == g_rig.hipj[h] ? k : pk;
-                    g_rig.leg_set[h][1] = subtree(bones, count, g_rig.knee[h]);
+                if (rig.parent[pk] == rig.hipj[h] || pk == rig.hipj[h]) {
+                    rig.knee[h] = pk == rig.hipj[h] ? k : pk;
+                    rig.leg_set[h][1] = snapshot.subtree(rig.knee[h]);
                     break;
                 }
                 k = pk;
             }
         }
-        for (int b : g_rig.attach) skip[b] = 1;
-        g_rig.belt_pin.assign(count, 0);
+        for (int b : rig.attach) skip[b] = 1;
+        rig.belt_pin.assign(count, 0);
         for (const char* nm : {"pistol", "thrower", "melee"}) {
-            const int bi = bone_index(bones, count, nm);
-            if (bi > 0 && bi < count && !(bi < static_cast<int>(g_rig.side.size()) && g_rig.side[bi] >= 0)) g_rig.belt_pin[bi] = 1;  // never an arm's
+            const int bi = snapshot.index(nm);
+            if (bi > 0 && bi < count && !(bi < static_cast<int>(rig.side.size()) && rig.side[bi] >= 0)) rig.belt_pin[bi] = 1;  // never an arm's
         }
         auto pin_all = [&](const std::vector<int>& v) {
             for (int b : v)
-                if (b > 0 && b < count && !skip[b]) g_rig.pin[b] = 1;
+                if (b > 0 && b < count && !skip[b]) rig.pin[b] = 1;
         };
-        pin_all(g_rig.pelvis_set);
-        pin_all(g_rig.chain_set[0]);
+        pin_all(rig.pelvis_set);
+        pin_all(rig.chain_set[0]);
         int np = 0;
-        for (uint8_t p : g_rig.pin) np += p;
+        for (uint8_t p : rig.pin) np += p;
         log::info("[body] the still stance: %d bones pinned (the torso less the arms, the legs and the attachments); feet %d %d", np,
-                  g_rig.foot[0], g_rig.foot[1]);
+                  rig.foot[0], rig.foot[1]);
     }
     // the highest bone anything here touches: a set is transformed only when it holds it (the draw's count test)
-    auto cover = [](int b) { g_rig.max_index = b > g_rig.max_index ? b : g_rig.max_index; };
+    auto cover = [&rig](int b) { rig.max_index = b > rig.max_index ? b : rig.max_index; };
     auto cover_all = [&](const std::vector<int>& v) {
         for (int b : v) cover(b);
     };
-    cover(g_rig.head);
-    cover(g_rig.up);
-    cover(g_rig.pelvis);
-    cover_all(g_rig.head_set);
-    cover_all(g_rig.up_set);
-    cover_all(g_rig.attach);
-    cover_all(g_rig.pelvis_set);
-    for (int b : g_rig.holster) cover(b);
+    cover(rig.head);
+    cover(rig.up);
+    cover(rig.pelvis);
+    cover_all(rig.head_set);
+    cover_all(rig.up_set);
+    cover_all(rig.attach);
+    cover_all(rig.pelvis_set);
+    for (int b : rig.holster) cover(b);
     for (int k = 0; k < 4; ++k) {
-        cover(g_rig.chain[k]);
-        cover_all(g_rig.chain_set[k]);
+        cover(rig.chain[k]);
+        cover_all(rig.chain_set[k]);
     }
     for (int h = 0; h < 2; ++h) {
-        cover(g_rig.arm[h]);
-        cover(g_rig.elbow[h]);
-        cover(g_rig.wrist[h]);
-        cover(g_rig.att_wrist[h]);
-        cover_all(g_rig.clav_set[h]);
-        cover_all(g_rig.arm_set[h]);
-        cover_all(g_rig.elbow_set[h]);
-        cover_all(g_rig.wrist_set[h]);
+        cover(rig.arm[h]);
+        cover(rig.elbow[h]);
+        cover(rig.wrist[h]);
+        cover(rig.att_wrist[h]);
+        cover_all(rig.clav_set[h]);
+        cover_all(rig.arm_set[h]);
+        cover_all(rig.elbow_set[h]);
+        cover_all(rig.wrist_set[h]);
         for (int k = 0; k < 2; ++k) {
-            cover_all(g_rig.seg_def[h][k]);
-            cover_all(g_rig.seg_att[h][k]);
+            cover_all(rig.seg_def[h][k]);
+            cover_all(rig.seg_att[h][k]);
         }
-        for (int i = 0; i < 15; ++i) cover(g_rig.finger[h][i]);
-        cover(g_rig.clav[h]);
+        for (int i = 0; i < 15; ++i) cover(rig.finger[h][i]);
+        cover(rig.clav[h]);
     }
     log::info("[body] rig: %u bones (the highest used %d); head %d (+%zu under it); upright bone \"%s\" %d (+%zu under it)", count,
-              g_rig.max_index, g_rig.head, g_rig.head_set.size() - 1, up_name.c_str(), g_rig.up, g_rig.up_set.empty() ? 0 : g_rig.up_set.size() - 1);
-    log::info("[body] %zu attachment bones (props are moved or hidden with the body); pelvis %d (+%zu, legs excluded)", g_rig.attach.size(), g_rig.pelvis, g_rig.pelvis_set.empty() ? 0 : g_rig.pelvis_set.size() - 1);
+              rig.max_index, rig.head, rig.head_set.size() - 1, up_name.c_str(), rig.up, rig.up_set.empty() ? 0 : rig.up_set.size() - 1);
+    log::info("[body] %zu attachment bones (props are moved or hidden with the body); pelvis %d (+%zu, legs excluded)", rig.attach.size(), rig.pelvis, rig.pelvis_set.empty() ? 0 : rig.pelvis_set.size() - 1);
+    // Publish only the complete rig. Rejected snapshots leave the old cache intact.
+    g_rig = std::move(rig);
+    g_rig_gen.fetch_add(1, std::memory_order_relaxed);
+    log::info("[body] rig snapshot: %zu memory-region queries, %.2f ms", reader.queries(), log::now_ms() - started);
     return true;
 }
 
@@ -539,6 +504,7 @@ const HeldSample* newest_held(const HeldSample (&held)[kHeldRing]) {
 }
 
 struct Frame {
+    body_facing::Heading facing;
     bool valid = false;
     uintptr_t skel = 0;
     bool hide = false;
@@ -4365,6 +4331,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
             g_hand_corr[h].ik = f.ik[h];
         }
         g_points.ms = now;
+        g_points.facing = f.facing;
         std::memcpy(g_points.cam, f.cam, sizeof(g_points.cam));
         g_points.cam_ok = f.cam_ok;
         g_points.fore_ok = pub_fore;
@@ -6122,7 +6089,12 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                         // camera-relative space as the player's own set (a held rifle: the player set's correction for
                         // its bone, as is, put it in the hands)
                         const bool rec_matrix = (*reinterpret_cast<const uint32_t*>(reinterpret_cast<uintptr_t>(rec) + 0xac) & 0x10000) != 0;
-                        if (!rec_matrix && hp) {  // a held prop's skinned set: the world less its offset, moved in the world
+                        if (rec_matrix && hp && hp_slot >= held_prop::kHolsterSlot && hp_slot < held_prop::kModelSlot) {
+                            // Move the outer current/previous record together, leaving local bones intact.
+                            // Record-only and record*bone consumers must see the same correction.
+                            // The existing rec_save path restores both halves after the draw.
+                            holster_record::apply_delta(rc, c.A, c.a);
+                        } else if (!rec_matrix && hp) {  // a held prop's skinned set: the world less its offset, moved in the world
                             const float* po = reinterpret_cast<const float*>(mset + 0x10);
                             for (size_t j = 0; j < static_cast<size_t>(count) * 2; ++j) {
                                 float* m = sm + j * 12;
@@ -7274,6 +7246,7 @@ bool install() {
 }
 
 void before_scene(const float* cam) {
+    static body_facing::HeadFacing physical_facing;
     {  // the filter's new entries, logged here (never in the draw hook), at most 4 a frame
         std::lock_guard lock(g_cull_note_mutex);
         for (int k = 0; k < 4 && g_cull_note_logged < g_cull_note_n; ++k, ++g_cull_note_logged) {
@@ -7292,7 +7265,10 @@ void before_scene(const float* cam) {
         log::info("[body] first-person body %s", active ? "on" : "off");
     }
     g_frame.valid = false;
-    if (!active) return;
+    if (!active) {
+        physical_facing = {};
+        return;
+    }
     bool hide, follow, lock_facing;
     float back, sign, pitch_deg;
     int stance;
@@ -7366,6 +7342,22 @@ void before_scene(const float* cam) {
         }
     }
     g_actor_flags.store(flags, std::memory_order_relaxed);
+    // Keep shoulders, elbow hints and holsters in one sampled facing frame.
+    // Tracking and camera transforms never receive the physical yaw a second time.
+    const float root_forward_length = std::hypot(w[8] * sign, w[10] * sign);
+    const bool physical_turn = root_forward_length > 1e-3f &&
+        body_facing::follows_physical_turn(pose::anchor_active(), lock_facing, f.actor_valid, flags);
+    // VehicleHeading/StickTurn can now supply a separate wagon view offset.
+    // Drivers use that view's tracking frame; horseback/cover keep their old frame.
+    const bool driver_view = physical_turn && (flags & RDRVR_ACTOR_DRIVING);
+    const float tracking_heading = driver_view ? pose::body_heading_deg() : pose::torso_heading_deg();
+    float head_yaw = 0;
+    const uint32_t before_gen = camera_lever::recentre_gen();
+    const bool head_valid = physical_turn && camera_lever::head_yaw_deg(&head_yaw);
+    const uint32_t after_gen = camera_lever::recentre_gen();
+    f.facing = physical_facing.sample(tracking_heading, physical_turn, head_valid && before_gen == after_gen,
+                                      head_yaw, after_gen, driver_view);
+    const float drawn_heading = f.facing.drawn_deg * 0.0174532925f;
     {  // [Body] Stance=still: the bind pose's origin, the head's height low-passed as the camera's (pose.cpp)
         static bool s_ok = false, prev_ok = false;
         static float s_h = 0.0f, prev_t[3] = {};
@@ -7551,8 +7543,8 @@ void before_scene(const float* cam) {
         std::memcpy(f.ik_r[hh], rr, sizeof(rr));
         std::memcpy(grip_wp[hh], wp, sizeof(wp));
         for (int k = 0; k < 3; ++k) f.ik_t[hh][k] = wp[k] + rr[k * 3 + 2] * hc.wrist_offset;  // back along the grip's +z
-        // the elbow's hint: down, out to the side, a little back (the camera's heading)
-        float hd_ = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's while the ride's view is turned
+        // The elbow hint and corrected shoulders use the same facing sample.
+        float hd_ = drawn_heading;
         float fwd[3] = {-std::sin(hd_), 0, -std::cos(hd_)}, right[3] = {std::cos(hd_), 0, -std::sin(hd_)};
         float out = hh ? 1.0f : -1.0f;
         for (int k = 0; k < 3; ++k) f.ik_pole[hh][k] = (k == 1 ? -1.0f : 0.0f) + 0.6f * out * right[k] - 0.3f * fwd[k];
@@ -7641,9 +7633,9 @@ void before_scene(const float* cam) {
         }
     }
     f.pitch = pitch_deg * 0.0174532925f;
-    // the facing lock: the angle about the world's up from the actor's forward (the root's -z) to the camera's
+    // the facing lock: the angle about the world's up from the actor's forward (the root's -z) to the drawn body's
     // (heading h faces (-sin h, -cos h))
-    float h = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's while the ride's view is turned
+    float h = drawn_heading;  // horseback and cover retain their existing torso frame
     float cfx = -std::sin(h), cfz = -std::cos(h);
     f.view_h = h;
     {
@@ -7666,8 +7658,10 @@ void before_scene(const float* cam) {
     }
     float off[3];
     if (follow && camera_lever::head_offset(off)) {
-        sw[0] += std::cos(h) * off[0] + std::sin(h) * off[2];
-        sw[2] += -std::sin(h) * off[0] + std::cos(h) * off[2];
+        // Head translation is expressed in the neutral tracking frame.
+        const float tracking_h = f.facing.tracking_deg * 0.0174532925f;
+        sw[0] += std::cos(tracking_h) * off[0] + std::sin(tracking_h) * off[2];
+        sw[2] += -std::sin(tracking_h) * off[0] + std::cos(tracking_h) * off[2];
     }
     for (int k = 0; k < 3; ++k) f.shift_bind[k] = sw[0] * w[k * 4 + 0] + sw[1] * w[k * 4 + 1] + sw[2] * w[k * 4 + 2];
     f.shift = sw[0] != 0 || sw[2] != 0;

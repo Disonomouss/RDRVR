@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.20)
+project(RDRVRRegressionTests LANGUAGES CXX)
+
+# Standalone: no game, OpenXR runtime, vcpkg packages or RedHook SDK needed.
+# rig_snapshot uses Windows VirtualQuery and MSVC structured exceptions.
+if(NOT MSVC OR NOT WIN32)
+    message(FATAL_ERROR "These tests require Windows and the MSVC C++ toolchain")
+endif()
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+enable_testing()
+foreach(name rig_snapshot body_facing steering holster_record holster_frame)
+    add_executable(${name}_test ${name}_test.cpp)
+    target_compile_features(${name}_test PRIVATE cxx_std_20)
+    target_compile_definitions(${name}_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(${name}_test PRIVATE /W4 /WX /permissive- /utf-8)
+    target_include_directories(${name}_test PRIVATE ../src)
+    add_test(NAME ${name} COMMAND ${name}_test)
+endforeach()
+
+add_executable(settings_compat_test settings_compat_test.cpp ../src/core/config.cpp)
+target_compile_features(settings_compat_test PRIVATE cxx_std_20)
+target_compile_definitions(settings_compat_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(settings_compat_test PRIVATE /W4 /WX /permissive- /utf-8)
+target_include_directories(settings_compat_test PRIVATE ../src)
+target_link_libraries(settings_compat_test PRIVATE shell32 ole32)
+add_test(NAME settings_compat COMMAND settings_compat_test "${CMAKE_CURRENT_BINARY_DIR}/compat-scratch")

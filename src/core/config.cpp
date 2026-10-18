@@ -1,5 +1,7 @@
 #include "core/config.h"
+#include "core/legacy_holsters.h"
 
+#include <atomic>
 #include <cstring>
 
 #include <windows.h>
@@ -29,6 +31,7 @@ std::map<std::string, Value> g_values;  // "section.key" (lower case) -> value
 std::map<std::string, std::string> g_shipped;  // the shipped RDRVR.ini's own values (a reset to the defaults)
 std::set<std::string> g_echoed;
 wchar_t g_user_path[MAX_PATH] = {};
+std::atomic<bool> g_legacy_holsters{false};
 
 std::string lower(std::string s) {
     for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
@@ -95,6 +98,7 @@ void echo(const char* section, const char* key, const std::string& shown, const 
 }  // namespace
 
 const wchar_t* user_ini_path() { return g_user_path; }
+bool legacy_holsters() { return g_legacy_holsters.load(); }
 
 bool g_user_override = false;
 
@@ -189,7 +193,23 @@ void load() {
     g_echoed.clear();  // re-echo after a reload so the log shows what the new values are
     parse_file(ini, "ini");
     if (g_user_path[0]) parse_file(g_user_path, "user");
+    const bool legacy = rdrvr::legacy_holsters::selected([](const char* key) {
+        return g_values.contains("holsters." + lower(key));
+    });
+    g_legacy_holsters = legacy;
+    if (legacy) {
+        // New optional input modes must not silently replace a legacy profile's
+        // melee/whistle/lasso controls. Explicit INI values always win.
+        g_values.try_emplace("gestures.fistsbothtriggers", Value{"0", "legacy-default"});
+        g_values.try_emplace("gestures.guard", Value{"0", "legacy-default"});
+        g_values.try_emplace("gestures.tiphat", Value{"0", "legacy-default"});
+        g_values.try_emplace("gestures.lassothrow", Value{"swing", "legacy-default"});
+    }
     ReleaseSRWLockExclusive(&g_lock);
+    if (legacy) {
+        log::info("[cfg] legacy holster profile: LowerBack layout and existing settings preserved; no release reset");
+        return;
+    }
     // 2026-10-13 (the user: "For the next release, can you have my current ini settings overwrite the users. I worry
     // there are people who have played since an early version whose old settings keep on carrying over"): a release
     // whose shipped ini names a [Compat] SettingsReset tag starts each player from its defaults once: a user file not

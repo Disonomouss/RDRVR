@@ -25,6 +25,8 @@
 #include "core/d3d_hooks.h"
 #include "core/dual.h"
 #include "core/hands.h"
+#include "core/holster_frame.h"
+#include "core/legacy_holsters.h"
 #include "core/hooks.h"
 #include "core/log.h"
 #include "core/menu.h"
@@ -696,7 +698,7 @@ void holster_frame() {
     auto zone_rounds = [&](int z) { return z == kAmmoZone; };
     auto any_here = [&](int z) { return any_item && z >= 0 && z < kZones && gun_zone(zones[z]); };
     const bool lefty = controls::left_handed();
-    const float hd = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's, not the ride's turned view
+    const float hd = bp.facing.drawn_deg * 0.0174532925f;  // the sample that placed the bones
     const float fwd[3] = {-std::sin(hd), 0.0f, -std::cos(hd)}, right[3] = {std::cos(hd), 0.0f, -std::sin(hd)}, up[3] = {0, 1, 0};
     // the holsters' own frame: the body's, or turned with the headset ([Holsters] TurnWithHead, below)
     float hr[3] = {right[0], right[1], right[2]}, hf[3] = {fwd[0], fwd[1], fwd[2]};
@@ -713,7 +715,6 @@ void holster_frame() {
     // the twins' mirror (and the left-handed layout's) through the pelvis as drawn: the root bone sways against the body
     // (r12_twinbase: 6 cm sideways standing still), and a twin mirrored through it went twice that (the user's "Left
     // sidearm ring still moves around")
-    const float* mid = bp.bone_ok[body::kPelvisPoint] ? bp.bone[body::kPelvisPoint] : bp.root;
     for (int z = 0; z < kZones; ++z) {
         // the wheel mode (run 8 item 5): no holster draws or put-aways, the chest's rounds kept
         zok[z] = zones[z].enabled && bp.bone_ok[zones[z].bone] && (zone_rounds(z) || !wheel::wheel_mode());
@@ -726,15 +727,13 @@ void holster_frame() {
             }
         }
         if (zones[z].mirror) {  // the twin's bone: mirrored across the body's middle
-            const float d = (base[0] - mid[0]) * right[0] + (base[2] - mid[2]) * right[2];
-            for (int k = 0; k < 3; ++k) base[k] -= 2.0f * d * right[k];
+            holster_frame::mirror_body_point(base, right, bp.root, bp.bone[body::kPelvisPoint], bp.bone_ok[body::kPelvisPoint]);
         }
         std::memcpy(bases[z], base, sizeof(base));
         for (int k = 0; k < 3; ++k)
             zp[z][k] = base[k] + right[k] * zoff(z, 0) + up[k] * zoff(z, 1) + fwd[k] * zoff(z, 2);
         if (lefty) {  // the whole layout mirrored across the body's middle: the sidearm on the left hip
-            const float d = (zp[z][0] - mid[0]) * right[0] + (zp[z][2] - mid[2]) * right[2];
-            for (int k = 0; k < 3; ++k) zp[z][k] -= 2.0f * d * right[k];
+            holster_frame::mirror_body_point(zp[z], right, bp.root, bp.bone[body::kPelvisPoint], bp.bone_ok[body::kPelvisPoint]);
         }
     }
     {  // [Holsters] Anchor=headset: every zone moved with the neck's offset since recentre (in the game camera's rows:
@@ -836,7 +835,8 @@ void holster_frame() {
                     zyaw = 0.0f;
                 }
                 float hy = 0.0f;
-                if (!g_turn_head.load(std::memory_order_relaxed)) {
+                const bool turn_head = g_turn_head.load(std::memory_order_relaxed);
+                if (!turn_head) {
                     zyaw = 0.0f;
                 } else if (camera_lever::head_yaw_deg(&hy)) {  // (no head pose this frame: kept where they point)
                     // [Holsters] TurnByHands: both hands well ahead of the neck: the target halfway to their direction
@@ -858,7 +858,7 @@ void holster_frame() {
                         const float sx = bp.hand[0][0] - bp.hand[1][0], sz = bp.hand[0][2] - bp.hand[1][2];
                         ahead = ahead && std::sqrt(sx * sx + sz * sz) < 0.35f;
                         if (ahead) {
-                            hands_yaw = std::remainder(std::atan2(-mx, -mz) * 57.29578f - hd * 57.29578f, 360.0f);
+                            hands_yaw = std::remainder(std::atan2(-mx, -mz) * 57.29578f - bp.facing.tracking_deg, 360.0f);
                             hy += 0.5f * std::remainder(hands_yaw - hy, 360.0f);
                         }
                     }
@@ -870,7 +870,7 @@ void holster_frame() {
                     zyaw = std::remainder(zyaw, 360.0f);
                 }
                 g_zone_yaw_pub.store(zyaw, std::memory_order_relaxed);
-                const float a = hd + zyaw * 0.0174532925f;
+                const float a = bp.facing.holster_deg(turn_head, zyaw) * 0.0174532925f;
                 hf[0] = -std::sin(a), hf[2] = -std::cos(a);
                 hr[0] = std::cos(a), hr[2] = -std::sin(a);
             }
@@ -918,7 +918,9 @@ void holster_frame() {
     // turn with you"): riding, the right stick's turn of the view turns the whole layout with it, about the head's
     // vertical axis: the player's own hips turn with their view while John keeps facing the horse (run 9 had the holsters
     // follow the horse)
-    const float ride_turn = (st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_VEHICLE)) ? pose::ride_turn_deg() : 0.0f;
+    // A driver's sampled body frame already includes the vehicle's view turn.
+    const float ride_turn = bp.facing.remaining_ride_turn(
+        (st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_VEHICLE)) ? pose::ride_turn_deg() : 0.0f);
     if (ride_turn != 0.0f && bp.cam_ok) {
         const float* cp = bp.cam + 12;
         const float a = hd + ride_turn * 0.0174532925f;
@@ -2047,6 +2049,7 @@ bool g_zone_defaults_ok = false;
 void load_zones() {
     std::lock_guard lock(g_zone_mutex);
     if (!g_zone_defaults_ok) {
+        if (config::legacy_holsters()) legacy_holsters::defaults(g_zones);
         for (int i = 0; i < kZones; ++i) g_zone_defaults[i] = g_zones[i];
         g_zone_defaults_ok = true;
     }
@@ -2087,7 +2090,8 @@ void load_zones() {
             z.weapon = weapon_from_token(config::get_string("Holsters", "AmmoWeapon", "auto"));
         } else if (z.slots[0] >= 0) {
             // the lower back takes the old knife holster's choice unless it has its own
-            z.weapon = weapon_from_token(config::get_string("Holsters", (std::string(z.key) + "Weapon").c_str(), "auto"));
+            const std::string def = !std::strcmp(z.key, "LowerBack") ? config::get_string("Holsters", "KnifeWeapon", "auto") : "auto";
+            z.weapon = weapon_from_token(config::get_string("Holsters", (std::string(z.key) + "Weapon").c_str(), def.c_str()));
             z.enabled = config::get_bool("Holsters", (std::string(z.key) + "Enabled").c_str(), z.enabled);
         }
     }
