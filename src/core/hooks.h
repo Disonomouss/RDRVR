@@ -16,6 +16,13 @@ bool install(const char* name, void* target, Fn detour, Fn* original) {
     return install(name, target, reinterpret_cast<void*>(detour), reinterpret_cast<void**>(original));
 }
 
+// ([Debug] PixCapturer, test only) on: a target already hooked is refused (logged; a backstop only: d3d's pre-scan installs no D3D12
+// vtable hook when two of its slots share a target, since the first detour would take the other method's calls). Off: nothing checked
+void set_refuse_shared(bool on);
+// the name of the installed hook on `target`; nullptr none (the PIX pre-scan's check against what is installed already)
+const char* hooked_name(void* target);
+void describe_target(void* target, char* out, size_t len);  // "module+rva" (or the address)
+
 int count();                                   // installed hooks
 void describe(char* out, size_t out_len);      // "name@module+rva, ..." for the status file
 

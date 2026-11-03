@@ -38,8 +38,11 @@ std::atomic<float> g_last_d[2] = {-1.0f, -1.0f};  // each hand's distance from t
 // inputs-greet-block.md), pressed for 200 ms; that trigger kept from the game as the whistle's is. Not with a gun in
 // that hand.
 std::atomic<bool> g_hat_on{false};
-float g_hat_off[3] = {0.0f, 0.15f, 0.03f};  // under g_mutex
-float g_hat_radius = 0.11f;                 // under g_mutex
+// (2026-11-02, GOAL-older-items item 4: the user's logs, 12 sessions, never a tip: the point at the brim now, 13 cm up and
+// 8 cm forward, 13 cm round (the mouth's 10 cm round 21 cm below: where both reach, the nearer); a trigger near it that
+// does not count is logged with why)
+float g_hat_off[3] = {0.0f, 0.13f, 0.08f};  // under g_mutex
+float g_hat_radius = 0.13f;                 // under g_mutex
 double g_hat_until = 0.0;
 std::atomic<uint64_t> g_tips{0};
 std::atomic<float> g_hat_d{-1.0f};  // the right hand's distance from the hat point at the last poll (m)
@@ -92,13 +95,13 @@ void init() {
               "the gun hand too %d (the game's whistle: D-pad up)",
               g_on.load() ? 1 : 0, o[0], o[1], o[2], r, g_gun_hand.load() ? 1 : 0);
     g_hat_on = config::get_bool("Gestures", "TipHat", true);  // run 10 item 5: on (the user's request)
-    float ho[3] = {0.0f, 0.15f, 0.03f};
+    float ho[3] = {0.0f, 0.13f, 0.08f};
     {
-        const std::string s = config::get_string("Gestures", "TipHatOffset", "0.000 0.150 0.030");
+        const std::string s = config::get_string("Gestures", "TipHatOffset", "0.000 0.130 0.080");
         float a = 0, b = 0, c = 0;
         if (sscanf_s(s.c_str(), "%f %f %f", &a, &b, &c) == 3 && std::fabs(a) < 0.5f && std::fabs(b) < 0.5f && std::fabs(c) < 0.5f) ho[0] = a, ho[1] = b, ho[2] = c;
     }
-    float hr = config::get_float("Gestures", "TipHatRadius", 0.11f);
+    float hr = config::get_float("Gestures", "TipHatRadius", 0.13f);
     hr = !(hr >= 0.03f) ? 0.03f : hr > 0.30f ? 0.30f : hr;
     {
         std::lock_guard lock(g_mutex);
@@ -147,11 +150,24 @@ bool poll(double now, float trig[2]) {
             const float d = std::sqrt((p[0] - hp[0]) * (p[0] - hp[0]) + (p[1] - hp[1]) * (p[1] - hp[1]) + (p[2] - hp[2]) * (p[2] - hp[2]));
             g_hat_d.store(d, std::memory_order_relaxed);
             at_hat = d < hrad && !gun && !(ds.on) && !menu::visible() && !controls::game_menu_open();  // (B is the game's reload, and Cancel in its menus)
+            if (at_hat && at_pt) {  // (both reached: the nearer one's)
+                if (g_last_d[h].load(std::memory_order_relaxed) < d) at_hat = false;
+                else at_pt = false;
+            }
         }
         g_mouth[h].store(at_pt || at_hat, std::memory_order_relaxed);  // (the punch is not judged for either)
         if (at_pt) g_polls_at_mouth.fetch_add(1, std::memory_order_relaxed);
         const bool down = trig[h] > 0.5f, was = g_trig_was[h];
         g_trig_was[h] = down;
+        if (h == 1 && have_hat && down && !was && !at_hat && g_hat_d.load(std::memory_order_relaxed) >= 0.0f &&
+            g_hat_d.load(std::memory_order_relaxed) < hrad + 0.20f) {  // (item 4) a press near the hat that did not count: why
+            static double logged = -1e9;
+            if (now - logged > 3000.0) {
+                logged = now;
+                log::info("[whistle] the right trigger near the hat, not a tip: %.2f m from the point (within %.2f), gun in hand %d, a second gun %d, "
+                          "a menu %d", g_hat_d.load(), hrad, gun ? 1 : 0, ds.on ? 1 : 0, menu::visible() || controls::game_menu_open() ? 1 : 0);
+            }
+        }
         if (at_hat && down && !was) {  // the press over the head: the greet
             g_hat_until = now + kPressMs;
             g_tips.fetch_add(1, std::memory_order_relaxed);

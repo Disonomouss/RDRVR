@@ -20,6 +20,9 @@ void status_text(char* out, size_t len);
 // 0 Off, 1 FXAA, 2 native TAA (technique 2 with the mod's resolve); false unless the core forces the AA mode.
 bool set_aa(int mode);
 int forced_aa();
+// (run 21 item 4) the AA setter hook installed (ForceAntiAliasing set and the hook in): every setter call gets frame
+// generation 0. Set once by install() (after prepass::install()), so readers check it at run time
+bool aa_hook_installed();
 // [Render] DlssFullJitter: DLSS's jitter sequence at 8 x (output / render width)^2 samples (the game leaves DLAA's 8)
 void set_full_jitter(bool on);
 void jitter_text(char* out, size_t len);  // "dlss jitter: ..."

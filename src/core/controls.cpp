@@ -77,6 +77,18 @@ constexpr int kSrcLeftStickClick = 4;  // kSourceKeys[4]
 std::atomic<bool> g_click_brake{true};
 int g_click_route = 0;
 bool g_lclk_was = false;
+// 2026-10-27 ([XR] PhysicalCrouch; the user: "Implement roomscale and physical crouch", research/run27/roomscale.md C1):
+// on foot both stick clicks (the recentre chord) sent L3 too and crouched John (ENGINE-NOTES 5434). With the physical
+// crouch on, route 2 whenever both are down on foot, and a left click alone is held back kChordWaitMs from its press
+// (route 3) for the right one to join: then nothing; held longer, the game's L3 from then; let go sooner, a 120 ms tap
+constexpr double kChordWaitMs = 150.0;
+double g_lclk_since = 0.0, g_lclk_tap_until = 0.0;
+std::atomic<uint64_t> g_chord_held{0};  // chords whose L3 was kept from the game
+// the physical crouch's press (pose.cpp): L3 for the game until then, a timer of its own (not inject's single slot, the
+// punch's and the lasso's; not xinput::press, the test aids'). Presenting thread
+double g_crouch_until = 0.0;
+std::atomic<uint64_t> g_crouch_pulses{0};
+std::atomic<double> g_user_l3_ms{-1e12};  // the last pad the player's own L3 went out in (the mod's pulse not counted)
 std::atomic<uint64_t> g_brakes{0};
 // [Hands] TriggerAims: with a gun in hand in first person, the right trigger alone fires. The game shoots only from its
 // aim pose (FUN_140d169a0 drops a fire request otherwise), so while the trigger is used LT is held for it, from the
@@ -171,6 +183,7 @@ uint16_t g_menu_tab_button = 0;
 int g_menu_dir = -1;  // the stick's step direction held: 0 up, 1 down, 2 left, 3 right
 double g_menu_dir_since = 0.0, g_menu_next_step = 0.0, g_menu_step_until = 0.0;
 constexpr double kStepPulse = 70.0, kStepFirstRepeat = 450.0, kStepRepeat = 180.0;
+std::atomic<uint64_t> g_wheel_steps{0};  // the wheel's D-pad steps from the holding hand's stick
 // The map screen (2026-10-11, the user: "the map is no longer usable. Does not respond to controls"): it pans by the
 // left stick's analog axes only and zooms by LT/RT (the game's action table: @MAP.SCROLL_* on the stick's directions,
 // no D-pad; @UI.ZOOM_OUT/IN on LT/RT), so MenuControls leaves it the raw stick and triggers. Its byte (anchor MapOpen)
@@ -191,7 +204,46 @@ bool game_menu_now() {
 std::atomic<bool> g_wrist_satchel{false};
 std::atomic<uint64_t> g_satchels{0}, g_wy_single{0}, g_y_frames{0};
 std::atomic<double> g_lt_ms{0.0};  // the last frame the game's LT was pressed (2026-10-12: the fists' fighting stance)
+// 2026-10-30 (item 12): the last pad's LT before the mod's presses (player_lt), and when
+std::atomic<float> g_player_lt{0.0f};
+std::atomic<double> g_player_lt_ms{-1e12};
 double g_back_until = 0;
+// [Controls] FlickUpRB (2026-10-31, the off-hand build step 1, R5; rounds 53.10 / 53.14, the user: "Can no longer use
+// grip as rb, use flick up on right hand joystick"): the gun hand's grip holds the gun (HoldToKeep), so the game's RB
+// (cover, Dead Eye's paint) comes from the layout's right stick flicked up: past OpenStickY in the upward cone and back
+// under 0.3 within OpenFlickMs (the down flick's own rule, actions.cpp), then RB for kFlickRbMs (r78 inputs P5: one
+// 120 ms pulse entered cover with a gun held, a second left it). Riding only in Dead Eye (the user, 2026-10-31: "Only
+// work in dead eye": riding, RB is the brake)
+constexpr double kFlickRbMs = 120.0;
+std::atomic<bool> g_flick_rb{true};
+double g_rb_until = 0.0, g_up_t0 = 0.0;
+bool g_up_armed = true;
+std::atomic<uint64_t> g_up_flicks{0}, g_up_skipped{0};
+void flick_up_rb(float x, float y, double now, bool seated, bool deadeye, bool menu) {
+    if (!g_flick_rb.load(std::memory_order_relaxed)) return;
+    const bool cone = y > 0.0f && std::fabs(x) <= 0.6f * y;
+    const float fms = actions::open_flick_ms() > 0.0f ? actions::open_flick_ms() : 300.0f;
+    if (cone && y >= actions::open_stick_y() && g_up_armed) {
+        g_up_armed = false;
+        g_up_t0 = now;
+    }
+    if (g_up_t0 > 0.0 && now - g_up_t0 > fms) g_up_t0 = 0.0;  // held too long: not a flick
+    // back near the centre (the stick's length, not y alone: pushed up and rolled sideways to turn is no flick; the
+    // review, as filter_second_stick's len)
+    if (std::sqrt(x * x + y * y) < 0.3f) {
+        if (g_up_t0 > 0.0) {
+            if (menu || (seated && !deadeye)) {
+                g_up_skipped.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_rb_until = now + kFlickRbMs;
+                g_up_flicks.fetch_add(1, std::memory_order_relaxed);
+                log::info("[controls] the right stick flicked up: RB (%s)", deadeye ? "Dead Eye" : seated ? "riding" : "on foot");
+            }
+        }
+        g_up_t0 = 0.0;
+        g_up_armed = true;
+    }
+}
 // run 9 item 2 (the user: "too easy to accidentally trigger with one press"): two taps within SatchelTapMs open the
 // satchel. The first tap is held back for that window (from its release): a second press inside it makes the pair (no Y
 // at all); none, and the game gets its Y at the window's end (a single Y SatchelTapMs late)
@@ -234,6 +286,10 @@ bool in_use(int h, const hands::Hand& d, double now) {
 
 bool game_menu_open() { return game_menu_now(); }
 double last_lt_ms() { return g_lt_ms.load(std::memory_order_relaxed); }  // run 10 (the review): the guard, the hat tip, the motion blur in the menu
+float player_lt(double* ms) {
+    if (ms) *ms = g_player_lt_ms.load(std::memory_order_relaxed);
+    return g_player_lt.load(std::memory_order_relaxed);
+}
 
 void init() {
     g_grip_on = config::get_float("Controls", "GripThreshold", 0.6f);
@@ -249,6 +305,8 @@ void init() {
     g_menu_ctl = config::get_bool("Controls", "MenuControls", true);
     g_w_shop = api::watch_native(0x6F2509E8u, reinterpret_cast<uint64_t>(kShopLayer), 1);  // UI_ISFOCUSED
     g_left_handed = config::get_bool("Controls", "LeftHanded", false);
+    g_flick_rb = config::get_bool("Controls", "FlickUpRB", true);
+    log::info("[controls] the right stick flicked up presses RB (FlickUpRB) %d (riding: only in Dead Eye)", g_flick_rb.load() ? 1 : 0);
     g_click_brake = config::get_bool("Horse", "StickClickBrake", true);
     g_trigger_aims = config::get_bool("Hands", "TriggerAims", true);
     g_fists_both = config::get_bool("Gestures", "FistsBothTriggers", true);
@@ -307,10 +365,15 @@ bool pad(xinput::PadState* out) {
         l.trigger = trig[0];
         r.trigger = trig[1];
     }
-    if (const dual::State ds = dual::state(); ds.on) (ds.ctrl ? r : l).trigger = 0.0f;  // [Hands] DualWield: the second gun's own
+    // [Hands] DualWield: the second gun's own (a carried long gun is never fired: its hand's trigger stays the game's aim)
+    if (const dual::State ds = dual::state(); ds.on && !ds.carry) (ds.ctrl ? r : l).trigger = 0.0f;
     if (g_left_handed.load(std::memory_order_relaxed)) std::swap(l, r);  // the mirror: every role swapped
     {  // the gun in the layout's other hand (drawn by it): its trigger fires, the other aims; changed only with both let go
-        const bool want = gun_hand() != layout_gun_hand();
+        // (2026-10-31, the off-hand build step 1, R16) not for the lasso: in either hand the left trigger aims and the
+        // right throws (the user, round 59; gestures.cpp reads the throw from the layout's gun-hand controller)
+        RdrvrActorState ls{};
+        const bool lasso_held = api::actor_state(&ls) && ls.weapon == 21;  // WEAPON_LASSO
+        const bool want = gun_hand() != layout_gun_hand() && !lasso_held;
         if (want != g_trig_swapped && l.trigger < 0.15f && r.trigger < 0.15f) g_trig_swapped = want;
         if (g_trig_swapped) std::swap(l.trigger, r.trigger);
     }
@@ -402,8 +465,34 @@ bool pad(xinput::PadState* out) {
         if (now < g_wy_tap_until) l.buttons |= hands::kB;
         if (now < g_back_until) p.buttons |= XINPUT_GAMEPAD_BACK;  // the game's GENERIC.INVENTORY
     }
-    // both stick clicks held a second: recentre
-    if ((l.buttons & hands::kStick) && (r.buttons & hands::kStick)) {
+    const bool rclk_raw = (r.buttons & hands::kStick) != 0;  // (the recentre's, below: the right click before the gun's filter)
+    {  // [Reload] ManualActions: a revolver opens by a flick down (that cone consumed); RevolverControl=cock: its click held down
+        // (not while the layout's right hand holds the wheel: its stick is the wheel's D-pad then, not the gun's flicks)
+        const int wh = wheel::holder();
+        const bool wheel_right = wh >= 0 && wheel::stick_dpad() && (wh == 1) != g_left_handed.load(std::memory_order_relaxed);
+        bool rclick = (r.buttons & hands::kStick) != 0;
+        RdrvrActorState s0{};
+        const bool seated = api::actor_state(&s0) && (s0.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING));
+        if (!wheel_right)  // (before the actions' filter: it returns early with ManualActions off; the down cone is its own)
+            flick_up_rb(rx, ry, now, seated, (s0.weapon_flags & RDRVR_WEAPON_DEADEYE) != 0,
+                        game_menu_now() || menu::visible() || map_open() || !pose::anchor_active() ||
+                            menu_down);  // (the review: the menu button's D-pad zeroes the stick, a flick's "back" then)
+        if (!wheel_right) actions::filter_stick(&rx, &ry, &rclick, seated);
+        if (!rclick) r.buttons &= ~static_cast<uint32_t>(hands::kStick);
+        // [Hands] DualWieldOpen (2026-10-28): the second gun's own stick (the layout's left, after the mirror: its controller
+        // the other one) held down and clicked opens it; that click never the game's L3 (nor the crouch, the chord's wait:
+        // gone from the buttons from its press); not filtered while it is the wheel's D-pad
+        // (2026-10-29: riding too, its brake as the crouch held back until the click is held in; the stick's walk wait on foot only)
+        const bool wheel_left = wh >= 0 && wheel::stick_dpad() && (wh == 1) == g_left_handed.load(std::memory_order_relaxed);
+        bool lclick = (l.buttons & hands::kStick) != 0;
+        actions::filter_second_stick(g_left_handed.load(std::memory_order_relaxed) ? 1 : 0, &l.stick[0], &l.stick[1], &lclick, rclk_raw, seated,
+                                     wheel_left);  // (the wheel's D-pad: not filtered, its state reset)
+        if (lclick) l.buttons |= hands::kStick;  // (a passed click kept down its least length)
+        else l.buttons &= ~static_cast<uint32_t>(hands::kStick);
+    }
+    // both stick clicks held a second: recentre (2026-10-29: after the filters, so a left click the second gun took is not
+    // half of it; the right click as it came, the revolver's held click included, as before)
+    if ((l.buttons & hands::kStick) && rclk_raw) {
         if (!g_combo_since) g_combo_since = now;
         if (!g_combo_fired && now - g_combo_since >= 1000) {
             g_combo_fired = true;
@@ -414,8 +503,10 @@ bool pad(xinput::PadState* out) {
         g_combo_since = 0;
         g_combo_fired = false;
     }
-    actions::filter_stick(&rx, &ry);  // [Reload] ManualActions: a revolver opens by a flick down (that cone consumed)
     if (menu::visible()) {  // the menu has the controllers
+        // (2026-10-27) a left click held back for the chord when the menu opened: nothing at its release after the menu
+        if (g_click_route == 3) g_click_route = 2;
+        g_lclk_tap_until = 0.0;
         wheel::cancel();
         g_fist_armed.store(false, std::memory_order_relaxed);
         return false;
@@ -425,13 +516,30 @@ bool pad(xinput::PadState* out) {
     {  // the horse brake: the route decided at the press
         const bool seated = have_st && (st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING));
         const bool lclk = (l.buttons & hands::kStick) != 0, rclk = (r.buttons & hands::kStick) != 0;
+        const bool chord_guard = pose::physical_crouch() && !seated;  // 2026-10-27: on foot, the chord no crouch
         if (lclk && !g_lclk_was) {
             g_click_route = g_click_brake.load(std::memory_order_relaxed) && seated && !rclk && !(st.weapon_flags & RDRVR_WEAPON_DEADEYE) ? 1 : 0;
             if (g_click_route == 1) g_brakes.fetch_add(1, std::memory_order_relaxed);
+            // (2026-10-29: a press DualWieldOpen already held back, DualWieldClickHoldMs, waits no more for the chord)
+            if (g_click_route == 0 && chord_guard) {
+                g_click_route = rclk ? 2 : actions::second_click_waited() ? 0 : 3;  // the right one down already: the chord; else wait for it
+                g_lclk_since = now;
+                if (rclk) g_chord_held.fetch_add(1, std::memory_order_relaxed);
+            }
         } else if (!lclk) {
+            if (g_click_route == 3) g_lclk_tap_until = now + 120.0;  // a short click alone: the game's L3 now, as a tap
             g_click_route = 0;
         } else if (g_click_route == 1 && (!seated || rclk)) {
             g_click_route = 2;  // dismounted, or the recentre chord: neither the brake nor a crouch
+        } else if (g_click_route == 3) {
+            if (rclk) {
+                g_click_route = 2;  // the chord: its L3 never sent
+                g_chord_held.fetch_add(1, std::memory_order_relaxed);
+            } else if (now - g_lclk_since >= kChordWaitMs || !chord_guard) {
+                g_click_route = 0;  // a click held alone: the game's L3 from here
+            }
+        } else if (g_click_route == 0 && chord_guard && rclk) {
+            g_click_route = 2;  // the right one late: L3 let go (its press already reached the game)
         }
         g_lclk_was = lclk;
     }
@@ -498,7 +606,23 @@ bool pad(xinput::PadState* out) {
         else if (t == kPadRT) rt = value[s] > rt ? value[s] : rt;
         else if (t > kNone && t < kTargets && value[s] > 0.5f) p.buttons |= kTargetButton[t];
     }
+    if (now < g_lclk_tap_until) {  // (2026-10-27) the left click held back for the chord and let go alone: its own target, a tap
+        const int t = g_map[kSrcLeftStickClick].load(std::memory_order_relaxed);
+        if (t == kPadLT) lt = 1.0f;  // (mapped to a trigger: that trigger, as the mapping loop gives it)
+        else if (t == kPadRT) rt = 1.0f;
+        else if (t > kNone && t < kTargets) p.buttons |= kTargetButton[t];
+    }
+    if (now < g_rb_until) p.buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;  // [Controls] FlickUpRB's press
+    if (p.buttons & XINPUT_GAMEPAD_LEFT_THUMB) g_user_l3_ms.store(now, std::memory_order_relaxed);  // the player's own L3 (any source)
+    if (now < g_crouch_until) p.buttons |= XINPUT_GAMEPAD_LEFT_THUMB;  // [XR] PhysicalCrouch's press: the game's @FOOT.CROUCH (L3)
     if (actions::fire_blocked()) rt = 0.0f;  // [Reload] ManualActions: the gun's action not worked (open, or not cycled)
+    // [Reload] CarriedBoltTrigger (2026-10-30): the free gun hand's trigger at (or holding) the carried gun's bolt is the bolt's
+    if (actions::carried_trigger_wanted(gun_hand())) rt = 0.0f;
+    // [Reload] OffHandBoltTrigger (2026-11-01): the off hand's trigger at (or holding) the gun in hand's bolt is the bolt's
+    if (actions::carried_trigger_wanted(1 - gun_hand())) lt = 0.0f;
+    // [Hands] DualWieldCrossReload (2026-10-27): the gun hand holds rounds for the second gun (or still holds the trigger it
+    // held them with): the gun in hand fires nothing mid-reload
+    if (holster::cross_holds_fire(gun_hand())) rt = 0.0f;
     // [Gestures] GuardTriggers (2026-10-12): both triggers held with the fists before the face are the guard's, which
     // holds the game's block (LT, RB): RT, the fists' attack, would break it (cycle G1: no block with it held)
     const float rt_unguarded = rt;  // (FistsBothTriggers: the stance holds through the guard)
@@ -719,8 +843,46 @@ bool pad(xinput::PadState* out) {
         g_menu_dir_since = now;
         g_menu_next_step = dir >= 0 ? 1e300 : now;
     }
+    {  // [Holsters] Mode=wheel, WheelStickDpad (2026-10-26): the stick of the hand whose grip holds the wheel is the D-pad
+       // (a push a step, held: repeated, as the menus' steps: the game's gun of the highlighted category), its axes held
+       // back (the left one does not walk, the right one does not turn; the wheel's own stick is the hand's place)
+        static int s_dir = -1;
+        static double s_since = 0, s_next = 0, s_until = 0, s_held_since = 0;
+        const int wc = wheel::holder();
+        if (wc < 0) s_held_since = 0;
+        else if (s_held_since == 0) s_held_since = now;
+        if (wc >= 0 && wheel::stick_dpad()) {
+            const bool right_side = (wc == 1) != swapped;  // the layout's right hand holds it (the left-handed swap)
+            const float sx = right_side ? rx : l.stick[0], sy = right_side ? ry : l.stick[1];
+            const float ax = std::fabs(sx), ay = std::fabs(sy);
+            const float on = s_dir >= 0 ? 0.35f : 0.6f;  // let go below 0.35 once held
+            int dir = -1;
+            // left and right only (the review: up is the game's whistle, and the wheel picks with left and right); and from
+            // 250 ms after the grip (the game opens its wheel after 0.2 s of LB: a push before would reach the game itself)
+            if (ax > ay && ax > on && now - s_held_since >= 250.0) dir = sx > 0.0f ? 3 : 2;
+            if (dir != s_dir) {
+                s_dir = dir;
+                s_since = now;
+                s_next = now;  // a new push: a step at once
+            }
+            if (dir >= 0 && now >= s_next) {
+                s_until = now + 100.0;
+                s_next = now + (now - s_since < 1.0 ? 450.0 : 220.0);
+                g_wheel_steps.fetch_add(1, std::memory_order_relaxed);
+            }
+            static const uint16_t kWheelDir[4] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
+            if (dir >= 0 && now < s_until) p.buttons |= kWheelDir[dir];
+            if (right_side) rx = ry = 0.0f;
+            else p.lx = p.ly = 0;
+        } else {
+            s_dir = -1;
+        }
+    }
     p.rx = axis(rx);
     p.ry = axis(ry);
+    // (item 12) the controllers' own LT, before the mod's presses below: [Gestures] LassoThrow=lock's hold
+    g_player_lt.store(static_cast<float>(p.lt) / 255.0f, std::memory_order_relaxed);
+    g_player_lt_ms.store(now, std::memory_order_relaxed);
     {
         std::lock_guard lock(g_inject_mutex);
         if (now < g_inj_until) {
@@ -767,6 +929,14 @@ void inject(uint16_t buttons, uint8_t rt, int16_t ly, int ms, uint8_t lt, int rt
     g_inj_until = now + (rt_after_ms > 0 ? rt_after_ms : 0) + ms;
     g_inj_lt_shown = false;
     g_injects.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool cancel_pending_rt() {
+    std::lock_guard lock(g_inject_mutex);
+    const double now = log::now_ms();
+    if (!(now < g_inj_until && now < g_inj_rt_from && g_inj_rt == 255 && !g_inj_lt && !g_inj_ly && !g_inj_buttons)) return false;
+    g_inj_until = now;  // (the merge's `now < g_inj_until` fails from here)
+    return true;
 }
 
 const char* source_label(int s) { return s >= 0 && s < kSources ? kSourceLabels[s] : "?"; }
@@ -877,11 +1047,20 @@ void commit_draw_hand(int weapon_in_hand, bool in_hand) {
     }
 }
 bool draw_to_grabbing_hand() { return g_draw_any.load(); }
+uint64_t wheel_steps() { return g_wheel_steps.load(std::memory_order_relaxed); }
 void set_draw_to_grabbing_hand(bool on, bool save) {
     g_draw_any = on;
     if (save) config::set("Hands", "DrawToGrabbingHand", on ? "1" : "0");
 }
 bool take_recentre() { return g_recentre.exchange(false); }
+void crouch_pulse(int ms) {
+    g_crouch_until = log::now_ms() + (ms > 0 ? ms : 0);
+    g_crouch_pulses.fetch_add(1, std::memory_order_relaxed);
+}
+bool left_click_held() { return g_lclk_was || g_click_route == 3 || actions::second_press_pending(); }  // (and DualWieldOpen's held-back press)
+double last_user_l3_ms() { return g_user_l3_ms.load(std::memory_order_relaxed); }
+bool click_tap_pending() { return log::now_ms() < g_lclk_tap_until; }
+uint64_t chords_held() { return g_chord_held.load(std::memory_order_relaxed); }
 
 void status_text(char* out, size_t len) {
     xinput::PadState p = g_last;
@@ -890,7 +1069,7 @@ void status_text(char* out, size_t len) {
                   "wrist satchel %d (opened %llu, window %.0f ms, single taps %llu: Y after %.0f ms; Y to the game %llu frames), game menu controls %d (in a menu %d: frames %llu, tab presses %llu, stick steps %llu), "
                   "left-handed %d, chord %d, click brake %d (route %d, brakes %llu), trigger aims %d (injects %llu, RT held back %llu frames, "
                   "aim pose %d, fire-ready %d, raised %d (frames %llu), LT tail frames %llu, let go for a sprint %llu frames) | jump drops aim %d: "
-                  "presses %llu, sent %llu (the last after %.0f ms) | the whistle from the aim stance %llu (the last sent after %.0f ms) | the map open %d (frames %llu, its stick and triggers the game's)",
+                  "presses %llu, sent %llu (the last after %.0f ms) | the whistle from the aim stance %llu (the last sent after %.0f ms) | the map open %d (frames %llu, its stick and triggers the game's) | flick up RB %d: sent %llu, skipped %llu (riding outside Dead Eye, a menu)",
                   g_was_in_use ? "in use" : "idle", static_cast<unsigned long long>(g_frames_in_use.load()), p.buttons, p.lt, p.rt, p.lx,
                   p.ly, p.rx, p.ry, static_cast<unsigned long long>(g_starts.load()), static_cast<unsigned long long>(g_toggles.load()),
                   g_wrist_satchel.load() ? 1 : 0, static_cast<unsigned long long>(g_satchels.load()), g_satchel_tap_ms,
@@ -906,7 +1085,8 @@ void status_text(char* out, size_t len) {
                   static_cast<unsigned long long>(g_sprint_frames.load()), g_jump_drops.load() ? 1 : 0,
                   static_cast<unsigned long long>(g_jump_presses.load()), static_cast<unsigned long long>(g_jump_waits.load()), g_jump_wait_ms.load(),
                   static_cast<unsigned long long>(g_wh_drops.load()), g_wh_wait_ms.load(), map_open() ? 1 : 0,
-                  static_cast<unsigned long long>(g_map_frames.load()));
+                  static_cast<unsigned long long>(g_map_frames.load()), g_flick_rb.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_up_flicks.load()), static_cast<unsigned long long>(g_up_skipped.load()));
 }
 
 }  // namespace rdrvr::controls

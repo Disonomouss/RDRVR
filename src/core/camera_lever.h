@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace rdrvr::camera_lever {
 
@@ -57,6 +58,9 @@ bool audio_rear_fold();
 float world_scale();
 void set_world_scale(float s, bool save);
 std::string audio_status();  // "cam audio [on|off] | cam audio fold on|off": both switches and their counters
+// (run 29 item 3, test only) "scope game": the scope spike's reads of the game's own zoom, its scope overlay and the
+// streamer's sniper byte (the scope itself: scope.h, r55 item 11)
+std::string scope_command(const std::vector<std::string>& t);
 // "cam audio log on|off|mark <n>|dump <file>" (run 12 item 10, a test's): each listener update, the game camera's and the
 // listener's headings and positions, and why the head's was not used
 std::string audio_log_command(const std::string& v, const std::string& arg);
@@ -98,6 +102,57 @@ bool head_offset(float out[3]);
 // turning or nodding the head leaves it nearly still while stepping and crouching move it. False before recentre.
 bool neck_offset(float out[3]);
 uint32_t recentre_gen();  // counts the recentres (the holsters' headset anchor takes its places again after one)
+// [XR] RoomScale (2026-10-27, research/run27/roomscale.md B2): while `owns` is set (pose.cpp: the room-scale walk's
+// command, and 600 ms after it), once a presented frame the anchored camera's horizontal move is taken off the head's
+// offset by moving the recentre origin (the frame's own camera, in SceneRender), so the view moves only with the head
+// while John walks in under it. (Cycle r163) John's whole horizontal move each tick, as a vector, at most a walk's speed a tick in length
+// (2.5 m/s): the view is the head's, his slide included; a faster move's excess (a train, a drag) stays in the view.
+// recentre_gen() is not bumped by it. Off and nothing queued, the frame's take-off is one relaxed load.
+void room_set_owns(bool on);
+bool room_owns();
+void room_set_take(bool on);  // "pose room take on|off": the take-off itself off (a test's negative control for the judder)
+bool room_take();
+// (cycle r189) the take-off's cap (2.5 m/s a step, 0.125 m at least) raised to `m` game metres for the steps until
+// log::now_ms() reaches `until_ms`: the room walk's end puts John under the head in one jump (pose.cpp rs_snap), taken
+// off whole so the view holds. Any thread
+void room_allow_step(float m, double until_ms);
+// [XR] BodyFollowsTurn (2026-10-27; the user: "Turning physically will turn johns body right?"): pose.cpp turns the body
+// heading after the head and pushes each frame's commanded heading with the follow's total in it (degrees, positive
+// left; `ours`: the anchor's own camera on foot). At each presented frame's start the frame camera's heading is matched
+// against them and the recentre origin's yaw turned by the total it shows, so the view (the camera and the head over the
+// origin) never turns with the body, whatever the camera's tick lag. Pushed only while the option is on (or a turn is
+// pending); body_turn_stop ends it (nothing then runs: room_take_frame's one load). Any thread
+void body_turn_push(float heading_deg, float total_deg, bool ours);
+void body_turn_stop();
+float body_turn_shown();  // the follow's total the origin's yaw has taken (degrees)
+// the camera's heading offset learned (30 still frames): before it pose starts no follow (a miss turns nothing)
+bool body_turn_ready();
+void body_turn_clear();  // a recentre: the pushed commands forgotten (the fresh origin matched only against new ones)
+// the match (error, misses, the camera's offset) and the view's world yaw, with its largest frame step the head still
+std::string body_turn_status();
+void body_turn_reset_view();
+// The origin moved by (dr, 0, db) game metres along the recentred frame's x (right) and z (back): the head's, neck's
+// and hands' offsets all less that (the hard clamp, the re-anchor). Queued: applied at the next frame's start, before
+// both eyes' passes. Any thread; nothing before the first recentre.
+void room_shift_origin(float dr, float db);
+// neck_offset as the next frame will have it (the queued shifts in): the room-scale walk's own reading
+bool room_neck_offset(float out[3]);
+// Every room shift so far added up, LOCAL raw metres (never reset; the physical crouch takes its differences).
+void room_shift_total(float out[3]);
+// metres taken off, the eye's largest frame step (the head still), frames, frames faster than a walk, metres not taken
+void room_stats(float* taken, float* judder, uint64_t* frames, uint64_t* rejects, float* refused);
+void room_reset_judder();
+// the judder over the head-still frames the walk owned: mean, 95th percentile (the last 1024), frames, frames over 5 mm
+void room_judder_stats(float* mean, float* p95, uint64_t* frames, uint64_t* over);
+// The centre eye's world place as the last frame drew it (the frame's camera and the views now). False before.
+bool eye_world(float out[3]);
+// 2026-10-27 ([XR] PhysicalCrouch): the same neck point in the LOCAL space itself (raw metres: not since recentre, not
+// divided by the world scale: the user's real body). False before the first views. Any thread.
+bool neck_local(float out[3]);
+// [Holsters] LeanSteady's model (2026-10-27: shared by the holsters and the physical crouch): a neck offset `n` (x right,
+// y up, z back) read as a torso of length L pivoting at the hips: the horizontal move it explains taken off, and the
+// drop that lean explains added back to y (a bend is not a crouch). Returns the lean (metres).
+float lean_split(float n[3], float L);
 // A LOCAL pose (the controllers') in the game's world, as the eye cameras are placed: cam (the frame's game camera
 // matrix: rows right, up, back, position) + its rows times the position since recentre (unturned by the recentre
 // yaw). rot (x y z w) -> wrot, a 3x3 row-major matrix rotating column vectors into the world. False before recentre.
@@ -109,9 +164,15 @@ void scene_clip(float* near_m, float* far_m);
 // XR pose; null otherwise (and in a mono frame).
 void* shadow_union_vp();
 bool local_to_world(const float* cam, const float* pos, const float* rot, float* wpos, float* wrot);
+// (2026-10-27: from the recentre's own origin, not the room-scale walk's shifted one)
 // A LOCAL position (a controller's) since recentre, in the recentred frame (x right, y up, z back): the hand's own
 // motion, without the game camera's (walking, turning, the head-bone anchor). False before recentre. Any thread.
-bool local_rel(const float* pos, float* prel);
+// (2026-10-27, [XR] BodyFollowsTurn) `turn_deg`: the follow's total the origin's yaw carried for this reading (read
+// under the same lock): a later reading is turned by its change (prel turned by -change about y), so a history of them
+// differentiates to the hand's own motion only (gestures.cpp)
+bool local_rel(const float* pos, float* prel, float* turn_deg = nullptr);
+// world_to_local then local_rel under one lock (one origin for both), with that reading's turn. Any thread
+bool world_to_local_rel(const float* cam, const float* wpos, float* prel, float* turn_deg);
 // The inverse of local_to_world's position: a point in the game's world as a LOCAL position (the space of the views,
 // the controllers and the quad layers), for the same frame camera `cam`. False before recentre. Any thread.
 bool world_to_local(const float* cam, const float* wpos, float* lpos);
@@ -158,7 +219,15 @@ void set_move_ramp(float dx, float dy, float dz);
 
 // The viewport SceneRender is drawing on this thread, while it runs (render thread), or nullptr.
 void* scene_viewport();
-// [Stereo] PrepassViews: the private eye-2 viewport built in this frame's pass 1 (never current), or nullptr
+// [Stereo] PrepassViews: the private eye-2 viewport built in this frame's pass 1, or nullptr. Never current, except under
+// [Stereo] PrepassEye2Collector (test only), which makes it current around its one FUN_1406e58a0 call in pass 1 and then
+// puts the scene viewport back (eye2_collector.cpp run_eye2)
 void* eye2_viewport();
+// [Stereo] PrepassWvpMirror (run 17, research\run17\sps.md (A); test only): called by the existing PushGlobals hook
+// (0x130e60) after the game's push, on the pushing thread, with the pushed viewport and that thread's scene viewport
+// (scene_viewport(), nullptr outside SceneRender). nullptr unsets it; unset costs the hook one relaxed load.
+using AfterPush_t = void (*)(void* vp, void* scene_vp);
+void set_after_push(AfterPush_t fn);
+bool push_hook_installed();  // the PushGlobals hook is in (set_after_push's function can be called)
 
 }  // namespace rdrvr::camera_lever

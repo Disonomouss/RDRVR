@@ -28,8 +28,25 @@ void init();                      // registers a frame listener that starts the 
 bool eye_views(EyeView out[2], uint64_t* xr_frame = nullptr);
 // The wrist HUD shown this frame (looked at, the palm flat; [XR] Hud=wrist). Any thread.
 bool wrist_hud_shown();
+void hud_shape_test(int mode);  // "hud shape rect|radar|half" ([XR] WristHudShape for the session; half: a test)
 // The same views without counting them as drawn with (the pose check): for the visibility cover.
 bool eye_views_peek(EyeView out[2]);
+// 2026-10-27 ([XR] PhysicalCrouch): the centre eye's height above the floor now (metres, the STAGE space's y), when the
+// runtime has a STAGE space and LOCAL was located in it; false otherwise (the ini's StandingHeight then). Any thread.
+bool standing_eye_height(float* out);
+bool has_stage();
+uint64_t local_space_changes();  // the runtime's own recentres seen (the LOCAL space moved)
+// [XR] PhysicalCrouch on: STAGE is made (once, the first time) and LOCAL located in it every 45 frames; off, neither
+// (2026-10-27, the review: off means unchanged). Any thread; acted on by the presenting thread.
+void set_stage_wanted(bool on);
+// LOCAL's origin pose in STAGE (position, x y z w), located since the runtime's last recentre; false otherwise.
+bool local_in_stage(float pos[3], float q[4]);
+// The session focused and the frame's views carrying a valid position (the headset worn and tracked). Any thread.
+bool head_tracked();
+bool session_focused();       // (the physical crouch's status: head_tracked's two halves)
+bool head_position_valid();
+// STAGE's own changes announced by the runtime (a boundary reset): a place held in STAGE before one is stale.
+uint64_t stage_space_changes();
 void rings_status(char* out, size_t len);  // the holster rings' layers and the runtime's layer limit
 const char* session_state();      // "none", "idle", "ready", "synchronized", "visible", "focused", "stopping", ...
 uint64_t frames();                // xrEndFrame calls
@@ -69,9 +86,13 @@ void set_latch_hands(bool on);  // the session only ("controllers latch on|off")
 bool latch_hands_on();
 // Recentre (DESIGN 3.7): the cinema screen and the UI quad are placed again from the head at the next frame.
 void recentre_layers();
+// [Horse] MountRecentre (2026-11-02): getting on a horse, a wagon or a vehicle recentres the view once. Any thread.
+bool mount_recentre();
+void set_mount_recentre(bool on, bool save);  // save: the user ini
 // R6: a measurement window of XR frames, missed display periods and mean frame times ("perf reset", "perf").
 void perf_reset();
 void perf_status(char* out, size_t len);
+void perf_vq(char* out, size_t len);  // the checked reads' VirtualQuery per scene frame over the same window (image_mem.h)
 void perf_probe(char* out, size_t len);  // the single-pass probe's split over the same window (frame_probe.h)
 // R5 step 3: cinema mode (DESIGN §3.7): the game's finished frame (with its UI) on a 3.2 m screen 3 m ahead of the
 // head pose taken when it is switched on, world-locked, in a dark room (no projection layer). The back buffer is copied

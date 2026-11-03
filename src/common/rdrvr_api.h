@@ -50,6 +50,9 @@ typedef enum RdrvrNativeOp {
 // v7: RDRVR_NATIVE_GUN_MELEE's arguments, this struct copied over the request's args (96 bytes, the same size)
 #define RDRVR_GUN_MELEE_POINT2 1u  // seg[1] and vel[1] are set (a second strike point)
 #define RDRVR_GUN_MELEE_SCAN 2u    // list the actors in the sphere (the log), no hit
+// (2026-10-31, the off-hand build step 5) living non-human actors hit too (the Undead Nightmare's zombies: IS_ACTOR_HUMAN
+// 0, r82 P1; animals as the game's own knife does): the off-hand knife's stab
+#define RDRVR_GUN_MELEE_NONHUMAN 4u
 typedef struct RdrvrGunMeleeArgs {
     float seg[2][2][3];   // the strike points (0: a long gun's butt or a pistol's frame at the hand, 1: the barrel), each
                           // from where it was at the last scan to where it is now (world)
@@ -64,7 +67,8 @@ typedef struct RdrvrGunMeleeArgs {
 
 typedef enum RdrvrGunMeleeOutcome {
     RDRVR_GUN_MELEE_NONE = 0,         // no bone sphere entered fast enough (run 8: vec[3] the nearest a strike segment came to a
-                                      // tested bone's sphere, m, 0 inside; vec[0] the speed there, vec[1] the bone; -1 none tested)
+                                      // tested bone's sphere, m, 0 inside; vec[0] the speed there, vec[1] the bone; -1 none tested;
+                                      // 2026-11-03: vec[2] the actors in the sphere that could be hit)
     RDRVR_GUN_MELEE_HIT = 1,          // a bone entered: the core's answer (RdrvrMeleeHitCode) in bits 40-47
     RDRVR_GUN_MELEE_GUARD = 2,        // no current script thread: no native called
     RDRVR_GUN_MELEE_NO_ITERATOR = 3,  // CREATE_OBJECT_ITERATOR gave no handle

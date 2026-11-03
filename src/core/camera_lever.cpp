@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "core/aim.h"
 #include "core/anchors.h"
 #include "core/api.h"
 #include "core/diag.h"
@@ -24,6 +26,7 @@
 #include "core/pose.h"
 #include "core/ring_probe.h"
 #include "core/prepass_arrays.h"
+#include "core/scope.h"
 #include "core/state.h"
 #include "core/xr.h"
 
@@ -68,6 +71,7 @@ std::atomic<void*> g_scene_vp{nullptr};
 std::atomic<uint64_t> g_vi_level_pushes{0};
 using PushGlobals_t = void (*)(void* vp, char push_view_inverse);
 PushGlobals_t o_PushGlobals = nullptr;
+std::atomic<AfterPush_t> g_after_push{nullptr};  // [Stereo] PrepassWvpMirror (set_after_push; test only): unset, one relaxed load
 
 // Round 3 correction: the trees turn as the head turns (yaw and pitch, not roll). Every billboard path faced a view
 // that follows the head: they must not follow the head's rotation at all. Their facing now comes from the game camera
@@ -101,11 +105,17 @@ void hk_PushGlobals(void* vp, char push_view_inverse) {
             std::memcpy(vi, saved, sizeof(saved));
             if (g_vi_level_pushes.fetch_add(1, std::memory_order_relaxed) == 0)
                 log::info("[cam] experiment: ViewInverse right/up levelled for the eye passes");
+            if (const AfterPush_t fn = g_after_push.load(std::memory_order_relaxed)) fn(vp, scene_viewport());
             return;
         }
     }
     o_PushGlobals(vp, push_view_inverse);
+    if (const AfterPush_t fn = g_after_push.load(std::memory_order_relaxed)) fn(vp, scene_viewport());
 } std::atomic<bool> g_double{false}, g_swap{false};
+// (r55 item 11, [Scope]) the scope's own change of the eyes' order (single pass, the scope at the right eye, [Scope]
+// SinglePassSwap): set by scope::frame_begin at a frame's start, before its passes; the frame's order is g_swap's turned by it
+std::atomic<bool> g_scope_swap{false};
+bool eff_swap() { return g_swap.load(std::memory_order_relaxed) != g_scope_swap.load(std::memory_order_relaxed); }
 std::atomic<float> g_ipd{0.0f};
 std::atomic<float> g_yaw{0.0f};
 std::atomic<float> g_yaw_step{0.0f};  // "cam yawramp": added to g_yaw at each scene frame's start
@@ -189,6 +199,67 @@ std::mutex g_recentre_mutex;
 bool g_recentred = false;
 std::atomic<uint32_t> g_recentre_gen{0};
 float g_q0[4] = {0, 0, 0, 1}, g_p0[3] = {0, 0, 0};  // recentre: yaw-only orientation and position (LOCAL)
+// [XR] RoomScale (2026-10-27; the user: "Implement roomscale and physical crouch", research/run27/roomscale.md B2): while
+// the room-scale walk owns John's walk, every metre his anchored camera moves is taken off the head's offset by moving
+// g_p0 (room_shift_origin), so the eye's world place moves only with the head and John walks in under it. The take-off
+// is the frame's own camera (room_take_frame, in hk_SceneRender before anything reads g_p0), horizontal only: his whole
+// move a game tick as a vector (cycle r163), at most a walk's 2.5 m/s over the tick's time in length: a train or a wagon
+// under John, a lasso's drag, a ragdoll or a stagger is not his walk, its excess stays in the view (and pose.cpp's gates
+// stand the walk down for them). pose.cpp's own
+// shifts (the blocked clamp, the re-anchor) are queued and applied here too, at the frame's start, so both eyes' passes
+// see one origin. g_recentre_gen is NOT bumped (the holsters' headset anchor would take its places again): only a
+// recentre does that. g_p0_base keeps the recentre's own origin, for local_rel (the hand's own motion, the gestures'
+// swings: a shifted origin would read John's walk as the hands' motion). Under g_recentre_mutex
+float g_p0_base[3] = {0, 0, 0};
+float g_room_shift[3] = {0, 0, 0};  // every shift so far, LOCAL raw metres (never reset: its differences are used)
+float g_room_q[2] = {0, 0};         // shifts queued by pose.cpp (game metres along the recentred x and z), applied at the frame's start
+// bit 1: the walk owns the take-off; bit 2: a shift queued. 0 (the option off, nothing queued): room_take_frame is one
+// relaxed load of this and nothing else
+std::atomic<int> g_room_state{0};
+std::atomic<bool> g_room_take_on{true};  // "pose room take off" (a test's negative control for the judder): no take-off
+// the judder's spread (cycle r159: a 23 mm peak against 50 mm with the take-off off; a rare spike and a steady one told
+// apart): every head-still frame's eye step while the walk owns the take-off, its sum, its count over 5 mm, the last 1024
+std::mutex g_judder_mutex;
+float g_judder_ring[1024];
+uint32_t g_judder_n = 0, g_judder_head = 0;  // under g_judder_mutex
+double g_judder_sum = 0.0;
+uint64_t g_judder_over = 0, g_judder_total = 0;
+std::atomic<float> g_room_taken{0.0f}, g_room_judder{0.0f}, g_room_refused{0.0f};  // metres taken off; the eye's largest step in a frame (the head still); not taken
+std::atomic<uint64_t> g_room_frames{0}, g_room_rejects{0};
+std::atomic<float> g_room_allow_m{0.0f};        // room_allow_step: the raised cap and until when
+std::atomic<double> g_room_allow_until{0.0};
+constexpr float kRoomWalkMax = 2.5f;  // m/s: the most of John's move taken off a second (a walk; RoomScaleMaxStick is at most 0.60)
+// [XR] BodyFollowsTurn (2026-10-27; the user: "Turning physically will turn johns body right?", then "Add it after room
+// scale works."): pose.cpp turns the body heading after the head; the view must not turn with it (the view is the
+// head). The eye cameras are the frame's camera (its heading) composed with the head relative to g_q0's yaw, so the
+// origin's yaw is turned by the same angle, but only by what the frame's camera already shows: the anchored camera takes
+// a heading once a script tick and its matrix lags the command by a tick or more (fp_cam's "after a turn, three frames"),
+// and an origin turned at once would swing the view by the part still pending, a few degrees, every tick. pose.cpp
+// pushes every frame's commanded heading with the follow's total then (body_turn_push); at each presented frame's start
+// (room_take_frame) the frame camera's heading is matched against them (newest first, within 2 degrees) and the total
+// that command carried is the one the camera shows: the origin turned by its change since the last frame. Bit 4 of
+// g_room_state while pose pushes (the option on, or a turn still pending after it went off); off, nothing here runs.
+// The ring under g_bt_mutex; g_bt_applied under g_recentre_mutex (a recentre takes a fresh origin: the total it already
+// shows stays applied, so only the turns after it move the new one)
+struct BtEntry {
+    float h, f;   // the heading commanded (degrees, positive left), the follow's total in it (degrees, wrapped)
+    bool ours;    // the anchor's own camera on foot (the offset's calibration takes only these)
+};
+constexpr int kBtRing = 160;  // (about 1.8 s at 90 Hz: a stalled tick's lag well inside)
+std::mutex g_bt_mutex;
+BtEntry g_bt_ring[kBtRing];
+int g_bt_n = 0, g_bt_head = 0;  // under g_bt_mutex
+float g_bt_off = 0.0f;          // the frame camera's heading less the commanded, learned standing still (0 expected)
+int g_bt_still = 0;
+float g_bt_last_hcam = 0.0f;
+bool g_bt_off_logged = false;
+int g_bt_miss_run = 0;                  // misses in a row (held: the origin not turned, up to kBtMissHold frames)
+constexpr int kBtMissHold = 30;
+std::atomic<bool> g_bt_ready{false};    // the offset learned once (pose starts no follow before: body_turn_ready)
+float g_bt_applied = 0.0f;  // under g_recentre_mutex: the follow's total the origin's yaw has taken
+std::atomic<float> g_bt_shown_pub{0.0f}, g_bt_err_pub{0.0f}, g_bt_off_pub{0.0f}, g_bt_view_pub{0.0f}, g_bt_view_step{0.0f};
+std::atomic<uint64_t> g_bt_frames{0}, g_bt_misses{0}, g_bt_turned{0}, g_bt_still_frames{0};
+float bt_wrap(float d) { return std::remainder(d, 360.0f); }
 // [Comfort] WorldScale (2026-10-13, the user: "Did we add a world scale setting at any point?"): every headset-space
 // position put into the game (the eyes, so their separation too, the head's and the neck's moves, the hands) divided
 // by it: above 1 the world looks bigger (you smaller), below 1 smaller. 1 = true scale. The game's world is unchanged
@@ -217,10 +288,26 @@ void quat_matrix(const float* q, float* r) {  // 3x3, row-major, rotating column
 void recentre_from(const xr::EyeView* v) {
     float mid[3], r[9];
     for (int k = 0; k < 3; ++k) mid[k] = 0.5f * (v[0].position[k] + v[1].position[k]);
+    // [XR] PhysicalCrouch (2026-10-27, cycle r157): a recentre while John is crouched keeps the origin's height (the turn
+    // and the floor place retaken): taken from a crouched head, standing up would lift the view by the crouch's depth
+    // (0.68 m). Only while the old origin is in the same LOCAL space (not after the runtime's own recentre moved it)
+    // (the review: g_recentred is always false here, cleared by recentre() before this pass: an origin of its own)
+    static uint64_t s_lchg = 0;
+    static bool s_have = false;
+    const uint64_t lchg = xr::local_space_changes();
+    if (s_have && lchg == s_lchg && pose::crouch_keeps_recentre_height()) {
+        log::info("[cam] recentre while crouched: the origin's height kept (%.3f, the head now %.3f)", g_p0[1], mid[1]);
+        mid[1] = g_p0[1];
+    }
+    s_lchg = lchg;
+    s_have = true;
     quat_matrix(v[0].orientation, r);
     float yaw = std::atan2(r[2], r[8]);  // the back axis (column 2) in the horizontal plane
     g_q0[0] = 0, g_q0[1] = std::sin(0.5f * yaw), g_q0[2] = 0, g_q0[3] = std::cos(0.5f * yaw);
     std::memcpy(g_p0, mid, sizeof(mid));
+    std::memcpy(g_p0_base, mid, sizeof(mid));  // ([XR] RoomScale: the room's shifts start again from here)
+    g_room_q[0] = g_room_q[1] = 0.0f;  // (a shift queued for the old origin is not the new one's)
+    g_room_state.fetch_and(~2, std::memory_order_relaxed);
     g_recentred = true;
     g_recentre_gen.fetch_add(1, std::memory_order_relaxed);
     log::info("[cam] recentred: yaw %.2f deg, origin (%.3f %.3f %.3f)", yaw * 57.29578f, mid[0], mid[1], mid[2]);
@@ -228,7 +315,7 @@ void recentre_from(const xr::EyeView* v) {
 
 // The camera matrix of eye `eye` (0 left, 1 right, 2 the centre between them): the game camera `cam` composed with
 // that eye's located pose. `peek`: the views are read without counting as drawn with (the visibility cover).
-bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false) {
+bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false, bool may_recentre = true) {
     xr::EyeView v[2];
     if (!(peek ? xr::eye_views_peek(v) : xr::eye_views(v))) return false;
     if (eye == 2) {  // the centre: the eyes' midpoint, the left eye's orientation
@@ -238,7 +325,10 @@ bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false) {
     float q0[4], p0[3];
     {
         std::lock_guard lock(g_recentre_mutex);
-        if (!g_recentred) recentre_from(v);
+        if (!g_recentred) {
+            if (!may_recentre) return false;  // (2026-10-27: off the render pass, no origin taken from peeked views)
+            recentre_from(v);
+        }
         std::memcpy(q0, g_q0, sizeof(q0));
         std::memcpy(p0, g_p0, sizeof(p0));
     }
@@ -268,10 +358,239 @@ bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false) {
     }
     return true;
 }
+// [XR] RoomScale's take-off (see g_p0_base): once a presented frame, while the room-scale walk owns the walk
+void room_shift_locked(float dr, float db) {  // under g_recentre_mutex: the origin moved by (dr, 0, db) game metres in the recentred frame
+    float r[9];
+    quat_matrix(g_q0, r);
+    const float s = 1.0f / ws_inv();  // (the world scale: d = (eye - p0) / scale)
+    for (int k = 0; k < 3; ++k) {
+        const float v = (r[k * 3 + 0] * dr + r[k * 3 + 2] * db) * s;
+        g_p0[k] += v;
+        g_room_shift[k] += v;
+    }
+}
+// the centre eye's world place for the frame's camera `cam` and an origin already copied (q0, p0): no recentre taken
+void centre_eye_world(const float* cam, const xr::EyeView* v, const float* q0, const float* p0, float* out) {
+    float q0c[4] = {-q0[0], -q0[1], -q0[2], q0[3]}, r0[9], d[3];
+    quat_matrix(q0c, r0);
+    for (int k = 0; k < 3; ++k) d[k] = (0.5f * (v[0].position[k] + v[1].position[k]) - p0[k]) * ws_inv();
+    const float prel[3] = {r0[0] * d[0] + r0[1] * d[1] + r0[2] * d[2], r0[3] * d[0] + r0[4] * d[1] + r0[5] * d[2], r0[6] * d[0] + r0[7] * d[1] + r0[8] * d[2]};
+    for (int k = 0; k < 3; ++k) out[k] = cam[12 + k] + prel[0] * cam[k] + prel[1] * cam[4 + k] + prel[2] * cam[8 + k];
+}
+// [XR] BodyFollowsTurn: the follow's total the frame camera `cam` shows (BtEntry): its heading (the back row (sin h,
+// cos h): h = atan2(bx, bz), as gestures.cpp reads it) matched against the commands pushed, newest first (a near tie the
+// newer's), within 2 degrees; none that near (a script's camera, the ride's): the newest total, as if caught up (counted)
+float bt_shown(const float* cam) {
+    const float hcam = std::atan2(cam[8], cam[10]) * 57.29578f;
+    std::lock_guard lock(g_bt_mutex);
+    if (g_bt_n == 0) return g_bt_shown_pub.load(std::memory_order_relaxed);
+    const BtEntry& nw = g_bt_ring[(g_bt_head + kBtRing - 1) % kBtRing];
+    // the offset (expected 0): learned with the command and the camera both still for a third of a second, the anchor's own
+    bool still = nw.ours && std::fabs(bt_wrap(hcam - g_bt_last_hcam)) < 0.05f && g_bt_n >= 30;
+    for (int i = 1; i < 30 && still; ++i) {
+        const BtEntry& e = g_bt_ring[(g_bt_head + kBtRing - 1 - i) % kBtRing];
+        still = e.ours && std::fabs(bt_wrap(e.h - nw.h)) < 0.05f;
+    }
+    g_bt_still = still ? g_bt_still + 1 : 0;
+    g_bt_last_hcam = hcam;
+    if (g_bt_still >= 30) {
+        const float off = bt_wrap(hcam - nw.h);
+        if (!g_bt_off_logged || std::fabs(bt_wrap(off - g_bt_off)) > 1.0f) {
+            log::info("[cam] body turn: the frame camera's heading %.2f deg, the commanded %.2f: read %.2f deg off it", hcam, nw.h, off);
+            g_bt_off_logged = true;
+        }
+        g_bt_off = off;
+        g_bt_off_pub.store(off, std::memory_order_relaxed);
+        g_bt_ready.store(true, std::memory_order_relaxed);
+    }
+    float best = 1e9f, f = nw.f;
+    for (int i = 0; i < g_bt_n; ++i) {
+        const BtEntry& e = g_bt_ring[(g_bt_head + kBtRing - 1 - i) % kBtRing];
+        const float err = std::fabs(bt_wrap(e.h + g_bt_off - hcam));
+        if (err < best - 1e-3f) {
+            best = err;
+            f = e.f;
+        }
+    }
+    g_bt_err_pub.store(best, std::memory_order_relaxed);
+    g_bt_frames.fetch_add(1, std::memory_order_relaxed);
+    // (the review) a miss turns nothing for up to kBtMissHold frames in a row (a wrong offset, a script's camera: the
+    // view never swung by a guess); only a run longer than that takes the newest total (the anchor gone mid-turn: a
+    // pending part left for ever otherwise), at once, counted
+    if (best > 2.0f) {
+        g_bt_misses.fetch_add(1, std::memory_order_relaxed);
+        if (++g_bt_miss_run <= kBtMissHold) return g_bt_shown_pub.load(std::memory_order_relaxed);
+        f = nw.f;
+    } else {
+        g_bt_miss_run = 0;
+    }
+    return f;
+}
+// the view's world yaw this frame (the frame camera's heading plus the head's yaw over the origin's, as the eyes are
+// drawn) and its largest step between frames the head itself held its yaw (under 0.05 degrees): the test's measure that
+// the body's turn never shows in the view. Under g_recentre_mutex (the origin just turned)
+void bt_view_locked(const float* cam, const xr::EyeView* v, bool reset) {
+    static float s_view = 0.0f, s_head = 0.0f;
+    static bool s_ok = false;
+    if (reset) {
+        s_ok = false;
+        return;
+    }
+    auto yaw_of = [](const float* q) {  // the forward (-z) of q in the horizontal plane (degrees, positive left)
+        const float fx = -2 * (q[0] * q[2] + q[3] * q[1]), fz = -(1 - 2 * (q[0] * q[0] + q[1] * q[1]));
+        return std::atan2(-fx, -fz) * 57.29578f;
+    };
+    float q0c[4] = {-g_q0[0], -g_q0[1], -g_q0[2], g_q0[3]}, q[4];
+    quat_mul(q0c, v[0].orientation, q);
+    const float view = bt_wrap(std::atan2(cam[8], cam[10]) * 57.29578f + yaw_of(q)), head = yaw_of(v[0].orientation);
+    if (s_ok && std::fabs(bt_wrap(head - s_head)) < 0.05f) {
+        const float step = std::fabs(bt_wrap(view - s_view));
+        if (step > g_bt_view_step.load(std::memory_order_relaxed)) g_bt_view_step.store(step, std::memory_order_relaxed);
+        g_bt_still_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+    s_view = view;
+    s_head = head;
+    s_ok = true;
+    g_bt_view_pub.store(view, std::memory_order_relaxed);
+}
+void room_take_frame(const float* cam) {
+    static uint64_t s_frame = ~0ull;
+    static float s_last[3], s_eye[3], s_head[3];
+    static bool s_last_ok = false, s_eye_ok = false;
+    static double s_ms = 0.0;
+    static double s_move_ms = 0.0;  // the frame the anchored camera last moved (it moves once a script tick)
+    static float s_dbg[5] = {};     // this frame's take-off, for the log of a frame over 5 mm
+    const int bits = g_room_state.load(std::memory_order_relaxed);
+    if (!bits || !cam) {  // the option off and nothing queued: this load only
+        s_last_ok = s_eye_ok = false;
+        s_move_ms = 0.0;  // (the next walk's first step capped over a tick from its own start, not from an old walk)
+        return;
+    }
+    const uint64_t f = state::presents.load();
+    if (f == s_frame) return;  // (once a presented frame: both passes after it, one origin)
+    s_frame = f;
+    const bool owns = (bits & 1) != 0;
+    // [XR] BodyFollowsTurn (bit 4): the follow's total this frame's camera shows, and the views (both before the mutex)
+    const bool bt = (bits & 4) != 0;
+    const float bt_f = bt ? bt_shown(cam) : 0.0f;
+    xr::EyeView btv[2];
+    const bool bt_v = bt && xr::eye_views_peek(btv);
+    float q0[4], p0[3];
+    {
+        std::lock_guard lock(g_recentre_mutex);
+        if (!g_recentred) {
+            s_last_ok = s_eye_ok = false;
+            g_room_q[0] = g_room_q[1] = 0.0f;
+            g_room_state.fetch_and(~2, std::memory_order_relaxed);
+            if (bt) {  // (the next pass takes a fresh origin: what this camera shows is in it)
+                g_bt_applied = bt_f;
+                g_bt_shown_pub.store(bt_f, std::memory_order_relaxed);
+            }
+            return;
+        }
+        if (g_room_q[0] != 0.0f || g_room_q[1] != 0.0f) {  // pose's queued shifts (the clamp, the re-anchor): before the passes
+            room_shift_locked(g_room_q[0], g_room_q[1]);
+            g_room_q[0] = g_room_q[1] = 0.0f;
+        }
+        g_room_state.fetch_and(~2, std::memory_order_relaxed);  // (the queue applied, under the mutex the queue is filled under)
+        if (bt) {  // the origin's yaw turned by what the camera newly shows of the body's turn (after the queue: it was the old frame's)
+            const float d = bt_wrap(bt_f - g_bt_applied);
+            if (d != 0.0f) {
+                const float yaw = 2.0f * std::atan2(g_q0[1], g_q0[3]) + d * 0.0174532925f;  // (g_q0 is yaw only: recentre_from)
+                g_q0[0] = g_q0[2] = 0.0f;
+                g_q0[1] = std::sin(0.5f * yaw);
+                g_q0[3] = std::cos(0.5f * yaw);
+                g_bt_turned.fetch_add(1, std::memory_order_relaxed);
+            }
+            g_bt_applied = bt_f;
+            g_bt_shown_pub.store(bt_f, std::memory_order_relaxed);
+            if (bt_v) bt_view_locked(cam, btv, false);
+        } else {
+            bt_view_locked(nullptr, nullptr, true);
+        }
+        if (!owns) {
+            s_last_ok = s_eye_ok = false;  // seeded again when it next owns the walk
+            s_move_ms = 0.0;
+            return;
+        }
+        const double now = log::now_ms();
+        if (s_last_ok) {
+            const float dx = cam[12] - s_last[0], dz = cam[14] - s_last[2];
+            // (cycle r159) the cap over the time since the camera last moved: it moves once a game tick, a step of a tick's
+            // walk in one render frame, which a cap over the render frame clipped (the clipped part left in the view: the
+            // 23 mm judder)
+            const bool stepped = dx * dx + dz * dz > 1e-10f;
+            double dt = (now - (s_move_ms > 0.0 ? s_move_ms : s_ms)) / 1000.0;
+            // (cycle r161: the first step after seeding was capped by one render frame, about 27 mm, and a step coming a
+            // frame early by less than a tick) a game tick's time at least (50 ms: 20 Hz and up), at most a quarter second
+            dt = dt < 0.05 ? 0.05 : dt > 0.25 ? 0.25 : dt;
+            const double fdt = (now - s_ms) / 1000.0;
+            if (stepped) s_move_ms = now;
+            // the move along the camera's own rows a (right) and c (back): the head's offset is in those
+            const float dr = dx * cam[0] + dz * cam[2], db = dx * cam[8] + dz * cam[10];
+            // (cycle r163: five rounds of a part along the walk's direction and its limits never converged) John's whole
+            // horizontal move, as a vector, at most a walk's speed a tick in length: the view is the head by construction,
+            // his slide included, in any direction; the part over the cap (a train, a drag) stays in the view
+            const float all = std::sqrt(dr * dr + db * db);
+            const float cap0 = kRoomWalkMax * static_cast<float>(dt);
+            float cap = cap0;
+            // (the review of r189) room_allow_step's raise is one jump's: spent on the first step over the usual cap
+            const bool allow = now < g_room_allow_until.load(std::memory_order_acquire);
+            if (allow) cap = std::fmax(cap0, g_room_allow_m.load(std::memory_order_relaxed));
+            if (allow && all > cap0) g_room_allow_until.store(0.0, std::memory_order_relaxed);
+            float k = all > cap ? cap / all : 1.0f;
+            if (!g_room_take_on.load(std::memory_order_relaxed)) k = 0.0f;  // (the test's negative control)
+            if (k > 0.0f && all > 0.0f) room_shift_locked(dr * k, db * k);
+            const float take = all * k;
+            s_dbg[0] = static_cast<float>(fdt * 1000.0), s_dbg[1] = static_cast<float>(dt * 1000.0), s_dbg[2] = all;
+            s_dbg[3] = take, s_dbg[4] = cap;
+            g_room_taken.store(g_room_taken.load(std::memory_order_relaxed) + take, std::memory_order_relaxed);
+            if (all - take > 1e-4f) g_room_refused.store(g_room_refused.load(std::memory_order_relaxed) + (all - take), std::memory_order_relaxed);
+            if (all > cap + 0.01f) g_room_rejects.fetch_add(1, std::memory_order_relaxed);  // faster than a walk: not all taken
+        }
+        std::memcpy(s_last, cam + 12, sizeof(s_last));
+        s_ms = now;
+        s_last_ok = true;
+        std::memcpy(q0, g_q0, sizeof(q0));
+        std::memcpy(p0, g_p0, sizeof(p0));
+    }
+    g_room_frames.fetch_add(1, std::memory_order_relaxed);
+    // the measure: the centre eye's world place frame to frame, over frames the head itself held still (under 2 mm)
+    xr::EyeView v[2];
+    if (xr::eye_views_peek(v)) {
+        float h[3], e[3];
+        for (int k = 0; k < 3; ++k) h[k] = 0.5f * (v[0].position[k] + v[1].position[k]);
+        centre_eye_world(cam, v, q0, p0, e);
+        if (s_eye_ok) {
+            const float hm = std::sqrt((h[0] - s_head[0]) * (h[0] - s_head[0]) + (h[1] - s_head[1]) * (h[1] - s_head[1]) + (h[2] - s_head[2]) * (h[2] - s_head[2]));
+            const float em = std::sqrt((e[0] - s_eye[0]) * (e[0] - s_eye[0]) + (e[2] - s_eye[2]) * (e[2] - s_eye[2]));  // (horizontal)
+            if (hm < 0.002f) {
+                if (em > g_room_judder.load(std::memory_order_relaxed)) g_room_judder.store(em, std::memory_order_relaxed);
+                if (em > 0.005f)  // (cycle r161: which frames step: a short frame, a cap, the limit)
+                    log::limited("cam.room.judder", 60,
+                                 "[cam] room take-off: the eye stepped %.4f m (head still): frame %.1f ms, since the camera moved %.1f ms, "
+                                 "the camera %.4f m, taken %.4f, cap %.4f",
+                                 em, s_dbg[0], s_dbg[1], s_dbg[2], s_dbg[3], s_dbg[4]);
+                std::lock_guard jl(g_judder_mutex);
+                g_judder_ring[g_judder_head] = em;
+                g_judder_head = (g_judder_head + 1) % 1024;
+                if (g_judder_n < 1024) ++g_judder_n;
+                g_judder_sum += em;
+                ++g_judder_total;
+                if (em > 0.005f) ++g_judder_over;
+            }
+        }
+        std::memcpy(s_eye, e, sizeof(s_eye));
+        std::memcpy(s_head, h, sizeof(s_head));
+        s_eye_ok = true;
+    }
+}
+
 alignas(16) char g_saved_vp[0x470 + 0x10];  // render thread only
 alignas(16) char g_cover_vp[kViewportSize + 0x10];
 alignas(16) char g_union_vp[kViewportSize + 0x10];  // render thread only: shadow_union_vp
-alignas(16) char g_eye2_vp[kViewportSize + 0x10];   // render thread only: [Stereo] PrepassViews' private eye-2 viewport (never current)
+alignas(16) char g_eye2_vp[kViewportSize + 0x10];   // render thread only: [Stereo] PrepassViews' private eye-2 viewport (never current but
+                                                     // under PrepassEye2Collector: around its one call in pass 1)
 uint64_t g_eye2_frame = ~0ull;                       // the frame it was built in
 bool g_union_ok = false;
 // The union's margin: each eye sits 3 cm or so off the centre, so its frustum edge leaves the centre's by up to
@@ -363,10 +682,13 @@ bool build_union_vp(void* vp, const float* cam_in);
 // the second pass would see consumed, and runs the post chain for the first eye between the passes (with the first
 // pass's viewport still current).
 std::atomic<float> g_scene_near{0}, g_scene_far{0};
+void scope_frame(const float* cam_in);  // (r55 item 11; below)
 thread_local float t_frame_yaw = 0.0f;  // the test yaw latched once a frame: both passes and the union see the same
 
+void room_take_frame(const float* cam);
 void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
     const float* cam = fp_cam(cam_game);  // [Body] FirstPersonMoments: the anchor's camera while a script's holds the channel
+    room_take_frame(cam);  // [XR] RoomScale (2026-10-27): off and nothing queued, one relaxed load (else g_recentre_mutex once a frame)
     if (const float st = g_yaw_step.load(std::memory_order_relaxed); st != 0.0f) {  // the test's ramp, once a frame
         float y = g_yaw.load(std::memory_order_relaxed) + st;
         if (y > 180.0f) y -= 360.0f;
@@ -406,7 +728,8 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
     }
     if (g_double.load(std::memory_order_relaxed) && vp) {
         if (g_xr_pose.load(std::memory_order_relaxed)) xr::late_latch();
-        int first = g_swap.load(std::memory_order_relaxed) ? 1 : 0;
+        scope_frame(cam);  // (r55 item 11) the scope's state for this frame: its eye, and the eyes' order it wants
+        int first = eff_swap() ? 1 : 0;
         std::memcpy(g_saved_vp, vp, kViewportSize);
         g_union_ok = (dual_pass::shadows_wanted() || prepass::union_cull_wanted()) && g_xr_pose.load(std::memory_order_relaxed) &&
                      build_union_vp(vp, cam);
@@ -464,6 +787,34 @@ bool build_union_vp(void* vp, const float* cam_in) {
     return true;
 }
 
+// (run 29 item 3, the scope spike's reads, kept for "scope game") the game's own vertical FOV at each eye pass's start
+// (vp +0x338, before the eye's tangents replace it)
+std::atomic<float> g_game_vfov[2] = {};
+std::atomic<uint64_t> g_scope_passes{0};
+// (r55 item 11) the scope's state for this frame (scope.h): the eyes' cameras and tangents as the passes will draw them,
+// once a stereo frame with the eyes from the XR views; nothing while [Scope] is off and nothing is forced (one load each)
+void scope_frame(const float* cam_in) {
+    if (!g_xr_pose.load(std::memory_order_relaxed)) {  // (the review: no eyes from the views, no scope's order kept)
+        g_scope_swap.store(false, std::memory_order_relaxed);
+        return;
+    }
+    if (!cam_in || !scope::wanted()) return;
+    xr::EyeView v[2];
+    uint64_t xf = 0;
+    if (!xr::eye_views(v, &xf)) return;
+    scope::FrameIn in{};
+    std::memcpy(in.cam, cam_in, sizeof(in.cam));
+    if (t_frame_yaw != 0) yaw_rows(in.cam, t_frame_yaw);  // (the passes draw the yawed camera)
+    for (int e = 0; e < 2; ++e) {
+        if (!xr_eye_camera(in.cam, e, in.eye[e])) return;
+        for (int k = 0; k < 4; ++k) in.tan[e][k] = std::tan(v[e].fov[k]);
+    }
+    in.single_pass = prepass::views_wanted();
+    in.first = g_swap.load(std::memory_order_relaxed) ? 1 : 0;  // (the base order: the scope's own swap is its state's)
+    in.xr_frame = xf;
+    g_scope_swap.store(scope::frame_begin(in), std::memory_order_relaxed);
+}
+
 // One scene pass. pass_eye: -1 mono, 0 left, 1 right (double mode).
 void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pass_eye) {
     g_scenes.fetch_add(1, std::memory_order_relaxed);
@@ -475,6 +826,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
         yaw_rows(yawed, yaw);
         cam = yawed;
     }
+    if (pass_eye == 0 || pass_eye == 1) g_game_vfov[pass_eye].store(*reinterpret_cast<const float*>(static_cast<const char*>(vp) + 0x338), std::memory_order_relaxed);
     int eye = g_eye.load(std::memory_order_relaxed);
     xr::EyeView views[2];
     float l = 0, r = 0, u = 0, d = 0;
@@ -511,14 +863,25 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
             move_along_rows(other, oo);
         }
     }
+    if (xr_pose && have && pass_eye >= 0) {  // (r55 item 11, [Scope]) this eye's pass from the scope's objective, its true field
+        float st[4];
+        if (scope::pass_camera(pass_eye, copy, st)) {
+            l = st[0], r = st[1], u = st[2], d = st[3];
+            apply_tangents(vp, l, r, u, d);
+            g_scope_passes.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (cam) ring_probe::matrix_expect(pass_eye, copy + 12, other + 12, cam + 12);
-    if (xr_pose && have && eye == 3 && pass_eye == (g_swap.load(std::memory_order_relaxed) ? 1 : 0) && prepass::views_wanted() &&
+    if (xr_pose && have && eye == 3 && pass_eye == (eff_swap() ? 1 : 0) && prepass::views_wanted() &&
         xr::eye_views(views)) {
         // [Stereo] PrepassViews: the other eye's viewport now, as pass 2 will make it (its saved copy, that eye's
-        // tangents, its camera); never current, so the engine pushes and records nothing for it
+        // tangents, its camera); never current, so the engine pushes and records nothing for it ([Stereo]
+        // PrepassEye2Collector, test only, makes it current around one call in pass 1: FUN_140130f00 then sets its
+        // +0x330/+0x334 to the locked target's size)
         const float* a2 = views[pass_eye == 1 ? 0 : 1].fov;
         std::memcpy(g_eye2_vp, g_saved_vp, kViewportSize);
-        apply_tangents(g_eye2_vp, std::tan(a2[0]), std::tan(a2[1]), std::tan(a2[2]), std::tan(a2[3]));
+        float l2 = std::tan(a2[0]), r2 = std::tan(a2[1]), u2 = std::tan(a2[2]), d2 = std::tan(a2[3]);
+        apply_tangents(g_eye2_vp, l2, r2, u2, d2);
         o_SetCamera(g_eye2_vp, other);
         prepass::set_eye2(g_eye2_vp, nullptr);  // (without jitter; the TAA update's jittered rows replace these)
         g_eye2_frame = state::presents.load();
@@ -527,7 +890,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
         if (have) round_draw::note_pass(pass_eye, copy, l, r, u, d);  // [Reload] RoundInHand: this eye's camera
         o_SceneRender(renderer, vp, copy, a4);
         ring_probe::matrix_expect(-2, nullptr, nullptr, nullptr);
-        if (pass_eye == (g_swap.load() ? 1 : 0) && g_findcam.exchange(false)) {
+        if (pass_eye == (eff_swap() ? 1 : 0) && g_findcam.exchange(false)) {
             log::info("[findcam] after the first pass: centre camera (%.3f %.3f %.3f), this eye (%.3f %.3f %.3f)", cam[12],
                       cam[13], cam[14], copy[12], copy[13], copy[14]);
             diag::find_pattern(cam + 12, 12, "centre camera position", 48);
@@ -977,7 +1340,7 @@ void set_cover(float vfov_deg, float aspect) {
     log::info("[cam] cover viewport %s (vfov %.2f deg, aspect %.3f)", vfov_deg > 0 ? "on" : "off", vfov_deg, aspect);
 }
 
-bool swap_order() { return g_double.load() && g_swap.load(); }
+bool swap_order() { return g_double.load() && eff_swap(); }
 
 void set_xr_pose(bool on) {
     g_xr_pose = on;
@@ -1154,7 +1517,7 @@ bool head_forward(float d[3]) {
     if (!g_game_cam_valid.load(std::memory_order_relaxed) || !g_xr_pose.load(std::memory_order_relaxed)) return false;
     float cam[16], c[16];
     std::memcpy(cam, g_game_cam, sizeof(cam));
-    if (!xr_eye_camera(cam, 2, c, true)) return false;
+    if (!xr_eye_camera(cam, 2, c, true, false)) return false;  // (2026-10-27: read off the render pass: never takes the recentre)
     const float n = std::sqrt(c[8] * c[8] + c[9] * c[9] + c[10] * c[10]);
     if (n < 1e-4f) return false;
     for (int k = 0; k < 3; ++k) d[k] = -c[8 + k] / n;  // the camera looks along -c
@@ -1197,8 +1560,108 @@ bool head_offset(float out[3]) {
 }
 
 uint32_t recentre_gen() { return g_recentre_gen.load(std::memory_order_relaxed); }
+void room_set_owns(bool on) {
+    if (on) g_room_state.fetch_or(1, std::memory_order_relaxed);
+    else if (g_room_state.load(std::memory_order_relaxed) & 1) g_room_state.fetch_and(~1, std::memory_order_relaxed);
+}
+bool room_owns() { return (g_room_state.load(std::memory_order_relaxed) & 1) != 0; }
+void room_set_take(bool on) { g_room_take_on.store(on, std::memory_order_relaxed); }
+bool room_take() { return g_room_take_on.load(std::memory_order_relaxed); }
+void room_allow_step(float m, double until_ms) {
+    g_room_allow_m.store(m, std::memory_order_relaxed);
+    g_room_allow_until.store(until_ms, std::memory_order_release);  // (after m: a reader that sees the window sees its m)
+}
+void body_turn_push(float heading_deg, float total_deg, bool ours) {
+    {
+        std::lock_guard lock(g_bt_mutex);
+        g_bt_ring[g_bt_head] = BtEntry{heading_deg, total_deg, ours};
+        g_bt_head = (g_bt_head + 1) % kBtRing;
+        if (g_bt_n < kBtRing) ++g_bt_n;
+    }
+    if (!(g_room_state.load(std::memory_order_relaxed) & 4)) g_room_state.fetch_or(4, std::memory_order_relaxed);
+}
+void body_turn_stop() {
+    if (!(g_room_state.load(std::memory_order_relaxed) & 4)) return;
+    g_room_state.fetch_and(~4, std::memory_order_relaxed);
+    std::lock_guard lock(g_bt_mutex);
+    g_bt_n = 0;  // (pushed again from scratch: an old command never matched)
+    g_bt_still = 0;
+}
+float body_turn_shown() { return g_bt_shown_pub.load(std::memory_order_relaxed); }
+bool body_turn_ready() { return g_bt_ready.load(std::memory_order_relaxed); }
+void body_turn_clear() {
+    std::lock_guard lock(g_bt_mutex);
+    g_bt_n = 0;  // (a recentre: the commands before it are not matched against the fresh origin)
+    g_bt_still = 0;
+    g_bt_miss_run = 0;
+}
+void body_turn_reset_view() { g_bt_view_step.store(0.0f, std::memory_order_relaxed); }
+std::string body_turn_status() {
+    char b[400];
+    std::snprintf(b, sizeof(b),
+                  "the origin's yaw: shown %.2f deg (frames %llu, turned %llu, matched within %.3f deg, misses %llu, the camera's offset %.2f, learned %d) | "
+                  "the view's yaw %.2f deg, its largest step with the head still %.3f deg over %llu frames",
+                  g_bt_shown_pub.load(), static_cast<unsigned long long>(g_bt_frames.load()), static_cast<unsigned long long>(g_bt_turned.load()),
+                  g_bt_err_pub.load(), static_cast<unsigned long long>(g_bt_misses.load()), g_bt_off_pub.load(), g_bt_ready.load() ? 1 : 0, g_bt_view_pub.load(),
+                  g_bt_view_step.load(), static_cast<unsigned long long>(g_bt_still_frames.load()));
+    return b;
+}
+void room_shift_origin(float dr, float db) {  // queued: room_take_frame applies it before the next frame's passes
+    std::lock_guard lock(g_recentre_mutex);
+    if (!g_recentred) return;
+    g_room_q[0] += dr;
+    g_room_q[1] += db;
+    g_room_state.fetch_or(2, std::memory_order_relaxed);
+}
+void room_shift_total(float out[3]) {
+    std::lock_guard lock(g_recentre_mutex);
+    std::memcpy(out, g_room_shift, sizeof(g_room_shift));
+}
+void room_stats(float* taken, float* judder, uint64_t* frames, uint64_t* rejects, float* refused) {
+    *refused = g_room_refused.load(std::memory_order_relaxed);
+    *taken = g_room_taken.load(std::memory_order_relaxed);
+    *judder = g_room_judder.load(std::memory_order_relaxed);
+    *frames = g_room_frames.load(std::memory_order_relaxed);
+    *rejects = g_room_rejects.load(std::memory_order_relaxed);
+}
+void room_reset_judder() {
+    g_room_judder.store(0.0f, std::memory_order_relaxed);
+    std::lock_guard jl(g_judder_mutex);
+    g_judder_n = g_judder_head = 0;
+    g_judder_sum = 0.0;
+    g_judder_over = 0;
+    g_judder_total = 0;
+}
+void room_judder_stats(float* mean, float* p95, uint64_t* frames, uint64_t* over) {
+    float v[1024];
+    uint32_t nn = 0;
+    {
+        std::lock_guard jl(g_judder_mutex);
+        nn = g_judder_n;
+        std::memcpy(v, g_judder_ring, nn * sizeof(float));
+        *frames = g_judder_total;
+        *over = g_judder_over;
+        *mean = g_judder_total ? static_cast<float>(g_judder_sum / static_cast<double>(g_judder_total)) : 0.0f;
+    }
+    std::sort(v, v + nn);
+    *p95 = nn ? v[std::min<uint32_t>(nn - 1, static_cast<uint32_t>(0.95 * nn))] : 0.0f;  // (over the last 1024 such frames)
+}
+bool eye_world(float out[3]) {  // (a status: the frame camera's copy unsynchronised, a torn read only a wrong number; never a recentre)
+    xr::EyeView v[2];
+    if (!g_game_cam_valid.load(std::memory_order_relaxed) || !g_xr_pose.load(std::memory_order_relaxed) || !xr::eye_views_peek(v)) return false;
+    float cam[16], q0[4], p0[3];
+    std::memcpy(cam, g_game_cam, sizeof(cam));
+    {
+        std::lock_guard lock(g_recentre_mutex);
+        if (!g_recentred) return false;
+        std::memcpy(q0, g_q0, sizeof(q0));
+        std::memcpy(p0, g_p0, sizeof(p0));
+    }
+    centre_eye_world(cam, v, q0, p0, out);
+    return true;
+}
 
-bool neck_offset(float out[3]) {
+bool neck_offset_impl(float out[3], bool queued) {
     xr::EyeView v[2];
     if (!xr::eye_views_peek(v)) return false;
     float q0[4], p0[3];
@@ -1207,6 +1670,12 @@ bool neck_offset(float out[3]) {
         if (!g_recentred) return false;
         std::memcpy(q0, g_q0, sizeof(q0));
         std::memcpy(p0, g_p0, sizeof(p0));
+        if (queued && (g_room_q[0] != 0.0f || g_room_q[1] != 0.0f)) {  // ([XR] RoomScale) as the next frame will have it
+            float r[9];
+            quat_matrix(g_q0, r);
+            const float sc = 1.0f / ws_inv();
+            for (int k = 0; k < 3; ++k) p0[k] += (r[k * 3 + 0] * g_room_q[0] + r[k * 3 + 2] * g_room_q[1]) * sc;
+        }
     }
     constexpr float kNeck[3] = {0.0f, -0.10f, 0.08f};  // the neck from the centre eye, in the head's axes (y up, z back)
     float rh[9], q0c[4] = {-q0[0], -q0[1], -q0[2], q0[3]}, r0[9], d[3];
@@ -1217,6 +1686,40 @@ bool neck_offset(float out[3]) {
                ws_inv();
     for (int r = 0; r < 3; ++r) out[r] = r0[r * 3 + 0] * d[0] + r0[r * 3 + 1] * d[1] + r0[r * 3 + 2] * d[2] - kNeck[r];
     return true;
+}
+
+bool neck_offset(float out[3]) { return neck_offset_impl(out, false); }
+bool room_neck_offset(float out[3]) { return neck_offset_impl(out, true); }
+
+// 2026-10-27 ([XR] PhysicalCrouch; the user: "Implement roomscale and physical crouch", research/run27/roomscale.md
+// C1): the same neck point in the LOCAL space itself, raw metres: not since the recentre, not divided by the world scale
+// (the user's real body: a crouch is judged on it, whatever the view's scale)
+bool neck_local(float out[3]) {
+    xr::EyeView v[2];
+    if (!xr::eye_views_peek(v)) return false;
+    constexpr float kNeck[3] = {0.0f, -0.10f, 0.08f};  // (neck_offset's)
+    float rh[9];
+    quat_matrix(v[0].orientation, rh);
+    for (int k = 0; k < 3; ++k)
+        out[k] = 0.5f * (v[0].position[k] + v[1].position[k]) + rh[k * 3 + 0] * kNeck[0] + rh[k * 3 + 1] * kNeck[1] + rh[k * 3 + 2] * kNeck[2];
+    return true;
+}
+
+// [Holsters] LeanSteady's model, shared (2026-10-27, roomscale.md B2/C1: the holsters and the physical crouch agree): the
+// torso pivoting at the hips: its drop gives the lean's most forward reach (L sin a with L (1 - cos a) = the drop), the
+// forward move up to that is the lean, the rest a step; the drop the lean explains is not a crouch
+float lean_split(float n[3], float L) {
+    if (!(L > 0.05f)) return 0.0f;
+    const float drop = std::fmax(0.0f, -n[1]), dh = std::sqrt(n[0] * n[0] + n[2] * n[2]);
+    const float c = 1.0f - std::fmin(drop, L) / L;
+    const float lean = std::fmin(dh, L * std::sqrt(std::fmax(0.0f, 1.0f - c * c)));
+    if (dh > 1e-4f) {
+        n[0] *= (dh - lean) / dh;
+        n[2] *= (dh - lean) / dh;
+    }
+    const float sa = std::fmin(1.0f, lean / L);
+    n[1] += L * (1.0f - std::sqrt(1.0f - sa * sa));
+    return lean;
 }
 
 bool local_to_world(const float* cam, const float* pos, const float* rot, float* wpos, float* wrot) {
@@ -1289,18 +1792,53 @@ void set_world_scale(float s, bool save) {
         config::set("Comfort", "WorldScale", b);
     }
 }
-bool local_rel(const float* pos, float* prel) {
+bool local_rel(const float* pos, float* prel, float* turn_deg) {
     float q0[4], p0[3];
     {
         std::lock_guard lock(g_recentre_mutex);
         if (!g_recentred) return false;
+        if (turn_deg) *turn_deg = g_bt_applied;  // ([XR] BodyFollowsTurn: the turn this q0 carries, read with it)
         std::memcpy(q0, g_q0, sizeof(q0));
-        std::memcpy(p0, g_p0, sizeof(p0));
+        std::memcpy(p0, g_p0_base, sizeof(p0));  // ([XR] RoomScale: the recentre's origin, not the room-shifted one: the hand's own motion)
     }
     float q0c[4] = {-q0[0], -q0[1], -q0[2], q0[3]}, r0[9], d[3];
     quat_matrix(q0c, r0);
     for (int k = 0; k < 3; ++k) d[k] = (pos[k] - p0[k]) * ws_inv();
     for (int r = 0; r < 3; ++r) prel[r] = r0[r * 3 + 0] * d[0] + r0[r * 3 + 1] * d[1] + r0[r * 3 + 2] * d[2];
+    return true;
+}
+
+// world_to_local then local_rel with one origin (the review of BodyFollowsTurn: two locks could see two yaws, a turn
+// between them a frame's step of false motion in a GunMelee point's history), and the follow's turn it carries
+bool world_to_local_rel(const float* cam, const float* wpos, float* prel, float* turn_deg) {
+    if (!cam || !wpos || !prel) return false;
+    float q0[4], p0[3], pb[3], turn;
+    {
+        std::lock_guard lock(g_recentre_mutex);
+        if (!g_recentred) return false;
+        std::memcpy(q0, g_q0, sizeof(q0));
+        std::memcpy(p0, g_p0, sizeof(p0));
+        std::memcpy(pb, g_p0_base, sizeof(pb));
+        turn = g_bt_applied;
+    }
+    const float *a = cam, *b = cam + 4, *c = cam + 8;  // (world_to_local's, then local_rel's, as they compute them)
+    const float bc[3] = {b[1] * c[2] - b[2] * c[1], b[2] * c[0] - b[0] * c[2], b[0] * c[1] - b[1] * c[0]};
+    const float ca[3] = {c[1] * a[2] - c[2] * a[1], c[2] * a[0] - c[0] * a[2], c[0] * a[1] - c[1] * a[0]};
+    const float ab[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    const float det = a[0] * bc[0] + a[1] * bc[1] + a[2] * bc[2];
+    if (std::fabs(det) < 1e-6f) return false;
+    const float v[3] = {wpos[0] - cam[12], wpos[1] - cam[13], wpos[2] - cam[14]};
+    const float sc = det * ws_inv();
+    const float pr[3] = {(bc[0] * v[0] + bc[1] * v[1] + bc[2] * v[2]) / sc, (ca[0] * v[0] + ca[1] * v[1] + ca[2] * v[2]) / sc,
+                         (ab[0] * v[0] + ab[1] * v[1] + ab[2] * v[2]) / sc};
+    float r0[9], lpos[3];
+    quat_matrix(q0, r0);
+    for (int r = 0; r < 3; ++r) lpos[r] = p0[r] + r0[r * 3] * pr[0] + r0[r * 3 + 1] * pr[1] + r0[r * 3 + 2] * pr[2];
+    float q0c[4] = {-q0[0], -q0[1], -q0[2], q0[3]}, r1[9], d[3];
+    quat_matrix(q0c, r1);
+    for (int k = 0; k < 3; ++k) d[k] = (lpos[k] - pb[k]) * ws_inv();
+    for (int r = 0; r < 3; ++r) prel[r] = r1[r * 3 + 0] * d[0] + r1[r * 3 + 1] * d[1] + r1[r * 3 + 2] * d[2];
+    if (turn_deg) *turn_deg = turn;
     return true;
 }
 
@@ -1352,6 +1890,8 @@ void status_text(char* out, size_t len) {
 }
 
 void* scene_viewport() { return t_scene_vp; }
+void set_after_push(AfterPush_t fn) { g_after_push.store(fn, std::memory_order_relaxed); }
+bool push_hook_installed() { return o_PushGlobals != nullptr; }  // (hooks::install leaves it null when the hook failed)
 void* eye2_viewport() { return g_eye2_frame == state::presents.load() ? static_cast<void*>(g_eye2_vp) : nullptr; }
 void* shadow_union_vp() { return g_union_ok ? g_union_vp : nullptr; }
 void scene_clip(float* near_m, float* far_m) {
@@ -1362,6 +1902,43 @@ void scene_clip(float* near_m, float* far_m) {
 bool mono_camera_changed() {
     if (g_yaw.load(std::memory_order_relaxed) != 0) return true;
     return g_active.load(std::memory_order_relaxed) && current().mode == Mode::Camera;
+}
+
+// (the scope spike) its reads, SEH only (no objects with destructors in this frame). The overlay's and the streamer's
+// globals are RDR.exe+0x2c45770 and +0x2ac5140 of the build the research read (no anchors: a test's numbers only, tagged
+// so in the status)
+static void scope_reads(int* zoom, int* aimbit, int* ov_on, int* ov_drawn, int* ov_2c, int* ov_model, int* sniper) {
+    __try {
+        const uintptr_t pia = anchors::addr(anchors::Id::PlayerInfo);
+        const uintptr_t pi = pia ? *reinterpret_cast<const uintptr_t*>(pia) : 0;
+        if (pi) {
+            const uintptr_t R = *reinterpret_cast<const uintptr_t*>(pi + 0x410);
+            if (R) *zoom = *reinterpret_cast<const int*>(R + 0x14), *aimbit = (*reinterpret_cast<const uint32_t*>(R + 0xc) >> 3) & 1;
+        }
+        const uintptr_t ov = *reinterpret_cast<const uintptr_t*>(anchors::base() + 0x2c45770);
+        if (ov) {
+            *ov_on = *reinterpret_cast<const uint8_t*>(ov + 0x28), *ov_drawn = *reinterpret_cast<const uint8_t*>(ov + 0x29);
+            *ov_2c = *reinterpret_cast<const uint8_t*>(ov + 0x2c), *ov_model = *reinterpret_cast<const int*>(ov + 0x34);
+        }
+        const uintptr_t st = *reinterpret_cast<const uintptr_t*>(anchors::base() + 0x2ac5140);
+        if (st) *sniper = *reinterpret_cast<const uint8_t*>(st + 0x126);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *zoom = -8;
+    }
+}
+
+// (run 29 item 3) the scope spike's reads, test only ("scope game"; scope.cpp's command hands it over): the game's zoom
+// (PlayerInfo +0x410 -> +0x14), the aim bit, the scope overlay (*(0x142c45770): +0x28 on, +0x29 drawn, +0x2c, +0x34 the
+// model), the streamer's sniper byte (*(0x142ac5140) +0x126), the game's own vertical FOV at each eye pass's start
+std::string scope_command(const std::vector<std::string>&) {
+    char o[400];
+    int zoom = -9, aimbit = -1, ov_on = -1, ov_drawn = -1, ov_2c = -1, ov_model = -9, sniper = -1;
+    scope_reads(&zoom, &aimbit, &ov_on, &ov_drawn, &ov_2c, &ov_model, &sniper);
+    std::snprintf(o, sizeof(o), "scope game: zoom state %d aim %d | overlay on %d drawn %d 2c %d model %d | streamer sniper byte %d (both at the "
+                  "research build's rvas) | game vfov %.3f %.3f | scoped passes %llu",
+                  zoom, aimbit, ov_on, ov_drawn, ov_2c, ov_model, sniper, g_game_vfov[0].load(), g_game_vfov[1].load(),
+                  static_cast<unsigned long long>(g_scope_passes.load()));
+    return o;
 }
 
 }  // namespace rdrvr::camera_lever

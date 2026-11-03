@@ -28,6 +28,7 @@ struct Slot {
     uint64_t rb_size = 0;
     bool valid[kMaxFrames] = {};   // recording thread writes, presenting thread reads after the phase handshake
     int recorded = 0;
+    int unmeasured = 0;            // copies refused: the resource's last barrier not in the bind's list (NOT MEASURED)
 };
 Slot g_slot[3];  // 0 mono, 1 left, 2 right
 
@@ -38,6 +39,12 @@ HANDLE g_done = nullptr;
 std::atomic<int> g_phase{0};
 int g_frames = 8, g_frames_waited = 0;
 int g_frame_i = 0, g_fxaa_binds = 0, g_doubles = 0, g_monos = 0;  // recording thread
+int g_first_try = 0;  // recording thread: the scene/vel copy at this frame's bind 1 (record()'s result)
+bool g_pereye = false;  // "pereye": scene/vel per eye (the first eye at bind 1); off, both at the binds the post output uses
+// the first-eye post run being played back (set and cleared by op-0x4a markers dual_pass records around first_eye_post
+// while a per-eye grab waits or records; read by the bind tap on the same playback thread, in stream order)
+std::atomic<int> g_in_first_post{0};
+bool t_mark_open = false;  // the render thread: a begin marker appended, its end owed
 bool g_swap = false;
 ID3D12Resource* g_res = nullptr;
 uint64_t g_rtv[8];
@@ -59,16 +66,23 @@ ID3D12Fence* g_fence = nullptr;
 uint64_t g_fence_value = 0;
 HANDLE g_fence_event = nullptr;
 
-void record(ID3D12GraphicsCommandList* cl, int eye) {
+// 1 copied, 0 not tried (past the burst, or the slot already has this frame), -1 NOT MEASURED (counted)
+int record(ID3D12GraphicsCommandList* cl, int eye) {
     Slot& s = g_slot[eye];
-    if (g_frame_i >= g_frames || s.valid[g_frame_i]) return;
+    if (g_frame_i >= g_frames || s.valid[g_frame_i]) return 0;
     ID3D12GraphicsCommandList* wcl = nullptr;
     uint32_t st = 0;
-    if (!d3d::watched_state(g_res, &wcl, &st) || wcl != cl) return;  // this frame's copy is not measured
+    if (!d3d::watched_state(g_res, &wcl, &st) || wcl != cl) {  // this frame's copy is not measured (its slot stays invalid)
+        ++s.unmeasured;
+        return -1;
+    }
     // the crop box and footprint are the armed target's: never copied from a target the game made again since (live:
     // its barrier is in this list) at another size or format
     const D3D12_RESOURCE_DESC d = g_res->GetDesc();
-    if (d.Width != g_src_w || d.Height != g_src_h || static_cast<uint32_t>(d.Format) != g_fmt) return;
+    if (d.Width != g_src_w || d.Height != g_src_h || static_cast<uint32_t>(d.Format) != g_fmt) {
+        ++s.unmeasured;
+        return -1;
+    }
     const auto state = static_cast<D3D12_RESOURCE_STATES>(st);
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -93,6 +107,7 @@ void record(ID3D12GraphicsCommandList* cl, int eye) {
     }
     s.valid[g_frame_i] = true;
     ++s.recorded;
+    return 1;
 }
 
 void bind_tap(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int,
@@ -103,21 +118,41 @@ void bind_tap(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIP
     for (int i = 0; i < g_nrtv; ++i) target = target || rts[0].ptr == g_rtv[i];
     if (!target) return;
     bool ui = ds != nullptr;
+    if (!ui && g_fxaa_binds == 0) g_first_try = 0;
+    const bool pereye = g_pereye && g_source != 0;
     if (ph == 2) {
         if (ui) {
-            g_fxaa_binds = g_frame_i = g_doubles = g_monos = 0;
+            g_fxaa_binds = g_frame_i = g_doubles = g_monos = g_first_try = 0;
             g_phase.store(3, std::memory_order_release);
         }
         return;
     }
+    const int first = g_swap ? 2 : 1;
     if (!ui) {
-        if (++g_fxaa_binds == 2) record(cl, g_swap ? 2 : 1);  // the first pass's eye
+        ++g_fxaa_binds;
+        // the post output: its content before the 2nd bind is the first pass's image. The scene colour and the Velocity
+        // RT (rewritten by every pass's scene) hold the first pass's only up to pass 2's scene: copied at the 1st bind
+        // (pass 1's tonemap, after its DLSS), the slot undone at the UI bind if the frame was mono
+        if (g_fxaa_binds == (pereye ? 1 : 2)) {
+            if (pereye && g_in_first_post.load(std::memory_order_relaxed) != 1) {  // bind 1 not in the first-eye post run
+                if (g_frame_i < g_frames && !g_slot[first].valid[g_frame_i]) ++g_slot[first].unmeasured;
+                g_first_try = -1;
+            } else {
+                g_first_try = record(cl, first);
+            }
+        }
         return;
     }
     if (g_fxaa_binds >= 2) {
         record(cl, g_swap ? 1 : 2);  // the last pass's eye
         ++g_doubles;
     } else if (g_fxaa_binds == 1) {
+        if (pereye && g_first_try == 1) {  // (a mono frame: what bind 1 took is not the first eye's)
+            g_slot[first].valid[g_frame_i] = false;
+            --g_slot[first].recorded;
+        } else if (pereye && g_first_try < 0) {
+            --g_slot[first].unmeasured;
+        }
         record(cl, 0);
         ++g_monos;
     }
@@ -192,6 +227,7 @@ std::string arm(uint64_t frame, int crop_w, int crop_h) {
         ok = ok && s.rb;
         std::memset(s.valid, 0, sizeof(s.valid));
         s.recorded = 0;
+        s.unmeasured = 0;
     }
     if (!g_fence) dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
     if (!g_fence_event) g_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -203,6 +239,7 @@ std::string arm(uint64_t frame, int crop_w, int crop_h) {
     g_src_w = d.Width;
     g_src_h = d.Height;
     g_swap = camera_lever::swap_order();
+    g_in_first_post.store(0, std::memory_order_relaxed);
     g_first_frame = frame + 1;
     g_res = res;
     d3d::watch_add(res);
@@ -229,7 +266,14 @@ std::string finish() {
     std::string out;
     for (int e = 0; e < 3; ++e) {
         Slot& s = g_slot[e];
-        if (!s.recorded) continue;
+        if (!s.recorded) {
+            if (s.unmeasured) {
+                char line[96];
+                std::snprintf(line, sizeof(line), " | %s 0 of %d frames: NOT MEASURED (%d refused)", kEyeTag[e], g_frames, s.unmeasured);
+                out += line;
+            }
+            continue;
+        }
         uint8_t* p = nullptr;
         D3D12_RANGE r{0, static_cast<SIZE_T>(s.rb_size)};
         if (FAILED(s.rb->Map(0, &r, reinterpret_cast<void**>(&p))) || !p) {
@@ -256,9 +300,13 @@ std::string finish() {
         }
         D3D12_RANGE none{0, 0};
         s.rb->Unmap(0, &none);
-        char line[96];
+        char line[160];
         std::snprintf(line, sizeof(line), " | %s %d of %d frames %s", kEyeTag[e], s.recorded, g_frames,
                       ok ? "written" : "NOT WRITTEN");
+        if (s.unmeasured) {  // (the resource's barrier not in the bind's list, or the target made again: those frames' slots invalid)
+            const size_t n = std::strlen(line);
+            std::snprintf(line + n, sizeof(line) - n, " (%d NOT MEASURED)", s.unmeasured);
+        }
         out += line;
     }
     char head[160];
@@ -290,17 +338,51 @@ void on_frame_end(uint64_t frame) {
     }
 }
 
+// the markers (op-0x4a callbacks through DeferredAppend on the render thread's recorder, as prepass_arrays' walk markers)
+void first_post_on(void*) { g_in_first_post.store(1, std::memory_order_relaxed); }
+void first_post_off(void*) { g_in_first_post.store(0, std::memory_order_relaxed); }
+template <class T>
+bool rd(uintptr_t a, T* out) {
+    if (!a) return false;
+    __try {
+        *out = *reinterpret_cast<const T*>(a);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool append_marker(void (*fn)(void*)) {
+    using Append_t = void (*)(void* recorder, void* fn, const void* data, uint64_t size);
+    uintptr_t dev = 0, hrec = 0, rec = 0, vt = 0;
+    if (!rd(anchors::addr(anchors::Id::D3dDeviceSingleton), &dev) || !rd(dev + 0x58, &hrec) || !rd(hrec + 0x128, &rec) || !rd(rec, &vt) ||
+        vt != anchors::addr(anchors::Id::RecorderVtbl))
+        return false;
+    reinterpret_cast<Append_t>(anchors::addr(anchors::Id::DeferredAppend))(reinterpret_cast<void*>(rec), reinterpret_cast<void*>(fn), nullptr, 0);
+    return true;
+}
 }  // namespace
+
+void first_post_mark(bool begin) {
+    if (!begin) {
+        if (t_mark_open) append_marker(&first_post_off);  // (owed whenever its begin went out, armed or not)
+        t_mark_open = false;
+        return;
+    }
+    const int ph = g_phase.load(std::memory_order_acquire);
+    if (!g_pereye || (ph != 2 && ph != 3)) return;
+    t_mark_open = append_marker(&first_post_on);
+}
 
 void init() {
     g_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     d3d::add_frame_end_listener(on_frame_end);
 }
 
-std::string grab(const std::string& prefix, int frames, int crop_w, int crop_h, unsigned timeout_ms, int source) {
+std::string grab(const std::string& prefix, int frames, int crop_w, int crop_h, unsigned timeout_ms, int source, bool pereye) {
     std::lock_guard lock(g_mutex);
     g_prefix = prefix;
     g_source = source < 0 || source > 2 ? 0 : source;
+    g_pereye = pereye && g_source != 0;
     g_frames = frames < 2 ? 2 : frames > kMaxFrames ? kMaxFrames : frames;
     g_crop_w = crop_w;
     g_crop_h = crop_h;

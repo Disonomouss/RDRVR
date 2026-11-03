@@ -60,6 +60,15 @@ foreach ($name in 'dinput8.dll', 'RDRVR.Gameplay.red') {
     $sha = (Get-FileHash -Algorithm SHA256 $out).Hash.ToLowerInvariant()
     Write-Host ("BUILD OK: {0}  {1:yyyy-MM-dd HH:mm:ss}  {2:N0} bytes  sha256 {3}" -f $name, $fi.LastWriteTime, $fi.Length, $sha) -ForegroundColor Green
 }
+# (run 19 item 4) the shader converter, test only: built when the SDK has dxcapi.h
+$conv = Join-Path $build 'rdrvr_vi_convert.exe'
+if (Test-Path $conv) {
+    $fi = Get-Item $conv
+    $sha = (Get-FileHash -Algorithm SHA256 $conv).Hash.ToLowerInvariant()
+    Write-Host ("BUILD OK: {0}  {1:yyyy-MM-dd HH:mm:ss}  {2:N0} bytes  sha256 {3}" -f 'rdrvr_vi_convert.exe', $fi.LastWriteTime, $fi.Length, $sha) -ForegroundColor Green
+} else {
+    Write-Warning 'rdrvr_vi_convert.exe not built (no dxcapi.h in the SDK): [Stereo] InstancedShadersAuto converts nothing'
+}
 $exports = & dumpbin /nologo /exports (Join-Path $build 'dinput8.dll') | Select-String '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)' |
            ForEach-Object { $_.Matches[0].Groups[1].Value }
 foreach ($e in 'DirectInput8Create', 'RDRVR_GetApi') {

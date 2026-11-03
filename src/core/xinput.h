@@ -22,7 +22,7 @@ struct PadState {
     int16_t lx = 0, ly = 0, rx = 0, ry = 0;
     uint8_t lt = 0, rt = 0;
 };
-void set_source(bool on, const PadState& state);
+void set_source(bool on, const PadState& state, bool quiet = false);  // quiet: [XR] RoomScale's toggles (logged a few times only)
 // Round 1 (headset, check 16): with no VR controllers the gamepad stays the input. While `on`, pad 0's left stick is
 // turned by `deg` (counter-clockwise seen from above: the head's yaw, for head-relative walking) and the right stick's
 // x is kept for the pose service's turning (-1..1) and given to the game as 0 (the anchored camera is not the game's
@@ -34,6 +34,9 @@ float pad_right_x();
 void set_override(uint16_t buttons, bool stick, float rx, float ry, uint32_t ms);
 // Headset round 2: true once after both stick clicks (L3 + R3) were held on the real pad for a second.
 bool take_recentre_combo();
+// 2026-10-27 ([XR] PhysicalCrouch): milliseconds since the real pad's own L3 was last seen down (huge: never)
+double pad_l3_age_ms();
+float pad_left_mag();  // [XR] RoomScale (2026-10-27): the real pad's own left stick's length as last read (0 without a pad)
 uint64_t polls();           // XInputGetState calls seen
 uint64_t injected();        // calls that returned injected state
 uint64_t caps_queries();    // XInputGetCapabilities calls seen

@@ -51,6 +51,8 @@ std::atomic<float> g_turn_deg{0.0f}, g_right_x{0.0f};
 ULONGLONG g_combo_since = 0;  // polling thread
 bool g_combo_fired = false;
 std::atomic<bool> g_recentre_combo{false};
+std::atomic<ULONGLONG> g_pad_l3_tick{0};  // the real pad's L3 last seen down (GetTickCount64; 0 never)
+std::atomic<float> g_pad_lmag{0.0f};       // the real pad's left stick's length (0..1.41), as read; 0 without a real pad
 
 // The game asks XInputGetCapabilities which pads exist (pads 0..3, at startup and again later) and then polls
 // only the connected ones: with no real pad it called XInputGetState 8 times in a 5-minute run (2026-10-03).
@@ -84,11 +86,19 @@ DWORD WINAPI hk_GetState(DWORD user, XINPUT_STATE* st) {
         ZeroMemory(st, sizeof(*st));
         st->dwPacketNumber = g_packet.load();
         r = ERROR_SUCCESS;
+        g_pad_lmag.store(0.0f, std::memory_order_relaxed);  // (no real pad: no stick of the player's)
     }
+    if (user == 0 && r != ERROR_SUCCESS) g_pad_lmag.store(0.0f, std::memory_order_relaxed);  // (a real pad gone, VirtualPad=0: no stick)
     if (n <= 4)
         log::info("[xinput] XInputGetState(%lu) -> %lu%s (call %llu)", user, r, synth ? " (virtual pad)" : "",
                   static_cast<unsigned long long>(n));
     if (user == 0 && st && r == ERROR_SUCCESS && !synth) {
+        // 2026-10-27 ([XR] PhysicalCrouch): the real pad's own L3 (read before any injection: the user's crouch press)
+        if (st->Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) g_pad_l3_tick.store(GetTickCount64(), std::memory_order_relaxed);
+        // [XR] RoomScale (2026-10-27): the real pad's own left stick, before any injection (the player's stick wins)
+        g_pad_lmag.store(std::sqrt(static_cast<float>(st->Gamepad.sThumbLX) * st->Gamepad.sThumbLX +
+                                   static_cast<float>(st->Gamepad.sThumbLY) * st->Gamepad.sThumbLY) / 32767.0f,
+                         std::memory_order_relaxed);
         constexpr WORD kBoth = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
         if ((st->Gamepad.wButtons & kBoth) == kBoth) {
             ULONGLONG now = GetTickCount64();
@@ -211,11 +221,21 @@ void set_override(uint16_t buttons, bool stick, float rx, float ry, uint32_t ms)
 }
 
 bool take_recentre_combo() { return g_recentre_combo.exchange(false); }
+float pad_left_mag() { return g_pad_lmag.load(std::memory_order_relaxed); }
+double pad_l3_age_ms() {
+    const ULONGLONG t = g_pad_l3_tick.load(std::memory_order_relaxed);
+    return t ? static_cast<double>(GetTickCount64() - t) : 1e12;
+}
 
-void set_source(bool on, const PadState& state) {
+void set_source(bool on, const PadState& state, bool quiet) {
     std::lock_guard lock(g_source_mutex);
     bool changed = on != g_source_on || std::memcmp(&state, &g_source, sizeof(state)) != 0;
-    if (on != g_source_on) log::info("[xinput] gameplay pad source %s", on ? "on" : "off");
+    // (2026-10-27: [XR] RoomScale turns it on and off with each walk on a gamepad alone: those, `quiet`, logged a few
+    // times only; every other change as before)
+    if (on != g_source_on) {
+        if (quiet) log::limited("xinput.source.room", 6, "[xinput] gameplay pad source %s (the room-scale walk)", on ? "on" : "off");
+        else log::info("[xinput] gameplay pad source %s", on ? "on" : "off");
+    }
     g_source_on = on;
     g_source = state;
     g_source_changed = g_source_changed || changed;

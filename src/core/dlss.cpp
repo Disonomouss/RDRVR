@@ -97,6 +97,12 @@ std::atomic<bool> g_opt_shaped{false};                 // the options last sent 
 std::atomic<uint32_t> g_opt_w{0}, g_opt_h{0};
 std::atomic<uint64_t> g_shape_marks{0}, g_shape_consts{0}, g_shape_tags{0}, g_shape_opts{0}, g_shape_refused{0}, g_shape_size_skips{0};
 std::atomic<int> g_shape_mv{1};  // the test aid "dlss shapemv game|eye": 1 = 1/(rw, rh) (the shaped render size), 0 = the game's
+// (r55 item 11) request_reset's: per slot, taken at the run's constants append (the render thread); viewport 0's marker
+// sets t_reset_vp0 on the playback thread, which the game's next slSetConstants for viewport 0 takes (a copy, reset set)
+std::atomic<bool> g_reset_req[2] = {};
+std::atomic<uint64_t> g_reset_put[2] = {};
+thread_local bool t_reset_vp0 = false;
+void mod_reset_mark(void*) { t_reset_vp0 = true; }
 void mod_shape_mark(void* data) {
     if (const auto* p = static_cast<const ShapePayload*>(data)) t_shape = *p;
     if (g_killed.load(std::memory_order_relaxed)) t_shape.on = 0;  // per-eye DLSS off: the game's own constants and tags
@@ -182,6 +188,14 @@ void mod_eval1(void* data) {
 
 // ---- slSetConstants (the game's own calls: viewport 0, the second eye's run of a double frame and mono)
 int hk_set_consts(const void* consts, const void* token, const void* vp) {
+    alignas(16) uint8_t reset_copy[kConstsSize];
+    if (consts && t_reset_vp0 && reinterpret_cast<uintptr_t>(vp) != reinterpret_cast<uintptr_t>(g_vp1)) {  // (r55 item 11)
+        t_reset_vp0 = false;
+        std::memcpy(reset_copy, consts, kConstsSize);
+        reset_copy[kConstsReset] = 1;
+        consts = reset_copy;
+        g_reset_put[1].fetch_add(1, std::memory_order_relaxed);
+    }
     if (consts && reinterpret_cast<uintptr_t>(vp) != reinterpret_cast<uintptr_t>(g_vp1)) {
         g_chk.tc[0] = token;
         std::memcpy(g_last_j0, static_cast<const char*>(consts) + kConstsJitter, sizeof(g_last_j0));
@@ -491,14 +505,20 @@ void hk_append(void* recorder, void* fn, const void* data, uint32_t size) {
         if (shaped || t_shape_recorded) o_append(recorder, reinterpret_cast<void*>(&mod_shape_mark), &sp, sizeof(sp));
         t_shape_recorded = shaped;
     }
+    if (slot == 1 && f == g_cb_consts && g_reset_req[1].exchange(false, std::memory_order_relaxed)) {  // (r55 item 11) viewport 0's reset
+        const uint32_t one = 1;
+        o_append(recorder, reinterpret_cast<void*>(&mod_reset_mark), &one, sizeof(one));
+    }
     if (slot != 0 || !ensure()) return o_append(recorder, fn, data, size);
     if (f == g_cb_consts) {
         ConstsPayload p;
         std::memcpy(p.consts, reinterpret_cast<const void*>(anchors::addr(Id::DlssConstantsStatic)), kConstsSize);
         p.token = *reinterpret_cast<const void* const*>(anchors::addr(Id::DlssTokenStatic));
-        if (g_need_reset.exchange(false)) {
+        const bool scope_rq = g_reset_req[0].exchange(false, std::memory_order_relaxed);  // (r55 item 11)
+        if (g_need_reset.exchange(false) || scope_rq) {
             p.consts[kConstsReset] = 1;
             g_resets.fetch_add(1, std::memory_order_relaxed);
+            if (scope_rq) g_reset_put[0].fetch_add(1, std::memory_order_relaxed);
         }
         g_consts_swaps.fetch_add(1, std::memory_order_relaxed);
         return o_append(recorder, reinterpret_cast<void*>(&mod_consts1), &p, sizeof(p));  // the append copies the payload
@@ -508,6 +528,14 @@ void hk_append(void* recorder, void* fn, const void* data, uint32_t size) {
 }
 
 }  // namespace
+
+void request_reset(int slot) {
+    if (slot == 0 || slot == 1) g_reset_req[slot].store(true, std::memory_order_relaxed);
+}
+void reset_counts(uint64_t* vp1, uint64_t* vp0) {
+    *vp1 = g_reset_put[0].load(std::memory_order_relaxed);
+    *vp0 = g_reset_put[1].load(std::memory_order_relaxed);
+}
 
 bool install() {
     // on with DLSS by default (probe P2: both eyes within mono DLSS's flicker; the shared viewport fails); the hook is

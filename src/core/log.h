@@ -23,6 +23,8 @@ void write(Level level, const char* fmt, ...);
 // Logs the first `max_count` calls for `key` (a string literal identifying the call site), then one
 // "suppressing" line, then nothing. Thread-safe.
 void limited(const char* key, uint32_t max_count, const char* fmt, ...);
+// (r117 DG4, test only) the keys starting with prefix counted from 0 again ("prepass diag layerlog reset")
+void reset_limited(const char* prefix);
 inline constexpr uint32_t kOnce = 1;
 
 double now_ms();                     // milliseconds since the process started (QPC)

@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <shlobj.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
@@ -173,7 +174,128 @@ bool set(const char* section, const char* key, const std::string& value) {
     return ok;
 }
 
+namespace {
+// (GOAL-single-pass-default.md item 3) [Stereo] SinglePass: 1 (the shipped default) supplies the single-pass stack's
+// keys wherever neither file sets them (the user's own lines win, the hand-made folder's InstancedShaders included);
+// the shaders come from the converter on the player's own game files (InstancedShadersAuto) unless a folder is named.
+// Without the converter or its DXC DLL (and no folder) nothing is supplied: two-pass, said in the log. 0 (the two-pass
+// switch) turns the stack's master keys off whatever the files say. The run 26 / r309 stack: the soak 99.85 % cut.
+const char* const kSinglePassSrc = "single pass";
+const char* const kTwoPassSrc = "two-pass switch";
+struct Implied {
+    const char* key;
+    const char* value;
+};
+constexpr Implied kSinglePassStack[] = {
+    {"prepassarrays", "1"},      {"prepassviews", "2"},          {"prepassunioncull", "1"},     {"prepassinstanced", "1"},
+    {"prepasswalkcut", "1"},     {"prepasswvpmirror", "1"},      {"prepassinstprevmirror", "1"}, {"prepassinstprevk", "64"},
+    {"prepasscutvelocity", "4"}, {"prepasscutholdstarted", "1"}, {"prepasscutemptydraws", "1"}, {"prepassinstprevnotaa", "1"},
+};
+constexpr const char* kTwoPassOff[] = {"prepassarrays", "prepassviews", "prepassinstanced", "prepasswalkcut"};
+std::atomic<int> g_sp_state{-1};  // single_pass_state(): -1 no key, 0 two-pass, 1 single pass, 2 no converter, 3 the files' 0s
+std::string g_sp_off_key;          // (state 3, under g_lock) the user's key that turns it off
+bool file_exists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+std::wstring widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
+void single_pass_defaults() {
+    std::string sp, folder, exe, dxc;
+    bool sp_set = false;
+    {
+        AcquireSRWLockShared(&g_lock);
+        auto get = [](const char* k, std::string& out) {
+            auto it = g_values.find(k);
+            if (it == g_values.end()) return false;
+            out = trim(it->second.text);
+            return true;
+        };
+        sp_set = get("stereo.singlepass", sp);
+        get("stereo.instancedshaders", folder);
+        get("stereo.instancedshadersconverter", exe);
+        get("stereo.instancedshadersdxc", dxc);
+        ReleaseSRWLockShared(&g_lock);
+    }
+    g_sp_state = -1;
+    if (!sp_set) return;  // (no key: the code's own defaults, as before)
+    if (sp == "0") {
+        AcquireSRWLockExclusive(&g_lock);
+        for (const char* k : kTwoPassOff) g_values[std::string("stereo.") + k] = {"0", kTwoPassSrc};
+        // (the review) no converter and no folder's twins either: nothing of single pass runs in two-pass
+        g_values["stereo.instancedshadersauto"] = {"0", kTwoPassSrc};
+        g_values["stereo.instancedshaders"] = {"", kTwoPassSrc};
+        ReleaseSRWLockExclusive(&g_lock);
+        g_sp_state = 0;
+        log::info("[cfg] [Stereo] SinglePass=0: two-pass (PrepassArrays, PrepassViews, PrepassInstanced and PrepassWalkCut off)");
+        return;
+    }
+    if (sp != "1") return;
+    // (the review) a master key the files turn off wins over the supplied ones (an older launcher's untick wrote each 0):
+    // then it is two-pass, said so, and nothing is supplied (no converter started for nothing)
+    {
+        std::string off;
+        AcquireSRWLockShared(&g_lock);
+        for (const char* k : kTwoPassOff) {
+            auto it = g_values.find(std::string("stereo.") + k);
+            if (it != g_values.end() && (trim(it->second.text) == "0" || trim(it->second.text).empty())) {
+                off = it->first.substr(7);
+                break;
+            }
+        }
+        ReleaseSRWLockShared(&g_lock);
+        if (!off.empty()) {
+            AcquireSRWLockExclusive(&g_lock);
+            g_sp_off_key = off;
+            ReleaseSRWLockExclusive(&g_lock);
+            g_sp_state = 3;
+            log::warn("[cfg] [Stereo] SinglePass=1 but your settings file sets %s=0: two-pass (the launcher's Single pass box writes the "
+                      "single-pass keys again)", off.c_str());
+            return;
+        }
+    }
+    const bool by_folder = !folder.empty();
+    if (!by_folder) {  // the converter as vi_auto.cpp finds it
+        const std::wstring e = exe.empty() ? std::wstring(log::game_dir()) + L"RDRVR_Converter\\rdrvr_vi_convert.exe" : widen(exe);
+        const std::wstring d = dxc.empty() ? e.substr(0, e.find_last_of(L"\\/") + 1) + L"rdrvr_dxcompiler.dll" : widen(dxc);
+        const bool he = file_exists(e), hd = file_exists(d);
+        if (!he || !hd) {
+            g_sp_state = 2;
+            log::warn("[cfg] [Stereo] SinglePass=1 but the shader converter is missing (%ls%s%ls): two-pass", he ? L"" : e.c_str(),
+                      he || hd ? "" : ", ", hd ? L"" : d.c_str());
+            return;
+        }
+    }
+    int n = 0;
+    AcquireSRWLockExclusive(&g_lock);
+    auto put = [&](const char* k, const char* v) {
+        const std::string key = std::string("stereo.") + k;
+        if (g_values.count(key)) return;
+        g_values[key] = {v, kSinglePassSrc};
+        ++n;
+    };
+    for (const Implied& i : kSinglePassStack) put(i.key, i.value);
+    if (!by_folder) {  // (the pending hold needs the converter's twins: pso's region table)
+        put("instancedshadersauto", "1");
+        put("prepasscutholdpending", "1");
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    g_sp_state = 1;
+    log::info("[cfg] [Stereo] SinglePass=1: single pass (%d keys supplied, the shaders %s)", n, by_folder ? "from the folder" : "converted on this PC");
+}
+void load_files();
+}  // namespace
+
 void load() {
+    load_files();
+    single_pass_defaults();
+}
+int single_pass_state() { return g_sp_state.load(std::memory_order_relaxed); }
+std::string single_pass_off_key() {
+    AcquireSRWLockShared(&g_lock);
+    std::string k = g_sp_off_key;
+    ReleaseSRWLockShared(&g_lock);
+    return k;
+}
+
+namespace {
+void load_files() {
     wchar_t ini[MAX_PATH];
     log::path_in_game_dir(L"RDRVR.ini", ini, MAX_PATH);
 
@@ -226,6 +348,7 @@ void load() {
     }
     set("Compat", "SettingsReset", tag);  // (a new user file: this tag's, so the reset is done once)
 }
+}  // namespace
 
 bool get_bool(const char* section, const char* key, bool def) {
     std::string v;

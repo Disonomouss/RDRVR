@@ -25,14 +25,30 @@ namespace rdrvr::controls {
 // punch with the fists needs the game's fighting stance, LT, before RT), the whole press lasting rt_after_ms + ms.
 // Any thread.
 void inject(uint16_t buttons, uint8_t rt, int16_t ly, int ms, uint8_t lt = 0, int rt_after_ms = 0);
+// 2026-10-30 (item 12): ends the injection now if it is a delayed RT alone (RT 255, no LT, no stick, no buttons: the lasso
+// lock throw's) whose RT has not started yet (log::now_ms() before its start); true if it did. Any thread.
+bool cancel_pending_rt();
 bool game_menu_open();  // a game menu open now (the pause menu, the satchel, a shop's): MenuControls' test
 double last_lt_ms();    // log::now_ms() of the last frame the game's LT was pressed (the mod's or the player's): the fists' stance
+// 2026-10-30 (item 12, [Gestures] LassoThrow=lock): the game's LT as the controllers drove it at the last pad (0..1),
+// before the mod's own presses (inject) were added: whichever controller's trigger is mapped to LT (the layout's off
+// hand by default; left-handed, the right controller's); `ms` (if not null) the log::now_ms() of that pad (an old one:
+// no pad since, as the menu or the gamepad alone). Any thread.
+float player_lt(double* ms);
 
 void init();
 // Presenting thread, once per frame end: true and the pad when a controller is in use and the RDRVR menu is closed.
 bool pad(xinput::PadState* out);
 bool take_menu_toggle();  // the menu button was held MenuHoldMs (once per hold)
 bool take_recentre();     // both stick clicks were held a second (once per hold)
+// [XR] PhysicalCrouch (2026-10-27): the game's L3 (its crouch) for `ms` from the next pad, on a timer of its own; with
+// the physical crouch on, the recentre chord on foot sends no L3 (a left click alone waits 150 ms for the right one).
+// Presenting thread.
+void crouch_pulse(int ms);
+bool left_click_held();   // the controllers' left stick click down at the last pad (the user's own crouch press)
+double last_user_l3_ms(); // log::now_ms() of the last pad carrying the player's own L3 (the mapping's, the chord's tap)
+bool click_tap_pending(); // the chord's held-back left click going out as a tap now
+uint64_t chords_held();   // chords on foot whose L3 was kept from the game
 void status_text(char* out, size_t len);
 
 // The remap (menu Controls tab). Sources and targets by index; names are the ini values.
@@ -46,7 +62,8 @@ void set_mapping(int s, int t);   // also written to the user ini
 void reset_mapping();             // the defaults, written to the user ini
 bool left_handed();
 void set_left_handed(bool on);    // also written to the user ini
-int gun_hand();                   // the controller holding the gun: the one that drew it ([Hands] DrawToGrabbingHand), else the layout's
+int gun_hand();
+uint64_t wheel_steps();             // [Holsters] WheelStickDpad: the D-pad steps from the wheel's hand (its status)                   // the controller holding the gun: the one that drew it ([Hands] DrawToGrabbingHand), else the layout's
 int layout_gun_hand();            // 1 right (default), 0 left when left-handed
 // [Hands] DrawToGrabbingHand: a holster draw puts the gun in the hand that grabbed it (the trigger roles follow: that
 // controller's trigger fires). Active with each arm on its own controller (right-handed, or left-handed with

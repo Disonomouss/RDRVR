@@ -164,7 +164,15 @@ struct Optional {
     const char* what;
 };
 constexpr Optional kOptional[] = {
+    {"IdleFxMatrixRet", "the held flames ([Hands] HeldEffectsFollow) stay at the game's animated hand, and the off-hand torch ([Hands] "
+                        "OffHandTorchLit) is drawn unlit, on this build"},
+    {"DeadEyeUpdate", "the Dead Eye level choice ([DeadEye] Level) is off on this build: the game's level"},
+    {"PppDirtyPtr", "the Dead Eye sepia toggle takes effect at the game's next preset copy on this build"},
     {"ReplayDispatch", "the batched hand-off to the playback thread ([Render] PlaybackBatch) is off on this build"},
+    {"WindowVtblIsActive", "the background focus ([Debug] BackgroundFocus, test only) is off on this build"},
+    {"WindowIsActive", "the background focus ([Debug] BackgroundFocus, test only) is off on this build"},
+    {"PadFocusGateCall", "the background focus ([Debug] BackgroundFocus, test only) is off on this build"},
+    {"FocusPauseCall", "the background focus ([Debug] BackgroundFocus, test only) is off on this build"},
     {"MapOpen", "the map screen is not told from the menu lists: [Controls] MenuControls takes its stick and triggers too"},
     {"LetterboxClear", "the pre-pass arrays ([Stereo] PrepassArrays, test only) are off on this build"},
     {"MotionBlurSetter", "motion blur is not forced off on this build ([Render] MotionBlur: the game's setting)"},
@@ -179,6 +187,73 @@ constexpr Optional kOptional[] = {
     {"HandleViewport", "the eye-2 constants ([Stereo] PrepassViews, test only) are off on this build"},
     {"AudioUpdateListeners", "the game's sound is heard from the game camera, not your head ([XR] AudioFollowsHead), on this build"},
     {"AudioOutputMatrix", "sounds behind you stay as the game mixes them on stereo ([XR] AudioRearFold) on this build"},
+    {"RecReemitState", "the record side's re-emit ([Stereo] RecorderReemit and PrepassRecordSkip, test only) is off on this build"},
+    {"CbCommitted", "the record side's re-emit ([Stereo] RecorderReemit and PrepassRecordSkip, test only) is off on this build"},
+    {"PassCurrent", "the record side's re-emit ([Stereo] RecorderReemit and PrepassRecordSkip, test only) is off on this build"},
+    {"CbList", "the record side's re-emit ([Stereo] RecorderReemit and PrepassRecordSkip, test only) is off on this build"},
+    {"VelocityPass", "the cut's velocity diagnosis and fix ([Stereo] PrepassCutVelocity, test only) is off on this build"},
+    {"RecorderStamp", "the cut's velocity diagnosis ([Stereo] PrepassCutVelocity, test only) reports no recorder stamp on this build"},
+    {"PassBind", "eye 2's previous instance matrices ([Stereo] PrepassInstPrevMirror, test only) are off on this build"},
+    {"InstPrevWvp", "eye 2's previous instance matrices ([Stereo] PrepassInstPrevMirror, test only) are off on this build"},
+    {"InstBufCur", "eye 2's previous instance matrices ([Stereo] PrepassInstPrevMirror, test only) are off on this build"},
+    {"InstBufPrev", "eye 2's previous instance matrices ([Stereo] PrepassInstPrevMirror, test only) are off on this build"},
+    {"ExtraCbInstMtx", "eye 2's previous instance matrices ([Stereo] PrepassInstPrevMirror, test only) are off on this build"},
+    {"ExtraCbInstMtxPrev", "eye 2's previous instance matrices ([Stereo] PrepassInstPrevMirror, test only) are off on this build"},
+    {"DirCollector", "eye 2's collector in pass 1 ([Stereo] PrepassEye2Collector, test only) is off on this build"},
+    {"DirCollectorCall", "eye 2's collector in pass 1 ([Stereo] PrepassEye2Collector, test only) is off on this build"},
+    {"LightStencilRef", "eye 2's collector in pass 1 ([Stereo] PrepassEye2Collector, test only) is off on this build"},
+    {"LightFrontHalf", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"LightFrontHalfCall", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"CullViewCtor", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"BuildCullView", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"Footprints", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"FootprintsCall", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"LightVolumes", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"LightPoolA", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"LightPoolB", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"ScissorSet", "eye 2's Light Buffer in pass 1 ([Stereo] PrepassEye2Light, test only) is off on this build"},
+    {"DecalMgr", "eye 2's collector decals in pass 1 ([Stereo] PrepassEye2Decals, test only) are off on this build"},
+    {"DecalDraw", "eye 2's collector decals in pass 1 ([Stereo] PrepassEye2Decals, test only) are off on this build"},
+    {"ImmRingCursor", "eye 2's collector decals in pass 1 ([Stereo] PrepassEye2Decals, test only) are off on this build"},
+    {"DescAlloc", "eye 2's images' bindless indices ([Stereo] PrepassEye2Images, test only) are off on this build"},
+    {"GlobalTexturesCb", "eye 2's images' bindless indices ([Stereo] PrepassEye2Images, test only) are off on this build"},
+    {"GlobalTexTable", "eye 2's images' bindless indices ([Stereo] PrepassEye2Images, test only) are off on this build"},
+    {"GlobalVarCount", "eye 2's images' bindless indices ([Stereo] PrepassEye2Images, test only) are off on this build"},
+    {"MainDvlCall", "the billboard compare ([Stereo] MainInstanced, test only) is off on this build"},
+    {"ShadowCamMtxId", "the billboard compare's shadow-constant diagnostic ([Stereo] MainInstanced, test only) is off on this build"},
+    {"ShadowPixelSizeId", "the billboard compare's shadow-constant diagnostic ([Stereo] MainInstanced, test only) is off on this build"},
+    {"DecalDrawCall", "pass 2's front-half skip ([Stereo] Pass2FrontSkip, test only) is off on this build"},
+    {"FadeValue", "pass 2's front-half skip ([Stereo] Pass2FrontSkip, test only) is off on this build"},
+    {"FadeBranchCall", "pass 2's front-half skip ([Stereo] Pass2FrontSkip, test only) is off on this build"},
+    {"FrontPassOwner", "pass 2's front-half skip ([Stereo] Pass2FrontSkip, test only) is off on this build"},
+    {"FrontPassMarks", "pass 2's front-half skip ([Stereo] Pass2FrontSkip, test only) is off on this build"},
+    {"DvlPostB0Body", "route F's state census ([Stereo] RouteFCensus, test only) is off on this build"},
+    {"DvlPostB1", "route F's state census ([Stereo] RouteFCensus, test only) is off on this build"},
+    {"TimeWarpClock", "the weapon wheel's pause ([Holsters] WheelPause) is off on this build: the world runs on while the wheel is open"},
+    // run 28 item 1c (deadeye.cpp; after optimumbox's fork, v0.8.11.9, commit ac942427, MIT): any one missing stands down
+    // only its feature, never the mod
+    {"ReticleHudUpdate", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"DeadeyeMarksUi", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"MarkWorldPos", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"ViewportPointVisible", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"ScreenToUi", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"DeadeyeVisRet", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"DeadeyePosRet", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"DeadeyePosRet2", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"DeadeyeUiRet", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"DeadeyeUiRet2", "the Dead Eye X in the headset ([Hands] DeadEyeMarks) is off on this build"},
+    {"TargetingUpdate", "Dead Eye's marks by the barrel ([Hands] DeadEyeBarrelPaint) are off on this build: the game's own pick"},
+    // 2026-10-29, [Hands] OffHandItems stage B (offhand.cpp): any one missing, only the off-hand throws are off
+    {"FireProjectileCore", "the off-hand throws ([Hands] OffHandItems) are off on this build"},
+    {"WeaponInfoTree", "the off-hand throws ([Hands] OffHandItems) are off on this build"},
+    {"WeaponNameMapOwner", "the off-hand throws ([Hands] OffHandItems) are off on this build"},
+    // 2026-10-29, [Hands] OffHandTorchLit (dual.cpp offhand_torch_fx): any one missing, the off-hand torch is drawn unlit
+    {"IdleFxStart", "the off-hand torch ([Hands] OffHandTorchLit) is drawn unlit on this build"},
+    {"IdleFxOffset", "the off-hand torch ([Hands] OffHandTorchLit) is drawn unlit on this build"},
+    {"IdleFxRot", "the off-hand torch ([Hands] OffHandTorchLit) is drawn unlit on this build"},
+    // 2026-10-30 (item 10): the launcher at the game's start holds the game here; launcher_start.cpp uses it only on the
+    // analysed build (anchors::precheck, before verify()), so another build never needs it
+    {"BootDeviceInit", "the launcher at the game's start ([Launcher] ShowAtStart) is off on this build"},
 };
 const char* optional_what(const char* name) {
     for (const Optional& o : kOptional)
@@ -356,8 +431,9 @@ bool scan_build(long long* reloc) {
     const char* cur = nullptr;
     long long shift = 0;
     int agree = 0, seen = 0, total = 0;
-    const char* opt_name[4] = {};
-    long long opt_shift[4] = {};
+    constexpr int kOptMax = 32;  // (run 23: was 4, so only the first four optional globals found were ever placed; 19 exist)
+    const char* opt_name[kOptMax] = {};
+    long long opt_shift[kOptMax] = {};
     int nopt = 0;
     auto flush = [&]() {
         if (!cur) return;
@@ -374,9 +450,11 @@ bool scan_build(long long* reloc) {
             return;
         }
         if (opt) {  // placed below only if it has the shift every required global has (else absent, the build still runs)
-            if (nopt < 4) {
+            if (nopt < kOptMax) {
                 opt_name[nopt] = cur;
                 opt_shift[nopt++] = shift;
+            } else {
+                out("DATA %s: more than %d optional globals found (optional: not placed)", cur, kOptMax);
             }
             return;
         }

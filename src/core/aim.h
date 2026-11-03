@@ -9,13 +9,33 @@
 //   matrix (the weapon object's +0x80, barrel along -row c) taken to the IK hand by the wrist's correction, from the
 //   muzzle (the weapon tune's MuzzleOffset).
 
+#include <cstdint>
 #include <string>
 
 namespace rdrvr::aim {
 int player_melee_state();  // the player's melee controller's state (1 a punch, 2 blocking; -1 none or unread)
+// 2026-10-30 (item 12, [Gestures] LassoThrow=lock; a test's probe, "gestures lassoprobe on"): the lasso's state, read only
+// (SEH-guarded, fixed offsets; -1 or 0 unread). aim_state: the player info's aim-trigger state (+0x244: 1 pressed, 2
+// held, 3 easing off; research/run17/lasso.md 1.2); user_state: the player's lasso component L ([[ped +0xaa8] +0x40]
+// +0x18; 5 holding someone); lasso_state: the lasso's own (L +0x30 -> +0x3d0, FUN_14035d900: 2 coiled, 3 in flight, 8-13
+// on someone); target: the lasso's +0xf0 (copied from the candidate +0xf8 for the player when +0xf0 is not live; a
+// previous throw's live value is kept: research/run30/lasso_lock.md 3), candidate (+0xf8, from the item's +0x210); from
+// the targeting T (actor +0xb8, FUN_14039bec0): reticle (+0x3900, GET_ACTOR_UNDER_RETICLE's 0),
+// lock (+0x3914, its 1: the reticle ray's hit, also beyond the reticle's range, or the magnet's), soft (+0x3920, the soft
+// lock's pick, an actor-pool handle: never equal to a script handle). The others as the script's (GET_LASSO_TARGET's).
+// Any thread.
+struct LassoProbe {
+    bool ok = false;
+    int32_t aim_state = -1, user_state = -1, lasso_state = -1;
+    uint32_t target = 0, candidate = 0, reticle = 0, lock = 0, soft = 0;
+};
+LassoProbe lasso_probe();
 
 void init();
 bool install();  // after anchors::verify()
+// (2026-10-29, [Hands] OffHandItems) the projectile launch hook is in place: an off-hand throw is made only then (its
+// velocity and place are set there; without it the core's 650 m/s would leave the hand)
+bool launch_hooked();
 bool barrel_aim();
 // [Hands] Reticle (off by default): where the shot lands, the game's own reticle target point (T +0x3810, on the barrel's line at
 // the probe's hit) while aiming with a gun in hand; on_actor: an actor under it. False when none (lowered, no gun, a
@@ -40,6 +60,9 @@ void set_shoot_past_arm_block(bool on, bool save);  // save: also written to the
 // The barrel of the gun in hand in its IK target's axes (the controller with the hand calibration; it is rigid there):
 // from the latest aim ray, false when none in the last 0.5 s. Any thread.
 bool barrel_in_target(float b[3]);
+// (run 29 item 3, the scope spike; test only) the latest aim ray in the world: the muzzle and the barrel's direction,
+// false when none in the last 0.5 s. Any thread (torn reads possible: a test's pictures only).
+bool last_ray(float muzzle[3], float dir[3]);
 // The player's item in hand as the game places it: W +0x80, its world matrix (rows a b c, then the origin; 4 floats
 // each), from which the game also places the gun's drawn prop (FUN_1402fe6d0 -> FUN_1402191c0), and whether the game
 // hangs it on the left hand (item +0x98). False with nothing in hand. Any thread: SEH-guarded reads and the item's own
@@ -54,17 +77,32 @@ bool aiming();
 // Channel 0's camera is the game's own gameplay camera ([[CamManager +8] +0x18] +0x10 == [CamManager +0x28]): no
 // scripted camera (the anchor's, a shop's, a mission's) is current. False when not read.
 bool gameplay_camera_current();
+// While another hook puts the gameplay camera on channel 0 for one game call (deadeye.cpp's reticle UI update; after
+// optimumbox's fork, v0.8.11.9, commit ac942427, MIT): gameplay_camera_current() stays false meanwhile, so the plugin's
+// camera job does not take the swap for the game's own. Paired: true before the call, false after.
+void camera_swap_flag(bool on);
 // [Gestures] ThrowByGrip: hold the grip to hold a throwable, the trigger to start it (the light, the knife by its tip),
 // the grip let go to throw it with the swing. grip_throw_wanted(ctrl): that controller's grip is the throwable's (the
 // gun hand with a throwable in it), not the game's button
 bool grip_throw_wanted(int ctrl);
 bool grip_throw();
+// (2026-10-31, the off-hand build step 2) the game's own throw under way: armed by the trigger (ThrowByGrip), held, its
+// LT tail, or a player throw clip started within the last 1.5 s (any options). holster.cpp's let-go of a held throwable
+// leaves it to the game then
+bool grip_throw_busy();
+// The player's own shots (the gun in hand's, one a shot however many pellets), counted in the spawn hook as the game
+// makes them (actions.cpp: a fanned shot taken). Any thread.
+uint64_t player_shots();
+// The player's gun controller G ([[actor +0x38 (ped)] +0xaa8] +8; +0x24 John's fire clip phase), 0 when none. Game thread.
+uintptr_t player_gun_ctl();
 bool mounted_gun_fired(double ms);  // the player shot a mounted gun (the Gatling, the Browning, the cannon) within ms
 bool mounted_shot(float d[3], double* ms);  // a mounted gun's last round: its direction (world) and when
 void on_exit();  // the process exit: others' shots since the last log line
 // the pad's triggers (the pad's thread): the trigger with the grip holding a throwable arms it (the game's LT, then its
 // RT after a lead), LT kept through the held throw and its tail
 void grip_throw_input(float* lt, float* rt);
+std::string throw_flight();
+double game_throw_launch_ms();  // (GOAL-offhand-changes C1) the player's last thrown item launched by the game's own throw (log::now_ms)  // (GOAL-offhand-changes C13) the last thrown projectile's flight ("offhand": its line)
 void throw_hold_tick();  // the game thread, once a frame (the visibility build): the held throw pinned, or let go
 // the throwing knife's readied throw held by its tip: its local turn axis (0-2) and pivot (the blade's middle)
 bool knife_tip(int* axis, float pivot[3]);

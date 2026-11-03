@@ -32,6 +32,7 @@ constexpr uintptr_t kDlssOutputW = 0xac, kDlssRenderW = 0xec;  // DLSS: the outp
 using AaSet_t = void (*)(int* p);
 AaSet_t o_AaSet = nullptr;
 std::atomic<int> g_force_aa{-1};
+std::atomic<bool> g_aa_hooked{false};  // (run 21 item 4) the AA setter hook installed: frame generation forced off on its calls
 int g_dlss_quality = 0;  // [Render] DlssQuality: the game's DLSS quality index 0..5 (0 DLAA, 1 dynamic, 2 ultra perf ... 5 quality)
 std::atomic<float> g_fixed_scale{0.0f};
 std::atomic<bool> g_release_scale{false};  // fixed scale switched off: hand DRS back once
@@ -214,6 +215,7 @@ bool install() {
     if (anchors::stand_down()) return false;
     bool ok = hooks::install("RDR AA/upscaler setter", reinterpret_cast<void*>(anchors::addr(anchors::Id::AaSetter)), hk_AaSet,
                              &o_AaSet);
+    g_aa_hooked = ok;
     d3d::add_frame_end_listener(on_frame_end);
     log::info("[render] forcing AA %s (DLSS quality index %d), fixed render scale %s",
               g_force_aa < 0 ? "no" : g_force_aa == 0 ? "Off" : g_force_aa == 1 ? "FXAA" : g_force_aa == 2 ? "native TAA (technique 2)"
@@ -222,6 +224,8 @@ bool install() {
               g_fixed_scale.load() > 0 ? "on" : "off");
     return ok;
 }
+
+bool aa_hook_installed() { return g_aa_hooked.load(std::memory_order_relaxed); }
 
 bool set_aa(int mode) {
     // only while the core forces the AA mode; DLSS (3) is set at boot only: switching to or from it at run time re-creates

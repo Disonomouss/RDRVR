@@ -20,6 +20,7 @@ namespace {
 std::mutex g_mutex;              // one request at a time
 std::string g_path, g_result;
 std::atomic<bool> g_pending{false};
+std::atomic<bool> g_late{false};  // the pending grab is taken after every frame-end listener
 HANDLE g_done = nullptr;
 
 ID3D12Device* g_dev = nullptr;
@@ -283,7 +284,14 @@ void on_frame_end(uint64_t) {
         g_depth_phase = 0;
         SetEvent(g_depth_done);
     }
-    if (!g_pending.load(std::memory_order_acquire)) return;
+    if (!g_pending.load(std::memory_order_acquire) || g_late.load(std::memory_order_relaxed)) return;
+    g_result = capture();
+    g_pending = false;
+    SetEvent(g_done);
+}
+
+void on_frame_end_last(uint64_t) {
+    if (!g_pending.load(std::memory_order_acquire) || !g_late.load(std::memory_order_relaxed)) return;
     g_result = capture();
     g_pending = false;
     SetEvent(g_done);
@@ -295,6 +303,7 @@ void init() {
     g_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_depth_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     d3d::add_frame_end_listener(on_frame_end);
+    d3d::set_frame_end_last(on_frame_end_last);
     d3d::set_copy_tap(copy_tap);
 }
 
@@ -315,9 +324,10 @@ std::string grab_depth(const std::string& path, unsigned timeout_ms) {
     return g_depth_result;
 }
 
-std::string grab(const std::string& path, unsigned timeout_ms) {
+std::string grab(const std::string& path, unsigned timeout_ms, bool late) {
     std::lock_guard lock(g_mutex);
     g_path = path;
+    g_late.store(late, std::memory_order_relaxed);
     ResetEvent(g_done);
     g_pending.store(true, std::memory_order_release);
     if (WaitForSingleObject(g_done, timeout_ms) != WAIT_OBJECT_0) {

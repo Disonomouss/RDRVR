@@ -31,9 +31,25 @@ bool has_ui();
 void size(uint32_t* w, uint32_t* h);
 // The whole UI into `dst`, without the UI pixels in `hole` (x0 y0 x1 y1; the wrist HUD's part) when given. Texel for
 // texel when `dst` is the UI's size; smaller (the quad's swapchain capped), box-filtered so text does not alias.
-bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4] = nullptr, const int hole2[4] = nullptr);
+// hole3: the Dead Eye X's slots in use (deadeye::band), left out too
+bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4] = nullptr, const int hole2[4] = nullptr, const int hole3[4] = nullptr);
 // The wrist HUD: the UI's cw x ch pixels from (x0, y0) into all of `dst` (texel for texel at that size, else filtered).
 // which: 0 the wrist HUD's image (its own list and view), 1 the hand-placed wheel's (run 8 item 5)
 bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw, uint32_t ch, int which = 0);
+// [XR] WristHudShape (2026-10-26): the wrist HUD as a shape inside its crop, not the whole rect: box (the ammo counter's
+// x0 y0 x1 y1) and ell (the radar's ellipse: centre x y, radii x y), UI pixels. The quad then leaves out only the shape
+// and the wrist draws only it, so the corner's other UI (a subtitle reaching into it) stays whole on the quad. Off: the
+// rect (as before).
+// crop: the wrist's crop (x0 y0 x1 y1): the shape is taken only inside it, so no UI is left on neither layer
+void set_wrist_shape(bool on, const float box[4], const float ell[4], const float crop[4]);
+// The Dead Eye X (deadeye.cpp; after optimumbox's fork, v0.8.11.9, commit ac942427, MIT): `dst` (an acquired XR image,
+// RENDER_TARGET) cleared, then each sprite's rect (x0 y0 x1 y1, pixels of `dst`) drawn from the UI target, its corner
+// from UI pixel `src`, `scale` UI pixels a destination pixel (box-filtered, up to 8)
+struct Sprite {
+    int dst[4];
+    float src[2];
+    float scale;
+};
+bool draw_sprites(ID3D12Resource* dst, DXGI_FORMAT fmt, const Sprite* sp, int n);
 
 }  // namespace rdrvr::ui_layer

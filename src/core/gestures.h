@@ -19,14 +19,17 @@ bool lasso_by_hand();
 // 2026-10-12 (the user: "Lasso gesture controls are difficult ... hard to aim and trigger the throw"): [Gestures]
 // LassoThrow 0 swing (a fast swing toward the aim), 1 trigger (the lasso hand's trigger: the game's aim held a moment
 // for its lock, then the throw), 2 both; LassoAim 0 the lasso hand (frozen once a swing starts), 1 the head, 2 the
-// other hand's controller
+// other hand's controller. 2026-10-30 (item 12): LassoThrow 3 lock: the game's LT held (the other hand's trigger) locks
+// on to the one you look at (the lasso aimed by the head, whatever LassoAim says) and plays its spin; the lasso hand's
+// trigger, or a swing toward where you look while LT is held, throws; LT let go without either throws nothing
 int lasso_throw();
 void set_lasso_throw(int m, bool save);
 int lasso_aim();
 void set_lasso_aim(int m, bool save);
 // The lasso's aim now (world, unit; aim.cpp's ray): false: the lasso hand's own pointing (not frozen)
 bool lasso_aim_dir(const float* hand_dir, float d[3]);
-bool lasso_trigger_owned();  // the lasso in hand, LassoThrow trigger or both: the raw RT held back (controls.cpp)
+bool lasso_lock_held();  // (C11b) LassoThrow=lock, the lasso in hand, LT held now
+bool lasso_trigger_owned();  // the lasso in hand, LassoThrow trigger, both or lock: the raw RT held back (controls.cpp)
 bool guard();  // [Gestures] Guard (run 10 item 7): both fists before the face hold the game's block
 bool guard_up();  // GuardTriggers on and the guard held or its pose taken now (any thread): the right trigger's RT held back meanwhile
 void set_guard(bool on, bool save);  // [Gestures] Lasso
@@ -41,6 +44,14 @@ bool is_thrown(int32_t weapon);  // the thrown weapons by eWeapon (fire bottle, 
 // aim.cpp's projectile launch for the player's thrown weapons: the gun hand's fastest velocity in the last 0.8 s (times
 // [Gestures] ThrowGain) and where the hand is now, when it moved fast enough; false: the game's own throw. Any thread.
 bool throw_launch(float vel[3], float origin[3]);
+// [Hands] OffHandItems: controller h's fastest velocity of the last `window_ms` (two-frame steps, the recentred local
+// frame) into the world times [Gestures] ThrowGain (vel), where its drawn hand is now (origin) and its own speed
+// (speed, m/s, without the gain); false: no recent sample. Throw by hand or not. Any thread.
+bool hand_throw(int h, double window_ms, float vel[3], float origin[3], float* speed);
+// [Reload] CarriedPump (2026-10-29): controller h's fastest velocity of the last `window_ms` (two-frame steps, the
+// recentred local frame: walking and turning not in it) into the world, m/s, without a gain; false: no recent sample.
+// Any thread.
+bool hand_velocity(int h, double window_ms, float vel[3]);
 
 std::string command(const std::string& line);  // "gestures [throw|melee|lasso on|off]": the switches, counters, speeds
 // Run 7 item 2, [Gestures] GunMelee (gun_melee.h; the swing's detector lives here, beside the punch's): "gunmelee [on|off]
@@ -48,5 +59,7 @@ std::string command(const std::string& line);  // "gestures [throw|melee|lasso o
 // the settings, the swing's state and counters (armed, requests, scans, actors seen, the iterators made and destroyed,
 // hits, dry hits, refusals, the swings suppressed by each window) and the hit side's (gun_melee::status)
 std::string gun_melee_command(const std::string& line);
+// [Hands] OffHandItems: the off hand's knife's stab detector's state and counters (offhand::command's line)
+std::string offhand_strike_status();
 
 }  // namespace rdrvr::gestures

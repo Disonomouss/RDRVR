@@ -165,4 +165,12 @@ void limited(const char* key, uint32_t max_count, const char* fmt, ...) {
     va_end(ap);
 }
 
+void reset_limited(const char* prefix) {
+    const size_t n = std::strlen(prefix);
+    AcquireSRWLockExclusive(&g_key_lock);
+    for (int i = 0; i < g_key_count; ++i)
+        if (g_keys[i].key && std::strncmp(g_keys[i].key, prefix, n) == 0) g_keys[i].count = 0;
+    ReleaseSRWLockExclusive(&g_key_lock);
+}
+
 }  // namespace rdrvr::log

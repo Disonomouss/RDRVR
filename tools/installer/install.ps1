@@ -35,8 +35,16 @@ if (-not (Test-Path -LiteralPath $Payload)) { $Payload = $PSScriptRoot }  # the 
 $Version = (Get-Content -LiteralPath (Join-Path $Payload 'RDRVR_version.txt') -TotalCount 1).Trim()
 # plain strings: Windows PowerShell's Get-Content lines carry note properties that ConvertTo-Json would write out
 $Files = @(Get-Content -LiteralPath (Join-Path $Payload 'RDRVR_files.txt') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-# A test build's simulator pointer: it would send the eyes to the simulator instead of the headset (removed, not kept)
-$Leftovers = @('RDRVR_xr_runtime.txt')
+# A test build's simulator pointer: it would send the eyes to the simulator instead of the headset (removed, not kept);
+# the 2026-10-30 layout's launcher at the root (there it loaded the game folder's winmm.dll, RedHook's proxy, and crashed;
+# it lives in RDRVR_Launcher\ now)
+$Leftovers = @('RDRVR_xr_runtime.txt', 'RDRVR_Launcher.exe')
+# A payload file by its path (RDRVR_Launcher\RDRVR_Launcher.exe), or flat by its name (the .exe extracts everything flat)
+function Payload-File([string] $f) {
+    $p = Join-Path $Payload $f
+    if (-not (Test-Path -LiteralPath $p)) { $p = Join-Path $Payload (Split-Path $f -Leaf) }
+    $p
+}
 
 function Sha([string] $p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLowerInvariant() }
 
@@ -131,10 +139,10 @@ function Test-Free([string] $p) {
     }
     return $false
 }
-foreach ($f in $Files) {
+foreach ($f in $Files + $Leftovers) {
     $dst = Join-Path $GameDir $f
     if ((Test-Path -LiteralPath $dst) -and -not (Test-Free $dst)) {
-        Say "  $f in the game folder is in use by another program (the game, its crash reporter, or a virus scan)."
+        Say "  $f in the game folder is in use by another program (the game, its crash reporter, the launcher, or a virus scan)."
         Say '  Nothing was changed. Close it (or restart the PC) and run the installer again.'
         Done 1
     }
@@ -152,11 +160,11 @@ $backedUp = @()
 foreach ($f in $Files) {
     $dst = Join-Path $GameDir $f
     if (-not (Test-Path -LiteralPath $dst)) { continue }
-    $src = Join-Path $Payload $f
+    $src = Payload-File $f
     if ((Test-Path -LiteralPath $src) -and (Sha $src) -eq (Sha $dst)) { continue }  # already this version's file
     $ours = $prev -and @($prev.files | Where-Object { $_.file -eq $f -and $_.sha256 -eq (Sha $dst) }).Count
     if ($ours) { continue }  # an earlier RDRVR install's file: replaced, not kept
-    New-Item -ItemType Directory -Force $backupDir | Out-Null
+    New-Item -ItemType Directory -Force (Split-Path (Join-Path $backupDir $f) -Parent) | Out-Null
     Copy-Item -LiteralPath $dst -Destination (Join-Path $backupDir $f) -Force
     $backedUp += $f
     Say "  backed up $f -> $backupRel"
@@ -175,8 +183,9 @@ function Copy-Retry([string] $src, [string] $dst) {
 }
 $record = @()
 foreach ($f in $Files) {
-    $src = Join-Path $Payload $f
+    $src = Payload-File $f
     $dst = Join-Path $GameDir $f
+    New-Item -ItemType Directory -Force (Split-Path $dst -Parent) | Out-Null
     if (-not (Copy-Retry $src $dst)) {
         Say "  $f is in use by another program (the game, its crash reporter, or a virus scan)."
         Say '  Close it (or restart the PC) and run the installer again; the files copied so far are replaced then.'
@@ -189,7 +198,11 @@ foreach ($f in $Files) {
 }
 foreach ($f in $Leftovers) {
     $p = Join-Path $GameDir $f
-    if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; Say "  removed $f (a test setting)" }
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop }
+    catch { Say "  $f could not be removed ($($_.Exception.Message)): close it and delete it by hand"; continue }
+    if ($f -eq 'RDRVR_Launcher.exe') { Say "  removed the old $f at the game folder's root: it is RDRVR_Launcher\RDRVR_Launcher.exe now (a shortcut to the old one no longer works)" }
+    else { Say "  removed $f (a test setting)" }
 }
 # The uninstaller, next to the game
 foreach ($u in @(@{ s = 'uninstall.ps1'; d = 'RDRVR_uninstall.ps1' }, @{ s = 'Uninstall.cmd'; d = 'RDRVR_Uninstall.cmd' })) {

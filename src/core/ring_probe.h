@@ -20,6 +20,8 @@ struct D3D12_RESOURCE_DESC;
 namespace rdrvr::ring_probe {
 
 bool enabled();
+// the CreateConstantBufferView hook and the upload buffers' tracking: [Debug] RingProbe=1, or the CBV map alone (below)
+bool tracking();
 void install_device_hooks(ID3D12Device* dev);            // CreateConstantBufferView
 void install_list_hooks(ID3D12GraphicsCommandList* cl);  // root CBV binds
 void on_upload_buffer(ID3D12Resource* res, const D3D12_RESOURCE_DESC* desc);  // from resource creation
@@ -36,5 +38,15 @@ void matrix_text(char* out, size_t len);
 uint64_t thread_cbvs();
 // The CPU copy of `bytes` at GPU address `va` when it lies in a tracked (persistently mapped) upload buffer, else null.
 const uint8_t* cpu_of(uint64_t va, uint64_t bytes);  // CBVs the calling thread has created so far (the drawlog's per-call attribution)
+// ([Stereo] PrepassEye2Images, test only) the CBV map. The CreateConstantBufferView hook and the upload buffers' tracking
+// are installed at the device's creation, before eye2_images can install, so they follow the ini (PrepassEye2Images=1,
+// PrepassEye2Collector=1 and PrepassEye2Light=1) without [Debug] RingProbe (its report and root-CBV hooks stay its own);
+// the map itself is written only while armed: arm_cbv_map(true) from eye2_images::install (false: the ini did not
+// ask for the hook), arm_cbv_map(false) at its stand-down; until then the hook's extra cost is one relaxed load. cbv_of gives the
+// last CBV written into a descriptor (its CPU handle), false if none is known
+bool arm_cbv_map(bool on);
+bool cbv_map_on();
+uint64_t cbvs_mapped();
+bool cbv_of(uint64_t cpu_handle, uint64_t* va, uint32_t* size);
 
 }  // namespace rdrvr::ring_probe

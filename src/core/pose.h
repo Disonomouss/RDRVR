@@ -40,6 +40,67 @@ bool holds_armed_height(const RdrvrActorState& st);  // [Horse] VehicleHeading (
 void set_vehicle_heading(bool on, bool save);
 void set_stick_turn_riding(bool on, bool save = true);
 float ride_turn_deg();  // the offset now (0 on foot or steering by the head)
+// [XR] PhysicalCrouch (2026-10-27, research/run27/roomscale.md Part C; off by default): the user's own crouch crouches
+// John (the neck's drop below its standing reference, the lean taken out; the game's L3 pressed on the change, checked
+// on IS_ACTOR_CROUCHING, retried once, never against the game's own changes); while it owns John's crouch the view's
+// height is held at the standing one. CrouchShare / StandShare of the standing eye height (STAGE's, else
+// StandingHeight), each held CrouchHoldMs. The setters write the user ini when `save` ("pose crouch ..." does not).
+// [XR] RoomScale (2026-10-27, research/run27/roomscale.md Part B; off by default): a step in the room walks John under
+// the head (the left stick, at most RoomScaleMaxStick: a walk), the view moving only with the head (camera_lever's
+// take-off); the player's stick wins; a blocked John stops the stick and fades the eyes (RoomScaleFade) with the offset
+// clamped at RoomScaleMaxOffset. On foot only. The setters write the user ini when `save` ("pose room ..." does not).
+bool room_scale();
+void set_room_scale(bool on, bool save = true);
+bool room_fade();
+void set_room_fade(bool on, bool save = true);
+void room_tuning(float* dead, float* stop, float* min_stick, float* max_stick, float* max_offset);
+void set_room_tuning(float dead, float stop, float min_stick, float max_stick, float max_offset, bool save);
+std::string room_status();
+// (2026-10-28) [XR] RoomScaleLeanSlack (m: the drop a lean is judged from, 0-0.10) and RoomScaleStartLead (s: the early
+// start's look ahead, 0-0.5; 0 = the dead zone alone). Ini only ("pose room quick <slack> <lead>" for the session)
+void room_response(float* lean_slack, float* start_lead);
+void set_room_response(float lean_slack, float start_lead, bool save);
+// [XR] RoomScaleDirect (2026-11-02): a small step put under the head at once, no walk, where a probe finds no wall
+bool room_direct();
+void set_room_direct(bool on, bool save);
+// "pose room": the offset, the walk, blocked, the fade, the slide, the metres taken off, the eye's world place
+void set_room_take(bool on);  // "pose room take on|off": the take-off itself (a test's negative control; the session only)
+// [XR] BodyFollowsTurn (2026-10-27; the user: "Turning physically will turn johns body right?"; off by default): the
+// head's yaw over the body held beyond BodyTurnDeadZone degrees for BodyTurnHoldMs turns the body heading after it
+// (smooth, at most BodyTurnSpeed deg/s), the view kept still (camera_lever turns the recentre origin's yaw by what the
+// camera shows). On foot only: not riding, in cover, a script's camera, a menu, the wheel, a long gun two-handed, a
+// room-scale walk. The setters write the user ini when `save` ("pose bodyturn ..." does not).
+bool body_follows_turn();
+void set_body_follows_turn(bool on, bool save = true);
+void body_turn_tuning(float* dead, float* hold_ms, float* speed);
+// gain, ease_s (2026-10-28): [XR] BodyTurnGain (a second, the tail) and BodyTurnEaseS (the ease-in); negative: unchanged
+void set_body_turn_tuning(float dead, float hold_ms, float speed, bool save, float gain = -1.0f, float ease_s = -1.0f);
+// [XR] BodyTurnDuringWalk (2026-10-28, on): the follow also during a room-scale walk (its direction turned with it)
+bool body_turn_during_walk();
+void set_body_turn_during_walk(bool on, bool save = true);
+std::string body_turn_status();  // "pose bodyturn": the gate, the head over the body, following, the origin's match, the view
+// the follow's turn so far (degrees, wrapped; 0 while the option was never on): its changes are the body's turns by it
+// (holster.cpp's TurnWithHead keeps its frame where it was in the world). Any thread
+float body_turn_total_deg();
+// the follow's own steps only, summed (degrees, wrapped): a recentre's correction of the total never in it (the holsters'
+// TurnWithHead turns its frame back by its changes alone: a recentre resets that frame itself). Any thread
+float body_turn_steps_deg();
+bool physical_crouch();
+void set_physical_crouch(bool on, bool save = true);
+// A recentre now keeps its origin's height (camera_lever::recentre_from): PhysicalCrouch on and John crouched
+bool crouch_keeps_recentre_height();
+float crouch_share();
+void set_crouch_share(float share, bool save = true);  // (StandShare kept 0.04 under it)
+// quick_ms: [XR] CrouchQuickHoldMs, the hold at 40 % past the threshold (2026-10-28; negative: unchanged)
+void set_crouch_tuning(float crouch_share, float stand_share, float hold_ms, float standing_m, bool save, float quick_ms = -1.0f);
+float crouch_hold_ms();                              // [XR] CrouchHoldMs (the menu's "Hold before he crouches")
+void set_crouch_hold(float hold_ms, bool save = true);  // (the other crouch keys kept)
+void calibrate_standing(double ms);  // "Set my standing height": the reference taken `ms` from now
+double standing_calibrate_in();      // ms left of that countdown (0: due, waiting for the headset's tracking), -1 none
+// the last one not taken, for 8 s (nullptr otherwise): John crouched (refused: stand him first), or the headset never tracked (10 s)
+const char* standing_calibrate_message();
+float standing_height(bool* from_floor);  // H now (from_floor: the headset's STAGE space gave it)
+std::string crouch_status();         // "pose crouch": drop, H, y_stand, want/have/owned, presses, retries, refusals
 // John's body's heading: the body heading less the ride's turn (the horse's while riding with the view turned): the
 // holsters' frame, the facing lock, the elbow hints
 float torso_heading_deg();

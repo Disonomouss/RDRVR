@@ -22,6 +22,7 @@ struct Entry {
 
 std::mutex g_mutex;
 std::deque<Entry> g_entries;  // deque: stable addresses, hooks are never moved after install
+bool g_refuse_shared = false;  // ([Debug] PixCapturer, set at startup before any install)
 
 void describe_address(void* p, char* out, size_t len) {
     HMODULE mod = nullptr;
@@ -47,6 +48,15 @@ bool install(const char* name, void* target, void* detour, void** original) {
         log::error("[hook] %s: no target", name);
         return false;
     }
+    if (g_refuse_shared) {
+        std::lock_guard lock(g_mutex);
+        for (const Entry& e : g_entries)
+            if (e.target == target) {
+                log::error("[hook] %s at %s: REFUSED, the target is already hooked as %s (one function behind two slots: PIX's wrappers?)", name,
+                           where, e.name);
+                return false;
+            }
+    }
     auto created = safetyhook::InlineHook::create(target, detour, safetyhook::InlineHook::StartDisabled);
     if (!created) {
         log::error("[hook] %s at %s: create failed (error type %d)", name, where, static_cast<int>(created.error().type));
@@ -64,6 +74,17 @@ bool install(const char* name, void* target, void* detour, void** original) {
     }
     log::info("[hook] %s installed at %s", name, where);
     return true;
+}
+
+void set_refuse_shared(bool on) { g_refuse_shared = on; }
+
+void describe_target(void* target, char* out, size_t len) { describe_address(target, out, len); }
+
+const char* hooked_name(void* target) {
+    std::lock_guard lock(g_mutex);
+    for (const Entry& e : g_entries)
+        if (e.target == target) return e.name;
+    return nullptr;
 }
 
 int count() {

@@ -1,6 +1,7 @@
 #pragma once
 // Settings: RDRVR.ini next to RDR.exe (shipped, every key commented, replaced by each release), then
-// %LOCALAPPDATA%\RDRVR\RDRVR.user.ini (only what the menu writes; never overwritten by releases or tests).
+// %LOCALAPPDATA%\RDRVR\RDRVR.user.ini (only what the menu writes, or RDRVR_Launcher.exe while the game is closed;
+// never overwritten by releases or tests).
 // A key in the user file wins. Every key read is echoed to the log once with its value and its source,
 // so a test can prove a switch reached the code.
 
@@ -9,6 +10,11 @@
 namespace rdrvr::config {
 
 void load();    // (re)reads both files; safe to call again (e.g. from the test channel)
+// [Stereo] SinglePass at the last load (GOAL-single-pass-default.md item 3): -1 no key (the code's defaults), 0 two-pass
+// (the switch), 1 single pass (the stack's keys supplied where unset), 2 asked for but the shader converter is missing,
+// 3 asked for but a user key turns it off (single_pass_off_key(): which)
+int single_pass_state();
+std::string single_pass_off_key();
 
 bool get_bool(const char* section, const char* key, bool def);
 int get_int(const char* section, const char* key, int def);

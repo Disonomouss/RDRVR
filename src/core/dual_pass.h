@@ -40,7 +40,14 @@
 namespace rdrvr::dual_pass {
 
 bool install();
+bool masks_hooked();                                 // the DrawMasksFn entry stub installed ([Compat] DrawMaskInit)
+uint64_t gust_kept();                                // [Stereo] PrepassWalkCut frames that kept pass 1's gust shift
 int pass();                                          // this thread's pass of a double frame: 0 none, 1, 2
+uint64_t double_seq();  // double frames begun on this thread (begin_frame's count; [Stereo] RouteFCensus's frame key)
+// ([Stereo] MainInstanced, test only) this thread's sun cascades in the current pass, at SceneRender's site: 0 not run
+// yet, 1 the eye's own fit (vanilla, or no union viewport), 2 the union's (Split_shadows or Split_shadowunion), 3 skipped
+// (Split_shadows' pass 2: pass 1's maps and fits kept). Reset at each pass's start.
+int cascades_act();
 int post_slot();  // the post run on this thread: 0 the first-eye run, 1 RenderFrame's run of a double frame, 2 mono
 void begin_frame(void* renderer);                    // before pass 1
 void between_passes(void* renderer, int first_eye);  // after pass 1 (its viewport still current), before pass 2

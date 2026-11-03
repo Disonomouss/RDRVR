@@ -58,6 +58,11 @@ foreach ($f in @($m.files)) {
     $p = Join-Path $GameDir $f.file
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; Say "  removed $($f.file)" }
 }
+# a subfolder of the mod's (RDRVR_Launcher\) goes once empty
+foreach ($d in @($m.files | Where-Object { $_.file -match '\\' } | ForEach-Object { Split-Path $_.file -Parent } | Select-Object -Unique)) {
+    $p = Join-Path $GameDir $d
+    if ((Test-Path -LiteralPath $p) -and -not @(Get-ChildItem -LiteralPath $p -Force).Count) { Remove-Item -LiteralPath $p -Force; Say "  removed $d\" }
+}
 foreach ($f in $Runtime) {
     $p = Join-Path $GameDir $f
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; Say "  removed $f" }
@@ -69,7 +74,9 @@ foreach ($b in @($m.backups)) {
         if ($restored.ContainsKey($f)) { continue }
         $src = Join-Path (Join-Path $GameDir $b.dir) $f
         if (Test-Path -LiteralPath $src) {
-            Copy-Item -LiteralPath $src -Destination (Join-Path $GameDir $f) -Force
+            $to = Join-Path $GameDir $f
+            New-Item -ItemType Directory -Force (Split-Path $to -Parent) | Out-Null  # (a subfolder removed above: RDRVR_Launcher\)
+            Copy-Item -LiteralPath $src -Destination $to -Force
             $restored[$f] = $true
             Say "  restored $f (from $($b.dir))"
         }
@@ -90,6 +97,9 @@ Remove-Item -LiteralPath $manifestPath -Force  # RDRVR_Uninstall.cmd then delete
 Say ''
 Say 'RDRVR is removed.'
 $ui = Join-Path $env:LOCALAPPDATA 'RDRVR'
+# (2026-10-31) the shaders converted for single pass go (made again from the game's files at the next install's start)
+$vc = Join-Path $ui 'vi_cache'
+if (Test-Path -LiteralPath $vc) { Remove-Item -LiteralPath $vc -Recurse -Force -ErrorAction SilentlyContinue; Say "  removed the converted shaders ($vc)" }
 if (Test-Path -LiteralPath $ui) { Say "Your settings are kept in $ui (delete that folder to remove them too)." }
 # This script removes itself last
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue

@@ -4,9 +4,12 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
+#include <intrin.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cwchar>
 #include <map>
 #include <mutex>
 #include <string>
@@ -18,6 +21,10 @@
 #include "core/config.h"
 #include "core/frame_probe.h"
 #include "core/hooks.h"
+#include "core/image_mem.h"
+#include "core/gpu_stages.h"
+#include "core/cut_velocity.h"
+#include "core/main_instanced.h"
 #include "core/prepass_arrays.h"
 #include "core/render_res.h"
 #include "core/pso.h"
@@ -66,6 +73,201 @@ constexpr UINT kSamplerPartitions = 112 + 16;
 std::atomic<UINT> g_cb_heap_n{0};    // the game's size of the enlarged heap (0: not enlarged)
 std::atomic<UINT> g_cb_headroom{0};  // descriptors added to it
 std::atomic<bool> g_cb_cap_raised{false};
+// ([Stereo] DescCensus, item 8e; test only) the game's shader-visible heap (the one enlarged above): its CPU start, its increment, its
+// partition 1 (the bindless Texture2D table: descriptors 32..15031, kOtherPartitions' second term)
+std::atomic<uintptr_t> g_dc_cpu0{0};
+std::atomic<UINT> g_dc_inc{0};
+constexpr UINT kDcP1First = 32, kDcP1Count = 15000;
+std::atomic<bool> g_dc_on{false};
+std::atomic<uint64_t> g_dc_writes{0}, g_dc_frames{0}, g_dc_mod{0}, g_dc_in{0};
+// (main_instanced, the render thread) from pass 1's DVL call 1 to pass 2's close: the CPU recording window, not the GPU's (a write
+// there is seen by both passes' execution; the frame number is the test's measure, matched with the failing frames)
+std::atomic<bool> g_dc_phase{false};
+uintptr_t g_dc_self0 = 0, g_dc_self1 = 0;  // the mod's own image: its writes counted apart (eye2_images', the slice SRVs)
+struct DcSlot {
+    std::atomic<uint64_t> frame{0};
+    std::atomic<uint32_t> n{0}, in{0}, first{0}, last{0};
+};
+DcSlot g_dc_ring[64];
+void dc_note(D3D12_CPU_DESCRIPTOR_HANDLE h, UINT count, uintptr_t ret) {  // (any thread) count descriptors from h inside partition 1
+    const uintptr_t c0 = g_dc_cpu0.load(std::memory_order_relaxed);
+    const UINT inc = g_dc_inc.load(std::memory_order_relaxed);
+    if (!c0 || !inc || h.ptr < c0 || !count) return;
+    const uint64_t i0 = (h.ptr - c0) / inc;
+    if (i0 >= kDcP1First + kDcP1Count || i0 + count <= kDcP1First) return;
+    const uint32_t a = static_cast<uint32_t>(i0 < kDcP1First ? kDcP1First : i0);
+    const uint64_t e = i0 + count < kDcP1First + kDcP1Count ? i0 + count : kDcP1First + kDcP1Count;
+    const uint32_t n = static_cast<uint32_t>(e - a);
+    if (ret >= g_dc_self0 && ret < g_dc_self1) {
+        g_dc_mod.fetch_add(n, std::memory_order_relaxed);
+        return;
+    }
+    const bool in = g_dc_phase.load(std::memory_order_relaxed);
+    if (in) g_dc_in.fetch_add(n, std::memory_order_relaxed);
+    const uint64_t f = state::presents.load(std::memory_order_relaxed);
+    DcSlot& s = g_dc_ring[f & 63];
+    uint64_t was = s.frame.load(std::memory_order_relaxed);
+    if (was != f && s.frame.compare_exchange_strong(was, f)) {  // (a new frame takes the slot; a racing writer may lose a count)
+        s.n.store(0, std::memory_order_relaxed);
+        s.in.store(0, std::memory_order_relaxed);
+        s.first.store(a, std::memory_order_relaxed);
+        g_dc_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+    s.n.fetch_add(n, std::memory_order_relaxed);
+    if (in) s.in.fetch_add(n, std::memory_order_relaxed);
+    s.last.store(a + n - 1, std::memory_order_relaxed);
+    g_dc_writes.fetch_add(n, std::memory_order_relaxed);
+}
+using CreateSRV_t = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using CopyDescs_t = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT,
+                                            const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
+using CopyDescsSimple_t = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                                  D3D12_DESCRIPTOR_HEAP_TYPE);
+CreateSRV_t o_CreateSRV = nullptr;
+CopyDescs_t o_CopyDescs = nullptr;
+CopyDescsSimple_t o_CopyDescsSimple = nullptr;
+// ---- (r117 DG4, test only) the depthlog: the next N presents' list calls on the game's depth, logged
+std::atomic<int> g_dl_frames{0};
+std::atomic<const void*> g_dl_res{nullptr};  // (the depth found by name, cached)
+std::atomic<uint64_t> g_dl_lines{0};
+uintptr_t g_dl_self0 = 0, g_dl_self1 = 0;  // (the mod's image: its SRV creations flagged)
+inline bool dl_on() { return g_dl_frames.load(std::memory_order_relaxed) > 0; }
+bool dl_is(const void* r) {
+    if (!r) return false;
+    if (g_dl_res.load(std::memory_order_relaxed) == r) return true;
+    if (!resource_named(r, "Shadow Collector Depth Buffer")) return false;
+    g_dl_res.store(r, std::memory_order_relaxed);
+    return true;
+}
+void dl_line(const char* what, bool mod, const void* cl, const char* detail) {
+    g_dl_lines.fetch_add(1, std::memory_order_relaxed);
+    log::limited("d3d.depthlog", 20000, "[depthlog] present %llu %s%s list %p thread %lu pass %d: %s", static_cast<unsigned long long>(state::presents.load()),
+                 mod ? "MOD " : "", what, cl, GetCurrentThreadId(), main_inst::pb_pass(), detail);
+}
+void dl_barriers(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b, bool mod) {
+    for (UINT i = 0; i < n && b; ++i) {
+        char d[200];
+        if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && dl_is(b[i].Transition.pResource)) {
+            std::snprintf(d, sizeof(d), "transition sub %d %#x -> %#x flags %#x", static_cast<int>(b[i].Transition.Subresource),
+                          static_cast<unsigned>(b[i].Transition.StateBefore), static_cast<unsigned>(b[i].Transition.StateAfter), static_cast<unsigned>(b[i].Flags));
+        } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && dl_is(b[i].UAV.pResource)) {
+            std::snprintf(d, sizeof(d), "UAV barrier");
+        } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING && (dl_is(b[i].Aliasing.pResourceBefore) || dl_is(b[i].Aliasing.pResourceAfter))) {
+            std::snprintf(d, sizeof(d), "aliasing %p -> %p", static_cast<const void*>(b[i].Aliasing.pResourceBefore),
+                          static_cast<const void*>(b[i].Aliasing.pResourceAfter));
+        } else {
+            continue;
+        }
+        dl_line("ResourceBarrier", mod, cl, d);
+    }
+}
+void dl_copy(ID3D12GraphicsCommandList* cl, const void* dst, const void* src, int dsub, int ssub, bool mod, const char* what) {
+    if (!dl_is(dst) && !dl_is(src)) return;
+    char d[160];
+    std::snprintf(d, sizeof(d), "%s %p sub %d <- %p sub %d", dl_is(dst) ? "into the depth" : "from the depth", dst, dsub, src, ssub);
+    dl_line(what, mod, cl, d);
+}
+void dl_dsv(ID3D12GraphicsCommandList* cl, const D3D12_CPU_DESCRIPTOR_HANDLE* ds, bool mod, const char* what, const char* extra) {
+    if (!ds) return;
+    if (!dl_is(view_resource(ds->ptr))) return;
+    char d[160];
+    std::snprintf(d, sizeof(d), "DSV %#llx%s", static_cast<unsigned long long>(ds->ptr), extra ? extra : "");
+    dl_line(what, mod, cl, d);
+}
+// (r117 DG4's depthlog: "draws A B") the per-list draw ordinals since the list's Reset, the thread's last DSV bind, the draws logged
+std::atomic<int> g_dl_da{-1}, g_dl_db{-1};
+struct DlList {
+    const void* cl = nullptr;
+    uint32_t draws = 0, all = 0;  // (Draw / DrawIndexed / ExecuteIndirect; and Dispatch too)
+    bool exact = false;           // (its Reset seen while armed)
+};
+thread_local DlList t_dl[8];
+thread_local int t_dl_next = 0;
+thread_local const void* t_dl_bind_cl = nullptr;
+thread_local uintptr_t t_dl_bind_ds = 0;  // (0: no DSV)
+std::mutex g_dsv_flags_mutex;
+bool g_dsv_flags_on = false;  // (decided once at the device hooks: [Stereo] MainInstanced=1 or [Debug] DepthLog=1; test only)
+std::unordered_map<uintptr_t, uint32_t> g_dsv_flags;  // (under g_dsv_flags_mutex) each DSV's D3D12_DSV_FLAGS
+DlList& dl_list(const void* cl) {
+    for (DlList& l : t_dl)
+        if (l.cl == cl) return l;
+    DlList& l = t_dl[t_dl_next++ & 7];
+    l = DlList{cl, 0, 0, false};
+    return l;
+}
+void dl_reset_list(const void* cl) {  // (a Reset while armed: the list's ordinals from 0, exact)
+    DlList& l = dl_list(cl);
+    l = DlList{cl, 0, 0, true};
+}
+void dl_draw(ID3D12GraphicsCommandList* cl, const char* what, bool draw, bool mod, uintptr_t ret) {
+    DlList& l = dl_list(cl);
+    const uint32_t o = l.draws, oa = l.all;
+    if (draw) ++l.draws;
+    ++l.all;
+    const int a = g_dl_da.load(std::memory_order_relaxed), b = g_dl_db.load(std::memory_order_relaxed);
+    if (!draw || a < 0 || static_cast<int64_t>(o) < a || static_cast<int64_t>(o) > b) return;
+    uint64_t vs = 0, ps = 0;
+    uint32_t wr = 0;
+    const bool game = pso::current(cl, &vs, &ps, &wr);
+    const void* raw = pso::raw_current(cl);
+    const void* root = nullptr;
+    uint64_t tables = 0;
+    const bool rn = root_note(cl, &root, &tables);
+    const void* dsv_res = nullptr;
+    uint32_t dsv_flags = 0;
+    bool dsv_known = false;
+    if (t_dl_bind_cl == cl && t_dl_bind_ds) {
+        dsv_res = view_resource(t_dl_bind_ds);
+        std::lock_guard lock(g_dsv_flags_mutex);
+        auto it = g_dsv_flags.find(t_dl_bind_ds);
+        if (it != g_dsv_flags.end()) {
+            dsv_flags = it->second;
+            dsv_known = true;
+        }
+    }
+    D3D12_RESOURCE_STATES s0{}, s1{};
+    const bool f0 = prepass::kind_followed(0, 0, &s0), f1 = prepass::kind_followed(0, 1, &s1);
+    D3D12_RESOURCE_STATES q{};
+    const bool fr0 = f0 && prepass::kind_followed_fresh(0, 0, cl, &q), fr1 = f1 && prepass::kind_followed_fresh(0, 1, cl, &q);
+    char d[480];
+    std::snprintf(d, sizeof(d),
+                  "draw ordinal %u (with dispatches %u)%s; %s pipeline %s vs %016llx ps %016llx (raw %p); root signature %s%p (tables %#llx); DSV %s%s "
+                  "flags %s%#x; depth followed %d:%d %#x:%#x fresh %d:%d%s",
+                  o, oa, l.exact ? "" : " (inexact: the list not reset since the arming)", what, game ? "the game's" : "not noted", static_cast<unsigned long long>(vs),
+                  static_cast<unsigned long long>(ps), raw, rn ? "" : "not noted ", root, static_cast<unsigned long long>(tables),
+                  t_dl_bind_cl != cl ? "not noted" : !t_dl_bind_ds ? "none" : dl_is(dsv_res) ? "the game's depth" : "another", "",
+                  dsv_known ? "" : "unknown ", dsv_flags, f0 ? 1 : 0, f1 ? 1 : 0, static_cast<unsigned>(s0), static_cast<unsigned>(s1), fr0 ? 1 : 0, fr1 ? 1 : 0, "");
+    char m[64] = "";
+    if (mod) std::snprintf(m, sizeof(m), " (the mod's raw_draw, called from RDRVR+%#llx)", static_cast<unsigned long long>(ret >= g_dl_self0 && ret < g_dl_self1 ? ret - g_dl_self0 : 0));
+    char line[560];
+    std::snprintf(line, sizeof(line), "%s%s", d, m);
+    dl_line("Draw", mod, cl, line);
+}
+void STDMETHODCALLTYPE hk_CreateSRV(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    o_CreateSRV(dev, r, d, h);
+    if (g_dc_on.load(std::memory_order_relaxed)) dc_note(h, 1, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    if (dl_on() && dl_is(r)) {  // (r117 DG4's depthlog: an SRV of the game's depth; its index in the game's shader-visible heap)
+        const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
+        const uintptr_t c0 = g_dc_cpu0.load(std::memory_order_relaxed);
+        const UINT inc = g_dc_inc.load(std::memory_order_relaxed);
+        char t[200];
+        if (c0 && inc && h.ptr >= c0) std::snprintf(t, sizeof(t), "an SRV at heap index %llu (format %d)", static_cast<unsigned long long>((h.ptr - c0) / inc),
+                                                    d ? static_cast<int>(d->Format) : -1);
+        else std::snprintf(t, sizeof(t), "an SRV at CPU %#llx, not the game's heap (format %d)", static_cast<unsigned long long>(h.ptr), d ? static_cast<int>(d->Format) : -1);
+        dl_line("CreateShaderResourceView", ret >= g_dl_self0 && ret < g_dl_self1, nullptr, t);
+    }
+}
+void STDMETHODCALLTYPE hk_CopyDescs(ID3D12Device* dev, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* ds, const UINT* dn, UINT ns,
+                                    const D3D12_CPU_DESCRIPTOR_HANDLE* ss, const UINT* sn, D3D12_DESCRIPTOR_HEAP_TYPE t) {
+    o_CopyDescs(dev, nd, ds, dn, ns, ss, sn, t);
+    if (g_dc_on.load(std::memory_order_relaxed) && t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && ds)
+        for (UINT i = 0; i < nd; ++i) dc_note(ds[i], dn ? dn[i] : 1, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+}
+void STDMETHODCALLTYPE hk_CopyDescsSimple(ID3D12Device* dev, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src,
+                                          D3D12_DESCRIPTOR_HEAP_TYPE t) {
+    o_CopyDescsSimple(dev, n, dst, src, t);
+    if (g_dc_on.load(std::memory_order_relaxed) && t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) dc_note(dst, n, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+}
 
 HRESULT STDMETHODCALLTYPE hk_CreateDescHeap(ID3D12Device* dev, const D3D12_DESCRIPTOR_HEAP_DESC* d, REFIID riid, void** out) {
     if (d) {
@@ -81,6 +283,10 @@ HRESULT STDMETHODCALLTYPE hk_CreateDescHeap(ID3D12Device* dev, const D3D12_DESCR
             if (SUCCEEDED(hr)) {
                 g_cb_headroom = extra;
                 g_cb_heap_n = d->NumDescriptors;
+                if (out && *out && riid == __uuidof(ID3D12DescriptorHeap) && config::get_int("Stereo", "DescCensus", 0) == 1) {  // (DescCensus)
+                    g_dc_cpu0 = static_cast<ID3D12DescriptorHeap*>(*out)->GetCPUDescriptorHandleForHeapStart().ptr;
+                    g_dc_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                }
                 log::info("[d3d] constant-buffer heap enlarged to %u descriptors (+%u for the type-6 partition)", big.NumDescriptors, extra);
                 return hr;
             }
@@ -129,6 +335,8 @@ FrameStartFn g_start_listeners[kMaxListeners];
 std::atomic<int> g_end_count{0}, g_start_count{0};
 std::atomic<bool> g_frame_started{false};
 std::atomic<EclBracketFn> g_bracket{nullptr};
+std::atomic<FrameEndFn> g_end_last{nullptr};  // set_frame_end_last: after every listener
+thread_local IDXGISwapChain* t_presenting = nullptr;  // presenting_swapchain(): inside hk_Present's / hk_Present1's frame end
 std::atomic<CopyTapFn> g_copy_tap[2] = {nullptr, nullptr};  // the frame grabber's, the round in hand's depth (round_draw)
 
 // --------------------------------------------------------------------------------------- per-frame counts
@@ -287,10 +495,82 @@ using ClearDSV_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_CP
                                             UINT8, UINT, const D3D12_RECT*);
 using BeginEvent_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const void*, UINT);
 using EndQuery_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT);
+using BeginQuery_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT);
 using ExecuteIndirect_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64,
                                                    ID3D12Resource*, UINT64);
 using SetPredication_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, D3D12_PREDICATION_OP);
 using Close_t = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*);
+using IASetPrimitiveTopology_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_PRIMITIVE_TOPOLOGY);  // ([Stereo] MainRegionHandover)
+using RSSetViewports_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*);
+using RSSetScissorRects_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*);
+IASetPrimitiveTopology_t o_IASetPrimitiveTopology = nullptr;
+RSSetViewports_t o_RSSetViewports = nullptr;
+RSSetScissorRects_t o_RSSetScissorRects = nullptr;
+std::atomic<bool> g_rs_hooked{false};
+thread_local RasterNote t_rs;
+// (item 8g, the review's SF1) the graphics root signature and the descriptor tables set since it, per thread's list
+using SetGraphicsRootSignature_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
+using SetGraphicsRootDescriptorTable_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+SetGraphicsRootSignature_t o_SetGraphicsRootSignature = nullptr;
+SetGraphicsRootDescriptorTable_t o_SetGraphicsRootDescriptorTable = nullptr;
+std::atomic<bool> g_rn_hooked{false};
+struct RootNote {
+    const void* cl = nullptr;
+    const void* root = nullptr;
+    uint64_t tables = 0;
+    uint64_t gpu[64] = {};  // (the delta review: each table's handle as last given)
+};
+thread_local RootNote t_rn;
+void STDMETHODCALLTYPE hk_SetGraphicsRootSignature(ID3D12GraphicsCommandList* cl, ID3D12RootSignature* r) {
+    if (nested(kNRaster)) return o_SetGraphicsRootSignature(cl, r);
+    t_rn = RootNote{};  // (a set makes every root argument undefined: the tables noted again from here)
+    t_rn.cl = cl;
+    t_rn.root = r;
+    InOriginal in(kNRaster);
+    o_SetGraphicsRootSignature(cl, r);
+}
+void STDMETHODCALLTYPE hk_SetGraphicsRootDescriptorTable(ID3D12GraphicsCommandList* cl, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
+    if (nested(kNRaster)) return o_SetGraphicsRootDescriptorTable(cl, i, h);
+    if (t_rn.cl == cl && i < 64) {
+        t_rn.tables |= 1ull << i;
+        t_rn.gpu[i] = h.ptr;
+    }
+    InOriginal in(kNRaster);
+    o_SetGraphicsRootDescriptorTable(cl, i, h);
+}
+void rs_take(ID3D12GraphicsCommandList* cl) {  // (this thread's note is this list's from here)
+    if (t_rs.cl != cl) {
+        t_rs = RasterNote{};
+        t_rs.cl = cl;
+    }
+}
+void STDMETHODCALLTYPE hk_IASetPrimitiveTopology(ID3D12GraphicsCommandList* cl, D3D12_PRIMITIVE_TOPOLOGY t) {
+    if (nested(kNRaster)) return o_IASetPrimitiveTopology(cl, t);
+    rs_take(cl);
+    t_rs.topo = static_cast<int>(t);
+    t_rs.has_topo = true;
+    InOriginal in(kNRaster);
+    o_IASetPrimitiveTopology(cl, t);
+}
+void STDMETHODCALLTYPE hk_RSSetViewports(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_VIEWPORT* v) {
+    if (nested(kNRaster)) return o_RSSetViewports(cl, n, v);
+    rs_take(cl);
+    t_rs.has_vp = n >= 1 && n <= 16 && v;
+    t_rs.nvp = t_rs.has_vp ? n : 0;
+    static_assert(sizeof(D3D12_VIEWPORT) == sizeof(t_rs.vp[0]) && sizeof(D3D12_RECT) == sizeof(t_rs.sc[0]), "the note's layouts");
+    for (UINT i = 0; i < t_rs.nvp; ++i) std::memcpy(t_rs.vp[i], &v[i], sizeof(t_rs.vp[0]));
+    InOriginal in(kNRaster);
+    o_RSSetViewports(cl, n, v);
+}
+void STDMETHODCALLTYPE hk_RSSetScissorRects(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RECT* r) {
+    if (nested(kNRaster)) return o_RSSetScissorRects(cl, n, r);
+    rs_take(cl);
+    t_rs.has_sc = n >= 1 && n <= 16 && r;
+    t_rs.nsc = t_rs.has_sc ? n : 0;
+    for (UINT i = 0; i < t_rs.nsc; ++i) std::memcpy(t_rs.sc[i], &r[i], sizeof(t_rs.sc[0]));
+    InOriginal in(kNRaster);
+    o_RSSetScissorRects(cl, n, r);
+}
 using Reset_t = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
 
 OMSetRenderTargets_t o_OMSetRenderTargets = nullptr;
@@ -304,24 +584,36 @@ ClearRTV_t o_ClearRTV = nullptr;
 ClearDSV_t o_ClearDSV = nullptr;
 BeginEvent_t o_BeginEvent = nullptr;
 EndQuery_t o_EndQuery = nullptr;
+BeginQuery_t o_BeginQuery = nullptr;  // ([Stereo] MainSlice only)
 ExecuteIndirect_t o_ExecuteIndirect = nullptr;
 SetPredication_t o_SetPredication = nullptr;
 Close_t o_Close = nullptr;
 Reset_t o_Reset = nullptr;
+
+// ---- re-entrancy (research\run17\sps.md (B); the guard itself: d3d_hooks.h, Nest / InOriginal / nested())
+std::atomic<uint64_t> g_nested[kNestKinds] = {};
 
 const void* rtv_resource(SIZE_T ptr) {
     auto it = g_rtv.find(ptr);
     return it == g_rtv.end() ? nullptr : it->second;
 }
 
-std::atomic<BindTapFn> g_bind_tap[5];
+std::atomic<BindTapFn> g_bind_tap[7];
 std::atomic<RtvSubstFn> g_rtv_subst{nullptr};
+std::atomic<RtvSubstFn> g_rtv_subst2{nullptr};  // ([Stereo] PrepassEye2Velocity, test only: null unless installed)
 std::atomic<FrameSizeFn> g_frame_size{nullptr};
 std::atomic<bool> g_present_unsynced{false};
 std::atomic<uint64_t> g_unsynced_presents{0};
 
 void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts,
                                              BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
+    if (nested(kNBind)) return o_OMSetRenderTargets(cl, n, rts, single, ds);  // (the debug layer's forward)
+    if (prepass::cut_pending()) prepass::cut_poll(cl);  // ([Stereo] PrepassWalkCut: eye 2's handover first)
+    if (dl_on()) {
+        dl_dsv(cl, ds, false, "OMSetRenderTargets", "");  // (r117 DG4's depthlog: the DSV bound)
+        t_dl_bind_cl = cl;
+        t_dl_bind_ds = ds ? ds->ptr : 0;
+    }
     for (auto& slot : g_bind_tap)
         if (BindTapFn tap = slot.load(std::memory_order_relaxed)) tap(cl, n, rts, single, ds);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
@@ -351,18 +643,47 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT
         rts = pp_rts;
         if (ds) ds = &pp_ds;
     }
+    // ([Stereo] PrepassEye2Velocity, test only) the second slot sees every bind of at most 8 targets; it substitutes only n == 1
+    if (RtvSubstFn sub2 = g_rtv_subst2.load(std::memory_order_relaxed); sub2 && n <= 8) {
+        D3D12_CPU_DESCRIPTOR_HANDLE repl1[1];
+        if (sub2(cl, n, rts, ds, &repl1[0]) && n == 1 && rts) {
+            if (main_inst::noting()) main_inst::note_bind(cl, n, repl1, single, ds);  // ([Stereo] MainInstanced: the bind as made)
+            InOriginal in(kNBind);
+            o_OMSetRenderTargets(cl, n, repl1, single, ds);
+            return;
+        }
+    }
     if (RtvSubstFn sub = g_rtv_subst.load(std::memory_order_relaxed); sub && n >= 1 && n <= 8 && rts && !single) {
         D3D12_CPU_DESCRIPTOR_HANDLE repl[8];
         if (sub(cl, n, rts, ds, &repl[0])) {
             for (UINT i = 1; i < n; ++i) repl[i] = rts[i];
+            if (main_inst::noting()) main_inst::note_bind(cl, n, repl, single, ds);  // ([Stereo] MainInstanced: the bind as made)
+            InOriginal in(kNBind);
             o_OMSetRenderTargets(cl, n, repl, single, ds);
             return;
         }
     }
+    if (main_inst::noting()) main_inst::note_bind(cl, n, rts, single, ds);  // ([Stereo] MainInstanced, test only: the list's last bind)
+    InOriginal in(kNBind);
     o_OMSetRenderTargets(cl, n, rts, single, ds);
 }
 
 thread_local uint64_t t_draws = 0, t_queries = 0;
+thread_local bool t_predicated = false;  // (thread_predicated: the last SetPredication on this thread's list had a buffer)
+thread_local int t_open_queries = 0;     // ([Stereo] MainSlice: thread_open_queries; 0 at its list's Reset)
+thread_local ID3D12GraphicsCommandList* t_q_cl = nullptr;  // (the delta review) the list the open count belongs to
+std::atomic<bool> g_bq_hooked{false};
+// ([Stereo] MainPredication, GOAL-single-pass item 6d; test only) the predicate this thread last passed on for its list (after
+// the mod's own null substitution): kept only while g_pd_track (set once at main_inst's install). cl null: unknown
+std::atomic<bool> g_pd_track{false};
+struct PdRec {
+    ID3D12GraphicsCommandList* cl;
+    ID3D12Resource* res;
+    UINT64 off;
+    D3D12_PREDICATION_OP op;
+    bool here;  // (the 6d/6e review's should-fix 1) the list's Reset was seen on this thread: else never trusted (another thread's)
+};
+thread_local PdRec t_pd{nullptr, nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO, false};
 
 void fg_draw(ID3D12GraphicsCommandList* cl) {
     if (!g_fg_armed.load(std::memory_order_relaxed)) return;
@@ -376,29 +697,68 @@ void fg_draw(ID3D12GraphicsCommandList* cl) {
 }
 
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
-    if (prepass::active() && prepass::before_draw(cl)) return;  // ([Stereo] PrepassInstanced: drawn in pass 1 for both eyes)
+    if (nested(kNDraw)) return o_DrawInstanced(cl, a, b, c, d);
+    if (prepass::cut_pending()) prepass::cut_poll(cl);  // ([Stereo] PrepassWalkCut: eye 2's handover first)
+    if (pso::glow::t_on && pso::glow::foreign(pso::glow::kDropNonIndexed)) return;  // ([Holsters] InteractionHighlights=parts: never the extra draw)
+    if (prepass::active() && prepass::before_draw(cl, a, b)) return;  // ([Stereo] PrepassInstanced: drawn in pass 1 for both eyes)
     if (pso::on_draw(cl)) return;
+    if (gpu_stages::walk_on() && gpu_stages::walk_draw(cl)) return;  // ([Stereo] PrepassGpuStages' walk census, item 8b, test only)
     ++t_draws;
     fg_draw(cl);
     pso::on_draw_args(cl, c, a);
-    o_DrawInstanced(cl, a, b, c, d);
+    // ([Stereo] MainInstanced, test only) a listed draw in a main region: pass 1's seeds before the game's draw, the
+    // duplicates into the mod's own arrays after it (the game's draw itself unchanged). ([Stereo] MainSlice, run 25 item 5)
+    // pass 2's listed draws of a handed-over frame: merged at the first, then dropped (t_draws counted above, as in pass 1)
+    const int mi = main_inst::listening() ? main_inst::before_draw(cl, DrawArgs{false, a, b, c, 0, d}) : main_inst::kNone;
+    if (mi == main_inst::kDrop) return;
+    if (dl_on()) dl_draw(cl, "DrawInstanced (the game's)", true, false, 0);  // (r117 DG4's depthlog: a draw that reaches the original)
+    {
+        InOriginal in(kNDraw);
+        o_DrawInstanced(cl, a, b, c, d);
+    }
+    if (mi == main_inst::kDuplicate) main_inst::after_draw(cl, DrawArgs{false, a, b, c, 0, d});
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
-    if (prepass::active() && prepass::before_draw(cl)) return;
+    if (nested(kNDrawIndexed)) return o_DrawIndexedInstanced(cl, a, b, c, d, e);
+    if (prepass::cut_pending()) prepass::cut_poll(cl);  // ([Stereo] PrepassWalkCut: eye 2's handover first)
+    // ([Holsters] InteractionHighlights=parts, run 29 item 2) between the part glow's markers: the part's runs drawn with the
+    // current pipeline's glow twin, anything else of the extra draw dropped (pso.h glow); none of the pre-pass's or the
+    // main region's work sees these draws. Off: one thread-local read
+    if (pso::glow::t_on && pso::glow::draw_indexed(cl, a, b, c, d, e, o_DrawIndexedInstanced)) return;
+    if (prepass::active() && prepass::before_draw(cl, a, b)) return;
     if (pso::on_draw(cl)) return;
+    if (gpu_stages::walk_on() && gpu_stages::walk_draw(cl)) return;  // ([Stereo] PrepassGpuStages' walk census, item 8b, test only)
     ++t_draws;
     fg_draw(cl);
     pso::on_draw_args(cl, d, a);
-    o_DrawIndexedInstanced(cl, a, b, c, d, e);
+    // ([Stereo] MainInstanced / MainSlice, test only: as hk_DrawInstanced)
+    const int mi = main_inst::listening() ? main_inst::before_draw(cl, DrawArgs{true, a, b, c, d, e}) : main_inst::kNone;
+    if (mi == main_inst::kDrop) return;
+    if (dl_on()) dl_draw(cl, "DrawIndexedInstanced (the game's)", true, false, 0);  // (r117 DG4's depthlog: a draw that reaches the original)
+    {
+        InOriginal in(kNDrawIndexed);
+        o_DrawIndexedInstanced(cl, a, b, c, d, e);
+    }
+    if (mi == main_inst::kDuplicate) main_inst::after_draw(cl, DrawArgs{true, a, b, c, d, e});
 }
 void STDMETHODCALLTYPE hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z) {
+    if (nested(kNDispatch)) return o_Dispatch(cl, x, y, z);
+    if (prepass::cut_pending()) prepass::cut_poll(cl);  // ([Stereo] PrepassWalkCut: eye 2's handover first)
+    if (dl_on()) dl_draw(cl, "Dispatch", false, false, 0);  // (r117 DG4's depthlog: counted in the second ordinal only)
     fg_count(cl, [](ListLog& l) { ++l.dispatches; });
+    InOriginal in(kNDispatch);
     o_Dispatch(cl, x, y, z);
 }
 void STDMETHODCALLTYPE hk_ExecuteIndirect(ID3D12GraphicsCommandList* cl, ID3D12CommandSignature* s, UINT n, ID3D12Resource* a,
                                           UINT64 b, ID3D12Resource* c, UINT64 d) {
+    if (nested(kNIndirect)) return o_ExecuteIndirect(cl, s, n, a, b, c, d);
+    if (prepass::cut_pending()) prepass::cut_poll(cl);  // ([Stereo] PrepassWalkCut: eye 2's handover first)
+    if (pso::glow::t_on && pso::glow::foreign(pso::glow::kDropIndirect)) return;  // ([Holsters] InteractionHighlights=parts: never the extra draw)
+    if (dl_on()) dl_draw(cl, "ExecuteIndirect (the game's)", true, false, 0);  // (r117 DG4's depthlog)
     fg_count(cl, [](ListLog& l) { ++l.indirect; });
     if (prepass::active()) prepass::before_indirect(cl);
+    if (main_inst::listening()) main_inst::indirect(cl);  // ([Stereo] MainRegion, item 8d: an indirect in e1 is a single; off: one load)
+    InOriginal in(kNIndirect);
     o_ExecuteIndirect(cl, s, n, a, b, c, d);
 }
 // ---- barrier watch (d3d::watch_add)
@@ -412,8 +772,11 @@ struct Watch {
     DWORD tid = 0;
     bool valid = false;
     int refs = 0;
+    uint64_t writes = 0;  // the game's transitions into a state that can write it, any list or thread (watched_writes)
 };
 Watch g_watch[kWatchSlots];
+constexpr uint32_t kWriteStates = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+                                  D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST;
 
 void watch_barriers(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
     if (g_watch_count.load(std::memory_order_relaxed) == 0) return;
@@ -426,6 +789,7 @@ void watch_barriers(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_
             x.cl = cl;
             x.state = static_cast<uint32_t>(b[i].Transition.StateAfter);
             x.tid = GetCurrentThreadId();
+            if (x.state & kWriteStates) ++x.writes;
             // A split barrier, or one subresource of several, leaves the whole resource's state unknown.
             x.valid = b[i].Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE &&
                       (b[i].Transition.Subresource == 0 ||
@@ -442,26 +806,97 @@ void watch_list_ends(ID3D12GraphicsCommandList* cl) {
 }
 
 void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+    if (nested(kNBarrier)) return o_ResourceBarrier(cl, n, b);  // (the debug layer's forward: followed once, at the outer call)
+    if (dl_on()) dl_barriers(cl, n, b, false);  // (r117 DG4's depthlog, test only)
+    if (main_inst::slice_installed() && main_inst::listening()) main_inst::pre_barrier(cl, n, b);  // ([Stereo] MainRegionE1Compare's remap, test only)
     if (prepass::tracing()) prepass::trace_barrier(cl, n, b);
     if (prepass::active()) prepass::barrier(cl, n, b);  // (before the game's batch: the pre-pass copies)
+    else if (prepass::cut_tracking()) prepass::cut_track(cl, n, b);  // ([Stereo] PrepassWalkCut: the handover, then followed)
     fg_count(cl, [n](ListLog& l) { l.barriers += n; });
     watch_barriers(cl, n, b);
+    if (main_inst::slice_installed() && main_inst::listening()) main_inst::barrier(cl, n, b);  // ([Stereo] MainSlice, test only: the family's targets inside a handed-over run)
+    InOriginal in(kNBarrier);
     o_ResourceBarrier(cl, n, b);
 }
+// ---- the mod's view-instance masks per list (d3d_hooks.h note_view_instance_mask; [Stereo] PrepassInstanced and MainInstanced)
+std::mutex g_vim_mutex;
+std::atomic<int> g_vim_count{0};
+struct Vim {
+    ID3D12GraphicsCommandList* cl;
+    unsigned mask;
+};
+Vim g_vim[16] = {};
+void vim_list_ends(ID3D12GraphicsCommandList* cl) {
+    if (g_vim_count.load(std::memory_order_relaxed) == 0) return;  // (off: one load)
+    std::lock_guard lock(g_vim_mutex);
+    for (Vim& v : g_vim)
+        if (v.cl == cl) {
+            v.cl = nullptr;
+            g_vim_count.fetch_sub(1, std::memory_order_relaxed);
+        }
+}
 HRESULT STDMETHODCALLTYPE hk_Close(ID3D12GraphicsCommandList* cl) {
+    if (nested(kNClose)) return o_Close(cl);
     watch_list_ends(cl);
+    vim_list_ends(cl);
+    if (t_rs.cl == cl) t_rs = RasterNote{};  // ([Stereo] MainRegionHandover: the list's raster note dropped)
+    if (t_rn.cl == cl) t_rn = RootNote{};  // (and its root note)
+    prepass::follow_list_ends(cl);  // (r117 DG4: the follow's states set on this list no longer this list's)
+    if (main_inst::noting()) {
+        main_inst::list_closing(cl);  // (GOAL-single-pass item 6c: SC2L and LB2 lent on this list given back before it closes)
+        main_inst::list_ends(cl);     // ([Stereo] MainInstanced: the list's notes dropped)
+    }
+    // ([Stereo] MainPredication: no longer known here; after list_closing, whose steps may record on this list and read its predicate)
+    if (g_pd_track.load(std::memory_order_relaxed) && t_pd.cl == cl) t_pd.cl = nullptr;
+    InOriginal in(kNClose);
     return o_Close(cl);
 }
 HRESULT STDMETHODCALLTYPE hk_Reset(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* a, ID3D12PipelineState* ps) {
+    if (nested(kNReset)) return o_Reset(cl, a, ps);
+    t_predicated = false;
+    if (g_pd_track.load(std::memory_order_relaxed)) t_pd = PdRec{cl, nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO, true};  // (6d: a reset list is unpredicated)
+    if (cl == t_q_cl || t_open_queries == 0) {  // (the delta review: another list's Reset on this thread keeps the count)
+        t_open_queries = 0;
+        t_q_cl = nullptr;
+    }
     watch_list_ends(cl);
+    vim_list_ends(cl);
+    if (t_rs.cl == cl) t_rs = RasterNote{};  // ([Stereo] MainRegionHandover: the list's raster note dropped)
+    if (t_rn.cl == cl) t_rn = RootNote{};  // (and its root note)
+    prepass::follow_list_ends(cl);  // (r117 DG4: the follow's states set on this list no longer this list's)
+    if (dl_on()) dl_reset_list(cl);  // (r117 DG4's depthlog: the list's draw ordinals from 0)
+    if (main_inst::noting()) main_inst::list_ends(cl);  // ([Stereo] MainInstanced: the list's notes dropped)
+    pso::glow::list_reset(cl, ps);  // ([Holsters] InteractionHighlights=parts: the list's pipeline the glow puts back)
+    InOriginal in(kNReset);
     return o_Reset(cl, a, ps);
 }
+// ([Stereo] MainSlice, test only; hooked only with MainSlice=1 and MainInstanced=1) the queries that count draws, open on this
+// thread's list: a draw dropped inside one would change the game's result unseen (main_instanced's handover refuses then)
+void STDMETHODCALLTYPE hk_BeginQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
+    if (nested(kNBeginQuery)) return o_BeginQuery(cl, h, t, i);
+    if (t != D3D12_QUERY_TYPE_TIMESTAMP) {
+        if (t_open_queries > 0 && t_q_cl != cl) t_q_cl = nullptr;  // (two lists' queries open on one thread: unknown, refused)
+        else t_q_cl = cl;
+        ++t_open_queries;
+        if (main_inst::slice_installed() && main_inst::listening()) main_inst::query(cl, true);
+    }
+    InOriginal in(kNBeginQuery);
+    o_BeginQuery(cl, h, t, i);
+}
 void STDMETHODCALLTYPE hk_EndQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
+    if (nested(kNEndQuery)) return o_EndQuery(cl, h, t, i);
+    if (t != D3D12_QUERY_TYPE_TIMESTAMP && g_bq_hooked.load(std::memory_order_relaxed)) {  // ([Stereo] MainSlice only)
+        if (t_open_queries > 0) --t_open_queries;
+        if (main_inst::slice_installed() && main_inst::listening()) main_inst::query(cl, false);
+    }
     ++t_queries;
     fg_count(cl, [](ListLog& l) { ++l.queries; });
+    InOriginal in(kNEndQuery);
     o_EndQuery(cl, h, t, i);
 }
 void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource* src) {
+    if (nested(kNCopy)) return o_CopyResource(cl, dst, src);  // (no copy taps: the outer call runs them)
+    if (prepass::cut_pending()) prepass::cut_poll(cl);  // ([Stereo] PrepassWalkCut: eye 2's handover first)
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32], b[32];
         std::string d, s;
@@ -472,12 +907,22 @@ void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Reso
         }
         fg_event(cl, "CopyResource %s <- %s", d.c_str(), s.c_str());
     }
-    o_CopyResource(cl, dst, src);
+    if (gpu_stages::walk_on()) gpu_stages::walk_copy(cl, dst);    // ([Stereo] PrepassGpuStages' walk census, item 8b: segment e's close)
+    if (dl_on()) dl_copy(cl, dst, src, -1, -1, false, "CopyResource");  // (r117 DG4's depthlog)
+    if (main_inst::slice_installed() && main_inst::listening()) main_inst::copy_write(cl, dst, src);  // ([Stereo] MainRegionE1Compare, test only: T to C2)
+    if (main_inst::listening()) main_inst::before_copy(cl, dst);  // ([Stereo] MainInstanced, test only: the Depth Resolve close)
+    if (cut_velocity::fsc_listening()) cut_velocity::fsc_before_copy(cl, dst);  // (item 8f0, test only: the FSC probe's slot)
+    {
+        InOriginal in(kNCopy);
+        o_CopyResource(cl, dst, src);
+    }
     for (auto& t : g_copy_tap)
         if (CopyTapFn tap = t.load(std::memory_order_relaxed)) tap(cl, dst, src);
 }
 void STDMETHODCALLTYPE hk_CopyTextureRegion(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y,
                                             UINT z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) {
+    if (nested(kNCopyRegion)) return o_CopyTextureRegion(cl, dst, x, y, z, src, box);
+    if (prepass::cut_pending()) prepass::cut_poll(cl);  // ([Stereo] PrepassWalkCut: eye 2's handover first)
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32], b[32];
         std::string d, s;
@@ -488,10 +933,17 @@ void STDMETHODCALLTYPE hk_CopyTextureRegion(ID3D12GraphicsCommandList* cl, const
         }
         fg_event(cl, "CopyTextureRegion %s <- %s", d.c_str(), s.c_str());
     }
+    if (dl_on() && dst && src) dl_copy(cl, dst->pResource, src->pResource, static_cast<int>(dst->SubresourceIndex), static_cast<int>(src->SubresourceIndex), false, "CopyTextureRegion");
+    if (main_inst::slice_installed() && main_inst::listening() && dst) main_inst::copy_write(cl, dst->pResource, src ? src->pResource : nullptr);  // ([Stereo] MainRegionE1Compare, test only)
+    InOriginal in(kNCopyRegion);
     o_CopyTextureRegion(cl, dst, x, y, z, src, box);
 }
 void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT n,
                                    const D3D12_RECT* r) {
+    if (nested(kNClearRtv)) return o_ClearRTV(cl, h, c, n, r);
+    if (prepass::cut_pending()) prepass::cut_poll(cl);  // ([Stereo] PrepassWalkCut: eye 2's handover first)
+    const D3D12_CPU_DESCRIPTOR_HANDLE h_game = h;       // ([Stereo] PrepassGpuStages: the game's view, before the substitution)
+    if (main_inst::slice_installed() && main_inst::listening()) main_inst::clear(cl, h_game.ptr);  // ([Stereo] MainRegionE1Compare, test only: T to C2)
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32];
         std::string name;
@@ -506,10 +958,19 @@ void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         h = prepass::clear_rtv(cl, h);
         if (prepass::take_skip_clear()) return;  // (pass 2's, instanced: its slice was cleared and drawn in pass 1)
     }
+    const int gs = gpu_stages::on() ? gpu_stages::clear_begin(cl, h_game, false) : -1;  // ([Stereo] PrepassGpuStages, test only)
+    InOriginal in(kNClearRtv);
     o_ClearRTV(cl, h, c, n, r);
+    if (gs >= 0) gpu_stages::clear_end(cl, gs);
 }
 void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT d,
                                    UINT8 s, UINT n, const D3D12_RECT* r) {
+    if (nested(kNClearDsv)) return o_ClearDSV(cl, h, f, d, s, n, r);
+    if (prepass::cut_pending()) prepass::cut_poll(cl);  // ([Stereo] PrepassWalkCut: eye 2's handover first)
+    if (dl_on()) dl_dsv(cl, &h, false, "ClearDepthStencilView", "");  // (r117 DG4's depthlog)
+    const D3D12_CPU_DESCRIPTOR_HANDLE h_game = h;       // ([Stereo] PrepassGpuStages: a pass's pre-pass starts at this clear)
+    if (main_inst::slice_installed() && main_inst::listening()) main_inst::clear(cl, h_game.ptr);  // ([Stereo] MainRegionE1Compare, test only: T to C2)
+    if (gpu_stages::on()) gpu_stages::depth_clear_seen(cl, h_game);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32];
         std::string name;
@@ -524,23 +985,34 @@ void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         h = prepass::clear_dsv(cl, h);  // (the pre-pass's start: its depth's clear)
         if (prepass::take_skip_clear()) return;
     }
+    const int gs = gpu_stages::on() ? gpu_stages::clear_begin(cl, h_game, true) : -1;  // ([Stereo] PrepassGpuStages, test only)
+    InOriginal in(kNClearDsv);
     o_ClearDSV(cl, h, f, d, s, n, r);
+    if (gs >= 0) gpu_stages::clear_end(cl, gs);
 }
 void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, const void* data, UINT size) {
+    if (nested(kNBeginEvent)) return o_BeginEvent(cl, meta, data, size);
     if (g_fg_armed.load(std::memory_order_relaxed) && data && size) {
         // PIX metadata 0 = Unicode string, 1 = ANSI string; PIX3 events are encoded (logged as size only).
         if (meta == 1) fg_event(cl, "BeginEvent \"%.*s\"", static_cast<int>(size), static_cast<const char*>(data));
         else if (meta == 0) fg_event(cl, "BeginEvent \"%ls\"", static_cast<const wchar_t*>(data));
         else fg_event(cl, "BeginEvent meta%u size%u", meta, size);
     }
+    InOriginal in(kNBeginEvent);
     o_BeginEvent(cl, meta, data, size);
 }
 void STDMETHODCALLTYPE hk_SetPredication(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, UINT64 off, D3D12_PREDICATION_OP op) {
+    if (nested(kNPredication)) return o_SetPredication(cl, r, off, op);
     fg_count(cl, [](ListLog& l) { ++l.queries; });
     if (r && prepass::predication_off()) {  // ([Stereo] PrepassInstanced: pass 2's queries count the dropped draws as nothing)
         r = nullptr;
         off = 0;
     }
+    t_predicated = r != nullptr;
+    if (g_pd_track.load(std::memory_order_relaxed))  // ([Stereo] MainPredication: what the list now has; trusted only after its Reset here)
+        t_pd = PdRec{cl, r, off, op, t_pd.cl == cl && t_pd.here};
+    if (main_inst::slice_installed()) main_inst::note_predication(cl, r, off, static_cast<int>(op));  // ([Stereo] MainRegionE1Compare's remap, test only)
+    InOriginal in(kNPredication);
     o_SetPredication(cl, r, off, op);
 }
 
@@ -597,7 +1069,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource(ID3D12Device* dev, const D3
                                                      const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st,
                                                      const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     HRESULT hr = o_CreateCommittedResource(dev, hp, hf, d, st, cv, riid, out);
-    if (SUCCEEDED(hr) && out && *out && hp && hp->Type == D3D12_HEAP_TYPE_UPLOAD && ring_probe::enabled()) {
+    if (SUCCEEDED(hr) && out && *out && hp && hp->Type == D3D12_HEAP_TYPE_UPLOAD && ring_probe::tracking()) {
         ID3D12Resource* r = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&r))) && r) {
             ring_probe::on_upload_buffer(r, d);
@@ -615,7 +1087,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource(ID3D12Device* dev, const D3
 HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* d,
                                                   D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     HRESULT hr = o_CreatePlacedResource(dev, heap, off, d, st, cv, riid, out);
-    if (SUCCEEDED(hr) && out && *out && heap && ring_probe::enabled() && heap->GetDesc().Properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
+    if (SUCCEEDED(hr) && out && *out && heap && ring_probe::tracking() && heap->GetDesc().Properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
         ID3D12Resource* r = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&r))) && r) {
             ring_probe::on_upload_buffer(r, d);
@@ -649,6 +1121,10 @@ void STDMETHODCALLTYPE hk_CreateDSV(ID3D12Device* dev, ID3D12Resource* res, cons
             g_rtv[h.ptr] = res;
             g_view_fmt[h.ptr] = desc ? *static_cast<const DXGI_FORMAT*>(desc) : DXGI_FORMAT_UNKNOWN;
         }
+    }
+    if (g_dsv_flags_on) {  // (r117 DG4's depthlog: the view's read-only flags; test inis only)
+        std::lock_guard lock(g_dsv_flags_mutex);
+        if (g_dsv_flags.size() < 2000000) g_dsv_flags[h.ptr] = desc ? static_cast<uint32_t>(static_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(desc)->Flags) : 0u;
     }
     o_CreateDSV(dev, res, desc, h);
 }
@@ -776,6 +1252,22 @@ void hook_command_list_methods(ID3D12Device* dev) {
     hooks::install("CL::ClearDepthStencilView", hooks::vtable_entry(cl, 47), hk_ClearDSV, &o_ClearDSV);
     hooks::install("CL::ClearRenderTargetView", hooks::vtable_entry(cl, 48), hk_ClearRTV, &o_ClearRTV);
     hooks::install("CL::EndQuery", hooks::vtable_entry(cl, 53), hk_EndQuery, &o_EndQuery);
+    // ([Stereo] MainSlice, test only; [Stereo] MainRegionHandover, item 8g: the queries open at its decision too)
+    const bool ho_hooks = config::get_int("Stereo", "MainRegionHandover", 0) == 1 && config::get_int("Stereo", "MainInstanced", 0) == 1;
+    if (ho_hooks) {  // (item 8g, test only: note only, so the merge can put the game's viewport, scissor and topology back)
+        hooks::install("CL::IASetPrimitiveTopology", hooks::vtable_entry(cl, 20), hk_IASetPrimitiveTopology, &o_IASetPrimitiveTopology);
+        hooks::install("CL::RSSetViewports", hooks::vtable_entry(cl, 21), hk_RSSetViewports, &o_RSSetViewports);
+        hooks::install("CL::RSSetScissorRects", hooks::vtable_entry(cl, 22), hk_RSSetScissorRects, &o_RSSetScissorRects);
+        g_rs_hooked = o_IASetPrimitiveTopology && o_RSSetViewports && o_RSSetScissorRects;
+        // (the review's SF1: the merge's bindless table proven set on the list since its root signature)
+        hooks::install("CL::SetGraphicsRootSignature", hooks::vtable_entry(cl, 30), hk_SetGraphicsRootSignature, &o_SetGraphicsRootSignature);
+        hooks::install("CL::SetGraphicsRootDescriptorTable", hooks::vtable_entry(cl, 32), hk_SetGraphicsRootDescriptorTable, &o_SetGraphicsRootDescriptorTable);
+        g_rn_hooked = o_SetGraphicsRootSignature && o_SetGraphicsRootDescriptorTable;
+    }
+    if ((config::get_int("Stereo", "MainSlice", 0) == 1 && config::get_int("Stereo", "MainInstanced", 0) == 1) || ho_hooks) {
+        hooks::install("CL::BeginQuery", hooks::vtable_entry(cl, 52), hk_BeginQuery, &o_BeginQuery);
+        g_bq_hooked = o_BeginQuery != nullptr;
+    }
     hooks::install("CL::SetPredication", hooks::vtable_entry(cl, 55), hk_SetPredication, &o_SetPredication);
     hooks::install("CL::BeginEvent", hooks::vtable_entry(cl, 57), hk_BeginEvent, &o_BeginEvent);
     hooks::install("CL::ExecuteIndirect", hooks::vtable_entry(cl, 59), hk_ExecuteIndirect, &o_ExecuteIndirect);
@@ -784,16 +1276,160 @@ void hook_command_list_methods(ID3D12Device* dev) {
     alloc->Release();
 }
 
+// ([Debug] PixCapturer, test only) PIX's wrapper vtables may fold identical methods into one function: a detour on it would take every
+// slot's calls with the wrong method's arguments. So before any D3D12 vtable hook, every slot any module may patch (a superset: the
+// conditional ones too) is resolved on probe objects (the device, Device2, a list, a resource, a queue) and compared with each other and
+// with the hooks installed already (DXGI's factory); any shared target: no D3D12 vtable hook (nor the swapchain's) this session
+std::atomic<bool> g_pix_collide{false};
+struct PixSlot {
+    const char* name;
+    void* target;
+};
+void pix_report(const std::vector<PixSlot>& v) {
+    std::string col;
+    for (size_t i = 0; i < v.size(); ++i) {
+        for (size_t j = i + 1; j < v.size(); ++j)
+            if (v[i].target == v[j].target) col += std::string(" ") + v[i].name + "=" + v[j].name;
+        if (const char* h = hooks::hooked_name(v[i].target)) col += std::string(" ") + v[i].name + "=" + h + "(installed)";
+    }
+    if (col.empty()) {
+        log::info("[pix] %zu hook targets resolved: no two share a function", v.size());
+        return;
+    }
+    g_pix_collide = true;
+    log::error("[pix] hook targets collide:%s: D3D12 hooks not installed (the PIX session is unusable)", col.c_str());
+}
+bool pix_prescan(ID3D12Device* dev) {
+    std::vector<PixSlot> v;
+    const auto add = [&v](const char* n, void* obj, int slot) { v.push_back({n, hooks::vtable_entry(obj, slot)}); };
+    static const struct {
+        const char* n;
+        int s;
+    } kDev[] = {{"Device::CreateCommandQueue", 8},       {"Device::CreateGraphicsPipelineState", 10}, {"Device::CreateDescriptorHeap", 14},
+                {"Device::CreateRootSignature", 16},     {"Device::CreateConstantBufferView", 17},    {"Device::CreateShaderResourceView", 18},
+                {"Device::CreateRenderTargetView", 20},  {"Device::CreateDepthStencilView", 21},      {"Device::CopyDescriptors", 23},
+                {"Device::CopyDescriptorsSimple", 24},   {"Device::CreateCommittedResource", 27},     {"Device::CreatePlacedResource", 29}},
+      kCl[] = {{"CL::Close", 9},
+               {"CL::Reset", 10},
+               {"CL::DrawInstanced", 12},
+               {"CL::DrawIndexedInstanced", 13},
+               {"CL::Dispatch", 14},
+               {"CL::CopyTextureRegion", 16},
+               {"CL::CopyResource", 17},
+               {"CL::IASetPrimitiveTopology", 20},
+               {"CL::RSSetViewports", 21},
+               {"CL::RSSetScissorRects", 22},
+               {"CL::SetPipelineState", 25},
+               {"CL::ResourceBarrier", 26},
+               {"CL::SetGraphicsRootSignature", 30},
+               {"CL::SetGraphicsRootDescriptorTable", 32},
+               {"CL::SetComputeRootConstantBufferView", 37},
+               {"CL::SetGraphicsRootConstantBufferView", 38},
+               {"CL::IASetVertexBuffers", 44},
+               {"CL::OMSetRenderTargets", 46},
+               {"CL::ClearDepthStencilView", 47},
+               {"CL::ClearRenderTargetView", 48},
+               {"CL::BeginQuery", 52},
+               {"CL::EndQuery", 53},
+               {"CL::SetPredication", 55},
+               {"CL::BeginEvent", 57},
+               {"CL::ExecuteIndirect", 59}};
+    for (const auto& e : kDev) add(e.n, dev, e.s);
+    ID3D12Device2* d2 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d2))) && d2) {
+        add("Device2::CreatePipelineState", d2, 47);
+        d2->Release();
+    }
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* cl = nullptr;
+    if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cl)))) {
+        if (alloc) alloc->Release();
+        g_pix_collide = true;
+        log::error("[pix] the pre-scan's probe list not made: D3D12 hooks not installed (the PIX session is unusable)");
+        return false;
+    }
+    for (const auto& e : kCl) add(e.n, cl, e.s);
+    cl->Close();
+    cl->Release();
+    alloc->Release();
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = 256;
+    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* probe = nullptr;
+    ID3D12CommandQueue* q = nullptr;
+    const D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&probe))) ||
+        !probe || FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) || !q) {
+        if (probe) probe->Release();
+        g_pix_collide = true;
+        log::error("[pix] the pre-scan's probe resource or queue not made: D3D12 hooks not installed (the PIX session is unusable)");
+        return false;
+    }
+    add("Resource::SetName", probe, 6);
+    add("Queue::ExecuteCommandLists", q, 10);
+    probe->Release();
+    q->Release();
+    char where[160] = "?";
+    hooks::describe_target(v[0].target, where, sizeof(where));
+    log::info("[pix] the pre-scan: Device::CreateCommandQueue at %s", where);
+    pix_report(v);
+    return !g_pix_collide.load();
+}
+
 void hook_device_methods(ID3D12Device* dev) {
     std::call_once(g_device_once, [dev] {
+        if (pix_loaded() && !pix_prescan(dev)) return;  // ([Debug] PixCapturer: shared targets, no D3D12 vtable hook)
         hooks::install("ID3D12Device::CreateCommandQueue", hooks::vtable_entry(dev, 8), hk_CreateCommandQueue,
                        &o_CreateCommandQueue);
         hooks::install("ID3D12Device::CreateDescriptorHeap", hooks::vtable_entry(dev, 14), hk_CreateDescHeap, &o_CreateDescHeap);
         ring_probe::install_device_hooks(dev);
+        if (config::get_int("Stereo", "DescCensus", 0) == 1) {  // (item 8e, test only, off by default)
+            HMODULE self = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(&dc_note), &self) && self) {
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(self);
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const char*>(self) + dos->e_lfanew);
+                g_dc_self0 = reinterpret_cast<uintptr_t>(self);
+                g_dc_self1 = g_dc_self0 + nt->OptionalHeader.SizeOfImage;
+            }
+            hooks::install("ID3D12Device::CreateShaderResourceView", hooks::vtable_entry(dev, 18), hk_CreateSRV, &o_CreateSRV);
+            hooks::install("ID3D12Device::CopyDescriptors", hooks::vtable_entry(dev, 23), hk_CopyDescs, &o_CopyDescs);
+            hooks::install("ID3D12Device::CopyDescriptorsSimple", hooks::vtable_entry(dev, 24), hk_CopyDescsSimple, &o_CopyDescsSimple);
+            g_dc_on = o_CreateSRV && o_CopyDescs && o_CopyDescsSimple && g_dc_self1;
+            log::info("[d3d] [Stereo] DescCensus %s (test only, item 8e): the game's writes into its bindless texture partition, per frame",
+                      g_dc_on.load() ? "on" : "NOT installed");
+        }
+        if (config::get_bool("Debug", "DepthLog", false) && !o_CreateSRV) {  // (r117 DG4, test only: the depthlog's SRV creations)
+            HMODULE self = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(&dl_line), &self) && self) {
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(self);
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const char*>(self) + dos->e_lfanew);
+                g_dl_self0 = reinterpret_cast<uintptr_t>(self);
+                g_dl_self1 = g_dl_self0 + nt->OptionalHeader.SizeOfImage;
+            }
+            hooks::install("ID3D12Device::CreateShaderResourceView", hooks::vtable_entry(dev, 18), hk_CreateSRV, &o_CreateSRV);
+            log::info("[d3d] [Debug] DepthLog: CreateShaderResourceView hooked (test only: the depthlog's SRVs of the game's depth)");
+        } else if (config::get_bool("Debug", "DepthLog", false)) {
+            HMODULE self = nullptr;  // (DescCensus hooked it already: its module range taken for the flag too)
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(&dl_line), &self) && self) {
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(self);
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const char*>(self) + dos->e_lfanew);
+                g_dl_self0 = reinterpret_cast<uintptr_t>(self);
+                g_dl_self1 = g_dl_self0 + nt->OptionalHeader.SizeOfImage;
+            }
+        }
         if (config::get_bool("Debug", "FrameGraph", true)) pso::install_device_hooks(dev);
         bool log_resources = config::get_bool("Debug", "LogResources", true);
-        if (!log_resources && !ring_probe::enabled()) return;
+        if (!log_resources && !ring_probe::tracking()) return;
         hooks::install("ID3D12Device::CreateRenderTargetView", hooks::vtable_entry(dev, 20), hk_CreateRTV, &o_CreateRTV);
+        g_dsv_flags_on = config::get_int("Stereo", "MainInstanced", 0) == 1 || config::get_bool("Debug", "DepthLog", false);  // (before the hook)
         hooks::install("ID3D12Device::CreateDepthStencilView", hooks::vtable_entry(dev, 21), hk_CreateDSV, &o_CreateDSV);
         hooks::install("ID3D12Device::CreateCommittedResource", hooks::vtable_entry(dev, 27), hk_CreateCommittedResource,
                        &o_CreateCommittedResource);
@@ -851,10 +1487,16 @@ bool made_here(ID3D12Device* d) {
 // simulator before they could fault the GPU): the debug layer on before the game's devices are made, and its
 // warnings and errors in the log ([d3d12] lines, at most 400 of each message id).
 std::atomic<bool> g_debug_layer{false};
+constexpr int kMsgIds = 2048;  // (item 8e: each message id's count, uncapped, for a test's windows: debug_msg_kv)
+std::atomic<uint64_t> g_msg_n[kMsgIds];
 void CALLBACK debug_message(D3D12_MESSAGE_CATEGORY cat, D3D12_MESSAGE_SEVERITY sev, D3D12_MESSAGE_ID id, LPCSTR text, void*) {
     if (sev > D3D12_MESSAGE_SEVERITY_WARNING) return;
-    char key[40];
-    std::snprintf(key, sizeof(key), "d3d12.msg.%d", static_cast<int>(id));
+    if (static_cast<int>(id) >= 0 && static_cast<int>(id) < kMsgIds) g_msg_n[static_cast<int>(id)].fetch_add(1, std::memory_order_relaxed);
+    // (r117 DG4) log::limited keeps the key's pointer: one stable string per id (a stack buffer made every id share the first's count)
+    static char keys[kMsgIds + 1][20];
+    const int slot = static_cast<int>(id) >= 0 && static_cast<int>(id) < kMsgIds ? static_cast<int>(id) : kMsgIds;
+    char* key = keys[slot];
+    if (!key[0]) std::snprintf(key, sizeof(keys[0]), "d3d12.msg.%d", slot == kMsgIds ? -1 : slot);
     log::limited(key, 400, "[d3d12] %s %d (category %d): %s", sev <= D3D12_MESSAGE_SEVERITY_ERROR ? "layer error" : "layer warning",
                  static_cast<int>(id), static_cast<int>(cat), text ? text : "");
 }
@@ -867,6 +1509,16 @@ void enable_debug_layer() {
         return;
     }
     d->EnableDebugLayer();
+    if (config::get_bool("Debug", "D3D12GpuValidation", false)) {  // (item 8g, test only: GPU-based validation with the layer)
+        ID3D12Debug1* d1 = nullptr;
+        if (SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&d1))) && d1) {
+            d1->SetEnableGPUBasedValidation(TRUE);
+            d1->Release();
+            log::info("[d3d12] GPU-based validation on ([Debug] D3D12GpuValidation)");
+        } else {
+            log::warn("[d3d12] GPU-based validation not available (no ID3D12Debug1)");
+        }
+    }
     d->Release();
     g_debug_layer = true;
     log::info("[d3d12] the debug layer on ([Debug] D3D12DebugLayer)");
@@ -933,8 +1585,10 @@ void on_frame_end() {
     state::frame_ecl_copy = t_ecl_copy.exchange(0, std::memory_order_relaxed);
     state::frame_ecl_present = t_ecl_present.exchange(0, std::memory_order_relaxed);
     uint64_t frame = state::presents.load() + 1;
+    if (dl_on() && g_dl_frames.fetch_sub(1, std::memory_order_relaxed) == 1) log::info("[depthlog] done (%llu lines)", static_cast<unsigned long long>(g_dl_lines.load()));
     int c = g_end_count.load();
     for (int i = 0; i < c; ++i) g_end_listeners[i](frame);
+    if (FrameEndFn last = g_end_last.load(std::memory_order_relaxed)) last(frame);
     fg_on_frame_end(frame);
     g_frame_started = false;
 }
@@ -972,7 +1626,9 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT flags) 
     ++t_in_present;
     const bool probe = frame_probe::on();
     const double t0 = probe ? log::now_ms() : 0;
+    t_presenting = sc;
     on_frame_end();
+    t_presenting = nullptr;
     if (sync && g_present_unsynced.load(std::memory_order_relaxed)) {
         sync = 0;
         g_unsynced_presents.fetch_add(1, std::memory_order_relaxed);
@@ -990,7 +1646,9 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags
     ++t_in_present;
     const bool probe = frame_probe::on();
     const double t0 = probe ? log::now_ms() : 0;
+    t_presenting = sc;
     on_frame_end();
+    t_presenting = nullptr;
     if (sync && g_present_unsynced.load(std::memory_order_relaxed)) {
         sync = 0;
         g_unsynced_presents.fetch_add(1, std::memory_order_relaxed);
@@ -1060,6 +1718,20 @@ void on_swapchain(IUnknown* device_or_queue, HWND hwnd, IDXGISwapChain* sc) {
                   d.Flags, d.Windowed, static_cast<unsigned>(d.BufferUsage));
     }
     std::call_once(g_swapchain_once, [sc] {
+        if (pix_loaded()) {  // ([Debug] PixCapturer: the swapchain's slots checked as the device's)
+            if (g_pix_collide.load()) {
+                log::error("[pix] the swapchain's hooks not installed either (the D3D12 hooks' targets collided)");
+                return;
+            }
+            std::vector<PixSlot> v{{"SwapChain::Present", hooks::vtable_entry(sc, 8)}, {"SwapChain::ResizeBuffers", hooks::vtable_entry(sc, 13)}};
+            IDXGISwapChain1* s1 = nullptr;
+            if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&s1))) && s1) {
+                v.push_back({"SwapChain1::Present1", hooks::vtable_entry(s1, 22)});
+                s1->Release();
+            }
+            pix_report(v);
+            if (g_pix_collide.load()) return;
+        }
         hooks::install("IDXGISwapChain::Present", hooks::vtable_entry(sc, 8), hk_Present, &o_Present);
         hooks::install("IDXGISwapChain::ResizeBuffers", hooks::vtable_entry(sc, 13), hk_ResizeBuffers, &o_ResizeBuffers);
         IDXGISwapChain1* sc1 = nullptr;
@@ -1130,7 +1802,83 @@ HRESULT WINAPI hk_CreateDXGIFactory2(UINT flags, REFIID riid, void** out) {
 
 }  // namespace
 
+namespace {
+HMODULE g_pix = nullptr;  // ([Debug] PixCapturer) set once at the startup hooks, before the device
+// the version directory names compared as dotted numbers ("2603.25" > "2509.9"); a name that is not one sorts first
+bool pix_newer(const wchar_t* a, const wchar_t* b) {
+    for (;;) {
+        wchar_t* ea = nullptr;
+        wchar_t* eb = nullptr;
+        const unsigned long va = std::wcstoul(a, &ea, 10), vb = std::wcstoul(b, &eb, 10);
+        if (ea == a || eb == b) return ea != a && eb == b;
+        if (va != vb) return va > vb;
+        if (*ea != L'.' || *eb != L'.') return *ea == L'.' && *eb != L'.';
+        a = ea + 1;
+        b = eb + 1;
+    }
+}
+void pix_load() {
+    const std::wstring root = L"C:\\Program Files\\Microsoft PIX\\";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((root + L"*").c_str(), &fd);
+    std::wstring best;
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+            const std::wstring dll = root + fd.cFileName + L"\\WinPixGpuCapturer.dll";
+            if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            if (best.empty() || pix_newer(fd.cFileName, best.c_str())) best = fd.cFileName;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (best.empty()) {
+        log::error("[pix] [Debug] PixCapturer: no WinPixGpuCapturer.dll under C:\\Program Files\\Microsoft PIX\\<version>; continuing without it");
+        return;
+    }
+    const std::wstring path = root + best + L"\\WinPixGpuCapturer.dll";
+    char p8[MAX_PATH * 2] = "?";
+    WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, p8, sizeof(p8), nullptr, nullptr);
+    const bool d3d12_before = GetModuleHandleW(L"d3d12.dll") != nullptr;
+    g_pix = LoadLibraryW(path.c_str());
+    if (!g_pix) {
+        log::error("[pix] LoadLibraryW %s failed (error %lu); continuing without it", p8, GetLastError());
+        return;
+    }
+    // (PIX's wrappers: each D3D12 object the game gets may be PIX's; the mod's vtable hooks then land in PIX's code: the device's
+    // pre-scan, pix_prescan; a target hooked twice still refused as a backstop, hooks::set_refuse_shared)
+    hooks::set_refuse_shared(true);
+    log::info("[pix] loaded %s at %p (d3d12.dll %s loaded before it; CaptureNextFrame %s)", p8, static_cast<void*>(g_pix),
+              d3d12_before ? "already" : "not yet", GetProcAddress(g_pix, "CaptureNextFrame") || GetProcAddress(g_pix, "PIXGpuCaptureNextFrames") ? "exported" : "NOT exported");
+}
+}  // namespace
+
+bool pix_loaded() { return g_pix != nullptr; }
+
+std::string pixcap(const std::string& file, unsigned frames) {
+    if (!g_pix) return "ERROR pixcap: the PIX capturer is not loaded ([Debug] PixCapturer=1 at startup)";
+    using Fn = HRESULT(WINAPI*)(PCWSTR, UINT32);
+    // (pix3_win.h's PIXGpuCaptureNextFrames: the capturer's "CaptureNextFrame" export, (PCWSTR fileName, UINT32 numFrames); the other name kept)
+    auto fn = reinterpret_cast<Fn>(GetProcAddress(g_pix, "CaptureNextFrame"));
+    if (!fn) fn = reinterpret_cast<Fn>(GetProcAddress(g_pix, "PIXGpuCaptureNextFrames"));
+    if (!fn) return "ERROR pixcap: neither CaptureNextFrame nor PIXGpuCaptureNextFrames exported by the loaded capturer";
+    if (file.empty() || file.size() >= MAX_PATH || frames < 1 || frames > 16) return "ERROR pixcap <file.wpix> [frames=1..16]";
+    // (the review: PIX may read the name when it writes, frames later: a static buffer, not rewritten while a capture may be pending:
+    // until the asked frames plus 30 presents have passed since the call; one caller, the test channel's thread)
+    static wchar_t w[MAX_PATH] = {};
+    static std::atomic<uint64_t> pending_until{0};
+    const uint64_t now = state::presents.load(std::memory_order_relaxed);
+    if (now < pending_until.load()) return "ERROR pixcap: a capture may still be pending (wait for its frames plus 30 presents)";
+    if (!MultiByteToWideChar(CP_UTF8, 0, file.c_str(), -1, w, MAX_PATH)) return "ERROR pixcap: the file name is not convertible";
+    const HRESULT hr = fn(w, frames);
+    if (SUCCEEDED(hr)) pending_until = now + frames + 30;
+    log::info("[pix] CaptureNextFrame(%s, %u) = 0x%08lx", file.c_str(), frames, static_cast<unsigned long>(hr));
+    char b[160];
+    std::snprintf(b, sizeof(b), "pixcap %s frames=%u hr=0x%08lx%s", file.c_str(), frames, static_cast<unsigned long>(hr), SUCCEEDED(hr) ? "" : " (failed)");
+    return b;
+}
+
 bool install_startup_hooks() {
+    if (config::get_bool("Debug", "PixCapturer", false)) pix_load();  // ([Debug] PixCapturer, test only: before d3d12.dll is hooked)
     HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
     if (!d3d12) d3d12 = LoadLibraryW(L"d3d12.dll");
     HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
@@ -1158,6 +1906,10 @@ void add_frame_end_listener(FrameEndFn fn) {
     g_end_listeners[i] = fn;
     g_end_count = i + 1;
 }
+
+void set_frame_end_last(FrameEndFn fn) { g_end_last.store(fn); }
+
+IDXGISwapChain* presenting_swapchain() { return t_presenting; }
 
 void add_frame_start_listener(FrameStartFn fn) {
     int i = g_start_count.load();
@@ -1207,18 +1959,122 @@ const void* view_resource(uintptr_t handle, int* format) {
 
 void raw_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
               const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
-    if (o_OMSetRenderTargets) o_OMSetRenderTargets(cl, n, rts, single, ds);
-    else cl->OMSetRenderTargets(n, rts, single, ds);
+    if (dl_on()) {
+        dl_dsv(cl, ds, true, "OMSetRenderTargets (raw)", "");  // (r117 DG4's depthlog: the mod's own binds of the game's DSV)
+        t_dl_bind_cl = cl;
+        t_dl_bind_ds = ds ? ds->ptr : 0;
+    }
+    if (o_OMSetRenderTargets) {
+        InOriginal in(kNBind);  // (a debug layer's forward inside it passes straight through the hook)
+        o_OMSetRenderTargets(cl, n, rts, single, ds);
+    } else {
+        cl->OMSetRenderTargets(n, rts, single, ds);
+    }
+}
+
+int dsv_flags(uintptr_t h) {
+    if (!g_dsv_flags_on) return -1;
+    std::lock_guard lock(g_dsv_flags_mutex);
+    const auto it = g_dsv_flags.find(h);
+    return it == g_dsv_flags.end() ? -1 : static_cast<int>(it->second);
 }
 
 void raw_barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b) {
-    if (o_ResourceBarrier) o_ResourceBarrier(cl, n, b);
-    else cl->ResourceBarrier(n, b);
+    if (dl_on()) dl_barriers(cl, n, b, true);  // (r117 DG4's depthlog: the mod's own)
+    if (o_ResourceBarrier) {
+        InOriginal in(kNBarrier);
+        o_ResourceBarrier(cl, n, b);
+    } else {
+        cl->ResourceBarrier(n, b);
+    }
 }
 
-void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src) {
-    if (o_CopyTextureRegion) o_CopyTextureRegion(cl, dst, 0, 0, 0, src, nullptr);
-    else cl->CopyTextureRegion(dst, 0, 0, 0, src, nullptr);
+void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) {
+    if (dl_on() && dst && src)  // (r117 DG4's depthlog: the mod's own)
+        dl_copy(cl, dst->pResource, src->pResource, dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? static_cast<int>(dst->SubresourceIndex) : -2,
+                src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? static_cast<int>(src->SubresourceIndex) : -2, true, "CopyTextureRegion (raw)");
+    if (o_CopyTextureRegion) {
+        InOriginal in(kNCopyRegion);
+        o_CopyTextureRegion(cl, dst, 0, 0, 0, src, box);
+    } else {
+        cl->CopyTextureRegion(dst, 0, 0, 0, src, box);
+    }
+}
+
+void raw_draw(ID3D12GraphicsCommandList* cl, const DrawArgs& x) {  // ([Stereo] MainInstanced, test only)
+    if (dl_on()) dl_draw(cl, x.indexed ? "DrawIndexedInstanced (raw)" : "DrawInstanced (raw)", true, true, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    if (x.indexed) {
+        if (o_DrawIndexedInstanced) {
+            InOriginal in(kNDrawIndexed);
+            o_DrawIndexedInstanced(cl, x.a, x.b, x.c, x.d, x.e);
+        } else {
+            cl->DrawIndexedInstanced(x.a, x.b, x.c, x.d, x.e);
+        }
+    } else if (o_DrawInstanced) {
+        InOriginal in(kNDraw);
+        o_DrawInstanced(cl, x.a, x.b, x.c, x.e);
+    } else {
+        cl->DrawInstanced(x.a, x.b, x.c, x.e);
+    }
+}
+
+void note_view_instance_mask(ID3D12GraphicsCommandList* cl, unsigned mask) {
+    std::lock_guard lock(g_vim_mutex);
+    Vim* free_slot = nullptr;
+    for (Vim& v : g_vim) {
+        if (v.cl == cl) {
+            v.mask = mask;
+            return;
+        }
+        if (!v.cl && !free_slot) free_slot = &v;
+    }
+    if (!free_slot) return;
+    *free_slot = {cl, mask};
+    g_vim_count.fetch_add(1, std::memory_order_relaxed);
+}
+bool known_view_instance_mask(ID3D12GraphicsCommandList* cl, unsigned* mask) {
+    if (g_vim_count.load(std::memory_order_relaxed) == 0) return false;
+    std::lock_guard lock(g_vim_mutex);
+    for (const Vim& v : g_vim)
+        if (v.cl == cl) {
+            *mask = v.mask;
+            return true;
+        }
+    return false;
+}
+void raw_clear_rtv(ID3D12GraphicsCommandList* cl, const D3D12_CPU_DESCRIPTOR_HANDLE* h, const float rgba[4]) {  // (MainInstanced)
+    if (o_ClearRTV) {
+        InOriginal in(kNClearRtv);
+        o_ClearRTV(cl, *h, rgba, 0, nullptr);
+    } else {
+        cl->ClearRenderTargetView(*h, rgba, 0, nullptr);
+    }
+}
+void raw_clear_dsv(ID3D12GraphicsCommandList* cl, const D3D12_CPU_DESCRIPTOR_HANDLE* h, float depth, unsigned char stencil) {  // (MainSlice)
+    if (dl_on()) dl_dsv(cl, h, true, "ClearDepthStencilView (raw)", "");  // (r117 DG4's depthlog)
+    const D3D12_CLEAR_FLAGS f = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+    if (o_ClearDSV) {
+        InOriginal in(kNClearDsv);
+        o_ClearDSV(cl, *h, f, depth, stencil, 0, nullptr);
+    } else {
+        cl->ClearDepthStencilView(*h, f, depth, stencil, 0, nullptr);
+    }
+}
+
+thread_local int t_in_original[kNestKinds] = {};
+
+void count_nested(Nest m) { g_nested[m].fetch_add(1, std::memory_order_relaxed); }
+
+
+void nested_status(char* out, size_t len) {
+    auto g = [](Nest m) { return static_cast<unsigned long long>(g_nested[m].load(std::memory_order_relaxed)); };
+    std::snprintf(out, len,
+                  "nested: barriers %llu, binds %llu, copy regions %llu, indirect %llu, draws %llu, indexed draws %llu, dispatches %llu, "
+                  "copies %llu, closes %llu, resets %llu, depth clears %llu, target clears %llu, queries %llu, predications %llu, events %llu, "
+                  "pipelines %llu, vertex buffers %llu, graphics root cbvs %llu, compute root cbvs %llu",
+                  g(kNBarrier), g(kNBind), g(kNCopyRegion), g(kNIndirect), g(kNDraw), g(kNDrawIndexed), g(kNDispatch), g(kNCopy),
+                  g(kNClose), g(kNReset), g(kNClearDsv), g(kNClearRtv), g(kNEndQuery), g(kNPredication), g(kNBeginEvent),
+                  g(kNPipeline), g(kNVertexBuffers), g(kNGraphicsRootCbv), g(kNComputeRootCbv));
 }
 
 const char* resource_name(const void* resource) {
@@ -1284,6 +2140,14 @@ void watch_remove(const void* res) {
         }
 }
 
+uint64_t watched_writes(const void* res) {
+    if (!res) return 0;
+    std::lock_guard lock(g_watch_mutex);
+    for (int w = 0; w < kWatchSlots; ++w)
+        if (g_watch_res[w].load() == res) return g_watch[w].writes;
+    return 0;
+}
+
 bool watched_state(const void* res, ID3D12GraphicsCommandList** cl, uint32_t* state) {
     if (!res) return false;
     std::lock_guard lock(g_watch_mutex);
@@ -1299,9 +2163,11 @@ bool watched_state(const void* res, ID3D12GraphicsCommandList** cl, uint32_t* st
 }
 
 namespace {
+// (2026-10-29) inside RDR.exe's image the working set's page check first, as body.cpp's checked reads (image_mem.h)
 bool readable(const void* p, size_t n) {
+    if (image_mem::fast_readable(reinterpret_cast<uintptr_t>(p), n, image_mem::kReadAny)) return true;
     MEMORY_BASIC_INFORMATION mbi{};
-    if (!p || VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT) return false;
+    if (!p || !image_mem::query(reinterpret_cast<uintptr_t>(p), &mbi, image_mem::kD3d) || mbi.State != MEM_COMMIT) return false;
     if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
     const DWORD ok = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
                      PAGE_EXECUTE_WRITECOPY;
@@ -1364,6 +2230,7 @@ int rtv_handles_of(const void* res, uint64_t* out, int max) {
 }
 
 void set_rtv_substitute(RtvSubstFn fn) { g_rtv_subst = fn; }
+void set_rtv_substitute2(RtvSubstFn fn) { g_rtv_subst2 = fn; }
 
 void set_present_unsynced(bool on) {
     if (g_present_unsynced.exchange(on) != on)
@@ -1371,7 +2238,7 @@ void set_present_unsynced(bool on) {
 }
 
 void set_bind_tap(int slot, BindTapFn fn) {
-    if (slot >= 0 && slot < 5) g_bind_tap[slot] = fn;
+    if (slot >= 0 && slot < 7) g_bind_tap[slot] = fn;
 }
 
 void set_frame_size_listener(FrameSizeFn fn) { g_frame_size.store(fn, std::memory_order_release); }
@@ -1379,6 +2246,110 @@ void set_frame_size_listener(FrameSizeFn fn) { g_frame_size.store(fn, std::memor
 
 
 uint64_t thread_draws() { return t_draws; }
+bool thread_predicated() { return t_predicated; }
+void set_predicate_tracking(bool on) { g_pd_track.store(on, std::memory_order_relaxed); }
+int thread_predicate(ID3D12GraphicsCommandList* cl, Predicate* out) {  // ([Stereo] MainPredication, test only)
+    if (!g_pd_track.load(std::memory_order_relaxed) || !cl || t_pd.cl != cl || !t_pd.here) return kPredUnknown;
+    out->res = t_pd.res;
+    out->off = t_pd.off;
+    out->op = static_cast<int>(t_pd.op);
+    return t_pd.res ? kPredSet : kPredNone;
+}
+void raw_set_predication(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, uint64_t off, int op) {  // (MainPredication)
+    const D3D12_PREDICATION_OP o = static_cast<D3D12_PREDICATION_OP>(op);
+    if (o_SetPredication) {
+        InOriginal in(kNPredication);  // (a debug layer's forward inside it passes straight through the hook)
+        o_SetPredication(cl, r, off, o);
+    } else {
+        cl->SetPredication(r, off, o);
+    }
+}
+void depthlog_draws(int a, int b) {  // (r117 DG4, test only: the draws' ordinal range; a < 0 none)
+    g_dl_da.store(a, std::memory_order_relaxed);
+    g_dl_db.store(b, std::memory_order_relaxed);
+}
+void depthlog_arm(int frames) {  // (r117 DG4, test only)
+    g_dl_lines.store(0, std::memory_order_relaxed);
+    g_dl_frames.store(frames > 0 ? frames : 0, std::memory_order_relaxed);
+    log::info("[depthlog] armed for %d presents (the game's depth %p as last found by name)", frames, g_dl_res.load());
+}
+std::string depthlog_status() {
+    char b[200];
+    std::snprintf(b, sizeof(b), "depthlog: %d presents left, %llu lines, the depth %p, SRV creations %s", g_dl_frames.load(),
+                  static_cast<unsigned long long>(g_dl_lines.load()), g_dl_res.load(), o_CreateSRV ? "hooked" : "not hooked ([Debug] DepthLog=1 at start)");
+    return b;
+}
+bool root_note(ID3D12GraphicsCommandList* cl, const void** root, uint64_t* tables) {  // (item 8g, the review's SF1)
+    if (!g_rn_hooked.load(std::memory_order_relaxed) || !cl || t_rn.cl != cl || !t_rn.root) return false;
+    *root = t_rn.root;
+    *tables = t_rn.tables;
+    return true;
+}
+bool root_table_gpu(ID3D12GraphicsCommandList* cl, unsigned param, uint64_t* gpu) {  // (item 8g, the delta review)
+    if (!g_rn_hooked.load(std::memory_order_relaxed) || !cl || t_rn.cl != cl || param >= 64 || !(t_rn.tables >> param & 1)) return false;
+    *gpu = t_rn.gpu[param];
+    return true;
+}
+bool raster_note(ID3D12GraphicsCommandList* cl, RasterNote* out) {  // ([Stereo] MainRegionHandover, item 8g)
+    if (!g_rs_hooked.load(std::memory_order_relaxed) || !cl || t_rs.cl != cl) return false;
+    *out = t_rs;
+    return true;
+}
+void raw_set_raster(ID3D12GraphicsCommandList* cl, unsigned nvp, const float (*vp)[6], unsigned nsc, const int32_t (*sc)[4], int topo) {
+    if (!g_rs_hooked.load(std::memory_order_relaxed)) return;
+    InOriginal in(kNRaster);  // (a debug layer's forward passes straight through the hooks: the note unchanged)
+    if (nvp && vp) o_RSSetViewports(cl, nvp, reinterpret_cast<const D3D12_VIEWPORT*>(vp));
+    if (nsc && sc) o_RSSetScissorRects(cl, nsc, reinterpret_cast<const D3D12_RECT*>(sc));
+    if (topo) o_IASetPrimitiveTopology(cl, static_cast<D3D12_PRIMITIVE_TOPOLOGY>(topo));
+}
+int thread_open_queries(ID3D12GraphicsCommandList* cl) {  // (-1: not hooked, or the open queries not this list's alone)
+    if (!g_bq_hooked.load(std::memory_order_relaxed)) return -1;
+    if (t_open_queries == 0) return 0;
+    return t_q_cl == cl ? t_open_queries : -1;
+}
 uint64_t thread_queries() { return t_queries; }
+bool in_present() { return t_in_present != 0; }
+std::string debug_msg_kv() {  // ([Debug] D3D12DebugLayer) " dbg_ids=id:count,..." (empty without the layer)
+    if (!g_debug_layer.load()) return "";
+    std::string out = " dbg_ids=";
+    char b[32];
+    int m = 0;
+    for (int i = 0; i < kMsgIds; ++i) {
+        const uint64_t n = g_msg_n[i].load(std::memory_order_relaxed);
+        if (!n) continue;
+        std::snprintf(b, sizeof(b), "%s%d:%llu", m++ ? "," : "", i, static_cast<unsigned long long>(n));
+        out += b;
+    }
+    if (!m) out += "-";
+    return out;
+}
+void desc_phase(bool in) { g_dc_phase.store(in, std::memory_order_relaxed); }
+std::string desc_census_kv() {  // ([Stereo] DescCensus) the ring's frames with writes, oldest first
+    if (!g_dc_on.load()) return "";
+    struct F {
+        uint64_t frame;
+        uint32_t n, in, first, last;
+    } f[64];
+    int m = 0;
+    for (DcSlot& s : g_dc_ring) {
+        const uint32_t n = s.n.load(std::memory_order_relaxed);
+        if (n)
+            f[m++] = F{s.frame.load(std::memory_order_relaxed), n, s.in.load(std::memory_order_relaxed), s.first.load(std::memory_order_relaxed),
+                       s.last.load(std::memory_order_relaxed)};
+    }
+    std::sort(f, f + m, [](const F& a, const F& b) { return a.frame < b.frame; });
+    char b[96];
+    std::snprintf(b, sizeof(b), " dc_on=1 dc_writes=%llu dc_in=%llu dc_mod=%llu dc_frames=%llu dcf=", static_cast<unsigned long long>(g_dc_writes.load()),
+                  static_cast<unsigned long long>(g_dc_in.load()), static_cast<unsigned long long>(g_dc_mod.load()),
+                  static_cast<unsigned long long>(g_dc_frames.load()));
+    std::string out = b;
+    for (int i = m > 32 ? m - 32 : 0; i < m; ++i) {  // (the last 32: frame:writes:within the passes:first:last)
+        std::snprintf(b, sizeof(b), "%s%llu:%u:%u:%u:%u", i > (m > 32 ? m - 32 : 0) ? "," : "", static_cast<unsigned long long>(f[i].frame), f[i].n,
+                      f[i].in, f[i].first, f[i].last);
+        out += b;
+    }
+    if (!m) out += "-";
+    return out;
+}
 
 }  // namespace rdrvr::d3d

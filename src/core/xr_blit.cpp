@@ -3,33 +3,70 @@
 #include <windows.h>
 #include <d3dcompiler.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <utility>
 
 #include "core/anchors.h"
+#include "core/config.h"
 #include "core/d3d_hooks.h"
+#include "core/d3d_util.h"
 #include "core/log.h"
 #include "core/round_draw.h"
+#include "core/pso.h"
 
 namespace rdrvr::xr_blit {
 namespace {
+
+// [XR] Sharpness (run 14, after optimumbox's sharpening, 0.8.10.4): AMD FidelityFX CAS's no-scaling filter (ffx_cas.h,
+// CasFilter with noScaling and CAS_BETTER_DIAGONALS, its default single weight from green), rewritten as HLSL.
+// Copyright (c) 2017-2019 Advanced Micro Devices, Inc. All rights reserved. MIT licence: Permission is hereby granted,
+// free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge,
+// publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions: The above copyright notice and this permission notice shall
+// be included in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY
+// OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+// PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// The 3 x 3 texels a..i around e, in the display encoding; peak < 0 sharpens (the blit's -0.2 x Sharpness: 0 off, 1 =
+// AMD's strongest, -1 / lerp(8, 5, 1)), 0 = off (the taps skipped: the image as before, bit for bit).
+#define RDRVR_CAS_HLSL \
+    "float3 cas(float3 a, float3 b, float3 c, float3 d, float3 e, float3 f, float3 g, float3 h, float3 i, float peak) {\n" \
+    "    float3 mn = min(min(min(d, e), min(f, b)), h);\n" \
+    "    mn += min(min(mn, a), min(min(c, g), i));\n" \
+    "    float3 mx = max(max(max(d, e), max(f, b)), h);\n" \
+    "    mx += max(max(mx, a), max(max(c, g), i));\n" \
+    "    float w = sqrt(saturate(min(mn.g, 2.0 - mx.g) / max(mx.g, 1e-5))) * peak;\n" \
+    "    return saturate((b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w));\n" \
+    "}\n"
 
 // A full-screen triangle; the pixel shader reads the eye image texel for texel (same size), applies the game's
 // final gamma and returns the linear value whose sRGB encoding is that display value.
 const char kShader[] = R"(
 Texture2D<float4> src : register(t0);
-cbuffer K : register(b0) { float gamma; };
+// size: the eye image (the taps kept inside it); fade: [XR] RoomScale's (2026-10-27): 0 the image as before (times 1: bit for bit), 1 black
+cbuffer K : register(b0) { float gamma; float peak; float2 size; float fade; };
+)" RDRVR_CAS_HLSL R"(
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 float4 ps(float4 pos : SV_Position) : SV_Target {
     float3 c = saturate(src.Load(int3(pos.xy, 0)).rgb);
+    [branch] if (peak < 0) {
+        int2 p = int2(pos.xy), hi = int2(size) - 1;
+#define T(x, y) saturate(src.Load(int3(clamp(p + int2(x, y), 0, hi), 0)).rgb)
+        c = cas(T(-1, -1), T(0, -1), T(1, -1), T(-1, 0), c, T(1, 0), T(-1, 1), T(0, 1), T(1, 1), peak);
+#undef T
+    }
     float3 d = pow(c, gamma);
     float3 lin = d <= 0.04045 ? d / 12.92 : pow((d + 0.055) / 1.055, 2.4);
-    return float4(lin, 1);
+    return float4(lin * (1.0 - fade), 1);
 }
 )";
 
@@ -38,7 +75,7 @@ ID3D12Device* g_dev = nullptr;
 ID3D12RootSignature* g_root = nullptr;
 ID3D12PipelineState* g_pso = nullptr;
 ID3D12DescriptorHeap* g_srv_heap = nullptr;  // shader visible: one SRV per staging texture
-ID3D12DescriptorHeap* g_rtv_heap = nullptr;  // two RTV slots, written per frame for the acquired images
+ID3D12DescriptorHeap* g_rtv_heap = nullptr;  // four RTV slots, written per frame for the acquired images (the eyes, the scope's two)
 UINT g_srv_step = 0, g_rtv_step = 0;
 ID3D12Resource* g_stage[kStages] = {};
 std::atomic<int> g_source[2] = {0, 1};
@@ -50,16 +87,22 @@ uint64_t g_fence_value = 0, g_slot_value[kLists] = {};
 int g_slot = 0;
 uint32_t g_w = 0, g_h = 0;
 DXGI_FORMAT g_dst_format = DXGI_FORMAT_UNKNOWN;
+DXGI_FORMAT g_src_format = DXGI_FORMAT_UNKNOWN;  // the staging textures' (2026-10-27: the round's scene light probe reads them)
 bool g_ready = false;
 std::atomic<uint64_t> g_blits{0}, g_skips{0};
 std::atomic<float> g_last_gamma{0.0f}, g_override{0.0f};
+std::atomic<float> g_sharp{-1.0f};  // [XR] Sharpness 0..1 (CAS in the eye blit); -1: not read yet
+// [XR] RoomScale (2026-10-27, research/run27/roomscale.md B3): the eye images darkened toward black (0 none: the image as
+// before, bit for bit; 1 black), the UI quad and the wrist HUD left as they are (the prompts over black)
+std::atomic<float> g_fade{0.0f};
 
 // ---- [XR] EyeShape's paths (eye_shape.h), made only when first used: their own root signature (a linear sampler),
 // the resample into an eye-shaped (or the runtime's largest) swapchain, the monitor's repaint and the cinema's resample
 const char kShapeShader[] = R"(
 Texture2D<float4> src : register(t0);
 SamplerState lin : register(s0);
-cbuffer K : register(b0) { float gamma; float decode; float2 image; float2 content; float2 stage; float2 dst; float2 pad1; };
+cbuffer K : register(b0) { float gamma; float decode; float2 image; float2 content; float2 stage; float2 dst; float peak; float fade; };  // (fade: the eyes' only)
+)" RDRVR_CAS_HLSL R"(
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
@@ -81,9 +124,16 @@ float3 fetch_box(float2 p, float2 s) {
 }
 float4 ps_resample(float4 pos : SV_Position) : SV_Target {
     float2 s = content / image;
-    float3 d = pow(fetch_box(pos.xy * s, s), gamma);
+    float3 c = fetch_box(pos.xy * s, s);
+    [branch] if (peak < 0) {  // over the image pixel's neighbours, a content texel apart at least
+        float2 p = pos.xy * s, o = max(s, 1.0);
+#define T(x, y) fetch(p + o * float2(x, y))
+        c = cas(T(-1, -1), T(0, -1), T(1, -1), T(-1, 0), c, T(1, 0), T(-1, 1), T(0, 1), T(1, 1), peak);
+#undef T
+    }
+    float3 d = pow(c, gamma);
     float3 l = d <= 0.04045 ? d / 12.92 : pow((d + 0.055) / 1.055, 2.4);
-    return float4(l, 1);
+    return float4(l * (1.0 - fade), 1);
 }
 float4 ps_mirror(float4 pos : SV_Position) : SV_Target {
     float s = min(dst.x / content.x, dst.y / content.y);
@@ -98,6 +148,29 @@ float4 ps_cinema(float4 pos : SV_Position) : SV_Target {
     float3 c = fetch_box(pos.xy * s, s);
     if (decode > 0.5) c = c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
     return float4(c, 1);
+}
+// (r55 item 11) the scope's picture: the whole content (the scope's narrow pass: its tangents square, so the content's
+// rect is the circle's square in angle whatever its pixels' shape) into the round quad image (image: its size), premultiplied: dst.x its opacity, decode the reticle (a fine cross, posts below and at the sides
+// from half the radius out), the edge 1.5 pixels soft and the last fifth of the radius darkening as a tube's rim
+float4 ps_scope(float4 pos : SV_Position) : SV_Target {
+    float2 q = pos.xy / image * 2.0 - 1.0;
+    float r = length(q);
+    float px = 2.0 / image.x;
+    float m = saturate((1.0 - r) / (1.5 * px));
+    [branch] if (m <= 0.0) return float4(0, 0, 0, 0);
+    float3 c = fetch_box((q * 0.5 + 0.5) * content, content / image);
+    float3 d = pow(c, gamma);
+    float3 l = d <= 0.04045 ? d / 12.92 : pow((d + 0.055) / 1.055, 2.4);
+    l *= lerp(1.0, 0.55, smoothstep(0.80, 1.0, r));
+    if (decode > 0.5) {
+        float ax = abs(q.x), ay = abs(q.y);
+        float w = 0.9 * px, wp = 3.0 * px;
+        float ink = (ax < w || ay < w) ? 1.0 : 0.0;
+        if ((ax < wp && q.y > 0.5) || (ay < wp && ax > 0.5)) ink = 1.0;
+        l *= 1.0 - ink;
+    }
+    float a = m * saturate(dst.x);
+    return float4(l * a, a);
 }
 )";
 uint32_t g_dw = 0, g_dh = 0;  // the eye swapchains (0: the staging textures' size)
@@ -115,6 +188,12 @@ HANDLE g_m_event = nullptr;
 uint64_t g_m_value = 0, g_m_slot_value[kLists] = {};
 int g_m_slot = 0;
 std::atomic<uint64_t> g_resamples{0}, g_rects{0}, g_mirrors{0};
+// (r55 item 11) the scope's picture: its pipeline for the quad image's format (made at the first scoped frame)
+ID3DBlob* g_ps_scope = nullptr;
+ID3D12PipelineState* g_pso_scope = nullptr;
+DXGI_FORMAT g_scope_fmt = DXGI_FORMAT_UNKNOWN;
+bool g_scope_failed = false;
+std::atomic<uint64_t> g_scope_drawn{0}, g_scope_fail{0};
 
 // ---- the cinema's resample (cinema_resample): its own pipeline, lists, fence and views, and the back buffer's copy
 ID3DBlob* g_ps_cinema = nullptr;
@@ -161,7 +240,7 @@ bool make_pipeline() {
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants = {0, 0, 1};
+        params[0].Constants = {0, 0, 5};  // gamma, the CAS peak, the image's size, [XR] RoomScale's fade
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {1, &range};
@@ -187,6 +266,7 @@ bool make_pipeline() {
         pd.NumRenderTargets = 1;
         pd.RTVFormats[0] = g_dst_format;
         pd.SampleDesc.Count = 1;
+        const pso::OwnCreation own_pso;  // (run 19: [Stereo] InstancedShadersAuto leaves the mod's own pipelines alone)
         ok = SUCCEEDED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_pso)));
     }
     if (vs) vs->Release();
@@ -250,11 +330,35 @@ ID3D12PipelineState* make_shape_pso(ID3DBlob* ps, DXGI_FORMAT fmt) {
     pd.RTVFormats[0] = fmt;
     pd.SampleDesc.Count = 1;
     ID3D12PipelineState* pso = nullptr;
+    const pso::OwnCreation own_pso;  // (run 19: [Stereo] InstancedShadersAuto leaves the mod's own pipelines alone)
     if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)))) {
         log::error("[xr] eye shape: a blit pipeline for format %d was not created", static_cast<int>(fmt));
         return nullptr;
     }
     return pso;
+}
+
+// (r55 item 11) the scope picture's pipeline for `fmt`, made once (one attempt per format; a format change waits for
+// nothing: it is made at the first scoped frame and the quad's format never changes in a session)
+bool ensure_scope(DXGI_FORMAT fmt) {
+    if (g_pso_scope && g_scope_fmt == fmt) return true;
+    if (g_scope_failed) return false;
+    g_scope_failed = true;  // (before ensure_shape: its failure latches this one too, scope_pipeline_failed says so)
+    if (!ensure_shape()) return false;
+    if (!g_ps_scope) {
+        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        auto fn = dc ? reinterpret_cast<Compile_t>(GetProcAddress(dc, "D3DCompile")) : nullptr;
+        if (!fn) return false;
+        g_ps_scope = compile(fn, "ps_scope", "ps_5_0", kShapeShader, sizeof(kShapeShader) - 1);
+        if (!g_ps_scope) return false;
+    }
+    if (g_pso_scope) return false;  // (another format: not made twice in a session)
+    g_pso_scope = make_shape_pso(g_ps_scope, fmt);
+    if (!g_pso_scope) return false;
+    g_scope_fmt = fmt;
+    g_scope_failed = false;
+    log::info("[xr] the scope's picture: its pipeline made (format %d)", static_cast<int>(fmt));
+    return true;
 }
 
 DXGI_FORMAT unorm_of(DXGI_FORMAT f) {
@@ -287,12 +391,10 @@ DXGI_FORMAT copy_view_of(DXGI_FORMAT copy, bool srgb) {
     }
 }
 
+using d3d_util::fence_reached;  // (d3d_util.h: the event reset before it is armed, the value checked after the wait)
+
 // The cinema's lists have passed every use (the copy or the pipeline may be replaced), within `ms`.
-bool cinema_idle(DWORD ms) {
-    if (!g_c_fence || g_c_fence->GetCompletedValue() >= g_c_value) return true;
-    g_c_fence->SetEventOnCompletion(g_c_value, g_c_event);
-    return WaitForSingleObject(g_c_event, ms) == WAIT_OBJECT_0;
-}
+bool cinema_idle(DWORD ms) { return !g_c_fence || fence_reached(g_c_fence, g_c_value, g_c_event, ms); }
 
 // The shape shader's constants: gamma, -, image, content, stage, dst, -.
 void shape_consts(float* k, float gamma, uint32_t iw, uint32_t ih, uint32_t cw, uint32_t ch, uint32_t dw, uint32_t dh) {
@@ -315,9 +417,10 @@ bool init(ID3D12Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT src_format, DXG
     if (g_ready) return w == g_w && h == g_h && dst_format == g_dst_format;
     g_dev = dev;
     g_dst_format = dst_format;
+    g_src_format = src_format;
     if (!make_pipeline()) return false;
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kStages, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};  // (the eyes, the scope's pictures)
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_srv_heap))) || FAILED(dev->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&g_rtv_heap)))) {
         log::error("[xr] eye blit: descriptor heaps not created");
         return false;
@@ -370,7 +473,8 @@ void set_source(int eye, int stage_index) {
     if (eye >= 0 && eye < 2 && stage_index >= 0 && stage_index < kStages) g_source[eye].store(stage_index, std::memory_order_relaxed);
 }
 
-bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma, const Frame* frame) {
+bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma, const Frame* frame, Scope* scope) {
+    if (scope) scope->drawn[0] = scope->drawn[1] = false;
     if (!g_ready || !dst[0] || !dst[1]) return false;
     // [XR] EyeShape: the image drawn at the swapchain image's origin, and how (no frame: the whole stage, texel for texel)
     const uint32_t iw = frame ? frame->iw : g_w, ih = frame ? frame->ih : g_h;
@@ -380,22 +484,32 @@ bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma, 
         return false;
     if (resample && (!ensure_shape() || (!g_pso_resample && !(g_pso_resample = make_shape_pso(g_ps_resample, g_dst_format))))) return false;
     int s = g_slot;
-    if (g_fence->GetCompletedValue() < g_slot_value[s]) {
-        g_fence->SetEventOnCompletion(g_slot_value[s], g_event);
-        if (WaitForSingleObject(g_event, 50) != WAIT_OBJECT_0) {
-            g_skips.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
+    if (!fence_reached(g_fence, g_slot_value[s], g_event, 50)) {
+        g_skips.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
+    const float sharp = sharpness();
+    const float peak = -0.2f * sharp;  // ([XR] Sharpness: 0 no taps, 1 AMD's strongest; a ramp from nothing, so 5% is a touch)
+    const float fade_k = g_fade.load(std::memory_order_relaxed);
+    // (r55 item 11) each eye's own fade over the room scale's: 1 - (1 - room)(1 - eye's); without a scope both the room's
+    float eye_fade[2] = {fade_k, fade_k};
+    if (scope)
+        for (int e = 0; e < 2; ++e) {
+            const float f = std::clamp(scope->eye_fade[e], 0.0f, 1.0f);
+            eye_fade[e] = f > 0.0f ? 1.0f - (1.0f - fade_k) * (1.0f - f) : fade_k;  // (none: the room's, bit for bit)
+        }
+    const bool scope_pic = scope && scope->size && ((scope->dst[0] && scope->alpha[0] > 0.0f) || (scope->dst[1] && scope->alpha[1] > 0.0f));
+    const bool scope_ok = scope_pic && ensure_scope(scope->fmt);
+    if (scope_pic && !scope_ok) g_scope_fail.fetch_add(1, std::memory_order_relaxed);
     if (FAILED(g_alloc[s]->Reset()) || FAILED(g_list->Reset(g_alloc[s], resample ? g_pso_resample : g_pso))) return false;
     g_list->SetGraphicsRootSignature(resample ? g_root2 : g_root);
     g_list->SetDescriptorHeaps(1, &g_srv_heap);
+    float k12[12];
+    float k5[5] = {gamma, peak, static_cast<float>(iw), static_cast<float>(ih), fade_k};
     if (resample) {
-        float k[12];
-        shape_consts(k, gamma, iw, ih, frame->cw, frame->ch, 0, 0);
-        g_list->SetGraphicsRoot32BitConstants(0, 12, k, 0);
-    } else {
-        g_list->SetGraphicsRoot32BitConstants(0, 1, &gamma, 0);
+        shape_consts(k12, gamma, iw, ih, frame->cw, frame->ch, 0, 0);
+        k12[10] = peak;
+        k12[11] = fade_k;
     }
     g_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_VIEWPORT vp{0, 0, static_cast<float>(iw), static_cast<float>(ih), 0, 1};
@@ -413,15 +527,67 @@ bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma, 
         D3D12_GPU_DESCRIPTOR_HANDLE srv = g_srv_heap->GetGPUDescriptorHandleForHeapStart();
         srv.ptr += static_cast<UINT64>(g_source[e].load(std::memory_order_relaxed)) * g_srv_step;
         g_list->SetGraphicsRootDescriptorTable(1, srv);
+        if (resample) {
+            k12[11] = eye_fade[e];
+            g_list->SetGraphicsRoot32BitConstants(0, 12, k12, 0);
+        } else {
+            k5[4] = eye_fade[e];
+            g_list->SetGraphicsRoot32BitConstants(0, 5, k5, 0);
+        }
         g_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         g_list->DrawInstanced(3, 1, 0, 0);
         rtvs[e] = rtv;
     }
-    // [Reload] RoundInHand, over both eyes (last: its own state); with EyeShape in the image's rect
+    if (scope_ok) {  // (r55 item 11) each scoped eye's picture from its own image, into its quad's image (RTV slots 2, 3)
+        g_list->SetPipelineState(g_pso_scope);
+        g_list->SetGraphicsRootSignature(g_root2);
+        D3D12_VIEWPORT svp{0, 0, static_cast<float>(scope->size), static_cast<float>(scope->size), 0, 1};
+        D3D12_RECT ssc{0, 0, static_cast<LONG>(scope->size), static_cast<LONG>(scope->size)};
+        g_list->RSSetViewports(1, &svp);
+        g_list->RSSetScissorRects(1, &ssc);
+        const uint32_t cw = frame ? frame->cw : g_w, ch = frame ? frame->ch : g_h;
+        for (int e = 0; e < 2; ++e) {
+            if (!scope->dst[e] || !(scope->alpha[e] > 0.0f)) continue;
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+            rtv.ptr += static_cast<SIZE_T>(2 + e) * g_rtv_step;
+            D3D12_RENDER_TARGET_VIEW_DESC rv{};
+            rv.Format = scope->fmt;
+            rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            g_dev->CreateRenderTargetView(scope->dst[e], &rv, rtv);
+            float k[12];
+            shape_consts(k, gamma, scope->size, scope->size, cw, ch, 0, 0);
+            k[1] = scope->reticle ? 1.0f : 0.0f;
+            k[8] = scope->alpha[e];
+            g_list->SetGraphicsRoot32BitConstants(0, 12, k, 0);
+            D3D12_GPU_DESCRIPTOR_HANDLE srv = g_srv_heap->GetGPUDescriptorHandleForHeapStart();
+            srv.ptr += static_cast<UINT64>(g_source[e].load(std::memory_order_relaxed)) * g_srv_step;
+            g_list->SetGraphicsRootDescriptorTable(1, srv);
+            g_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            g_list->DrawInstanced(3, 1, 0, 0);
+            scope->drawn[e] = true;
+            g_scope_drawn.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_list->RSSetViewports(1, &vp);  // (the rounds after it draw over the eyes)
+        g_list->RSSetScissorRects(1, &sc);
+    }
+    // [Reload] RoundInHand, over both eyes (last: its own state); with EyeShape in the image's rect. 2026-10-27: the eye
+    // images it was just drawn from (still in PIXEL_SHADER_RESOURCE), for the new rounds' scene light round them
+    round_draw::EyeImages eyes{};
+    for (int e = 0; e < 2; ++e) eyes.tex[e] = g_stage[g_source[e].load(std::memory_order_relaxed)];
+    eyes.fmt = g_src_format;
+    eyes.cw = frame ? frame->cw : (g_dw ? g_dw : g_w);  // (no frame: drawn texel for texel)
+    eyes.ch = frame ? frame->ch : (g_dh ? g_dh : g_h);
+    eyes.gamma = gamma;
+    eyes.fade = fade_k;
+    for (int e = 0; e < 2; ++e) eyes.skip[e] = scope && scope->hide[e];  // (r55 item 11: the scope's own eye, not a darkened other one)
     round_draw::record(g_dev, g_list, dst, rtvs, g_dw ? g_dw : g_w, g_dh ? g_dh : g_h, g_dst_format, s, frame ? iw : 0, frame ? ih : 0,
-                       frame ? frame->dw : 0, frame ? frame->dh : 0);
-    if (FAILED(g_list->Close())) return false;
+                       frame ? frame->dw : 0, frame ? frame->dh : 0, &eyes);
+    if (FAILED(g_list->Close())) {
+        round_draw::list_submitted(s, false);  // (2026-10-27: what it recorded never runs: the atlas's copy among it)
+        return false;
+    }
     d3d::submit_internal(queue, g_list);
+    round_draw::list_submitted(s, true);
     g_slot_value[s] = ++g_fence_value;
     queue->Signal(g_fence, g_fence_value);
     g_slot = (s + 1) % kLists;
@@ -466,10 +632,7 @@ bool repaint(ID3D12CommandQueue* queue, ID3D12Resource* bb, uint32_t cw, uint32_
         failed = false;
     }
     const int s = g_m_slot;
-    if (g_m_fence->GetCompletedValue() < g_m_slot_value[s]) {
-        g_m_fence->SetEventOnCompletion(g_m_slot_value[s], g_m_event);
-        if (WaitForSingleObject(g_m_event, 50) != WAIT_OBJECT_0) return false;
-    }
+    if (!fence_reached(g_m_fence, g_m_slot_value[s], g_m_event, 50)) return false;
     if (FAILED(g_m_alloc[s]->Reset()) || FAILED(g_m_list->Reset(g_m_alloc[s], g_pso_mirror))) return false;
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_m_rtv->GetCPUDescriptorHandleForHeapStart();
     D3D12_RENDER_TARGET_VIEW_DESC rv{};
@@ -540,10 +703,7 @@ bool cinema_resample(ID3D12Device* dev, ID3D12CommandQueue* queue, ID3D12Resourc
         !bd.Height || w > dd.Width || h > dd.Height)
         return false;
     const int s = g_c_slot;
-    if (g_c_fence->GetCompletedValue() < g_c_slot_value[s]) {
-        g_c_fence->SetEventOnCompletion(g_c_slot_value[s], g_c_event);
-        if (WaitForSingleObject(g_c_event, 50) != WAIT_OBJECT_0) return false;
-    }
+    if (!fence_reached(g_c_fence, g_c_slot_value[s], g_c_event, 50)) return false;
     // the copy, made again when the back buffer's size or format changes (the game's frame resized), and the pipeline
     // for the quad image's format: each replaced only once the GPU has passed every list that used the old one
     const bool srgb = is_srgb(dst_format);
@@ -652,15 +812,40 @@ float game_gamma(float def) {
     return g > 0.05f && g < 10.0f ? g : def;
 }
 
+float sharpness() {
+    float v = g_sharp.load(std::memory_order_relaxed);
+    if (v < 0.0f) {  // the first read: the ini's (a set in between wins)
+        float want = std::clamp(config::get_float("XR", "Sharpness", 0.0f), 0.0f, 1.0f);
+        if (!g_sharp.compare_exchange_strong(v, want)) return v;
+        v = want;
+    }
+    return v;
+}
+bool scope_pipeline_failed() { return g_scope_failed && !g_pso_scope; }
+void scope_counts(uint64_t* drawn, uint64_t* failed) {
+    *drawn = g_scope_drawn.load(std::memory_order_relaxed);
+    *failed = g_scope_fail.load(std::memory_order_relaxed);
+}
+void set_fade(float f) { g_fade.store(!(f > 0.0f) ? 0.0f : f > 1.0f ? 1.0f : f, std::memory_order_relaxed); }
+float fade() { return g_fade.load(std::memory_order_relaxed); }
+void set_sharpness(float v, bool save) {
+    v = std::clamp(v, 0.0f, 1.0f);
+    if (std::fabs(g_sharp.exchange(v) - v) > 1e-4f) log::info("[xr_blit] sharpening (CAS) %.2f", v);
+    if (save) {
+        char b[16];
+        std::snprintf(b, sizeof(b), "%.2f", v);
+        config::set("XR", "Sharpness", b);
+    }
+}
 void set_gamma_override(float g) {
     g_override = g;
     log::info("[xr] eye blit gamma: %s %.4f", g > 0 ? "fixed" : "the game's", g);
 }
 
 void status_text(char* out, size_t len) {
-    int n = std::snprintf(out, len, "blit %s, %llu frames, %llu skipped, gamma %.4f%s", g_ready ? "ready" : "not made",
+    int n = std::snprintf(out, len, "blit %s, %llu frames, %llu skipped, gamma %.4f%s, sharpen %.2f, fade %.2f", g_ready ? "ready" : "not made",
                           static_cast<unsigned long long>(g_blits.load()), static_cast<unsigned long long>(g_skips.load()),
-                          g_last_gamma.load(), g_override.load() > 0 ? " (FIXED, control)" : "");
+                          g_last_gamma.load(), g_override.load() > 0 ? " (FIXED, control)" : "", sharpness(), g_fade.load());
     if ((g_dw && (g_dw != g_w || g_dh != g_h)) || g_rects.load() || g_resamples.load() || g_mirrors.load())
         if (n > 0 && static_cast<size_t>(n) < len)
             std::snprintf(out + n, len - static_cast<size_t>(n), " (eye shape: rect %llu, resampled %llu, monitor %llu)",

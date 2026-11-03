@@ -19,11 +19,13 @@
 #include "core/controllers.h"
 #include "core/controls.h"
 #include "core/d3d_hooks.h"
+#include "core/dual.h"
 #include "core/gun_melee.h"
 #include "core/hands.h"
 #include "core/holster.h"
 #include "core/log.h"
 #include "core/menu.h"
+#include "core/offhand.h"
 #include "core/pose.h"
 #include "core/reload.h"
 #include "core/whistle.h"
@@ -48,7 +50,22 @@ constexpr int kLassoWeapon = 21, kKnife = 22, kTorch = 33;
 struct Sample {
     double ms;
     float p[3];
+    float turn;  // 2026-10-27 ([XR] BodyFollowsTurn): the follow's turn the recentred frame carried (camera_lever::local_rel)
 };
+// (the review of BodyFollowsTurn) the recentred frame turns with the body's follow (the origin's yaw), so a still hand's
+// reading turns about the recentre point: up to 4 m/s of false swing 1.5 m from it. A sample is taken into the newest
+// one's frame first (turned by -(the newest's turn - its own) about y, as local_rel would read it now): only the hand's
+// own motion is differentiated. Off (no turn ever), the turns are equal and the sample is used as it is
+void in_frame(const Sample& s, float turn_now, float out[3]) {
+    if (s.turn == turn_now) {
+        out[0] = s.p[0], out[1] = s.p[1], out[2] = s.p[2];
+        return;
+    }
+    const float d = std::remainder(turn_now - s.turn, 360.0f) * 0.0174532925f, c = std::cos(d), sn = std::sin(d);
+    out[0] = s.p[0] * c - s.p[2] * sn;
+    out[1] = s.p[1];
+    out[2] = s.p[0] * sn + s.p[2] * c;
+}
 constexpr int kSamples = 32;
 Sample g_hist[2][kSamples] = {};
 int g_count[2] = {0, 0}, g_head[2] = {0, 0};
@@ -66,8 +83,70 @@ std::atomic<int> g_lasso_throw{1}, g_lasso_aim{1};  // the defaults the trigger 
 std::atomic<bool> g_lasso_trig_owned{false};
 std::atomic<uint64_t> g_lasso_trigger_throws{0}, g_lasso_freezes{0};
 constexpr int kLassoLeadMs = 300;
+// 2026-10-30 (item 12; the user: "Holding left trigger locks on to the npc you're looking at and activates the lasso
+// spinning animation. and right trigger or a throwing motion throws it."): LassoThrow=lock (3). The game's own LT (the
+// layout's other hand's trigger, passed as it is) is its lock and its spin; the lasso's ray along the head while it is
+// in hand (whatever LassoAim says), so the lock takes the one you look at. While LT is held, its RT (the lasso hand's
+// trigger, held back as for trigger) or a swing toward where you look throws: RT at once when LT has been held
+// kLassoLeadMs (the lock settled), else after the rest of that lead (no LT added: the player's own, a part press too,
+// stays the game's, so a caught one is not dropped as an injected LT ends). Without LT neither throws (counted). LT let
+// go without a throw: nothing sent (the game puts the lasso down). A rope already on someone (the yank) as before.
+constexpr int kLassoLock = 3;
+std::atomic<uint64_t> g_lock_holds{0}, g_lock_rt_throws{0}, g_lock_swing_throws{0}, g_lock_no_throw{0}, g_lock_swings_unheld{0}, g_lock_rt_unheld{0},
+    g_lock_rt_mouth{0}, g_lock_cancels{0};
+std::atomic<bool> g_lock_lt{false};    // LT held now (lock mode, the lasso in hand)
+std::atomic<double> g_lock_since{0.0};  // when that hold began
+// "gestures lassoprobe on" (a test's; reads game memory each frame for 3 s after a mod throw): at the throw the game's
+// lock (aim::lasso_probe's lock, soft), then the first target the lasso took in flight
+std::atomic<bool> g_lasso_probe{false};
+std::atomic<uint32_t> g_probe_lock{0}, g_probe_soft{0}, g_probe_target{0};
+std::atomic<int> g_probe_max_state{-1};
+double g_probe_until = 0;  // frame end only
+bool g_lock_thrown = false;  // (frame end only) a throw made in this hold
+double g_lock_rt_from = 0;   // (frame end only) a lock throw's delayed RT starts then (the lead's rest); cancelled if LT goes first
+// (2026-11-03, round 73 check 4, the user: the lasso "Inconsistent, sometimes it throws, sometimes it stop before hitting the
+// target"; their log: 29 throws, one catch, most sent 300 ms after LT with no lock yet; research/run17/lasso.md 4: the aim
+// stance and the lock take 0.5-0.8 s) a lock throw with no lock yet waits for it: RT once the game locks someone (and LT
+// has been held kLassoLeadMs), or kLassoLockWaitMs after LT without one (thrown as before); cancelled as the lead's RT is
+constexpr int kLassoLockWaitMs = 1000;  // (cycle N28: the lock came 689 ms after LT; one throw waited 800 ms without it)
+double g_lock_wait_until = 0;  // (frame end only) a held lock throw's last moment, 0: none held
+const char* g_lock_wait_by = "";
+std::atomic<uint64_t> g_lock_waits{0}, g_lock_waits_locked{0};
+// (the re-review) a lock throw's RT still waiting for its lead: taken back (LT let go, the lasso put away, out of first
+// person); the yank disarmed with it, the next press not held off (next_ok, if given). True if it was still pending.
+// ("thrown by RT / by a swing" count the accepted presses, a cancelled one too)
+bool cancel_lock_throw(double* lasso_out_until, double* next_ok, const char* why) {
+    if (g_lock_thrown && g_lock_wait_until > 0) {  // (held for the lock: nothing sent yet)
+        g_lock_wait_until = 0;
+        g_lock_thrown = false;
+        *lasso_out_until = 0;
+        if (next_ok) *next_ok = 0;
+        g_probe_until = 0;
+        g_probe_max_state.store(-1, std::memory_order_relaxed);
+        g_lock_cancels.fetch_add(1, std::memory_order_relaxed);
+        log::info("[gestures] lasso: %s while the throw waited for the game's lock (nothing thrown)", why);
+        return true;
+    }
+    if (!g_lock_thrown || g_lock_rt_from <= 0) return false;
+    g_lock_rt_from = 0;
+    if (!controls::cancel_pending_rt()) return false;  // (its RT already went out: thrown)
+    g_lock_thrown = false;
+    *lasso_out_until = 0;
+    if (next_ok) *next_ok = 0;
+    g_probe_until = 0;
+    g_probe_max_state.store(-1, std::memory_order_relaxed);  // ("at the last throw": a throw that never went out)
+    g_lock_cancels.fetch_add(1, std::memory_order_relaxed);
+    log::info("[gestures] lasso: %s inside the lead: the throw's RT cancelled (nothing thrown)", why);
+    return true;
+}
+int lasso_aim_mode() { return g_lasso_throw.load(std::memory_order_relaxed) == kLassoLock ? 1 : g_lasso_aim.load(std::memory_order_relaxed); }
 float g_lasso_frozen[3] = {0, 0, -1}, g_lasso_off_dir[3] = {0, 0, -1};  // world; under g_mutex
 double g_lasso_frozen_until = 0;  // under g_mutex
+// (2026-11-01, GOAL-offhand-changes C11; round 64, the user: "Lock on does not seem to be working, aim follows head even if
+// I am holding LT") lock mode: once the game holds a lock with LT held, the lasso's ray kept where the head looked then
+// (world; under g_mutex), not along the head after: the head's ray moved the game's lock off its target
+float g_lock_dir[3] = {0, 0, -1};
+bool g_lock_dir_on = false;  // under g_mutex
 bool g_lasso_off_ok = false;      // under g_mutex
 double g_last_swing_ms = 0;  // the last punch's swing (frame end only): the strike probe's reference
 // run 10 item 7 ([Gestures] Guard; the user: "with fists equipped, holding hands in front of face in a guarding pose"):
@@ -198,8 +277,10 @@ bool velocity(int h, double now, double window_ms, float v[3], float* speed, flo
         if (now - a.ms > window_ms) break;
         const double dt = (a.ms - b.ms) * 0.001;
         if (dt < 1e-3) continue;
-        float w[3];
-        for (int k = 0; k < 3; ++k) w[k] = static_cast<float>((a.p[k] - b.p[k]) / dt);
+        float w[3], ap[3], bpp[3];
+        in_frame(a, last.turn, ap);  // ([XR] BodyFollowsTurn: both in the newest sample's frame)
+        in_frame(b, last.turn, bpp);
+        for (int k = 0; k < 3; ++k) w[k] = static_cast<float>((ap[k] - bpp[k]) / dt);
         const float s = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
         if (s > kMaxSpeed) continue;  // a jump (tracking lost and found, a teleport, the recentre), not a swing
         if (s > *speed) {
@@ -244,6 +325,7 @@ int npts = 0, family = -1, weapon = -1;  // family: 0 a pistol, 1 a long gun by 
 bool armed = false, struck = false, counted = false, have_prev = false;
 // the armed swing's peak, its fast part and its scans (the "swing over" line); the last suppression line's time
 float swing_peak = 0.0f, swing_near = -1.0f, swing_near_speed = 0.0f;  // near: the nearest a scan came to a bone (m; -1 none)
+int swing_seen = 0, swing_fit = 0;  // (round 73) the most actors a scan of the swing found within kRadiusCm, and of them to hit
 bool over_pending = false;  // a swing over without a hit, its line kept until its last scan has answered (the review's finding)
 float over_peak = 0.0f;
 int over_part = 0, over_scans = 0, over_family = 0;
@@ -275,8 +357,10 @@ bool point_velocity(const Point& p, double now, double window_ms, float v[3], fl
         if (now - a.ms > window_ms) break;
         const double dt = (a.ms - b.ms) * 0.001;
         if (dt < 1e-3) continue;
-        float w[3];
-        for (int k = 0; k < 3; ++k) w[k] = static_cast<float>((a.p[k] - b.p[k]) / dt);
+        float w[3], ap[3], bpp[3];
+        in_frame(a, last_s.turn, ap);  // ([XR] BodyFollowsTurn: both in the newest sample's frame)
+        in_frame(b, last_s.turn, bpp);
+        for (int k = 0; k < 3; ++k) w[k] = static_cast<float>((ap[k] - bpp[k]) / dt);
         const float s = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
         if (s > kMaxSpeed) continue;  // a jump, not a swing
         if (s > *speed) {
@@ -301,6 +385,11 @@ void note(const RdrvrNativeResult& r, bool swing, int gun_h) {
             if (swing && r.vec[3] >= 0.0f && (swing_near < 0.0f || r.vec[3] < swing_near)) {
                 swing_near = r.vec[3];
                 swing_near_speed = r.vec[0];
+            }
+            if (swing) {
+                const int sn = static_cast<int>((r.value >> 48) & 0xff), fn = std::isfinite(r.vec[2]) ? static_cast<int>(r.vec[2]) : 0;
+                if (sn > swing_seen) swing_seen = sn;
+                if (fn > swing_fit) swing_fit = fn;
             }
             break;
         case RDRVR_GUN_MELEE_GUARD: ++n_guard; break;
@@ -403,8 +492,8 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
     }
     for (int k = 0; k < 2; ++k) {  // each point in the recentred local frame (the hand's own motion)
         Point& p = pt[k];
-        float lp[3], rel[3];
-        if (k >= np || !camera_lever::world_to_local(bp->cam, wp[k], lp) || !camera_lever::local_rel(lp, rel)) {
+        float rel[3], turn = 0.0f;  // (one origin for both steps: camera_lever::world_to_local_rel)
+        if (k >= np || !camera_lever::world_to_local_rel(bp->cam, wp[k], rel, &turn)) {
             p.count = 0;
             p.ok = false;
             continue;
@@ -415,6 +504,7 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
         Sample& s = p.hist[p.head];
         s.ms = now;
         std::memcpy(s.p, rel, sizeof(rel));
+        s.turn = turn;
         p.head = (p.head + 1) % kSamples;
         if (p.count < kSamples) ++p.count;
     }
@@ -433,13 +523,14 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
     speed_now = speed;
     if (speed > speed_peak) speed_peak = speed;
     // the exclusion windows (their edges each frame, so the windows run whatever the speed)
-    const bool cons = holster::grip_consumed(gun_h) || (holster::gun_at_zone() && hands::get(gun_h).grip > 0.5f);
+    // ([Holsters] HoldToKeep: the gun hand's grip held as the gun's hold away from the holsters is no holster's grip)
+    const bool cons = (holster::grip_consumed(gun_h) && !holster::grip_keeps(gun_h)) || (holster::gun_at_zone() && hands::get(gun_h).grip > 0.5f);
     if (holster_was && !cons) holster_ms = now;
     holster_was = cons;
     float part[3];
-    const int hint = actions::hint(nullptr);  // 1 open, 3 a flick wanted, 0 unknown (ActionHints off) or nothing
-    const bool act = (actions::fire_blocked() && (hint == 0 || hint == 1 || hint == 3)) || actions::grip_wanted(1 - gun_h) ||
-                     actions::part_snap(part) > 0.0f || actions::barrel_snap() > 0.0f;
+    const int hint = actions::hint(nullptr);  // 1 open, 3 a flick wanted, 5 shut it (step 7), 0 unknown (ActionHints off) or nothing
+    const bool act = (actions::fire_blocked() && (hint == 0 || hint == 1 || hint == 3 || hint == 5)) || actions::grip_wanted(1 - gun_h) ||
+                     actions::part_snap(part) > 0.0f || actions::carried_part_snap() > 0.0f || actions::barrel_snap() > 0.0f;
     if (action_was && !act) action_ms = now;
     action_was = act;
     const float blend = holster::two_hand_blend();
@@ -473,7 +564,8 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
         over_pending = false;
         if (!struck) {
             ++n_swings_missed;
-            char nr[96] = "no one near";
+            char nr[160];
+            std::snprintf(nr, sizeof(nr), "no one near (actors within %.0f m: %d, to hit %d)", kRadiusCm * 0.01f, swing_seen, swing_fit);
             if (swing_near >= 0.0f) std::snprintf(nr, sizeof(nr), "the nearest bone missed by %.2f m at %.1f m/s", swing_near, swing_near_speed);
             log::info("[gunmelee] swing over: peak %.1f m/s (the %s), %d scan%s, no hit, %s (a hit needs a bone entered %s %.1f m/s)", over_peak,
                       over_part ? "barrel" : over_family == 0 ? "frame" : "butt", over_scans, over_scans == 1 ? "" : "s", nr,
@@ -499,6 +591,7 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
         swing_part = fast;
         swing_scans = 0;
         swing_near = -1.0f;
+        swing_seen = swing_fit = 0;
         ++n_armed;
         log::info("[gunmelee] armed: the %s at %.1f m/s (weapon %d, %s)", fast ? "barrel" : fam == 0 ? "frame" : "butt", speed, w,
                   fam == 0 ? "a pistol" : fam == 1 ? "a long gun by its frame" : "a long gun by the hand's ray");
@@ -536,6 +629,160 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
 }
 }  // namespace gm
 
+// ---- [Hands] OffHandItems (offhand.h): the off hand's knife (or torch), a stab or a slash. Its two points (the hilt at
+// the drawn hand; the knife's tip kBlade, the torch's head kTorchHead, along the controller's pointing) followed in the
+// recentred local frame as the gun melee's strike points (gm above: the same history, the same velocity), the same rule
+// for a hit (armed past GunMeleeArm, a hit at GunMeleeSpeed, by the swing's peak as GunMeleeByPeak says) and the same scan
+// (RDRVR_NATIVE_GUN_MELEE, its weapon the item's: gun_melee::hit takes it for the off hand's own); a slow move never arms.
+// GunMelee itself may be off. Not while the menu is open, riding or driving, in Dead Eye. Out of first person, or the item
+// put back, it is forgotten.
+namespace ohs {
+constexpr float kBlade = 0.22f;      // m: the tip from the grip [I] (the game's knife model's blade; not measured)
+constexpr float kTorchHead = 0.45f;  // m: the torch's burning head from the grip [I] (not measured)
+std::mutex mu;
+gm::Point pt[2];
+bool armed = false, struck = false, have_prev = false;
+int weapon = -1, hand = -1;
+float prev[2][3] = {}, peak = 0.0f, speed_now = 0.0f;
+uint64_t req = 0;
+double req_ms = 0.0;
+uint64_t n_armed = 0, n_scans = 0, n_hits = 0, n_dry = 0, n_refused = 0, n_none = 0, n_timeouts = 0, n_slow = 0;
+char last[200] = "none";
+
+void reset() {
+    armed = struck = have_prev = false;
+    peak = 0.0f;
+    for (gm::Point& p : pt) p.count = 0, p.ok = false;
+}
+void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
+    int h = -1, jh = -1, w = -1;
+    const bool on = offhand::strike_hand(&h, &jh, &w);
+    if (!on && !req && !armed && weapon < 0) return;  // off: this check only
+    std::lock_guard lock(mu);
+    if (req) {
+        RdrvrNativeResult r{};
+        if (api::wait_native(req, &r, 0)) {
+            req = 0;
+            ++n_scans;
+            const uint32_t outcome = static_cast<uint32_t>(r.value >> 32) & 0xff, code = static_cast<uint32_t>(r.value >> 40) & 0xff;
+            if (outcome == RDRVR_GUN_MELEE_HIT) {
+                const bool made = code == RDRVR_MELEE_HIT_OK, dry = code == RDRVR_MELEE_HIT_DRY;
+                made ? ++n_hits : dry ? ++n_dry : ++n_refused;
+                if (made || dry) {
+                    struck = true;
+                    if (hand >= 0) controllers::pulse(hand, made ? 0.8f : 0.4f, 30);
+                }
+                std::snprintf(last, sizeof(last), "%s 0x%x at (%.2f %.2f %.2f), the core's answer %u", made ? "hit" : dry ? "dry hit" : "refused",
+                              static_cast<uint32_t>(r.value), r.vec[0], r.vec[1], r.vec[2], code);
+                log::info("[offhand] the stab's scan: %s", last);
+            } else if (outcome == RDRVR_GUN_MELEE_NONE) {
+                ++n_none;
+            }
+        } else if (now - req_ms > gm::kReqMs) {
+            api::cancel_op(req);
+            req = 0;
+            ++n_timeouts;
+        }
+    }
+    if (!on || !bp || !st || !st->actor || w != weapon || h != hand) {
+        if (req && (!on || w != weapon)) {  // (the review) the item put back or another: its scan still queued is dropped
+            api::cancel_op(req);
+            req = 0;
+        }
+        reset();
+        weapon = on ? w : -1;
+        hand = on ? h : -1;
+        speed_now = 0.0f;
+        if (!on || !bp || !st || !st->actor) return;
+    }
+    if (jh < 0 || jh > 1 || !bp->hand_ok[jh] || !bp->cam_ok) {
+        reset();
+        return;
+    }
+    const float* R = bp->target_rot[jh];
+    const float bt[3] = {0.0f, 0.174f, -0.985f};
+    float u[3], wp[2][3];
+    for (int k = 0; k < 3; ++k) u[k] = R[k * 3] * bt[0] + R[k * 3 + 1] * bt[1] + R[k * 3 + 2] * bt[2];
+    for (int k = 0; k < 3; ++k) {
+        wp[0][k] = bp->hand[jh][k];
+        wp[1][k] = bp->hand[jh][k] + u[k] * (w == 33 ? kTorchHead : kBlade);
+    }
+    for (int k = 0; k < 2; ++k) {
+        gm::Point& p = pt[k];
+        float rel[3], turn = 0.0f;
+        if (!camera_lever::world_to_local_rel(bp->cam, wp[k], rel, &turn)) {
+            p.count = 0;
+            p.ok = false;
+            continue;
+        }
+        std::memcpy(p.last_world, p.ok ? p.world : wp[k], sizeof(p.last_world));
+        std::memcpy(p.world, wp[k], sizeof(p.world));
+        p.ok = true;
+        Sample& s = p.hist[p.head];
+        s.ms = now;
+        std::memcpy(s.p, rel, sizeof(rel));
+        s.turn = turn;
+        p.head = (p.head + 1) % kSamples;
+        if (p.count < kSamples) ++p.count;
+    }
+    float v[2][3] = {}, sp[2] = {}, speed = 0.0f;
+    bool measured = false;
+    for (int k = 0; k < 2; ++k) {
+        if (!pt[k].ok || !gm::point_velocity(pt[k], now, 60.0, v[k], &sp[k])) continue;
+        measured = true;
+        if (sp[k] > speed) speed = sp[k];
+    }
+    speed_now = speed;
+    const gun_melee::Config cfg = gun_melee::config();
+    if (armed && speed > peak) peak = speed;
+    if (measured && speed < gm::kRearm) {
+        if (armed && !struck) log::info("[offhand] the stab over: peak %.1f m/s, no hit", peak);
+        armed = struck = false;
+    }
+    const bool blocked = menu::visible() || (st->flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING)) || (st->weapon_flags & RDRVR_WEAPON_DEADEYE);
+    if (blocked) {
+        armed = have_prev = false;
+        return;
+    }
+    if (!armed && !struck && speed > cfg.arm) {
+        armed = true;
+        have_prev = false;
+        peak = speed;
+        ++n_armed;
+        log::info("[offhand] the %s armed at %.1f m/s (the %s hand)", w == 33 ? "torch" : "knife", speed, h ? "right" : "left");
+    }
+    if (!armed) {
+        if (measured && speed > 0.3f && speed <= cfg.arm) ++n_slow;  // (a slow move: no scan; the status counts the frames)
+        return;
+    }
+    if (struck || req || anchors::stand_down()) return;
+    float bx = 0.0f, bz = 1.0f;
+    camera_lever::game_heading(&bx, &bz);
+    const float right[3] = {bz, 0.0f, -bx}, back[3] = {bx, 0.0f, bz};
+    RdrvrGunMeleeArgs a{};
+    for (int k = 0; k < 2; ++k) {
+        const float* from = have_prev ? prev[k] : pt[k].last_world;
+        for (int i = 0; i < 3; ++i) {
+            a.seg[k][0][i] = from[i];
+            a.seg[k][1][i] = pt[k].world[i];
+            a.vel[k][i] = right[i] * v[k][0] + (i == 1 ? v[k][1] : 0.0f) + back[i] * v[k][2];
+        }
+    }
+    a.guard = static_cast<uint64_t>(anchors::addr(anchors::Id::ScriptThreadCurrent));
+    a.actor = static_cast<uint32_t>(st->actor);
+    a.weapon = w;
+    a.flags = static_cast<uint16_t>(RDRVR_GUN_MELEE_POINT2 | RDRVR_GUN_MELEE_NONHUMAN);  // (step 5: zombies too)
+    a.radius_cm = gm::kRadiusCm;
+    a.speed = cfg.by_peak && peak >= cfg.speed ? 0.5f * cfg.speed : cfg.speed;
+    uint64_t args[12];
+    std::memcpy(args, &a, sizeof(args));
+    req = api::queue_op(RDRVR_NATIVE_GUN_MELEE, args, 12, nullptr);
+    req_ms = now;
+    for (int k = 0; k < 2; ++k) std::memcpy(prev[k], pt[k].world, sizeof(prev[k]));
+    have_prev = true;
+}
+}  // namespace ohs
+
 void frame() {
     static double next_ok[2] = {0, 0}, lasso_out_until = 0, yank_ok = 0;
     const double now = log::now_ms();
@@ -548,11 +795,15 @@ void frame() {
             g_count[0] = g_count[1] = 0;
         }
         gm::frame(now, nullptr, nullptr);  // [Gestures] GunMelee: the swing forgotten
+        ohs::frame(now, nullptr, nullptr);  // [Hands] OffHandItems: the knife's stab forgotten
         // the guard down (its update not run here: third person, a cutscene, a load), so the right trigger's RT is not
         // held back meanwhile (the 0.8.6 review)
         if (g_guard_up.exchange(false, std::memory_order_relaxed)) log::info("[gestures] guard down (out of first person)");
         g_guard_pose.store(false, std::memory_order_relaxed);
         g_lasso_trig_owned.store(false, std::memory_order_relaxed);  // nor the lasso's (the 0.8.7 review: a pause kept it)
+        cancel_lock_throw(&lasso_out_until, &next_ok[controls::gun_hand()], "out of first person");  // (item 12) a pending lock throw's RT not sent there
+        g_lock_thrown = false;
+        g_lock_lt.store(false, std::memory_order_relaxed);  // (item 12) nor a lock's hold (not counted: no frame to judge it)
         return;
     }
     float bx = 0.0f, bz = 1.0f;
@@ -567,7 +818,7 @@ void frame() {
             const hands::Hand hd = hands::get(h);
             const float* lp = hd.grip_valid ? hd.grip_pos : hd.pos;
             Sample& s = g_hist[h][g_head[h]];
-            if (!bp.hand_ok[jh] || !(hd.grip_valid || hd.valid) || !camera_lever::local_rel(lp, s.p)) {
+            if (!bp.hand_ok[jh] || !(hd.grip_valid || hd.valid) || !camera_lever::local_rel(lp, s.p, &s.turn)) {
                 g_count[h] = 0;
                 continue;
             }
@@ -578,6 +829,7 @@ void frame() {
         }
     }
     gm::frame(now, &bp, &st);  // [Gestures] GunMelee (off: one flag check)
+    ohs::frame(now, &bp, &st);  // [Hands] OffHandItems: the off hand's knife (none held: one check)
     guard_frame(now, st);       // [Gestures] Guard (run 10 item 7)
     // forward: where the head faces, in the local frame (positive yaw turns left)
     float hy = 0.0f;
@@ -617,33 +869,187 @@ void frame() {
             qrot(oh.rot, f, l);
             for (int k = 0; k < 3; ++k) wo[k] = right[k] * l[0] + (k == 1 ? l[1] : 0.0f) + back[k] * l[2];
         }
-        const int am = g_lasso_aim.load(std::memory_order_relaxed);
+        const int am = lasso_aim_mode();  // (item 12: lock mode, the head)
         float hf[3];
         const bool head_ok = am == 1 && camera_lever::head_forward(hf);
+        // (C11) the game's lock with LT held (the last frame's hold): the head's ray then kept, until LT is let go (cycle H3:
+        // the game drops its lock as the head turns away from it; the ray kept, the throw still goes at it)
+        const bool lt_on = am == 1 && lasso_in && g_lock_lt.load(std::memory_order_relaxed);
+        const bool locked = lt_on && (g_lock_dir_on || aim::lasso_probe().lock != 0);
         std::lock_guard lock(g_mutex);
         g_lasso_off_ok = off_ok;
         if (off_ok) std::memcpy(g_lasso_off_dir, wo, sizeof(wo));
-        if (head_ok) local(hf, aim_l);
+        if (!locked) g_lock_dir_on = false;
+        else if (!g_lock_dir_on && head_ok) {
+            std::memcpy(g_lock_dir, hf, sizeof(hf));
+            g_lock_dir_on = true;
+            log::info("[gestures] lasso: the game's lock held (LT): its ray kept where the head looked (%.2f %.2f %.2f)", hf[0], hf[1], hf[2]);
+        }
+        if (g_lock_dir_on) local(g_lock_dir, aim_l);
+        else if (head_ok) local(hf, aim_l);
         else if (am == 2 && off_ok) local(wo, aim_l);
         else if (am == 0 && now < g_lasso_frozen_until) local(g_lasso_frozen, aim_l);
     }
     static bool trig_down = false, lasso_was = false;
-    if (lasso_in && !lasso_was) trig_down = hands::get(gun_h).trigger > 0.4f;  // taken with it held: no press (the review)
+    // (2026-10-31, the off-hand build step 1, R16; round 59, the user: "Holding lasso by either hand should mean that holding
+    // left trigger aims and right trigger throws") the trigger throw is the layout's gun-hand controller's (the right; the
+    // left mirrored), whichever hand holds the lasso: controls.cpp keeps the triggers unswapped while it is in hand
+    const int lasso_rt = controls::layout_gun_hand();
+    if (lasso_in && !lasso_was) trig_down = hands::get(lasso_rt).trigger > 0.4f;  // taken with it held: no press (the review)
     lasso_was = lasso_in;
+    // (item 12) LassoThrow=lock: the game's LT as the controllers drive it (the hold: on above 0.25, off below 0.12, or no
+    // pad for 200 ms: a light press is the game's aim too), only with the lasso in hand; its end without a throw sends nothing
+    const bool lock_mode = lasso_in && g_lasso_throw.load(std::memory_order_relaxed) == kLassoLock;
+    {
+        double lt_ms = 0;
+        const float ltv = controls::player_lt(&lt_ms);
+        const bool was = g_lock_lt.load(std::memory_order_relaxed);
+        const bool held = lock_mode && now - lt_ms < 200.0 && ltv > (was ? 0.12f : 0.25f);
+        if (held && !was) {
+            g_lock_since.store(now, std::memory_order_relaxed);
+            g_lock_thrown = false;
+            g_lock_holds.fetch_add(1, std::memory_order_relaxed);
+            log::info("[gestures] lasso: LT held (the game's lock and its spin, the lasso aimed by the head)");
+        } else if (!held && was) {
+            // (the re-review) let go inside the lead: the RT not yet sent is taken back (then counted as let go without a throw)
+            cancel_lock_throw(&lasso_out_until, &next_ok[gun_h], lock_mode ? "LT let go" : "the lasso put away or the mode changed");
+            if (!g_lock_thrown && lock_mode) {  // (the review) LT let go itself, not the lasso put away or the mode changed
+                g_lock_no_throw.fetch_add(1, std::memory_order_relaxed);
+                log::info("[gestures] lasso: LT let go after %.0f ms without a throw (nothing thrown)", now - g_lock_since.load(std::memory_order_relaxed));
+            }
+            g_lock_thrown = false;
+        }
+        g_lock_lt.store(held, std::memory_order_relaxed);
+    }
+    // a throw in lock mode (LT held): RT at once once LT has been held the lead, else after the rest of it; the player's
+    // own LT (no injected LT: its end would drop a caught one, research/run17/lasso.md 1.2)
+    auto lock_throw = [&](const char* by) {
+        const double held_ms = now - g_lock_since.load(std::memory_order_relaxed);
+        if (g_lock_wait_until > 0) {  // (the review) one throw a hold: a second press while the first waits adds none
+            log::info("[gestures] lasso: %s while the throw waits for the game's lock: no second throw", by);
+            return;
+        }
+        if (aim::lasso_probe().lock == 0 && held_ms < kLassoLockWaitMs) {  // no lock yet: held for it (below)
+            g_lock_thrown = true;
+            g_lock_rt_from = 0;
+            g_lock_wait_until = g_lock_since.load(std::memory_order_relaxed) + kLassoLockWaitMs;
+            g_lock_wait_by = by;
+            g_lock_waits.fetch_add(1, std::memory_order_relaxed);
+            log::info("[gestures] lasso thrown by %s in lock mode (LT held %.0f ms): no lock yet, the throw waits for it (up to %.0f ms more)", by, held_ms,
+                      g_lock_wait_until - now);
+            return;
+        }
+        const int lead = held_ms >= kLassoLeadMs ? 0 : kLassoLeadMs - static_cast<int>(held_ms);
+        controls::inject(0, 255, 0, 150, 0, lead);
+        g_lock_thrown = true;
+        g_lock_rt_from = lead > 0 ? now + lead : 0;
+        log::info("[gestures] lasso thrown by %s in lock mode (LT held %.0f ms; RT after %d ms more)", by, held_ms, lead);
+    };
+    if (g_lock_wait_until > 0) {  // a held lock throw: RT on the game's lock (LT held the lead), or at its last moment
+        const double held_ms = now - g_lock_since.load(std::memory_order_relaxed);
+        const bool lk = aim::lasso_probe().lock != 0;
+        if ((lk && held_ms >= kLassoLeadMs) || now >= g_lock_wait_until) {
+            g_lock_wait_until = 0;
+            controls::inject(0, 255, 0, 150, 0, 0);
+            if (lasso_out_until > 0) lasso_out_until = now + 15000.0;  // (the review) the yank's 600 ms counted from this RT
+            if (lk) g_lock_waits_locked.fetch_add(1, std::memory_order_relaxed);
+            log::info("[gestures] lasso: the throw by %s sent %s, LT held %.0f ms", g_lock_wait_by, lk ? "on the game's lock" : "without a lock (none came)", held_ms);
+        }
+    }
+    auto probe_start = [&] {  // "gestures lassoprobe on": the lock at the throw
+        if (!g_lasso_probe.load(std::memory_order_relaxed)) return;
+        const aim::LassoProbe p = aim::lasso_probe();
+        g_probe_lock.store(p.lock, std::memory_order_relaxed);
+        g_probe_soft.store(p.soft, std::memory_order_relaxed);
+        g_probe_target.store(0, std::memory_order_relaxed);
+        g_probe_max_state.store(p.lasso_state, std::memory_order_relaxed);
+        g_probe_until = now + 3000.0;
+    };
     if (lasso_in) {  // the trigger throw: its press (with hysteresis) holds the aim for the lock, then throws
         const int tm = g_lasso_throw.load(std::memory_order_relaxed);
-        const float tv = hands::get(gun_h).trigger;
+        const float tv = hands::get(lasso_rt).trigger;
         const bool was = trig_down;
         trig_down = tv > (was ? 0.4f : 0.6f);
-        if ((tm == 1 || tm == 2) && trig_down && !was && now >= next_ok[gun_h]) {
+        // (item 12) lock mode: RT only while LT is held; without it (or at the mouth / the hat: the whistle's, the hat
+        // tip's) nothing, the press counted
+        const bool lt_held = g_lock_lt.load(std::memory_order_relaxed), mouth = tm == kLassoLock && whistle::at_mouth(lasso_rt);
+        const bool lock_refused = tm == kLassoLock && (!lt_held || mouth);
+        if (lock_refused && trig_down && !was) {
+            (lt_held ? g_lock_rt_mouth : g_lock_rt_unheld).fetch_add(1, std::memory_order_relaxed);
+            log::info("[gestures] lasso: RT in lock mode %s: not thrown", lt_held ? "at the mouth or the hat (the whistle's, the hat tip's)" : "without LT held");
+        }
+        if ((tm == 1 || tm == 2 || tm == kLassoLock) && !lock_refused && trig_down && !was && now >= next_ok[gun_h]) {
             next_ok[gun_h] = now + 800.0;
             lasso_out_until = now + 15000.0;
-            controls::inject(0, 255, 0, 150, 255, kLassoLeadMs);
+            probe_start();
+            if (tm == kLassoLock) {
+                lock_throw("the trigger");
+                g_lock_rt_throws.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                controls::inject(0, 255, 0, 150, 255, kLassoLeadMs);
+                log::info("[gestures] lasso thrown by the trigger (the aim held %d ms first)", kLassoLeadMs);
+            }
             g_lasso_trigger_throws.fetch_add(1, std::memory_order_relaxed);
-            log::info("[gestures] lasso thrown by the trigger (the aim held %d ms first)", kLassoLeadMs);
+        }
+    }
+    if (g_lasso_probe.load(std::memory_order_relaxed) && now < g_probe_until) {  // (the probe) the first target the thrown lasso took, its furthest state
+        const aim::LassoProbe p = aim::lasso_probe();
+        if (p.lasso_state > g_probe_max_state.load(std::memory_order_relaxed)) g_probe_max_state.store(p.lasso_state, std::memory_order_relaxed);
+        if (p.lasso_state >= 3 && p.target && !g_probe_target.load(std::memory_order_relaxed)) g_probe_target.store(p.target, std::memory_order_relaxed);
+    }
+    // (2026-11-01, GOAL-offhand-changes C12b; round 66 check 6, the user: the lasso still damages the NPC) a diagnostic, always
+    // on: the one on the lasso (its probe's target, state 3 or more) and its health (GET_ACTOR_HEALTH, a native each 250 ms for
+    // 8 s from the catch), logged as it changes, with each throw (RT) made meanwhile: at the catch, or by the game's pulls
+    {
+        static uint32_t hp_target = 0, hp_last_target = 0;
+        static double hp_until = 0, hp_next = 0;
+        static uint64_t hp_id = 0, hp_throws = 0;
+        static float hp_last = -1.0f;
+        if (lasso_in) {
+            const aim::LassoProbe lp = aim::lasso_probe();
+            // (the review) on someone (state 8 or more), once a target (the lasso keeps its last), its last result dropped
+            if (lp.ok && lp.lasso_state >= 8 && lp.target && lp.target != hp_target && lp.target != hp_last_target) {
+                if (hp_id) api::cancel_op(hp_id);
+                hp_id = 0;
+                hp_target = hp_last_target = lp.target;
+                hp_until = now + 8000.0;
+                hp_last = -1.0f;
+                hp_throws = g_lasso_throws.load(std::memory_order_relaxed) + g_lasso_trigger_throws.load(std::memory_order_relaxed);
+                log::info("[gestures] lasso: on 0x%x (state %d): its health watched 8 s", lp.target, lp.lasso_state);
+            }
+        }
+        if (hp_target && now < hp_until) {
+            RdrvrNativeResult r{};
+            if (hp_id && api::wait_native(hp_id, &r, 0)) {
+                float h = 0.0f;
+                const uint32_t bits = static_cast<uint32_t>(r.value);
+                std::memcpy(&h, &bits, sizeof(h));
+                const uint64_t th = g_lasso_throws.load(std::memory_order_relaxed) + g_lasso_trigger_throws.load(std::memory_order_relaxed);
+                if (std::isfinite(h) && std::fabs(h - hp_last) > 0.01f)
+                    log::info("[gestures] lasso: 0x%x's health %.1f (was %.1f) %.0f ms from the catch, %llu throws (RT) since", hp_target, h, hp_last,
+                              8000.0 - (hp_until - now), static_cast<unsigned long long>(th - hp_throws));
+                hp_last = h;
+                hp_id = 0;
+            }
+            if (!hp_id && now >= hp_next) {
+                hp_next = now + 250.0;
+                const uint64_t a1[1] = {static_cast<uint64_t>(hp_target)};
+                hp_id = api::queue_native(0xF246F15D, a1, 1);  // GET_ACTOR_HEALTH
+            }
+        } else if (hp_target && now >= hp_until) {
+            if (hp_id) api::cancel_op(hp_id);
+            hp_target = 0;
+            hp_id = 0;
         }
     }
     g_lasso_trig_owned.store(lasso_in && g_lasso_throw.load(std::memory_order_relaxed) != 0, std::memory_order_relaxed);
+    // [Hands] DualWieldBesideTorch (2026-10-29): the controller holding DualWield's second gun beside the torch (-1: none);
+    // its swings are no torch attack (its thrusts aim and fire a gun). Only with the option's torch in hand
+    int torch_sec = -1;
+    if (dual::beside_torch(st.weapon)) {  // (step 6: the knife too: its stab only by the hand that holds it)
+        const dual::State ds = dual::state();
+        if (ds.on && !ds.copy && !ds.carry) torch_sec = ds.ctrl;
+    }
     for (int h = 0; h < 2; ++h) {
         float v[3], s = 0;
         if (!velocity(h, now, 60.0, v, &s, nullptr)) continue;  // the latest step or two
@@ -658,7 +1064,9 @@ void frame() {
         // the fists' swing: with FistsBothTriggers only while both triggers are held (the stance), whatever Melee says;
         // without it as Melee says. The knife and the torch: Melee.
         const bool fists_ok = st.weapon < 0 && (controls::fists_both_triggers() ? stance : melee);
-        if ((fists_ok || (melee && (st.weapon == kKnife || st.weapon == kTorch))) && s > g_swing_speed.load(std::memory_order_relaxed) &&
+        // (step 5, O4) not the hand holding an off-hand item: its own stab (offhand's) strikes, not the game's attack
+        if ((fists_ok || (melee && ((st.weapon == kKnife || st.weapon == kTorch) && h != torch_sec && !offhand::held(h)))) &&
+            s > g_swing_speed.load(std::memory_order_relaxed) &&
             fwd_speed > 0.4f * s && now >= next_ok[h] && !whistle::at_mouth(h)) {  // run 8: a hand to the mouth is no punch
             next_ok[h] = now + 400.0;
             // run 10 item 6 (the user: "moving hand rapidly while on horseback draws last held gun"): riding or driving,
@@ -683,7 +1091,7 @@ void frame() {
         if (lasso && st.weapon == kLassoWeapon && h == gun_h) {
             const int tm = g_lasso_throw.load(std::memory_order_relaxed);
             // the hand's aim frozen as the swing starts (its wrist turns through the swing): for 0.7 s, or through a throw
-            if (g_lasso_aim.load(std::memory_order_relaxed) == 0 && tm != 1 && s > 1.0f) {
+            if (lasso_aim_mode() == 0 && tm != 1 && s > 1.0f) {
                 float w[3], bt[3] = {0.0f, 0.174f, -0.985f};
                 aim::barrel_in_target(bt);
                 const int gj = bp.gun;
@@ -698,17 +1106,32 @@ void frame() {
             }
             const float al = std::sqrt(aim_l[0] * aim_l[0] + aim_l[1] * aim_l[1] + aim_l[2] * aim_l[2]);
             const float toward = al > 1e-4f ? (v[0] * aim_l[0] + v[1] * aim_l[1] + v[2] * aim_l[2]) / al : along;
-            // thrown by a swing toward the aim (within 60 deg); then a yank back steps John back on the rope for a moment
-            if (tm != 1 && s > g_swing_speed.load(std::memory_order_relaxed) && toward > 0.5f * s && now >= next_ok[h]) {
+            // thrown by a swing toward the aim (within 60 deg); then a yank back steps John back on the rope for a moment.
+            // (item 12) Lock mode: the swing toward where you look, only while LT is held (without it: nothing, counted)
+            const bool swing0 = tm != 1 && s > g_swing_speed.load(std::memory_order_relaxed) && toward > 0.5f * s;
+            const bool unheld = swing0 && tm == kLassoLock && !g_lock_lt.load(std::memory_order_relaxed);
+            static double unheld_ok = 0;
+            if (unheld && now >= unheld_ok) {
+                unheld_ok = now + 800.0;
+                g_lock_swings_unheld.fetch_add(1, std::memory_order_relaxed);
+                log::info("[gestures] lasso: a %.1f m/s swing without LT held in lock mode (not thrown)", s);
+            }
+            if (swing0 && !unheld && now >= next_ok[h]) {
                 next_ok[h] = now + 800.0;
                 {
                     std::lock_guard lock(g_mutex);
-                    if (g_lasso_aim.load(std::memory_order_relaxed) == 0) g_lasso_frozen_until = std::fmax(g_lasso_frozen_until, now + 400.0);
+                    if (lasso_aim_mode() == 0) g_lasso_frozen_until = std::fmax(g_lasso_frozen_until, now + 400.0);
                 }
                 lasso_out_until = now + 15000.0;
-                controls::inject(0, 255, 0, 150);
+                probe_start();
+                if (tm == kLassoLock) {
+                    lock_throw("a swing");
+                    g_lock_swing_throws.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    controls::inject(0, 255, 0, 150);
+                    log::info("[gestures] lasso thrown by a %.1f m/s swing", s);
+                }
                 g_lasso_throws.fetch_add(1, std::memory_order_relaxed);
-                log::info("[gestures] lasso thrown by a %.1f m/s swing", s);
             } else if (now < lasso_out_until && now > lasso_out_until - 15000.0 + 600.0 && along < -kYankSpeed && now >= yank_ok) {
                 yank_ok = now + 600.0;
                 controls::inject(0, 0, -32767, 350);
@@ -730,7 +1153,7 @@ void init() {
     {  // 2026-10-12: [Gestures] LassoThrow, LassoAim
         // the defaults (the user, after their headset round: "head aim and trigger work well"): the trigger, the head
         const std::string t = config::get_string("Gestures", "LassoThrow", "trigger"), a = config::get_string("Gestures", "LassoAim", "head");
-        g_lasso_throw = t == "swing" ? 0 : t == "both" ? 2 : 1;
+        g_lasso_throw = t == "swing" ? 0 : t == "both" ? 2 : t == "lock" ? kLassoLock : 1;  // (item 12: lock)
         g_lasso_aim = a == "hand" ? 0 : a == "offhand" ? 2 : 1;
     }
     g_swing_speed = config::get_float("Gestures", "SwingSpeed", 2.5f);
@@ -777,8 +1200,8 @@ void set_guard(bool on, bool save_it) {
 bool lasso_by_hand() { return g_lasso.load(); }
 int lasso_throw() { return g_lasso_throw.load(); }
 void set_lasso_throw(int m, bool save_it) {
-    m = m < 0 || m > 2 ? 0 : m;
-    static const char* const kN[3] = {"swing", "trigger", "both"};
+    m = m < 0 || m > kLassoLock ? 0 : m;
+    static const char* const kN[4] = {"swing", "trigger", "both", "lock"};
     if (g_lasso_throw.exchange(m) != m) log::info("[gestures] the lasso thrown by: %s", kN[m]);
     if (save_it) config::set("Gestures", "LassoThrow", kN[m]);
 }
@@ -791,7 +1214,14 @@ void set_lasso_aim(int m, bool save_it) {
 }
 bool lasso_aim_dir(const float* hand_dir, float d[3]) {
     (void)hand_dir;
-    const int am = g_lasso_aim.load(std::memory_order_relaxed);
+    const int am = lasso_aim_mode();  // (item 12: lock mode, the head)
+    {
+        std::lock_guard lock(g_mutex);
+        if (am == 1 && g_lock_dir_on) {  // (C11) the ray kept at the lock
+            std::memcpy(d, g_lock_dir, 12);
+            return true;
+        }
+    }
     if (am == 1) return camera_lever::head_forward(d);
     std::lock_guard lock(g_mutex);
     if (am == 2) {
@@ -807,6 +1237,7 @@ bool lasso_aim_dir(const float* hand_dir, float d[3]) {
     return true;
 }
 bool lasso_trigger_owned() { return g_lasso_trig_owned.load(std::memory_order_relaxed); }
+bool lasso_lock_held() { return lasso_aim_mode() == 1 && g_lasso_throw.load(std::memory_order_relaxed) == kLassoLock && g_lock_lt.load(std::memory_order_relaxed); }
 void set_lasso_by_hand(bool on) {
     if (g_lasso.exchange(on) != on) log::info("[gestures] lasso by hand: %s", on ? "on" : "off");
     save("Lasso", on);
@@ -844,6 +1275,36 @@ bool throw_launch(float vel[3], float origin[3]) {
     return true;
 }
 
+bool hand_throw(int h, double window_ms, float vel[3], float origin[3], float* speed) {
+    if (h < 0 || h > 1 || !pose::anchor_active()) return false;
+    float v[3], s = 0, b[2] = {0.0f, 1.0f};
+    if (!velocity(h, log::now_ms(), window_ms, v, &s, origin, b)) return false;
+    const float right[3] = {b[1], 0.0f, -b[0]}, back[3] = {b[0], 0.0f, b[1]};  // as throw_launch: the camera's rows
+    for (int k = 0; k < 3; ++k) vel[k] = (right[k] * v[0] + (k == 1 ? v[1] : 0.0f) + back[k] * v[2]) * g_throw_gain.load(std::memory_order_relaxed);
+    if (speed) *speed = s;
+    return true;
+}
+bool hand_velocity(int h, double window_ms, float vel[3]) {
+    if (h < 0 || h > 1 || !pose::anchor_active()) return false;
+    float v[3], s = 0, b[2] = {0.0f, 1.0f};
+    if (!velocity(h, log::now_ms(), window_ms, v, &s, nullptr, b)) return false;
+    const float right[3] = {b[1], 0.0f, -b[0]}, back[3] = {b[0], 0.0f, b[1]};  // as hand_throw
+    for (int k = 0; k < 3; ++k) vel[k] = right[k] * v[0] + (k == 1 ? v[1] : 0.0f) + back[k] * v[2];
+    return true;
+}
+
+std::string offhand_strike_status() {
+    std::lock_guard lock(ohs::mu);
+    char b[400];
+    std::snprintf(b, sizeof(b), "the stab: weapon %d hand %d, speed %.2f m/s, armed %d (peak %.2f), struck %d | armed %llu, scans %llu, hits %llu, dry %llu, "
+                  "refused %llu, none %llu, timeouts %llu, slow frames %llu | last: %s",
+                  ohs::weapon, ohs::hand, ohs::speed_now, ohs::armed ? 1 : 0, ohs::peak, ohs::struck ? 1 : 0, static_cast<unsigned long long>(ohs::n_armed),
+                  static_cast<unsigned long long>(ohs::n_scans), static_cast<unsigned long long>(ohs::n_hits), static_cast<unsigned long long>(ohs::n_dry),
+                  static_cast<unsigned long long>(ohs::n_refused), static_cast<unsigned long long>(ohs::n_none),
+                  static_cast<unsigned long long>(ohs::n_timeouts), static_cast<unsigned long long>(ohs::n_slow), ohs::last);
+    return b;
+}
+
 std::string command(const std::string& line) {
     std::istringstream in(line);
     std::string c, w, v;
@@ -853,7 +1314,8 @@ std::string command(const std::string& line) {
         if (w == "throw") set_throw_by_hand(on);
         if (w == "melee") set_melee_by_swing(on);
         if (w == "lasso") set_lasso_by_hand(on);
-        if (w == "lassothrow") set_lasso_throw(v == "trigger" ? 1 : v == "both" ? 2 : 0, false);  // the session only
+        if (w == "lassothrow") set_lasso_throw(v == "trigger" ? 1 : v == "both" ? 2 : v == "lock" ? kLassoLock : 0, false);  // the session only
+        if (w == "lassoprobe") g_lasso_probe = v == "on";  // (item 12) a test's: the lasso's state read (game memory)
         if (w == "lassoaim") set_lasso_aim(v == "head" ? 1 : v == "offhand" ? 2 : 0, false);
         if (w == "gripthrow") aim::set_grip_throw(on, false);  // [Gestures] ThrowByGrip (the session only)
         if (w == "peak") g_peak_speed[0] = g_peak_speed[1] = 0;  // "peak reset"
@@ -894,7 +1356,7 @@ std::string command(const std::string& line) {
                   gh[1][2], g_guard_triggers.load() ? 1 : 0);
     char l[200];
     {
-        static const char* const kT[3] = {"swing", "trigger", "both"};
+        static const char* const kT[4] = {"swing", "trigger", "both", "lock"};
         static const char* const kA[3] = {"hand", "head", "offhand"};
         float fz[3];
         double until;
@@ -908,7 +1370,29 @@ std::string command(const std::string& line) {
                       static_cast<unsigned long long>(g_lasso_freezes.load()), log::now_ms() < until ? 1 : 0, fz[0], fz[1], fz[2],
                       g_lasso_trig_owned.load() ? 1 : 0);
     }
-    return b + std::string(g) + l + aim::tip_command("", "");
+    char k[480];  // (item 12) LassoThrow=lock; the probe's reads only when it is on
+    {
+        const bool held = g_lock_lt.load();
+        std::snprintf(k, sizeof(k), " | lasso lock: LT held %d (%.0f ms), holds %llu, thrown by RT %llu, by a swing %llu, LT let go without a throw %llu, "
+                      "swings without LT %llu, RT without LT %llu, RT at the mouth or hat %llu, RT cancelled in the lead %llu, waited for the lock %llu (locked %llu)",
+                      held ? 1 : 0, held ? log::now_ms() - g_lock_since.load() : 0.0, static_cast<unsigned long long>(g_lock_holds.load()),
+                      static_cast<unsigned long long>(g_lock_rt_throws.load()), static_cast<unsigned long long>(g_lock_swing_throws.load()),
+                      static_cast<unsigned long long>(g_lock_no_throw.load()), static_cast<unsigned long long>(g_lock_swings_unheld.load()),
+                      static_cast<unsigned long long>(g_lock_rt_unheld.load()), static_cast<unsigned long long>(g_lock_rt_mouth.load()),
+                      static_cast<unsigned long long>(g_lock_cancels.load()), static_cast<unsigned long long>(g_lock_waits.load()),
+                      static_cast<unsigned long long>(g_lock_waits_locked.load()));
+    }
+    std::string probe;
+    if (g_lasso_probe.load()) {
+        const aim::LassoProbe p = aim::lasso_probe();
+        char q[360];
+        std::snprintf(q, sizeof(q), " | lasso probe: ok %d aim state %d user state %d lasso state %d, target 0x%x candidate 0x%x, reticle 0x%x lock 0x%x "
+                      "soft 0x%x | at the last throw: lock 0x%x soft 0x%x, its target in flight 0x%x, the lasso's furthest state %d",
+                      p.ok ? 1 : 0, p.aim_state, p.user_state, p.lasso_state, p.target, p.candidate, p.reticle, p.lock, p.soft, g_probe_lock.load(),
+                      g_probe_soft.load(), g_probe_target.load(), g_probe_max_state.load());
+        probe = q;
+    }
+    return b + std::string(g) + l + k + probe + aim::tip_command("", "");
 }
 
 namespace {

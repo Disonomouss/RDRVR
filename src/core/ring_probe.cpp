@@ -148,18 +148,61 @@ void touch(uint64_t va, uint64_t bytes, bool desc) {
 }
 
 void STDMETHODCALLTYPE hk_SetGraphicsRootCbv(ID3D12GraphicsCommandList* cl, UINT root, D3D12_GPU_VIRTUAL_ADDRESS va) {
+    if (d3d::nested(d3d::kNGraphicsRootCbv)) return o_SetGraphicsRootCbv(cl, root, va);  // (the debug layer's forward)
     touch(va, 256, false);  // a root CBV carries no size; 256 is the minimum CBV granularity
+    d3d::InOriginal orig(d3d::kNGraphicsRootCbv);
     o_SetGraphicsRootCbv(cl, root, va);
 }
 void STDMETHODCALLTYPE hk_SetComputeRootCbv(ID3D12GraphicsCommandList* cl, UINT root, D3D12_GPU_VIRTUAL_ADDRESS va) {
+    if (d3d::nested(d3d::kNComputeRootCbv)) return o_SetComputeRootCbv(cl, root, va);
     touch(va, 256, false);
+    d3d::InOriginal orig(d3d::kNComputeRootCbv);
     o_SetComputeRootCbv(cl, root, va);
 }
 thread_local uint64_t t_cbvs = 0;
 
+// ([Stereo] PrepassEye2Images, test only) the CBV map: each descriptor's last CBV (its BufferLocation and size), by its CPU
+// handle's slot in the CBV/SRV/UAV heap (handle / increment, modulo the table: the game's ring descriptors are contiguous,
+// so a slot is that descriptor's until a heap of more than kCbvSlots wraps onto it; a lookup compares the handle). Each slot
+// is a seqlock: its sequence odd while written (release/acquire, plain stores on x64); a reader takes the fields only when
+// the sequence is even and unchanged across its reads. (Two threads writing one slot at once could mix their fields: the
+// game's ring descriptors are each written by the thread that owns the ring, and the handle is compared.)
+constexpr size_t kCbvSlots = 16384;
+struct CbvSlot {
+    std::atomic<uint32_t> seq{0};
+    std::atomic<uint32_t> size{0};
+    std::atomic<uint64_t> h{0}, va{0};
+};
+CbvSlot g_cbv_map[kCbvSlots];
+int g_map_wanted = -1;          // (the ini, read once: see map_wanted)
+uint64_t g_cbv_inc = 0;         // the CBV/SRV/UAV descriptor increment (install_device_hooks)
+std::atomic<bool> g_map_armed{false};  // eye2_images installed (arm_cbv_map) and not stood down: the hook writes the map
+std::atomic<uint64_t> g_cbv_mapped{0};  // (approximate: a relaxed load and store, no locked add; the test's "> 0" only)
+
+bool map_wanted() {
+    if (g_map_wanted < 0)
+        g_map_wanted = config::get_int("Stereo", "PrepassEye2Images", 0) == 1 && config::get_int("Stereo", "PrepassEye2Collector", 0) == 1 &&
+                               config::get_int("Stereo", "PrepassEye2Light", 0) == 1
+                           ? 1
+                           : 0;
+    return g_map_wanted == 1;
+}
+inline size_t cbv_slot(uint64_t h) { return static_cast<size_t>((h / g_cbv_inc) % kCbvSlots); }
+
 void STDMETHODCALLTYPE hk_CreateCbv(ID3D12Device* dev, const D3D12_CONSTANT_BUFFER_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     ++t_cbvs;
-    if (d) touch(d->BufferLocation, d->SizeInBytes, true);
+    if (d && g_enabled == 1) touch(d->BufferLocation, d->SizeInBytes, true);
+    if (d && h.ptr && g_cbv_inc && g_map_armed.load(std::memory_order_relaxed)) {
+        CbvSlot& s = g_cbv_map[cbv_slot(h.ptr)];
+        const uint32_t q = s.seq.load(std::memory_order_relaxed);
+        s.seq.store(q + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        s.h.store(h.ptr, std::memory_order_relaxed);
+        s.va.store(d->BufferLocation, std::memory_order_relaxed);
+        s.size.store(d->SizeInBytes, std::memory_order_relaxed);
+        s.seq.store(q + 2, std::memory_order_release);
+        g_cbv_mapped.store(g_cbv_mapped.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
     o_CreateCbv(dev, d, h);
 }
 
@@ -241,8 +284,15 @@ bool enabled() {
     return g_enabled == 1;
 }
 
+bool tracking() { return enabled() || map_wanted(); }
+
 void install_device_hooks(ID3D12Device* dev) {
-    if (!enabled()) return;
+    if (!tracking()) return;
+    if (map_wanted()) {
+        g_cbv_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        log::info("[ring] the CBV map on ([Stereo] PrepassEye2Images, test only): each descriptor's last CBV by its CPU handle (increment %llu)%s",
+                  static_cast<unsigned long long>(g_cbv_inc), enabled() ? "" : "; the upload buffers tracked, the ring report off ([Debug] RingProbe=0)");
+    }
     hooks::install("ID3D12Device::CreateConstantBufferView", hooks::vtable_entry(dev, 17), hk_CreateCbv, &o_CreateCbv);
 }
 
@@ -255,7 +305,7 @@ void install_list_hooks(ID3D12GraphicsCommandList* cl) {
 }
 
 void on_upload_buffer(ID3D12Resource* res, const D3D12_RESOURCE_DESC* desc) {
-    if (!enabled() || !res || !desc || desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || desc->Width < kMinTracked) return;
+    if (!tracking() || !res || !desc || desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || desc->Width < kMinTracked) return;
     uint64_t va = res->GetGPUVirtualAddress();
     if (!va) return;
     std::lock_guard lock(g_mutex);
@@ -279,6 +329,27 @@ void init() {
 }
 
 uint64_t thread_cbvs() { return t_cbvs; }
+
+bool arm_cbv_map(bool on) {
+    if (on && !map_wanted()) return false;  // (the ini did not ask for it at the device's creation: no hook)
+    g_map_armed.store(on, std::memory_order_relaxed);
+    return on;
+}
+bool cbv_map_on() { return g_map_armed.load(std::memory_order_relaxed) && g_cbv_inc && o_CreateCbv; }
+uint64_t cbvs_mapped() { return g_cbv_mapped.load(std::memory_order_relaxed); }
+bool cbv_of(uint64_t cpu_handle, uint64_t* va, uint32_t* size) {
+    if (!cpu_handle || !g_cbv_inc || !g_map_armed.load(std::memory_order_relaxed)) return false;
+    const CbvSlot& s = g_cbv_map[cbv_slot(cpu_handle)];
+    const uint32_t q = s.seq.load(std::memory_order_acquire);
+    if (q & 1) return false;  // (being written)
+    const uint64_t h = s.h.load(std::memory_order_relaxed), v = s.va.load(std::memory_order_relaxed);
+    const uint32_t n = s.size.load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (s.seq.load(std::memory_order_relaxed) != q || h != cpu_handle) return false;  // (rewritten meanwhile, or another descriptor's)
+    *va = v;
+    *size = n;
+    return true;
+}
 
 const uint8_t* cpu_of(uint64_t va, uint64_t bytes) {
     std::lock_guard lock(g_mutex);

@@ -12,6 +12,7 @@
 #include "core/api.h"
 #include "core/config.h"
 #include "core/log.h"
+#include "core/offhand.h"
 
 namespace rdrvr::gun_melee {
 namespace {
@@ -166,8 +167,13 @@ int zone_of(const char* b) {
 int hit(const RdrvrMeleeHit* h) {
     g_calls.fetch_add(1, std::memory_order_relaxed);
     // only inside the plugin's tick (the game thread, as KILL_ACTOR_WITH_KILLER's handler calls the same hit), with
-    // the anchors verified (ActorHit placed)
-    if (!g_on.load(std::memory_order_relaxed) || anchors::stand_down() || !api::in_script_tick() || !anchors::addr(anchors::Id::ActorHit))
+    // the anchors verified (ActorHit placed). ([Hands] OffHandItems) the off hand's knife: its own hit, GunMelee on or off
+    const bool off = h && offhand::strike_weapon(h->weapon);
+    // (the review) an off-hand item's weapon (the knife, the torch) is never the gun melee's own (its swing sends the gun
+    // in hand): such a hit is the off hand's or none (a scan still queued as the item went back, a test's injection)
+    const bool off_kind = h && offhand::kind_of(h->weapon) != offhand::kNone;
+    if ((!g_on.load(std::memory_order_relaxed) && !off) || (off_kind && !off) || anchors::stand_down() || !api::in_script_tick() ||
+        !anchors::addr(anchors::Id::ActorHit))
         return answer(RDRVR_MELEE_HIT_NOT_NOW);
     if (!h || !finite3(h->pos) || !finite3(h->dir) || !std::isfinite(h->speed) || !(h->speed > 0.0f) || !h->bone[0])
         return answer(RDRVR_MELEE_HIT_BAD_INPUT);
@@ -225,11 +231,13 @@ int hit(const RdrvrMeleeHit* h) {
     const float span = c.heavy - c.speed > 0.1f ? c.heavy - c.speed : 0.1f;
     float k = (h->speed - c.speed) / span;
     k = k < 0.0f ? 0.0f : k > 1.0f ? 1.0f : k;
-    const float damage = c.damage * (1.0f + k);
+    float damage = c.damage * (1.0f + k);
     float game_t = 0.0f;
     rd(anchors::addr(anchors::Id::GameTime), &game_t);
     const int zone = zone_of(bone);
-    const uint32_t flags = c.lethal ? 4u : 2u;
+    uint32_t flags = c.lethal ? 4u : 2u;
+    bool dry = c.dry;
+    if (off) offhand::hit_params(h->weapon, h->speed, &damage, &flags, &dry);  // the off hand's item: its own damage and flags
     const int away = vrow[0] * prow[0] + vrow[1] * prow[1] + vrow[2] * prow[2] >= 0.0f ? 1 : 0;
     // the DamageInfo, as FUN_140d007f0 builds it (0x140d017aa .. 0x140d01ad2; research 3.1)
     alignas(16) uint8_t info[0x100] = {};
@@ -262,7 +270,7 @@ int hit(const RdrvrMeleeHit* h) {
     put<float>(info, 0xe4, -1.0f);   // outputs: the health after, its ratio
     put<float>(info, 0xe8, -1.0f);
     char line[260];
-    if (c.dry) {
+    if (dry) {
         std::snprintf(line, sizeof(line), "dry hit 0x%x %s zone %d at %.1f m/s: damage %.1f, flags %u, faces away %d, at (%.2f %.2f %.2f) along (%.2f %.2f %.2f); health %.1f, KO %.1f",
                       h->victim, bone, zone, h->speed, damage, flags, away, h->pos[0], h->pos[1], h->pos[2], dir[0], dir[1], dir[2], hp, ko);
         log::info("[gunmelee] %s", line);
@@ -271,6 +279,7 @@ int hit(const RdrvrMeleeHit* h) {
             std::snprintf(g_last, sizeof(g_last), "%s", line);
         }
         g_recent[g_recent_next++ % 8] = {h->victim, now};
+        if (off) offhand::on_hit(h->victim, h->weapon, false);
         return answer(RDRVR_MELEE_HIT_DRY);
     }
     log::info("[gunmelee] hit 0x%x %s zone %d at %.1f m/s: damage %.1f, flags %u, faces away %d, force %.2f: the game's hit (ActorHit)", h->victim, bone,
@@ -290,6 +299,7 @@ int hit(const RdrvrMeleeHit* h) {
         std::lock_guard lock(g_last_mutex);
         std::snprintf(g_last, sizeof(g_last), "%s", line);
     }
+    if (off) offhand::on_hit(h->victim, h->weapon, true);
     return answer(RDRVR_MELEE_HIT_OK);
 }
 

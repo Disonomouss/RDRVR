@@ -14,6 +14,7 @@
 #include "core/d3d_hooks.h"
 #include "core/diag.h"
 #include "core/dlss.h"
+#include "core/deadeye.h"
 #include "core/dual.h"
 #include "core/dual_pass.h"
 #include "core/exit_guard.h"
@@ -27,6 +28,15 @@
 #include "core/menu.h"
 #include "core/eye_grab.h"
 #include "core/eye_shape.h"
+#include "core/gpu_stages.h"
+#include "core/eye2_collector.h"
+#include "core/eye2_images.h"
+#include "core/main_instanced.h"
+#include "core/main_region.h"
+#include "core/eye2_light.h"
+#include "core/eye2_velocity.h"
+#include "core/pass2_skip.h"
+#include "core/fcensus.h"
 #include "core/lum_check.h"
 #include "core/taa.h"
 #include "core/frame_grab.h"
@@ -40,15 +50,20 @@
 #include "core/ring_probe.h"
 #include "core/body.h"
 #include "core/holster.h"
+#include "core/launcher_start.h"
 #include "core/aim.h"
+#include "core/scope.h"
 #include "core/reload.h"
 #include "core/gestures.h"
 #include "core/gun_melee.h"
+#include "core/offhand.h"
 #include "core/controls.h"
 #include "core/test_channel.h"
 #include "core/xinput.h"
 #include "core/wheel.h"
 #include "core/whistle.h"
+#include "core/hogtie.h"
+#include "core/bgfocus.h"
 #include "core/xr.h"
 #include "core/zone_rings.h"
 #include "core/round_draw.h"
@@ -118,6 +133,10 @@ DWORD WINAPI bootstrap_thread(void*) {
     log_modules("after MTLX");
 
     config::load();
+    // [Launcher] ShowAtStart (item 10, research/run30/launcher.md): RDRVR_Launcher.exe opened and the game's main thread
+    // held at its device init until the launcher closes, then the ini read again, so what was saved there applies to this
+    // start. Nothing when it is off, absent, a simulator cycle or the launcher's own Play (the reason logged)
+    launcher_start::run();
     // the test of the no-MTLX branch on the Steam exe: from here on as for an executable without the stage (its only
     // difference after the wait is the order check below)
     const bool forced = !no_stage && config::get_bool("Debug", "ForceNoMtlx", false);
@@ -149,13 +168,17 @@ DWORD WINAPI bootstrap_thread(void*) {
     pose::init();
     holster::init();
     aim::init();
+    scope::init();  // (r55 item 11) [Scope]
     reload::init();
     audio::init();
     gestures::init();
     gun_melee::init();
+    offhand::init();  // [Hands] OffHandItems
     whistle::init();
+    hogtie::init();
     wheel::init();
     dual::init();  // after holster::init: its frame-end listener runs after the holsters'
+    deadeye::init();
     actions::init();
     physics::init();
     menu::init();  // before the XR frame end, which reads the cinema switch
@@ -177,16 +200,30 @@ DWORD WINAPI bootstrap_thread(void*) {
         frame_probe::install();  // after dual_pass: its wait sites
         playback::install();
         prepass::install();
+        gpu_stages::install();  // [Stereo] PrepassGpuStages (run 19 item 3, test only; off: nothing)
+        eye2_collector::install();  // [Stereo] PrepassEye2Collector (run 20 item 5, test only; off: nothing)
+        eye2_light::install();      // [Stereo] PrepassEye2Light (run 21 item 5, test only; off: nothing)
+        eye2_images::install();     // [Stereo] PrepassEye2Images (run 23, test only; off: nothing)
+        main_inst::install();       // [Stereo] MainInstanced (run 25 item 3, test only; off: nothing)
+        eye2_velocity::install();   // [Stereo] PrepassEye2Velocity (run 25 item 4, test only; off: nothing)
+        p2skip::install();          // [Stereo] Pass2FrontSkip (run 25 item 7's S2, test only; off: nothing)
+        fcensus::install();         // [Stereo] RouteFCensus (run 25 item 8h' step 1, test only; off: nothing)
+        main_region::install();     // [Stereo] MainRegion (run 25 item 8d, test only; off: nothing; after main_inst and fcensus)
         eye_shape::install();
         body::install();
         holster::install();
         aim::install();
         dual::install();
+        deadeye::install();
         reload::install();
         taa::install();
         dlss::install();
         render_settings::install();
+        bgfocus::install();  // [Debug] BackgroundFocus (test only: the bench's no-focus cycles)
     }
+    // the device init may go on (held only while the launcher was open): everything above is in before the game's device,
+    // as on a start without it (the bootstrap ends about 1 s before the device: 637 ms and 1684 ms on 2026-10-30)
+    launcher_start::release_game();
     log_modules("bootstrap done");
     return 0;
 }

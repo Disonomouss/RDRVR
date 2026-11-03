@@ -93,7 +93,7 @@ uint32_t g_rec_w = 0, g_rec_h = 0, g_cap_w = 0, g_cap_h = 0;
 uint64_t g_vram_mb = 0;
 
 // ---- the state file: %LOCALAPPDATA%\RDRVR\RDRVR.state.ini (the boot sentinel and the runtimes' records; never the
-// user ini, which only the menu writes)
+// user ini, which only the menu (or the launcher, with the game closed) writes)
 wchar_t g_state_path[MAX_PATH] = L"";
 const wchar_t* state_path() {
     if (!g_state_path[0]) {

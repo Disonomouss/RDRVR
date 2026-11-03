@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <vector>
 
+#include "core/body.h"
 #include "core/camera_lever.h"
+#include "core/deadeye.h"
 #include "core/config.h"
 #include "core/controllers.h"
 #include "core/controls.h"
@@ -28,13 +30,16 @@
 #include "core/d3d_hooks.h"
 #include "core/eye_shape.h"
 #include "core/frame_probe.h"
+#include "core/image_mem.h"
 #include "core/vr_mode.h"
 #include "core/hands.h"
 #include "core/anchors.h"
+#include "core/api.h"
 #include "core/holster.h"
 #include "core/log.h"
 #include "core/post_target.h"
 #include "core/render_res.h"
+#include "core/scope.h"
 #include "core/state.h"
 #include "core/xr_blit.h"
 #include "core/ui_layer.h"
@@ -42,6 +47,7 @@
 #include "core/xinput.h"
 #include "core/wheel.h"
 #include "core/zone_rings.h"
+#include "core/pso.h"
 
 namespace rdrvr::xr {
 namespace {
@@ -74,6 +80,7 @@ struct Perf {
     XrTime prev = 0;
     uint64_t scene_us0 = 0, scene_n0 = 0;  // camera_lever::scene_time at the window's start
     frame_probe::Snap probe0{};            // the single-pass probe at the window's start
+    image_mem::Snap vq0{};                 // the checked reads' VirtualQuery at the window's start (per scene frame)
 };
 // Its own lock, not g_frame_mutex: the menu's Debug tab reads it while the presenting thread holds the frame mutex
 // (headset round 4: locking g_frame_mutex there again threw std::system_error, a deadlock, and ended the game).
@@ -92,6 +99,8 @@ struct TimingWin {
     uint64_t pose_m0 = 0, pose_s0 = 0, pose_n0 = 0, latch0 = 0, copies0 = 0, misses0 = 0, late_binds0 = 0;
     float latch_sum0 = 0;
     frame_probe::Snap probe0;  // the single-pass probe at the window's start
+    image_mem::Snap vq0;       // the checked reads' VirtualQuery (2026-10-29), per scene frame (camera_lever::scene_time)
+    uint64_t scene_n0 = 0;
 };
 TimingWin g_tw;
 double g_open_ms = 0;  // when the open XR frame began (xrBeginFrame returned)
@@ -348,7 +357,32 @@ XrTime g_display_time = 0;
 // changeTime; the mod takes its origin and the body heading again from the first frame displayed at or after it.
 std::atomic<XrTime> g_space_change_at{0};
 std::atomic<uint64_t> g_recentres{0};
+std::atomic<uint64_t> g_local_changes{0};  // 2026-10-27: those of the runtime (the LOCAL space moved: a standing reference in it is stale)
+// 2026-10-27 ([XR] PhysicalCrouch; the user: "Implement roomscale and physical crouch", research/run27/roomscale.md
+// A4/C1): STAGE (core OpenXR, y = 0 at the floor on Quest Link and SteamVR), made beside LOCAL the first time the physical
+// crouch wants it (set_stage_wanted; on the presenting thread, when the runtime lists it: xrEnumerateReferenceSpaces),
+// and LOCAL located in it every 45 presented frames while it is wanted: the standing eye height H above the floor, the
+// crouch's scale. Off, nothing is made or located (the review: off means unchanged). Without it [XR] StandingHeight
+std::atomic<XrSpace> g_stage{XR_NULL_HANDLE};
+std::atomic<bool> g_stage_want{false};
+bool g_stage_tried = false, g_stage_was_wanted = false;  // presenting thread: looked for this session; wanted last frame
+std::mutex g_stage_mutex;
+bool g_stage_valid = false;  // under g_stage_mutex: LOCAL's origin pose in STAGE
+float g_stage_pos[3] = {0, 0, 0}, g_stage_q[4] = {0, 0, 0, 1};
+uint64_t g_stage_lchg = 0;  // under g_stage_mutex: g_local_changes when it was located
+uint64_t g_stage_schg = 0;  // under g_stage_mutex: g_stage_changes then (a pose from before STAGE's change is refused)
+uint64_t g_stage_tick = 0;  // presenting thread
+// the session focused and the frame's views with a valid position (the headset worn and tracked): the crouch's gate
+std::atomic<bool> g_focused{false}, g_pos_tracked{false};
+std::atomic<uint64_t> g_stage_changes{0};  // STAGE's own changes announced (a boundary reset)
+std::atomic<XrTime> g_stage_change_at{0};  // from then the pose is located again (presenting thread)
 bool g_scroll_down = false;  // XR thread
+// [Horse] MountRecentre (2026-11-02, GOAL-older-items item 25; after optimumbox's 0.8.11.11): on a horse, a wagon's
+// bench or in a vehicle (the actor mounted or driving) 1.2 s after getting on (the mount's own turn done): the view
+// recentred once, as both stick clicks held do. XR thread.
+std::atomic<bool> g_mount_recentre{true};
+bool g_seated_was = false, g_seated_done = false;
+double g_seated_since = 0.0;
 XrView g_frame_views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 uint32_t g_w = 0, g_h = 0;
 uint32_t g_sw = 0, g_sh = 0;  // the eye swapchains: g_w x g_h, or the eye size with [XR] EyeShape (eye_shape.h)
@@ -411,7 +445,7 @@ bool make_quad_swapchain(ID3D12Resource* bb) {
     ci.width = qw;
     ci.height = qh;
     ci.faceCount = ci.arraySize = ci.mipCount = 1;
-    XrResult r = xrCreateSwapchain(g_session, &ci, &g_quad);
+    XrResult r = pso::as_own([&] { return xrCreateSwapchain(g_session, &ci, &g_quad); });
     if (XR_FAILED(r)) {
         log::error("[xr] cinema: xrCreateSwapchain -> %s", result_name(g_inst, r));
         return false;
@@ -675,13 +709,15 @@ bool shape_views(float tan[2][4]) {
         XrViewState vs{XR_TYPE_VIEW_STATE};
         XrView v[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
         uint32_t nv = 0;
-        if (XR_SUCCEEDED(xrLocateViews(g_session, &li, &vs, 2, &nv, v)) && nv == 2 && (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
-            store_views(v, g_frames.load() + 1);
+        const bool located = XR_SUCCEEDED(xrLocateViews(g_session, &li, &vs, 2, &nv, v)) && nv == 2 &&
+                             (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+        if (located) store_views(v, g_frames.load() + 1);
+        g_pos_tracked.store(located && (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT), std::memory_order_relaxed);  // (2026-10-27)
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
         ei.displayTime = fs.predictedDisplayTime;
         ei.environmentBlendMode = g_blend;
         ei.layerCount = 0;
-        xrEndFrame(g_session, &ei);
+        pso::as_own([&] { return xrEndFrame(g_session, &ei); });
         ++g_frames;
         g_empty.fetch_add(1, std::memory_order_relaxed);
     }
@@ -754,7 +790,7 @@ bool make_swapchains() {
         ci.faceCount = 1;
         ci.arraySize = 1;
         ci.mipCount = 1;
-        XrResult r = xrCreateSwapchain(g_session, &ci, &g_chain[e].sc);
+        XrResult r = pso::as_own([&] { return xrCreateSwapchain(g_session, &ci, &g_chain[e].sc); });
         if (XR_FAILED(r)) {
             log::error("[xr] xrCreateSwapchain -> %s", result_name(g_inst, r));
             return false;
@@ -814,7 +850,13 @@ uint32_t g_ui_tw = 0, g_ui_th = 0;  // the UI target (the frame's size), drawn i
 // keeps the rest (the prompts)
 std::atomic<uint32_t> g_max_layers{16};  // XrSystemGraphicsProperties::maxLayerCount
 std::atomic<bool> g_hud_wrist{false};
-float g_hud_rect[4] = {0.02f, 0.63f, 0.34f, 0.96f};
+float g_hud_rect[4] = {0.02f, 0.60f, 0.34f, 0.96f};  // (2026-10-26: top 0.63 cut the ammo counter's top, at 0.625)
+// [XR] WristHudShape (2026-10-26): radar (the default): the wrist takes only the radar's ellipse ([XR] WristHudRadar:
+// centre x y, radii x y) and the ammo counter's box ([XR] WristHudAmmo: x0 y0 x1 y1), fractions of the screen, measured
+// in the UI target (cycle r142: the radar x 0.053-0.306, y 0.700-0.935; the counter x 0.052-0.087, y 0.625-0.690); rect:
+// the whole WristHudRect, as before
+std::atomic<bool> g_hud_shape{true};  // (the test channel sets it too)
+float g_hud_radar[4] = {0.1795f, 0.8175f, 0.1380f, 0.1300f}, g_hud_ammo[4] = {0.040f, 0.612f, 0.135f, 0.700f};
 XrSwapchain g_wr_sc = XR_NULL_HANDLE;
 std::vector<ID3D12Resource*> g_wr_images;
 int g_wr_x0 = 0, g_wr_y0 = 0;        // the crop in the UI target's pixels
@@ -854,7 +896,7 @@ bool make_ui_swapchain() {
     ci.faceCount = 1;
     ci.arraySize = 1;
     ci.mipCount = 1;
-    XrResult r = xrCreateSwapchain(g_session, &ci, &g_ui_sc);
+    XrResult r = pso::as_own([&] { return xrCreateSwapchain(g_session, &ci, &g_ui_sc); });
     if (XR_FAILED(r)) {
         log::error("[xr] UI quad: xrCreateSwapchain -> %s", result_name(g_inst, r));
         g_ui_sc = XR_NULL_HANDLE;
@@ -876,6 +918,16 @@ bool make_ui_swapchain() {
 
 // The wrist HUD's swapchain: the crop (fractions of the UI target, in its pixels) at the UI quad's scale (its own size
 // when the quad is the UI's), the UI quad's format.
+// the wrist HUD's shape in the UI target's pixels to ui_layer (k: the ellipse's radii scaled: a test's "half")
+void push_hud_shape(float k) {
+    const float W = static_cast<float>(g_ui_tw), Hh = static_cast<float>(g_ui_th);
+    const float box[4] = {g_hud_ammo[0] * W, g_hud_ammo[1] * Hh, g_hud_ammo[2] * W, g_hud_ammo[3] * Hh};
+    const float ell[4] = {g_hud_radar[0] * W, g_hud_radar[1] * Hh, g_hud_radar[2] * W * k, g_hud_radar[3] * Hh * k};
+    const float crop[4] = {static_cast<float>(g_wr_x0), static_cast<float>(g_wr_y0), static_cast<float>(g_wr_x0) + static_cast<float>(g_wr_cw),
+                           static_cast<float>(g_wr_y0) + static_cast<float>(g_wr_ch)};
+    ui_layer::set_wrist_shape(g_hud_shape.load() && W > 0.0f && g_wr_cw > 0, box, ell, crop);
+}
+
 bool make_wrist_swapchain() {
     if (g_wr_sc != XR_NULL_HANDLE) return true;
     if (g_wr_failed || !make_ui_swapchain()) return false;
@@ -890,6 +942,8 @@ bool make_wrist_swapchain() {
     if (x1 - g_wr_x0 < 16 || y1 - g_wr_y0 < 16) return false;
     g_wr_cw = static_cast<uint32_t>(x1 - g_wr_x0);
     g_wr_ch = static_cast<uint32_t>(y1 - g_wr_y0);
+    push_hud_shape(1.0f);
+    log::info("[xr] the wrist HUD: %s", g_hud_shape.load() ? "the radar's ellipse and the ammo counter (the corner's other UI on the quad)" : "the whole rect");
     uint32_t max_w = g_wr_cw;
     if (g_ui_w != g_ui_tw) {
         max_w = static_cast<uint32_t>(std::lround(static_cast<double>(g_wr_cw) * g_ui_w / g_ui_tw));
@@ -905,7 +959,7 @@ bool make_wrist_swapchain() {
     ci.faceCount = 1;
     ci.arraySize = 1;
     ci.mipCount = 1;
-    XrResult r = xrCreateSwapchain(g_session, &ci, &g_wr_sc);
+    XrResult r = pso::as_own([&] { return xrCreateSwapchain(g_session, &ci, &g_wr_sc); });
     if (XR_FAILED(r)) {
         log::error("[xr] wrist HUD: xrCreateSwapchain -> %s", result_name(g_inst, r));
         g_wr_sc = XR_NULL_HANDLE;
@@ -993,7 +1047,7 @@ bool make_wheel_swapchain(const float rect[4]) {
     ci.faceCount = 1;
     ci.arraySize = 1;
     ci.mipCount = 1;
-    XrResult r = xrCreateSwapchain(g_session, &ci, &g_wh_sc);
+    XrResult r = pso::as_own([&] { return xrCreateSwapchain(g_session, &ci, &g_wh_sc); });
     if (XR_FAILED(r)) {
         log::error("[xr] the hand's wheel: xrCreateSwapchain -> %s", result_name(g_inst, r));
         g_wh_sc = XR_NULL_HANDLE;
@@ -1009,6 +1063,68 @@ bool make_wheel_swapchain(const float rect[4]) {
     return true;
 }
 // Presenting thread, frame end, before fill_ui (which leaves the rect out while this shows)
+// ---- (r55 item 11, [Scope]; scope.h) the scope's pictures: one quad swapchain per eye ([Scope] ImageSize square, within
+// the runtime's largest image; the eye images' sRGB format), made at its first scoped frame; drawn by the eye blit from
+// that eye's image (xr_blit::Scope) and submitted with eyeVisibility that eye only
+XrSwapchain g_sc_sc[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+std::vector<ID3D12Resource*> g_sc_images[2];
+DXGI_FORMAT g_sc_fmt = DXGI_FORMAT_UNKNOWN;
+uint32_t g_sc_size = 0;
+bool g_sc_failed[2] = {false, false};
+// (the review) each eye's image across frames: acquired (held, not released) and its index; waited once a frame at most
+// (20 ms), a timed-out wait tried again next frame (the image kept, never released unwaited)
+bool g_sc_held[2] = {false, false}, g_sc_waited[2] = {false, false};
+uint32_t g_sc_index[2] = {0, 0};
+std::atomic<uint64_t> g_sc_wait_timeouts{0};
+
+bool make_scope_swapchain(int e, uint32_t want) {
+    if (e < 0 || e > 1) return false;
+    if (g_sc_sc[e] != XR_NULL_HANDLE) return true;
+    if (g_sc_failed[e]) return false;
+    g_sc_failed[e] = true;
+    if (g_sc_fmt == DXGI_FORMAT_UNKNOWN) {
+        uint32_t nf = 0;
+        int64_t formats[64];
+        xrEnumerateSwapchainFormats(g_session, 64, &nf, formats);
+        g_sc_fmt = xr_blit::pick_format(formats, nf < 64 ? nf : 64);
+    }
+    if (g_sc_fmt == DXGI_FORMAT_UNKNOWN) {
+        log::error("[xr] the scope's picture: no sRGB swapchain format");
+        return false;
+    }
+    if (!g_sc_size) {
+        uint32_t sz = want;
+        const uint32_t cw = g_cap_w.load(), ch = g_cap_h.load();
+        if (cw && sz > cw) sz = cw;
+        if (ch && sz > ch) sz = ch;
+        g_sc_size = sz < 64 ? 64 : sz;
+    }
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.format = static_cast<int64_t>(g_sc_fmt);
+    ci.sampleCount = 1;
+    ci.width = g_sc_size;
+    ci.height = g_sc_size;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+    XrResult r = pso::as_own([&] { return xrCreateSwapchain(g_session, &ci, &g_sc_sc[e]); });
+    if (XR_FAILED(r)) {
+        log::error("[xr] the scope's picture (%s eye): xrCreateSwapchain -> %s", e ? "right" : "left", result_name(g_inst, r));
+        g_sc_sc[e] = XR_NULL_HANDLE;
+        return false;
+    }
+    uint32_t ni = 0;
+    xrEnumerateSwapchainImages(g_sc_sc[e], 0, &ni, nullptr);
+    std::vector<XrSwapchainImageD3D12KHR> imgs(ni, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    xrEnumerateSwapchainImages(g_sc_sc[e], ni, &ni, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+    for (auto& im : imgs) g_sc_images[e].push_back(im.texture);
+    g_sc_failed[e] = false;
+    log::info("[xr] the scope's picture (%s eye): swapchain %ux%u format %d, %zu images", e ? "right" : "left", g_sc_size, g_sc_size,
+              static_cast<int>(g_sc_fmt), g_sc_images[e].size());
+    return true;
+}
+
 bool fill_wheel(XrCompositionLayerQuad& quad) {
     g_wh_on = false;
     float pos[3], q[4], rect[4];
@@ -1048,8 +1164,10 @@ bool fill_ui(XrCompositionLayerQuad& quad) {
     const bool wrist = g_hud_wrist.load(std::memory_order_relaxed) && g_wr_sc != XR_NULL_HANDLE;
     const int hole[4] = {g_wr_x0, g_wr_y0, g_wr_x0 + static_cast<int>(g_wr_cw), g_wr_y0 + static_cast<int>(g_wr_ch)};
     const int hole2[4] = {g_wh_x0, g_wh_y0, g_wh_x0 + static_cast<int>(g_wh_cw), g_wh_y0 + static_cast<int>(g_wh_ch)};  // the hand's wheel
+    int band[4];
+    const bool de_band = deadeye::band(band);  // the Dead Eye X's slots in use: drawn where the marks are instead
     bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_ui_sc, &wsi)) && index < g_ui_images.size() &&
-              ui_layer::draw_quad(g_ui_images[index], g_ui_fmt, wrist ? hole : nullptr, g_wh_on ? hole2 : nullptr);
+              ui_layer::draw_quad(g_ui_images[index], g_ui_fmt, wrist ? hole : nullptr, g_wh_on ? hole2 : nullptr, de_band ? band : nullptr);
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g_ui_sc, &ri);
     if (!ok) return false;
@@ -1072,6 +1190,134 @@ void qrot(const XrQuaternionf& q, const float v[3], float out[3]) {
     out[1] = v[1] + w * ty + (z * tx - x * tz);
     out[2] = v[2] + w * tz + (x * ty - y * tx);
 }
+// ---- the Dead Eye X (deadeye.cpp; after optimumbox's fork, v0.8.11.9, commit ac942427, MIT: his xr.cpp's layer): the
+// game's own X for each mark, cropped from its slot in the UI target and drawn into both eyes where the mark is, on one
+// projection layer over the scene (each eye half the eye image's size, side by side in one image). Made at the first
+// marks; submitted only while marks show.
+XrSwapchain g_de_sc = XR_NULL_HANDLE;
+std::vector<ID3D12Resource*> g_de_images;
+uint32_t g_de_w = 0, g_de_h = 0;  // one eye's half
+bool g_de_failed = false;
+std::atomic<uint64_t> g_de_frames{0};
+bool make_deadeye_swapchain(uint32_t iw, uint32_t ih) {
+    if (g_de_sc != XR_NULL_HANDLE) return true;
+    if (g_de_failed || !make_ui_swapchain()) return false;
+    g_de_failed = true;  // one attempt; the reason is logged
+    g_de_w = iw / 2;
+    g_de_h = ih / 2;
+    if (g_de_w < 64 || g_de_h < 64) {
+        log::error("[xr] Dead Eye X: the eye image %ux%u is too small for its layer", iw, ih);
+        return false;
+    }
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.format = static_cast<int64_t>(g_ui_fmt);
+    ci.sampleCount = 1;
+    ci.width = 2 * g_de_w;
+    ci.height = g_de_h;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+    XrResult r = pso::as_own([&] { return xrCreateSwapchain(g_session, &ci, &g_de_sc); });
+    if (XR_FAILED(r)) {
+        log::error("[xr] Dead Eye X: xrCreateSwapchain -> %s", result_name(g_inst, r));
+        g_de_sc = XR_NULL_HANDLE;
+        return false;
+    }
+    uint32_t ni = 0;
+    xrEnumerateSwapchainImages(g_de_sc, 0, &ni, nullptr);
+    std::vector<XrSwapchainImageD3D12KHR> imgs(ni, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    xrEnumerateSwapchainImages(g_de_sc, ni, &ni, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+    for (auto& im : imgs) g_de_images.push_back(im.texture);
+    g_de_failed = false;
+    log::info("[xr] Dead Eye X swapchain %ux%u (two eyes side by side), %zu images", 2 * g_de_w, g_de_h, g_de_images.size());
+    return true;
+}
+
+// Presenting thread, frame end: this frame's X into the layer. False when no mark shows (or it cannot be drawn).
+bool fill_deadeye(uint32_t iw, uint32_t ih, XrCompositionLayerProjection& layer, XrCompositionLayerProjectionView pv[2]) {
+    deadeye::Mark m[deadeye::kMax];
+    float crop = 0, deg = 0;
+    const int n = deadeye::marks(m, deadeye::kMax, &crop, &deg);
+    if (n <= 0 || !(crop > 0.0f) || !ui_layer::has_ui() || !make_deadeye_swapchain(iw, ih)) return false;
+    body::BodyPoints bp;
+    if (!body::body_points(&bp) || !bp.cam_ok) return false;
+    ui_layer::Sprite sp[2 * deadeye::kMax];
+    int ns = 0;
+    for (int e = 0; e < 2; ++e) {
+        const XrView& v = g_frame_views[e];
+        const float tl = std::tan(v.fov.angleLeft), tr = std::tan(v.fov.angleRight), tu = std::tan(v.fov.angleUp), td = std::tan(v.fov.angleDown);
+        if (!(tr - tl > 1e-3f) || !(tu - td > 1e-3f)) return false;
+        const XrQuaternionf inv = {-v.pose.orientation.x, -v.pose.orientation.y, -v.pose.orientation.z, v.pose.orientation.w};
+        const float ppt = static_cast<float>(g_de_w) / (tr - tl);  // pixels a unit of tangent (about a radian at the centre)
+        float cd = deg * 0.0174532925f * ppt;                       // the crop's size in this eye (pixels)
+        if (cd < 4.0f) cd = 4.0f;
+        if (crop / cd > 8.0f) cd = crop / 8.0f;  // the box filter's reach
+        const int x0 = static_cast<int>(e * g_de_w), x1 = x0 + static_cast<int>(g_de_w);
+        for (int k = 0; k < n; ++k) {
+            float l[3], c[3];
+            bool drawn = false;
+            float px = -1.0f, py = -1.0f, un = -1.0f, vn = -1.0f;
+            if (camera_lever::world_to_local(bp.cam, m[k].world, l)) {
+                const float dv[3] = {l[0] - v.pose.position.x, l[1] - v.pose.position.y, l[2] - v.pose.position.z};
+                qrot(inv, dv, c);
+                if (c[2] < -0.1f) {  // in front of the eye
+                    const float xn = c[0] / -c[2], yn = c[1] / -c[2];
+                    un = (xn - tl) / (tr - tl);
+                    vn = (tu - yn) / (tu - td);
+                    px = un * static_cast<float>(g_de_w);
+                    py = vn * static_cast<float>(g_de_h);
+                    ui_layer::Sprite& t = sp[ns];
+                    const long side = std::lround(cd);
+                    t.dst[0] = x0 + static_cast<int>(std::lround(px - 0.5f * cd));
+                    t.dst[1] = static_cast<int>(std::lround(py - 0.5f * cd));
+                    t.dst[2] = t.dst[0] + static_cast<int>(side);
+                    t.dst[3] = t.dst[1] + static_cast<int>(side);
+                    t.scale = crop / static_cast<float>(side);
+                    t.src[0] = m[k].slot[0] - 0.5f * crop;
+                    t.src[1] = m[k].slot[1] - 0.5f * crop;
+                    if (t.dst[0] < x0) {  // kept in its eye's half
+                        t.src[0] += static_cast<float>(x0 - t.dst[0]) * t.scale;
+                        t.dst[0] = x0;
+                    }
+                    if (t.dst[2] > x1) t.dst[2] = x1;
+                    if (t.dst[2] > t.dst[0] && t.dst[3] > 0 && t.dst[1] < static_cast<int>(g_de_h)) {
+                        ++ns;
+                        drawn = true;
+                    }
+                }
+            }
+            deadeye::note_drawn(k, e, drawn ? px : -1.0f, drawn ? py : -1.0f, un, vn, g_de_w, g_de_h);
+        }
+    }
+    if (!ns) return false;
+    uint32_t index = 0;
+    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wsi.timeout = 100000000;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_de_sc, &ai, &index))) return false;
+    const bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_de_sc, &wsi)) && index < g_de_images.size() &&
+                    ui_layer::draw_sprites(g_de_images[index], g_ui_fmt, sp, ns);
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_de_sc, &ri);
+    if (!ok) return false;
+    for (int e = 0; e < 2; ++e) {
+        pv[e] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+        pv[e].pose = g_frame_views[e].pose;
+        pv[e].fov = g_frame_views[e].fov;
+        pv[e].subImage.swapchain = g_de_sc;
+        pv[e].subImage.imageRect = {{static_cast<int32_t>(e * g_de_w), 0}, {static_cast<int32_t>(g_de_w), static_cast<int32_t>(g_de_h)}};
+    }
+    layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    layer.space = g_space;
+    layer.viewCount = 2;
+    layer.views = pv;
+    g_de_frames.fetch_add(1, std::memory_order_relaxed);
+    deadeye::note_layer();
+    return true;
+}
+
 // A rotation from its axes (unit, right-handed: the matrix's columns x, y, z).
 XrQuaternionf quat_from_axes(const float x[3], const float y[3], const float z[3]) {
     const float m00 = x[0], m10 = x[1], m20 = x[2], m01 = y[0], m11 = y[1], m21 = y[2], m02 = z[0], m12 = z[1], m22 = z[2];
@@ -1199,7 +1445,11 @@ void check_poses(uint64_t frame) {
     g_handed_other = false;
 }
 
-void end_open_frame() {
+// presenting: called from submit_frame_end (the presenting thread, inside the game's frame end, before its Present);
+// false from the event thread's STOPPING, EXITING/LOSS_PENDING and "submission off" (g_session_running already false):
+// the game may be rendering into its back buffer then, so nothing here reads or writes it (the cinema's copy, the
+// menu's desktop copy); a cinema frame ends with no layer (2026-10-29, the review of 374a871)
+void end_open_frame(bool presenting = false) {
     if (g_relayout.exchange(false)) {
         g_cinema_placed = false;
         g_ui_placed = false;
@@ -1224,10 +1474,58 @@ void end_open_frame() {
     const uint32_t iw = cw <= g_sw ? cw : g_sw, ih = ch <= g_sh ? ch : g_sh;
     // the eyes' queue: the session's, after the game's work (the raw copies are in the game's lists: the fence alone)
     ID3D12CommandQueue* q = g_filled.load() == 3 && !resized ? image_queue() : nullptr;
+    // (r55 item 11, [Scope]) this frame's scope: each eye's fade, and the pictures' images acquired for the blit to draw
+    scope::Layer sl;
+    xr_blit::Scope sb;
+    bool sc_acq[2] = {false, false};  // (waited this frame: drawn into, then released)
+    bool sc_hard = false;             // (a picture wanted but its swapchain cannot be made)
+    bool sc_soft = false;             // (a picture's acquire failed, or its wait failed other than by a timeout)
+    const bool scope_on = g_blit && g_filled.load() == 3 && !resized && !g_cinema.load() && scope::frame_layer(g_frames.load() + 1, &sl);
+    if (scope_on) {
+        for (int e = 0; e < 2; ++e) {
+            sb.eye_fade[e] = sl.eye_fade[e];
+            sb.alpha[e] = sl.alpha[e];
+            sb.hide[e] = sl.hide[e];
+            if (!(sl.alpha[e] > 0.0f)) continue;
+            if (!make_scope_swapchain(e, sl.image)) {
+                sc_hard = true;
+                continue;
+            }
+            if (!g_sc_held[e]) {
+                XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                if (XR_FAILED(xrAcquireSwapchainImage(g_sc_sc[e], &ai, &g_sc_index[e]))) {
+                    sc_soft = true;
+                    continue;
+                }
+                g_sc_held[e] = true;
+                g_sc_waited[e] = false;
+            }
+            if (!g_sc_waited[e]) {
+                XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                wsi.timeout = 20000000;
+                const XrResult wr = xrWaitSwapchainImage(g_sc_sc[e], &wsi);
+                if (wr == XR_SUCCESS) g_sc_waited[e] = true;
+                else if (wr == XR_TIMEOUT_EXPIRED) g_sc_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+                else sc_soft = true;
+            }
+            if (!g_sc_waited[e]) continue;  // (not waited: neither drawn nor released this frame)
+            sc_acq[e] = true;
+            if (g_sc_index[e] < g_sc_images[e].size()) sb.dst[e] = g_sc_images[e][g_sc_index[e]];
+        }
+        sb.fmt = g_sc_fmt;
+        sb.size = g_sc_size;
+        sb.reticle = sl.reticle;
+    }
     if (g_blit && g_filled.load() == 3 && !resized) {
         const xr_blit::Frame f{cw, ch, iw, ih, rect ? rw : 0, rect ? rh : 0};
         const bool plain = !rect && g_sw == g_w && g_sh == g_h;
-        if (!q || !xr_blit::blit(q, acquired, xr_blit::game_gamma(1.0f), plain ? nullptr : &f)) g_filled = 0;  // not converted: no layer
+        if (!q || !xr_blit::blit(q, acquired, xr_blit::game_gamma(1.0f), plain ? nullptr : &f, scope_on ? &sb : nullptr)) g_filled = 0;  // not converted: no layer
+    }
+    for (int e = 0; e < 2; ++e) {  // (the waited images released: drawn or not; only a drawn one is submitted)
+        if (!sc_acq[e]) continue;
+        XrSwapchainImageReleaseInfo sri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g_sc_sc[e], &sri);
+        g_sc_held[e] = g_sc_waited[e] = false;
     }
     g_rect_w.store(iw, std::memory_order_relaxed);
     g_rect_h.store(ih, std::memory_order_relaxed);
@@ -1250,7 +1548,10 @@ void end_open_frame() {
     XrCompositionLayerQuad ui_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, menu_quad{XR_TYPE_COMPOSITION_LAYER_QUAD},
         wrist_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, wheel_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad ring_quads[holster::kMaxMarkers];
+    XrCompositionLayerQuad hl_quads[holster::kHlCount];
     XrCompositionLayerQuad reticle_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, reticle2_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerProjection de_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    XrCompositionLayerProjectionView de_pv[2];
     constexpr uint32_t kLayerArray = 16;
     const XrCompositionLayerBaseHeader* layers[kLayerArray] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
     uint32_t nlayers = 1;
@@ -1259,17 +1560,70 @@ void end_open_frame() {
     const bool cinema_on = g_cinema.load() || resized;
     // the holster rings over the scene, under the HUD, the wrist, the hand's wheel and the menu (which keep four places);
     // never more layers than the runtime takes (a frame over it is dropped whole)
+    XrCompositionLayerQuad scope_quads[2];
+    int nscope = 0;
+    if (full && !cinema_on && scope_on) {
+        for (int e = 0; e < 2; ++e) {
+            if (!sc_acq[e] || !sb.drawn[e] || !(sl.size[e] > 0.0f)) continue;
+            XrCompositionLayerQuad& sq = scope_quads[nscope++];
+            sq = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            sq.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            sq.space = g_space;
+            sq.eyeVisibility = e ? XR_EYE_VISIBILITY_RIGHT : XR_EYE_VISIBILITY_LEFT;
+            sq.subImage.swapchain = g_sc_sc[e];
+            sq.subImage.imageRect = {{0, 0}, {static_cast<int32_t>(g_sc_size), static_cast<int32_t>(g_sc_size)}};
+            sq.pose.position = {sl.pos[e][0], sl.pos[e][1], sl.pos[e][2]};
+            sq.pose.orientation = {sl.rot[e][0], sl.rot[e][1], sl.rot[e][2], sl.rot[e][3]};
+            sq.size = {sl.size[e], sl.size[e]};
+            layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&sq);
+        }
+    }
+    if (scope_on) {
+        const bool drawn[2] = {sb.drawn[0], sb.drawn[1]};
+        scope::note_drawn(drawn, sl.alpha, nscope > 0, sc_hard || xr_blit::scope_pipeline_failed(), sc_soft);
+    }
+    const uint32_t scope_after = nlayers;  // (the quads added after the scope's: kept out of a scoped eye)
     if (full && !cinema_on) {
         const uint32_t cap = g_max_layers.load(std::memory_order_relaxed) < kLayerArray ? g_max_layers.load(std::memory_order_relaxed) : kLayerArray;
         const int room = static_cast<int>(cap) - static_cast<int>(nlayers) - (wheel::wheel_mode() ? 4 : 3);
-        const int keep = dual::state().on ? 2 : 1;  // run 10 item 8: a second reticle only while dual wielding
+        const dual::State dws = dual::state();
+        const bool de = deadeye::showing();  // the Dead Eye X (marks shown): one more layer kept, under the reticles
+        // run 10 item 8: a second reticle only while dual wielding (not a carry)
+        const int keep = (dws.on && !dws.carry ? 2 : 1) + (de ? 1 : 0);
+        // [Holsters] InteractionHighlights (2026-10-29): the highlights first, then the rings in what is left (with the mode
+        // rings, the default, there are none: the rings' room as before)
+        const int nh = zone_rings::highlights_frame(g_frame_views, g_session, g_space, hl_quads,
+                                                    room - keep < holster::kHlCount ? room - keep : holster::kHlCount);
+        for (int i = 0; i < nh; ++i) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hl_quads[i]);
         const int nr = zone_rings::frame(g_frame_views, g_session, g_space, ring_quads,
-                                         room - keep < holster::kMaxMarkers ? room - keep : holster::kMaxMarkers);  // kept for the reticles
+                                         room - keep - nh < holster::kMaxMarkers ? room - keep - nh : holster::kMaxMarkers);  // kept for the reticles
         for (int i = 0; i < nr; ++i) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ring_quads[i]);
-        if (room - nr >= 1 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle_quad))
+        int used = nr + nh;
+        if (de && room - used >= 1 && fill_deadeye(iw, ih, de_layer, de_pv)) {
+            layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&de_layer);
+            ++used;
+        }
+        if (room - used >= 1 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle_quad))
             layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&reticle_quad);
-        if (room - nr >= 2 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle2_quad, 1))  // run 10 item 8: dual wield
+        if (room - used >= 2 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle2_quad, 1))  // run 10 item 8: dual wield
             layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&reticle2_quad);
+    }
+    if (scope_on && (sl.hide[0] || sl.hide[1])) {  // (r55 item 11) the rings, the highlights and the reticles out of a scoped eye
+        uint32_t keep = scope_after;
+        for (uint32_t i = scope_after; i < nlayers; ++i) {
+            const XrCompositionLayerBaseHeader* h = layers[i];
+            // (the Dead Eye X: a projection layer drawn for the eyes' own views, so out of both eyes while scoped: noted in the
+            // ini's [Scope])
+            if (h->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
+            if (h->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                auto* qd = const_cast<XrCompositionLayerQuad*>(reinterpret_cast<const XrCompositionLayerQuad*>(h));
+                if (sl.hide[0] && sl.hide[1]) continue;  // (both eyes scoped: binoculars)
+                if (qd->eyeVisibility == XR_EYE_VISIBILITY_BOTH) qd->eyeVisibility = sl.hide[0] ? XR_EYE_VISIBILITY_RIGHT : XR_EYE_VISIBILITY_LEFT;
+                else if ((qd->eyeVisibility == XR_EYE_VISIBILITY_LEFT && sl.hide[0]) || (qd->eyeVisibility == XR_EYE_VISIBILITY_RIGHT && sl.hide[1])) continue;
+            }
+            layers[keep++] = h;
+        }
+        nlayers = keep;
     }
     const bool wheel_q = full && !cinema_on && fill_wheel(wheel_quad);  // first: the floating quad leaves its rect out
     bool ui = full && !cinema_on && fill_ui(ui_quad);
@@ -1279,7 +1633,7 @@ void end_open_frame() {
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     const XrCompositionLayerBaseHeader* quad_layers[2] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad)};
     uint32_t nquad = 1;
-    bool cinema = cinema_on && g_should_render;
+    bool cinema = cinema_on && g_should_render && presenting;
     if (cinema) {
         if (!g_cinema_placed) place_cinema();
         cinema = fill_quad();
@@ -1294,19 +1648,31 @@ void end_open_frame() {
         quad.size = {3.2f, 3.2f * static_cast<float>(qh) / static_cast<float>(qw ? qw : 1)};
     }
     // the menu over everything, in either view
+    bool menu_shown = false;
     if (g_should_render && menu::frame(g_frame_views, g_session, g_space, &menu_quad)) {
         if (cinema) quad_layers[nquad++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_quad);
         else if (full) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_quad);
+        menu_shown = cinema || full;
     }
     image_written();  // the frame's XR writes are in: the game's next lists wait for them
+    // 2026-10-29 ("Mod menu isn't visible in recordings"): the menu shown in the headset also drawn onto the desktop's
+    // back buffer (on the present queue, after the wait just queued for the menu's draw), where it sits in the eye the
+    // monitor mirrors: the post output's second eye (the gamma blit's source: the right unless the eyes' order is
+    // swapped), or with [XR] EyeShape's repaint the left eye's rect pillarboxed (eye_shape.cpp's monitor); in the cinema
+    // at a fixed place (the desktop is the flat game there). Every eye image and the cinema's copy of the back buffer were
+    // made before this.
+    if (menu_shown && presenting) {
+        const bool shaped = !cinema && rect;
+        menu::desktop(g_frame_views, shaped ? 0 : (camera_lever::swap_order() ? 0 : 1), shaped ? cw : 0, shaped ? ch : 0, cinema);
+    }
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_display_time;
     ei.environmentBlendMode = g_blend;
-    ei.layerCount = cinema ? nquad : (full ? nlayers : 0);
+    ei.layerCount = cinema ? nquad : (full && (presenting || !cinema_on) ? nlayers : 0);
     ei.layers = cinema ? quad_layers : layers;
     if (cinema) g_cinema_frames.fetch_add(1, std::memory_order_relaxed);
     if (!cinema && full) controllers::submit_probe(g_space, ei.displayTime);  // [handlag]: how late the drawn hands are
-    XrResult r = xrEndFrame(g_session, &ei);
+    XrResult r = pso::as_own([&] { return xrEndFrame(g_session, &ei); });
     if (XR_FAILED(r)) log::limited("xr.endframe", 8, "[xr] xrEndFrame -> %s", result_name(g_inst, r));
     if (g_open_ms > 0) {  // the timing window: how long this XR frame was open, and its wait
         const double open = log::now_ms() - g_open_ms;
@@ -1340,6 +1706,9 @@ void timing_window(const XrFrameState& fs) {
         g_tw.misses0 = g_misses.load();
         g_tw.late_binds0 = g_late_eye_binds.load();
         frame_probe::snap(&g_tw.probe0);
+        image_mem::snap(&g_tw.vq0);
+        uint64_t scene_us = 0;
+        camera_lever::scene_time(&scene_us, &g_tw.scene_n0);
         prev = 0;
     }
     if (fs.predictedDisplayPeriod > 0) {
@@ -1387,12 +1756,21 @@ void timing_window(const XrFrameState& fs) {
               lat ? (g_latch_sum_deg.load() - g_tw.latch_sum0) / static_cast<float>(lat) : 0.0f,
               static_cast<unsigned long long>(g_copies.load() - g_tw.copies0), static_cast<unsigned long long>(g_misses.load() - g_tw.misses0),
               static_cast<unsigned long long>(g_late_eye_binds.load() - g_tw.late_binds0));
+    // the checked reads' VirtualQuery (2026-10-29, round 42: the 4 Hz cycle's render thread was 98% in it): per scene frame
+    image_mem::Snap vq_now;
+    image_mem::snap(&vq_now);
+    uint64_t scene_us = 0, scene_n = 0;
+    camera_lever::scene_time(&scene_us, &scene_n);
+    bool vq_quiet = false;  // no call and none slow: no line of its own (the users' logs)
+    const std::string vq = image_mem::format(g_tw.vq0, vq_now, scene_n - g_tw.scene_n0, 0, &vq_quiet);
     if (frame_probe::on()) {  // the same window's per-frame split (research\sps\current.md 3.7)
         frame_probe::Snap now_snap;
         frame_probe::snap(&now_snap);
         char line[768];
         frame_probe::format(g_tw.probe0, now_snap, line, sizeof(line));
-        log::info("[xr] timing %s", line);
+        log::info("[xr] timing %s | %s", line, vq.c_str());
+    } else if (!vq_quiet) {
+        log::info("[xr] timing %s", vq.c_str());
     }
     {  // the last windows for the menu's preset suggestion: stereo gameplay only, missed periods over 3%
         const double mp = 100.0 * static_cast<double>(g_tw.missed) / static_cast<double>(g_tw.frames + g_tw.missed ? g_tw.frames + g_tw.missed : 1);
@@ -1412,7 +1790,7 @@ void submit_frame_end() {
         if (!make_swapchains()) return;
         g_submit = true;
     }
-    if (g_frame_open) end_open_frame();
+    if (g_frame_open) end_open_frame(true);
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
     const double w0 = log::now_ms();
@@ -1438,6 +1816,8 @@ void submit_frame_end() {
         if (at && fs.predictedDisplayTime >= at) {
             g_space_change_at = 0;
             why = "the headset's recentre";
+            g_local_changes.fetch_add(1, std::memory_order_relaxed);
+            g_stage_tick = 0;  // LOCAL moved in STAGE: located again this frame
         }
         // Scroll Lock while the game is in front (the game reads raw keyboard input; this key is unbound in it)
         bool down = false;
@@ -1448,6 +1828,17 @@ void submit_frame_end() {
         g_scroll_down = down;
         if (xinput::take_recentre_combo()) why = "the gamepad (L3 + R3 held)";
         if (controls::take_recentre()) why = "the controllers (both stick clicks held)";
+        if (g_mount_recentre.load(std::memory_order_relaxed)) {
+            RdrvrActorState st{};
+            const bool seated = api::actor_state(&st) && st.actor && (st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING)) != 0;
+            const double nm = log::now_ms();
+            if (seated && !g_seated_was) g_seated_since = nm, g_seated_done = false;
+            if (seated && !g_seated_done && nm - g_seated_since >= 1200.0) {
+                g_seated_done = true;
+                if (!why) why = "getting on a mount ([Horse] MountRecentre)";
+            }
+            g_seated_was = seated;
+        }
         if (why) {
             g_recentres.fetch_add(1);
             log::info("[xr] recentre: %s", why);
@@ -1460,6 +1851,11 @@ void submit_frame_end() {
         g_perf.start_ms = log::now_ms();
         camera_lever::scene_time(&g_perf.scene_us0, &g_perf.scene_n0);
         frame_probe::snap(&g_perf.probe0);
+        image_mem::snap(&g_perf.vq0);
+        double us = 0;
+        uintptr_t at = 0;
+        bool img = false;
+        image_mem::take_slowest(1, &us, &at, &img);  // the window's own slowest from here
     }
     if (fs.predictedDisplayPeriod > 0) {
         double period = static_cast<double>(fs.predictedDisplayPeriod);
@@ -1487,10 +1883,69 @@ void submit_frame_end() {
     uint32_t nv = 0;
     g_frame_views[0] = {XR_TYPE_VIEW};
     g_frame_views[1] = {XR_TYPE_VIEW};
-    if (XR_SUCCEEDED(xrLocateViews(g_session, &li, &vs, 2, &nv, g_frame_views)) && nv == 2 &&
-        (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
-        apply_pos_ramp(g_frame_views);
-        store_views(g_frame_views, g_frames.load() + 1);
+    {
+        const bool located = XR_SUCCEEDED(xrLocateViews(g_session, &li, &vs, 2, &nv, g_frame_views)) && nv == 2 &&
+                             (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+        if (located) {
+            apply_pos_ramp(g_frame_views);
+            store_views(g_frame_views, g_frames.load() + 1);
+        }
+        // (2026-10-27) the views' position tracked too, not only their orientation (the headset off, tracking lost)
+        g_pos_tracked.store(located && (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT), std::memory_order_relaxed);
+    }
+    const bool stage_wanted = g_stage_want.load(std::memory_order_relaxed);
+    const bool stage_was = g_stage_was_wanted;
+    g_stage_was_wanted = stage_wanted;
+    if (stage_wanted) {  // [XR] PhysicalCrouch on: STAGE made once, LOCAL located in it
+        if (!g_stage_tried) {
+            g_stage_tried = true;
+            uint32_t ns = 0;
+            std::vector<XrReferenceSpaceType> types;
+            bool listed = false;
+            if (XR_SUCCEEDED(xrEnumerateReferenceSpaces(g_session, 0, &ns, nullptr)) && ns > 0) {  // the count, then the list
+                types.resize(ns);
+                if (XR_SUCCEEDED(xrEnumerateReferenceSpaces(g_session, static_cast<uint32_t>(types.size()), &ns, types.data())))
+                    for (uint32_t i = 0; i < ns && i < types.size(); ++i) listed = listed || types[i] == XR_REFERENCE_SPACE_TYPE_STAGE;
+            }
+            if (listed) {
+                XrReferenceSpaceCreateInfo ss{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+                ss.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+                ss.poseInReferenceSpace.orientation.w = 1.0f;
+                XrSpace stage = XR_NULL_HANDLE;
+                const XrResult sr = xrCreateReferenceSpace(g_session, &ss, &stage);
+                if (XR_SUCCEEDED(sr)) g_stage = stage;
+                g_stage_tick = 0;
+                log::info("[xr] STAGE reference space (the floor, for the physical crouch's standing height) -> %s", result_name(g_inst, sr));
+            } else {
+                log::info("[xr] the runtime lists no STAGE space (%u spaces): the physical crouch's standing height from [XR] StandingHeight", ns);
+            }
+        }
+        if (const XrTime at = g_stage_change_at.load(std::memory_order_relaxed); at && fs.predictedDisplayTime >= at) {
+            g_stage_change_at = 0;
+            g_stage_tick = 0;  // STAGE changed: located again now (its count is already bumped: the pose before refused)
+        }
+        if (const XrSpace stage = g_stage.load(std::memory_order_relaxed); stage != XR_NULL_HANDLE && g_stage_tick-- == 0) {
+            g_stage_tick = 45;  // (LOCAL in STAGE, the floor under the standing reference; the runtime's recentre locates it at once)
+            XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+            const bool ok = XR_SUCCEEDED(xrLocateSpace(g_space, stage, fs.predictedDisplayTime, &loc)) &&
+                            (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+            std::lock_guard stage_lock(g_stage_mutex);
+            g_stage_valid = ok;
+            if (ok) {
+                g_stage_pos[0] = loc.pose.position.x, g_stage_pos[1] = loc.pose.position.y, g_stage_pos[2] = loc.pose.position.z;
+                g_stage_q[0] = loc.pose.orientation.x, g_stage_q[1] = loc.pose.orientation.y, g_stage_q[2] = loc.pose.orientation.z,
+                g_stage_q[3] = loc.pose.orientation.w;
+                g_stage_lchg = g_local_changes.load(std::memory_order_relaxed);
+                // (a pose located before STAGE's change time still counts as before it)
+                // (the review: the count first, acquire, then the time: a new count implies its time is visible)
+                const uint64_t schg_now = g_stage_changes.load(std::memory_order_acquire);
+                g_stage_schg = g_stage_change_at.load(std::memory_order_relaxed) ? g_stage_schg : schg_now;
+            }
+        }
+    } else if (stage_was) {
+        g_stage_tick = 0;  // off: nothing located, the last pose dropped (stale by the time it is on again)
+        std::lock_guard stage_lock(g_stage_mutex);
+        g_stage_valid = false;
     }
     controllers::sync(g_space, fs.predictedDisplayTime);
     g_filled = 0;
@@ -1703,7 +2158,7 @@ DWORD WINAPI session_thread(void*) {
     sci.next = &binding;
     sci.systemId = sys;
     XrSession session = XR_NULL_HANDLE;
-    r = xrCreateSession(inst, &sci, &session);
+    r = pso::as_own([&] { return xrCreateSession(inst, &sci, &session); });
     log::info("[xr] xrCreateSession(device %p, queue %p) -> %s", static_cast<void*>(dev), static_cast<void*>(queue), result_name(inst, r));
     if (XR_FAILED(r)) {
         set_state("no_session");
@@ -1758,6 +2213,7 @@ DWORD WINAPI session_thread(void*) {
         log::info("[xr] the runtime offers no refresh rate choice (XR_FB_display_refresh_rate): [XR] RefreshRate unused");
     }
     g_submit_mode = config::get_bool("XR", "Submit", false);
+    g_mount_recentre = config::get_bool("Horse", "MountRecentre", true);
 
     bool running = false;
     XrSpace local = XR_NULL_HANDLE;
@@ -1768,6 +2224,10 @@ DWORD WINAPI session_thread(void*) {
             if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
                 auto* sc = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
                 set_state(state_name(sc->state));
+                // (2026-10-27: the physical crouch's gate) the session shown, visible or focused: not FOCUSED alone, which
+                // is the input focus (the simulator's follows its preview window; Quest's dashboard takes it), never the
+                // headset's being worn: a headset taken off leaves the session below VISIBLE on Quest (SteamVR keeps it)
+                g_focused = sc->state == XR_SESSION_STATE_FOCUSED || sc->state == XR_SESSION_STATE_VISIBLE;
                 if (sc->state == XR_SESSION_STATE_READY) {
                     XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
                     bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -1804,6 +2264,13 @@ DWORD WINAPI session_thread(void*) {
                         if (g_frame_open) end_open_frame();
                         d3d::set_bind_tap(d3d::kBindTapXr, nullptr);
                     }
+                    g_stage = XR_NULL_HANDLE;  // (the session's spaces go with it)
+                    g_stage_tried = false;
+                    g_pos_tracked = false;
+                    {
+                        std::lock_guard lock(g_stage_mutex);
+                        g_stage_valid = false;
+                    }
                     xrDestroySession(session);
                     xrDestroyInstance(inst);
                     log::info("[xr] session ended");
@@ -1821,6 +2288,12 @@ DWORD WINAPI session_thread(void*) {
                     XrTime at = sc->changeTime ? sc->changeTime : 1;
                     g_space_change_at = at;
                     log::info("[xr] the runtime recentres the LOCAL space (change time %lld)", static_cast<long long>(sc->changeTime));
+                } else if (sc->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE) {
+                    // 2026-10-27 ([XR] PhysicalCrouch): the floor's space reset (a new boundary): anything held in it is stale
+                    // (the third review) the time first: a locate between the two never takes the new count for an old pose
+                    g_stage_change_at = sc->changeTime ? sc->changeTime : 1;
+                    g_stage_changes.fetch_add(1, std::memory_order_release);
+                    log::info("[xr] the runtime changes the STAGE space (change time %lld)", static_cast<long long>(sc->changeTime));
                 }
             } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
                 set_state("instance_loss");
@@ -1880,9 +2353,11 @@ DWORD WINAPI session_thread(void*) {
             XrViewState vs{XR_TYPE_VIEW_STATE};
             XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
             uint32_t nv = 0;
-            if (XR_SUCCEEDED(xrLocateViews(session, &li, &vs, 2, &nv, views)) && nv == 2 &&
-                (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
-                store_views(views, g_frames.load() + 1);
+            const bool located = XR_SUCCEEDED(xrLocateViews(session, &li, &vs, 2, &nv, views)) && nv == 2 &&
+                                 (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+            if (located) store_views(views, g_frames.load() + 1);
+            // (2026-10-27: the idle loop's views too: the physical crouch's tracking gate is never left stale)
+            g_pos_tracked.store(located && (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT), std::memory_order_relaxed);
         }
         XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
         xrBeginFrame(session, &bi);
@@ -1891,7 +2366,7 @@ DWORD WINAPI session_thread(void*) {
         ei.displayTime = fs.predictedDisplayTime;
         ei.environmentBlendMode = blend;
         ei.layerCount = 0;
-        r = xrEndFrame(session, &ei);
+        r = pso::as_own([&] { return xrEndFrame(session, &ei); });
         uint64_t n = ++g_frames;
         if (XR_FAILED(r)) log::limited("xr.endframe", 8, "[xr] xrEndFrame -> %s", result_name(inst, r));
         if (n == 1 || n % 6000 == 0) log::info("[xr] idle frames %llu", static_cast<unsigned long long>(n));
@@ -1924,6 +2399,13 @@ void init() {
     float v[4];
     if (!r.empty() && sscanf_s(r.c_str(), "%f %f %f %f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] < v[2] && v[1] < v[3])
         std::memcpy(g_hud_rect, v, sizeof(v));
+    g_hud_shape = config::get_string("XR", "WristHudShape", "radar") != "rect";
+    r = config::get_string("XR", "WristHudRadar", "");
+    if (!r.empty() && sscanf_s(r.c_str(), "%f %f %f %f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[2] > 0.01f && v[3] > 0.01f)
+        std::memcpy(g_hud_radar, v, sizeof(v));
+    r = config::get_string("XR", "WristHudAmmo", "");
+    if (!r.empty() && sscanf_s(r.c_str(), "%f %f %f %f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] < v[2] && v[1] < v[3])
+        std::memcpy(g_hud_ammo, v, sizeof(v));
     log::info("[xr] HUD %s", g_hud_wrist.load() ? "on the wrist (when you look at it)" : "on the floating quad");
     d3d::add_frame_end_listener(on_frame_end);
     d3d::set_frame_size_listener(on_frame_size);
@@ -1936,8 +2418,8 @@ void force_frame_resized() {
 
 bool hud_on_wrist() { return g_hud_wrist.load(); }
 void hud_status(char* out, size_t len) {
-    std::snprintf(out, len, "hud %s, wrist swapchain %ux%u from (%d, %d), shown frames %llu, hidden frames %llu, now %s, top (%.2f %.2f %.2f) | the hand's wheel %ux%u from (%d, %d), frames %llu",
-                  g_hud_wrist.load() ? "wrist" : "quad", g_wr_w, g_wr_h, g_wr_x0, g_wr_y0, static_cast<unsigned long long>(g_wr_frames.load()),
+    std::snprintf(out, len, "hud %s (shape %s), wrist swapchain %ux%u from (%d, %d), shown frames %llu, hidden frames %llu, now %s, top (%.2f %.2f %.2f) | the hand's wheel %ux%u from (%d, %d), frames %llu",
+                  g_hud_wrist.load() ? "wrist" : "quad", g_hud_shape.load() ? "radar" : "rect", g_wr_w, g_wr_h, g_wr_x0, g_wr_y0, static_cast<unsigned long long>(g_wr_frames.load()),
                   static_cast<unsigned long long>(g_wr_hidden.load()), g_wr_shown ? "shown" : "hidden", g_wr_up[0].load(), g_wr_up[1].load(),
                   g_wr_up[2].load(), g_wh_w, g_wh_h, g_wh_x0, g_wh_y0, static_cast<unsigned long long>(g_wh_frames.load()));
 }
@@ -1947,6 +2429,10 @@ void set_hud_on_wrist(bool on) {
 }
 
 bool wrist_hud_shown() { return g_wr_visible.load(std::memory_order_relaxed); }
+void hud_shape_test(int mode) {  // the session only: 0 the rect, 1 the radar's shape, 2 its ellipse at half size (a test)
+    g_hud_shape = mode != 0;
+    push_hud_shape(mode == 2 ? 0.5f : 1.0f);
+}
 
 bool eye_views(EyeView out[2], uint64_t* xr_frame) {
     std::lock_guard lock(g_views_mutex);
@@ -1968,6 +2454,42 @@ bool eye_views_peek(EyeView out[2]) {
     out[1] = g_views[1];
     return true;
 }
+bool standing_eye_height(float* out) {
+    EyeView v[2];
+    if (!out || g_stage.load(std::memory_order_relaxed) == XR_NULL_HANDLE || !eye_views_peek(v)) return false;
+    float p[3], q[4];
+    {
+        std::lock_guard lock(g_stage_mutex);
+        if (!g_stage_valid || g_stage_lchg != g_local_changes.load(std::memory_order_relaxed) ||
+            g_stage_schg != g_stage_changes.load(std::memory_order_relaxed))
+            return false;
+        std::memcpy(p, g_stage_pos, sizeof(p));
+        std::memcpy(q, g_stage_q, sizeof(q));
+    }
+    // the centre eye (LOCAL) in STAGE: y = p.y + (R(q) e).y, R's middle row
+    const float e[3] = {0.5f * (v[0].position[0] + v[1].position[0]), 0.5f * (v[0].position[1] + v[1].position[1]),
+                        0.5f * (v[0].position[2] + v[1].position[2])};
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    *out = p[1] + 2 * (x * y + z * w) * e[0] + (1 - 2 * (x * x + z * z)) * e[1] + 2 * (y * z - x * w) * e[2];
+    return true;
+}
+bool has_stage() { return g_stage.load(std::memory_order_relaxed) != XR_NULL_HANDLE; }
+void set_stage_wanted(bool on) { g_stage_want.store(on, std::memory_order_relaxed); }
+bool local_in_stage(float pos[3], float q[4]) {
+    std::lock_guard lock(g_stage_mutex);
+    // located since the runtime's last recentre (else LOCAL moved after it)
+    if (!g_stage_valid || g_stage_lchg != g_local_changes.load(std::memory_order_relaxed) ||
+        g_stage_schg != g_stage_changes.load(std::memory_order_relaxed))
+        return false;
+    std::memcpy(pos, g_stage_pos, sizeof(g_stage_pos));
+    std::memcpy(q, g_stage_q, sizeof(g_stage_q));
+    return true;
+}
+uint64_t stage_space_changes() { return g_stage_changes.load(std::memory_order_relaxed); }
+bool head_tracked() { return g_focused.load(std::memory_order_relaxed) && g_pos_tracked.load(std::memory_order_relaxed); }
+bool session_focused() { return g_focused.load(std::memory_order_relaxed); }
+bool head_position_valid() { return g_pos_tracked.load(std::memory_order_relaxed); }
+uint64_t local_space_changes() { return g_local_changes.load(std::memory_order_relaxed); }
 const char* session_state() { return g_state; }
 uint64_t frames() { return g_frames.load(); }
 const char* runtime_name() { return g_runtime; }
@@ -2087,6 +2609,20 @@ void perf_probe(char* out, size_t len) {
     frame_probe::format(a, b, out, len);
 }
 
+void perf_vq(char* out, size_t len) {
+    image_mem::Snap a, b;
+    uint64_t n0 = 0;
+    {
+        std::lock_guard lock(g_perf_mutex);
+        a = g_perf.vq0;
+        n0 = g_perf.scene_n0;
+    }
+    image_mem::snap(&b);
+    uint64_t us = 0, n = 0;
+    camera_lever::scene_time(&us, &n);
+    std::snprintf(out, len, "%s", image_mem::format(a, b, n - n0, 1).c_str());
+}
+
 void late_latch() {
     static const bool enabled = config::get_bool("XR", "LateLatch", true);
     if (!enabled || !submitting()) return;
@@ -2170,4 +2706,9 @@ void set_cinema(bool on) {
     log::info("[xr] cinema %s", on ? "on" : "off");
 }
 
+bool mount_recentre() { return g_mount_recentre.load(std::memory_order_relaxed); }
+void set_mount_recentre(bool on, bool save) {
+    if (g_mount_recentre.exchange(on) != on) log::info("[xr] recentre on getting on a mount (MountRecentre): %s", on ? "on" : "off");
+    if (save) config::set("Horse", "MountRecentre", on ? "1" : "0");
+}
 }  // namespace rdrvr::xr

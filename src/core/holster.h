@@ -11,6 +11,10 @@
 #include "core/body.h"
 
 namespace rdrvr::holster {
+// [Hands] KnifeSwap (2026-11-01, GOAL-offhand-changes C2; on): the off hand's knife with a gun in hand is the game's weapon,
+// the gun the second gun (as TorchSwap's torch)
+bool knife_swap();
+void set_knife_swap(bool on);  // also written to the user ini
 
 void init();
 bool install();                 // after anchors::verify()
@@ -27,6 +31,11 @@ float two_hand_blend();
 // A grip pressed now would be a holster's: the hand is in a zone, or it is the front hand at a long gun's foregrip
 // (as of the last frame end). Any thread.
 bool grip_wanted(int h);
+// [Hands] CarryByForegrip, [Reload] CarriedBolt: the carried gun's take-back point (world: where the gun hand let go of
+// its grip, on the carried gun as last placed, else on the carrying hand's target), as of the last frame end (within 100
+// ms); false without a carry, or while taken back. ctl: the same point in the carrying controller's frame (the
+// fallback's), by_gun: out is on the placed gun (a test's print)
+bool carry_take_point(float out[3], float ctl[3] = nullptr, bool* by_gun = nullptr);
 // The game's gun is in its aim pose (the gun controller's +0x5d6 bit 0x40, set by the aim-pose op): only then does a
 // fire request shoot (FUN_140d169a0 drops it otherwise). As of the last frame end; any thread.
 bool aim_pose();
@@ -56,6 +65,7 @@ void set_anchor(int a, bool save = true);
 // at the hips, TorsoLength); TurnByHands (with TurnWithHead): both hands ahead pull the turn halfway to their direction
 bool lean_steady();
 void set_lean_steady(bool on, bool save = true);
+float torso_length();  // [Holsters] TorsoLength (0.3-0.9 m): the lean model's (the physical crouch reads it too, 2026-10-27)
 bool turn_by_hands();
 void set_turn_by_hands(bool on, bool save = true);
 bool turn_with_head();
@@ -98,10 +108,18 @@ void set_foregrip(const float off[3], float radius, bool save);
 // (ForegripOffset's); kAdjForeRing, where the front hand takes hold and its size (ForegripZoneOffset, -Radius's);
 // kAdjLoadRing, where a round goes in and its size (LoadPointOffset, -Radius's). Offsets right, up, forward (m) in the
 // gun's axes. gun_adjust: the values in effect for gun w, its own if set (own), else every gun's. Any thread.
-enum GunAdj { kAdjForegrip, kAdjForeRing, kAdjLoadRing };
-void gun_adjust(int w, int what, float off[3], float* radius, bool* own = nullptr);
-void set_gun_adjust(int w, int what, const float off[3], float radius, bool save);  // save: the user ini's [Weapon.<token>]
-void clear_gun_adjust(int w, int what);  // back to every gun's (its entries cleared)
+// (2026-11-01, GOAL-offhand-changes C35, C38) kAdjMag: a magazine pistol's well (MagazineWellOffset's; none of every gun's: 0 0 0),
+// and every weapon (the Blunderbuss, the Explosive Rifle) its own, each hand's. (C36) kAdjPart: the action's spot (the bolt's,
+// the breech's, the slide's, the fanned hammer's, the muzzle's ram), PartOffset's; none of every gun's (0 0 0)
+enum GunAdj { kAdjForegrip, kAdjForeRing, kAdjLoadRing, kAdjMag, kAdjPart, kAdjCount };
+// (C8) hand: John's hand holding the gun (0 left: its ...Left set, else the right's; 1 or -1 the right's); exact: the
+// left's alone (the menu's: none of its own reads as every gun's)
+void gun_adjust(int w, int what, float off[3], float* radius, bool* own = nullptr, int hand = 1, bool exact = false);
+// save: the user ini's [Weapon.<token>]; keep_other (C8b, a person's change: the menu's, the tests'): the right hand's set while
+// the left has none of its own, the left keeps where it was as its own (never on the ini's load)
+void set_gun_adjust(int w, int what, const float off[3], float radius, bool save, int hand = 1, bool keep_other = false);
+// back to every gun's (the left's: to the right's) (its entries cleared); keep_other: as set_gun_adjust's (the right's clear)
+void clear_gun_adjust(int w, int what, int hand = 1, bool keep_other = false);
 int gun_in_hand();                       // the gun the holsters' last update saw in hand (0-20; -1 none)
 void interact_offset(float off[3]);
 void set_interact_offset(const float off[3], bool save);  // save: also written to the user ini
@@ -118,6 +136,43 @@ void foregrip_zone(float off[3], float* radius);
 void set_foregrip_zone(const float off[3], float radius, bool save);  // save: also written to the user ini
 void set_load_point(const float off[3], float radius, bool touch, bool save);  // save: also written to the user ini
 bool foregrip_snap();
+// [Reload] PhysicalStock (run 14; off): the front hand's trigger also holds the foregrip, the front hand does not turn the
+// gun, and every long gun is turned in the gun hand by [Reload] StockTurn (degrees, a rotation vector), learned by
+// stock_calibrate: in delay_ms, with a long gun held on both controllers, its barrel set along the line from the gun hand's
+// controller to the front hand's, its top up (body.cpp takes the sample: stock_calibrate_due, once).
+bool physical_stock();
+void set_physical_stock(bool on);  // also written to the user ini
+void stock_calibrate(double delay_ms);
+double stock_calibrate_in();  // ms until the sample (-1: none asked)
+bool stock_calibrate_due();     // once, at its time (a request a second past it is dropped)
+void stock_calibrate_expire();  // a request past its time and a second dropped (called each body frame)
+void stock_turn(float deg[3]);
+// [Reload] TriggerTakesRound (run 14; off): the off hand's trigger pressed at the chest's ammo zone takes a round as the grip
+// does, held while the trigger is (the trigger still aims)
+bool trigger_takes_round();
+void set_trigger_takes_round(bool on);  // also written to the user ini
+// [Reload] RoundsPerGrab (2026-10-26; 1): the rounds a hand takes at the chest at once (up to the gun's room and the
+// spare ammo, 1-8). [Reload] RoundsGoIn: "one" (one at a time, a round each RoundInsertMs while they are held at the
+// gun's loading ring) or "all" (all of them as they reach it). Let go at the gun, the rest go in at once
+int rounds_per_grab();
+void set_rounds_per_grab(int n);  // also written to the user ini
+bool rounds_all_at_once();
+void set_rounds_all_at_once(bool on);  // also written to the user ini
+// [Reload] RoundSource (2026-10-28; chest): 0 chest, the rounds taken at the chest's ammo zone only; also, by the hand
+// that may take them (the free hand; with DualWieldCrossReload each dual-wielding hand, for the other gun), its grip
+// pressed out of the holsters' zones where no part of the gun wants it (the action's parts, the foregrip, the carried
+// gun's grip): 1 gun, within 15 cm of the target gun's loading ring (inside it too: they go straight in); 2 palm, turned
+// palm up, 5 cm or more outside that ring. RoundsPerGrab of them appear in it, loaded at the loading point as the
+// chest's are. The test channel's "holster source chest|gun|palm" is the session's (save false)
+int round_source();
+void set_round_source(int src, bool save = true);
+bool trigger_for_round(int h);          // TriggerTakesRound on and controller h's trigger is the round's (at the ammo zone, or
+                                        // holding the round it took): not the lever lock's
+// [Hands] DualWieldCrossReload (2026-10-27): controller h holds a gun and rounds it took for the gun in the other hand (or
+// its trigger, held then, is not yet let go): its own gun does not fire (controls.cpp holds RT back for the gun hand,
+// dual.cpp the second gun's pull), so no shot goes off mid-reload. Any thread.
+bool cross_holds_fire(int h);
+void set_stock_turn(const float deg[3]);  // also written to the user ini
 void set_foregrip_snap(bool on, bool save);
 // The weapon in each holster ([Holsters] WeaponChoice, <Key>Weapon; the menu's Weapons tab): a holster with a chosen
 // weapon the player owns draws that one (ACTOR_PUT_WEAPON_IN_HAND takes any owned weapon; the game then keeps it in
@@ -139,6 +194,7 @@ bool zone_takes_weapons(int z);   // not the chest (its rounds)
 bool zone_any(int z);             // a gun holster (the hips, the backs): AnyWeapon's (2026-10-13)
 int zone_piece(int z);            // its belt piece (body::Piece index; body::kPieces the mirrored left holster), -1 none
 bool zone_fits(int z, int equip_slot);
+bool zone_fits_weapon(int z, int weapon, int equip_slot);  // zone_fits, and the Sawed-off at the sidearm holsters
 struct Arsenal {
     bool valid;
     uint64_t owned;
@@ -186,10 +242,71 @@ bool show_weapon_points();
 void set_show_hand_dots(bool on, bool save);
 void set_show_weapon_points(bool on, bool save);
 bool markers(Markers* out);    // false when off, out of first person, or older than 100 ms. Any thread.
+// [Holsters] InteractionHighlights (2026-10-29, GOAL-weapons-handling.md item 5, research\run28\highlights.md): 0 rings
+// (today's: the rings by their own switches, no highlight), 1 highlights (a soft glow over each place a ring marks,
+// instead of its ring: on the gun's part, an area glow at a holster; only while using it would do something now and a
+// hand is near, brighter at reach; never over the sights), 2 both (the rings as their switches say, and the highlights).
+// The hand dots (ShowHandDots) and placing the holsters by hand keep their rings in every mode. save: the user ini too.
+// (run 29 item 2, research\run29\glow.md; the user, 2026-10-29: "I want the weapon parts to look like they have a glowing
+// texture on them") 3 parts: as highlights, but each place on a gun (the foregrip, the pump, the loading points, the magazine
+// well, the action's part, the lever) glows on the gun's own surface (the part's own triangles drawn again with a glow:
+// body.cpp, pso.h glow), in the scene, hidden where the hand covers it; the holster zones and the chest keep their glow. A
+// gun place keeps the sprite only while no glow draw is played (no glow twin on this PC, no triangles found for it).
+int interaction_highlights();
+// (2026-10-31, the off-hand build step 4) a hand holds rounds for the second gun or the copy (DualWieldCrossReload), as of
+// the last frame end: actions.cpp's wrist-flick shut of that gun waits
+bool rounds_for_second();
+void set_interaction_highlights(int mode, bool save = true);
+// [Holsters] PartGlowColor (sRGB 0-1: "r g b", round 45's warm gold 1.0 0.84 0.52 by default) and PartGlowStrength (0-8,
+// 1 by default: the glow's brightness against the part's own diffuse): the parts mode's glow. Any thread. save: the user ini
+void part_glow_color(float rgb[3]);
+void set_part_glow_color(const float rgb[3], bool save = true);
+float part_glow_strength();
+void set_part_glow_strength(float s, bool save = true);
+// The highlights' places (the update's ids): a holster zone (kHlZone + its index), the foregrip, the gun in hand's
+// loading point, its magazine well (PistolMagazines), the second gun's loading point (DualWieldCrossReload), the
+// action's part to work (ActionHints 2: a bolt, a breech's part, a slide, the semi-auto's handle, FanHammer's hammer), the
+// part a flick works (ActionHints 3: a lever, a hammer cocked by the stick, a breech's block) and the pump's fore-end
+// (ActionHints 4)
+// (2026-10-31, step 7, R11: kHlShut, the part that closes: actions' hint 5)
+enum HighlightId : int8_t { kHlZone = 0, kHlFore = 8 /* kZones, below */, kHlLoad, kHlMag, kHlLoadSec, kHlPart, kHlLever, kHlPump, kHlShut, kHlCount };
+enum HighlightShape : uint8_t { kHlShapePart = 0, kHlShapeArea = 1 };
+struct Highlight {
+    float pos[3];
+    float radius;  // the part's (or the area's) size, m: the glow is drawn about twice as wide, fading out
+    float target;  // the strength wanted now (0 off, up to 0.65 near, 1 at reach); the drawing eases toward it (below 0: off at once)
+    uint8_t shape;
+    int8_t id;
+    // (2026-11-03, round 74: the Henry's own ring off its surface, its loading place unlit) the loading place's point with every
+    // gun's ring, for the glow when the gun's own ring's point is on none of the gun (kHlLoad only; else alt_ok false)
+    float alt[3];
+    bool alt_ok;
+};
+struct Highlights {
+    float cam[16];
+    int n;
+    Highlight h[kHlCount];  // every place that exists this frame (target 0 where it is not usable, or over the sights)
+};
+// The last frame end's (the presenting thread publishes before the XR frame end, as markers()). False with the mode
+// rings, out of first person, or older than 100 ms. Any thread.
+bool highlights(Highlights* out);
+const char* highlight_name(int id);  // "RightHip" ... "Foregrip", "LoadPoint", "MagWell", "LoadPoint2", "Part", "Lever", "Pump"
+// (run 29 item 2) the gun a place is on: 0 the gun in hand (the foregrip, the pump, its loading point, its magazine well,
+// the action's part, the lever), 1 the other gun (the second gun's or the copy's loading point; round 52: the carried
+// gun's part or pump this update, [Hands] CarryByForegrip's gun drawn as the second), -1 none (a holster zone). Any thread.
+int highlight_gun(int id);
 // [Holsters] UnarmedAfterHolster: a put-away at a holster also selects unarmed (the fists), as the weapon wheel's
 // Unarmed does (SET_PLAYER_MELEE_MODE_SELECTED): LT is then the fist-fight stance, not a draw of the last gun.
 bool unarmed_after_holster();
 void set_unarmed_after_holster(bool on);  // also written to the user ini
+// [Holsters] HoldToKeep (2026-10-30, off; holster.cpp's g_hold has the rules): a gun drawn at a holster stays in the hand
+// only while the grip that drew it stays held; let go, it goes back to its holster, or with the other hand on a long
+// gun's foregrip it stays carried by that hand ([Hands] CarryByForegrip); DualWield's second gun and the copy too
+bool hold_to_keep();
+void set_hold_to_keep(bool on, bool save);  // save: also written to the user ini (the menu; "holster hold on|off" is the session's)
+// that controller's grip is HoldToKeep's hold on its gun, away from the holsters and holding no rounds (gestures.cpp: the
+// gun's swing is not held off as a holster's grip)
+bool grip_keeps(int h);
 constexpr int kZones = 8;  // RightHip, Back, Belt, Knife, Ammo (the chest: a round to reload, reload.h), LeftHip, LeftShoulder, LowerBack
 bool zone_enabled(int z);
 void set_zone_enabled(int z, bool on, bool save);  // [Holsters] <Key>Enabled

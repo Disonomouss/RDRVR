@@ -82,6 +82,72 @@ XrPath path(const char* s) {
     return p;
 }
 
+// [Hands] HandSmoothing (controllers.h): each hand's aim [0] and grip [1] pose, filtered at the frame's predicted display
+// time; the late latch locates the same time again, so the step is taken again from the state before it (prev), never
+// twice. Under g_mutex.
+std::atomic<bool> g_smooth{false};
+struct EuroState {
+    bool ok = false;
+    XrTime t = 0;
+    float p[3] = {};
+    float q[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float v = 0.0f, w = 0.0f;  // the filtered speeds (m/s, rad/s)
+};
+struct Euro {
+    EuroState prev, cur;
+};
+Euro g_euro[2][2];
+float euro_alpha(float fc, float dt) {
+    const float tau = 1.0f / (6.2831853f * fc);
+    return 1.0f / (1.0f + tau / dt);
+}
+EuroState euro_step(const EuroState& s, const float p[3], const float q[4], XrTime t) {
+    EuroState o;
+    o.ok = true;
+    o.t = t;
+    const float dt = s.ok && t > s.t ? static_cast<float>(static_cast<double>(t - s.t) * 1e-9) : 0.0f;
+    if (dt <= 0.0f || dt > 0.25f) {  // the first sample, or after a gap: as located
+        std::memcpy(o.p, p, sizeof(o.p));
+        std::memcpy(o.q, q, sizeof(o.q));
+        return o;
+    }
+    const float dx = p[0] - s.p[0], dy = p[1] - s.p[1], dz = p[2] - s.p[2];
+    float dot = s.q[0] * q[0] + s.q[1] * q[1] + s.q[2] * q[2] + s.q[3] * q[3];
+    const float sg = dot < 0.0f ? -1.0f : 1.0f;
+    dot = std::fmin(1.0f, std::fabs(dot));
+    const float ad = euro_alpha(1.0f, dt);  // the speeds low-passed at 1 Hz
+    o.v = s.v + ad * (std::sqrt(dx * dx + dy * dy + dz * dz) / dt - s.v);
+    o.w = s.w + ad * (2.0f * std::acos(dot) / dt - s.w);
+    const float ap = euro_alpha(1.0f + 10.0f * o.v, dt), aq = euro_alpha(1.0f + 4.0f * o.w, dt);
+    for (int i = 0; i < 3; ++i) o.p[i] = s.p[i] + ap * (p[i] - s.p[i]);
+    float n = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        o.q[i] = s.q[i] + aq * (sg * q[i] - s.q[i]);
+        n += o.q[i] * o.q[i];
+    }
+    n = std::sqrt(n);
+    if (n > 1e-6f)
+        for (float& x : o.q) x /= n;
+    else
+        std::memcpy(o.q, q, sizeof(o.q));
+    return o;
+}
+void smooth(int h, int k, bool valid, float p[3], float q[4], XrTime t) {
+    Euro& e = g_euro[h][k];
+    if (!valid || !g_smooth.load(std::memory_order_relaxed)) {
+        e = Euro{};
+        return;
+    }
+    if (e.cur.ok && t == e.cur.t) {
+        e.cur = euro_step(e.prev, p, q, t);  // (the late latch: the same display time again)
+    } else {
+        e.prev = e.cur;
+        e.cur = euro_step(e.cur, p, q, t);
+    }
+    std::memcpy(p, e.cur.p, sizeof(e.cur.p));
+    std::memcpy(q, e.cur.q, sizeof(e.cur.q));
+}
+
 bool has_ext(const char* e) {
     for (const std::string& x : g_exts)
         if (x == e) return true;
@@ -391,6 +457,7 @@ bool create(XrInstance inst, XrSession session) {
     g_haptics = config::get_bool("Input", "Haptics", true);
     g_haptic_gain = config::get_float("Input", "HapticStrength", 1.0f);
     g_pad_buttons = config::get_bool("Controls", "TrackpadButtons", true);
+    g_smooth = config::get_bool("Hands", "HandSmoothing", false);
     for (int k = 0; k < kKinds; ++k) {  // [Controls] GripFit<Type>
         const std::string v = config::get_string("Controls", (std::string("GripFit") + kKindName[k]).c_str(), "");
         Fit f;
@@ -491,6 +558,8 @@ void sync(XrSpace base, XrTime time) {
         d.grip_valid = locate(g_grip_space[h], base, time, d.grip_pos, d.grip_rot);
         if (d.valid) apply_fit(h, d.pos, d.rot);
         if (d.grip_valid) apply_fit(h, d.grip_pos, d.grip_rot);
+        smooth(h, 0, d.valid, d.pos, d.rot, time);  // [Hands] HandSmoothing
+        smooth(h, 1, d.grip_valid, d.grip_pos, d.grip_rot, time);
         d.connected = active || d.valid;
         tracked[h] = d.valid;
         hands::set_real(h, d);
@@ -510,6 +579,8 @@ void relocate(XrSpace base, XrTime time) {
         const bool v = locate(g_aim_space[h], base, time, p, q), gv = locate(g_grip_space[h], base, time, gp, gq);
         if (v) apply_fit(h, p, q);
         if (gv) apply_fit(h, gp, gq);
+        if (v && d.valid) smooth(h, 0, true, p, q, time);  // [Hands] HandSmoothing (the latch's own pose filtered the same)
+        if (gv && d.grip_valid) smooth(h, 1, true, gp, gq, time);
         g_latched_ok[h] = v;
         if (v) std::memcpy(g_latched[h], p, sizeof(p));
         if (v && d.valid) {
@@ -612,6 +683,11 @@ void set_fit(int h, const float off[3], const float ang[3], bool save) {
     log::info("[controllers] fit for %s: %s%s", kKindName[k], b, save ? " (saved)" : "");
 }
 
+bool hand_smoothing() { return g_smooth.load(std::memory_order_relaxed); }
+void set_hand_smoothing(bool on, bool save) {
+    if (g_smooth.exchange(on) != on) log::info("[controllers] hand smoothing (HandSmoothing): %s", on ? "on" : "off");
+    if (save) config::set("Hands", "HandSmoothing", on ? "1" : "0");
+}
 void pulse(int h, float amplitude, int ms) {
     if (h < 0 || h > 1 || ms <= 0) return;
     g_req_amp[h] = amplitude < 0 ? 0 : amplitude > 1 ? 1 : amplitude;
@@ -627,11 +703,11 @@ void status_text(char* out, size_t len) {
     char b[320];
     std::snprintf(b, sizeof(b),
                   "profile L %s / R %s, syncs %llu (not focused %llu), late latched %llu (moved the hand %.1f mm, at most %.1f), haptic pulses "
-                  "%llu, rumble %#010x%s | types %s / %s, trackpad buttons %d",
+                  "%llu, rumble %#010x%s | types %s / %s, trackpad buttons %d, smoothing %d",
                   g_profile[0], g_profile[1], static_cast<unsigned long long>(g_syncs.load()), static_cast<unsigned long long>(g_not_focused.load()),
                   static_cast<unsigned long long>(g_relocates.load()), g_relocate_last_mm, g_relocate_max_mm,
                   static_cast<unsigned long long>(g_pulses.load()), xinput::rumble(), hands::synthetic() ? ", SYNTHETIC hands win" : "",
-                  g_kind[0] >= 0 ? kKindName[g_kind[0]] : "none", g_kind[1] >= 0 ? kKindName[g_kind[1]] : "none", g_pad_buttons ? 1 : 0);
+                  g_kind[0] >= 0 ? kKindName[g_kind[0]] : "none", g_kind[1] >= 0 ? kKindName[g_kind[1]] : "none", g_pad_buttons ? 1 : 0, g_smooth.load() ? 1 : 0);
     s += b;
     for (int h = 0; h < 2; ++h) {
         hands::Hand d = hands::get_real(h);

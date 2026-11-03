@@ -2,7 +2,9 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include "core/audio.h"
 #include "core/burst_grab.h"
 #include "core/camera_lever.h"
+#include "core/scope.h"
 #include "core/body.h"
 #include "core/controllers.h"
 #include "core/controls.h"
@@ -31,14 +34,32 @@
 #include "core/reload.h"
 #include "core/actions.h"
 #include "core/dlss.h"
+#include "core/deadeye.h"
 #include "core/dual.h"
 #include "core/physics.h"
 #include "core/gestures.h"
+#include "core/offhand.h"
+#include "core/pgo.h"
+#include "core/probe.h"
 #include "core/hooks.h"
+#include "core/image_mem.h"
 #include "core/log.h"
 #include "core/lum_check.h"
+#include "core/gpu_stages.h"
+#include "core/eye2_collector.h"
+#include "core/eye2_images.h"
+#include "core/main_instanced.h"
+#include "core/main_region.h"
+#include "core/eye2_light.h"
+#include "core/eye2_velocity.h"
+#include "core/pass2_skip.h"
+#include "core/fcensus.h"
 #include "core/prepass_arrays.h"
 #include "core/pso.h"
+#include "core/rec_state.h"
+#include "core/cut_velocity.h"
+#include "core/inst_prev_mirror.h"
+#include "core/prevworld_mirror.h"
 #include "core/render_settings.h"
 #include "core/align_grab.h"
 #include "core/ring_probe.h"
@@ -47,6 +68,8 @@
 #include "core/xinput.h"
 #include "core/wheel.h"
 #include "core/whistle.h"
+#include "core/hogtie.h"
+#include "core/bgfocus.h"
 #include "core/xr.h"
 #include "core/xr_blit.h"
 #include "core/ui_layer.h"
@@ -123,8 +146,159 @@ std::string run_native(uint32_t hash, const std::vector<uint64_t>& args, uint32_
     return buf;
 }
 
+// bench act (run 16 item 3, the input-only rule): while on, execute() answers only the forms below (read-only queries and
+// status) and refuses every other command before it runs, so a scenario's act() moves the player only through the
+// simulator's head, hands and buttons. Test only: off at every start, never read from the ini, never saved.
+// tests\bench\ALLOWLIST.md lists every command and why each form is here.
+std::atomic<bool> g_bench_act{false};
+std::atomic<uint64_t> g_bench_refused{0};
+std::string g_bench_last = "none";  // the worker thread's only (execute runs there alone)
+
+// each form is the command's tokens exactly: "*" one token of any value, a final "..." any further tokens (or none)
+constexpr const char* kBenchAllow[] = {
+    "ping", "status", "log ...", "pos", "census", "recdump",
+    // holster: the status forms, no argument that sets
+    "holster", "holster zones", "holster bases", "holster slots", "holster weapons", "holster gun", "holster load", "holster fore",
+    "holster fore trace", "holster grab", "holster anchor", "holster guns", "holster rings", "holster stock", "holster turret",
+    "holster pieces", "holster model",
+    // aim: the reports (aim::command matches substrings, so only these exact lines)
+    "aim", "aim frames", "aim reticle", "aim reticle stats", "aim ledge", "aim armblock", "aim cover", "aim executions", "aim spawns",
+    "props", "props diag", "hogtie", "actions", "actions all", "gestures", "gunmelee", "ammo", "dual", "physics", "round", "sound",
+    "whistle", "wheel", "deadeye", "skel stock", "skel two",
+    "pose", "pose crouch", "pose room", "mode", "perf", "prepass", "prepass views", "prepass cull", "prepass wvp", "prepass instprev",
+    "controls", "controllers", "rings", "menu", "hud", "xr status", "xr sharpen", "taa", "taa status", "cuts", "dlss", "cam audio",
+    "cam audio log", "cam fp", "renderres", "eyeshape", "eyeshape status", "playback", "shadows", "sun", "drops",
+    "grabeyes *",  // an eye capture: observation
+    // memory reads checked committed, readable and not a guard page, under SEH (peek and peekpp skip the guard check, and
+    // peekabs reads without SEH after its check: refused, the review)
+    "peekx * *", "peekx * * *",
+};
+
+// native <hash> ...: only these pure getters (names from extern\redhook-sdk\include\Natives.h)
+constexpr uint32_t kBenchNatives[] = {
+    0xE8CFDD53u,  // GET_PLAYER_ACTOR
+    // (not GET_POSITION: it writes a Vector3 through its second argument, so a number there is a write anywhere: the
+    // review; the read-only "pos" gives the player's)
+    0x42DE39F0u,  // GET_HEADING
+    0xAA364907u,  // GET_LASSO_TARGET
+    0xA610DC79u,  // IS_ACTOR_HOGTIED
+    0x0D798FFEu,  // IS_ACTOR_DEAD
+    0x2F232639u,  // IS_ACTOR_ALIVE
+    0xF246F15Du,  // GET_ACTOR_HEALTH
+    0x44787A58u,  // GET_ACTOR_KO_POINTS
+    0x0B28E9ECu,  // GET_ACTOR_ENUM
+    0x7DF72579u,  // STREAMING_IS_ACTOR_LOADED
+    0xA4B2016Du,  // GET_WEAPON_IN_HAND
+    0x42C0FAAAu,  // GET_WEAPON_EQUIPPED
+    0x118D085Eu,  // GET_NUM_WEAPONS_IN_INVENTORY
+    0xA677B204u,  // GET_WEAPON_MAX_AMMO
+    0x17883570u,  // GET_AMMOENUM_FOR_WEAPONENUM
+    0x8DDE894Fu,  // GET_ACTORS_HORSE
+    0xA0936EB6u,  // GET_VEHICLE
+    0x2C0F211Du,  // GET_LAST_ATTACKER
+    0x08308EBAu,  // GET_LAST_HIT_FLAGS
+    0xF6BF4242u,  // IS_ACTOR_CROUCHING
+    0x3918D335u,  // IS_ACTOR_RAGDOLL
+    0x882C84DCu,  // IS_ACTOR_HUMAN
+    0xDC99C124u,  // IS_ACTOR_DRIVING_VEHICLE
+    0xD39C4A9Eu,  // IS_ACTOR_USING_COVER
+    0x3612AC73u,  // IS_ACTOR_WHISTLING
+    0x2C5983E0u,  // IS_USING_TURRET
+    0x57246C02u,  // IS_GAME_PAUSED
+    0xA61FA36Bu,  // CUTSCENE_MANAGER_IS_CUTSCENE_PLAYING
+    // 2026-10-27 ([Holsters] WheelPause, research\run27\wheelpause.md 1.1): the game timer's clocks, no arguments, each
+    // handler one float from the timer 0x142314d00 into the return slot (read: 0x140202e10 +0x3c, 0x140202e20 +0x44,
+    // 0x140202ef0 +0x08), for the time ratio game / unwarped
+    0x5842B9D1u,  // GET_CURRENT_GAME_TIME
+    // (GET_CURRENT_UNWARPED_TIME 0xF83666A6 taken out again: cycle r167 read garbage from it, 0x7ffa... values)
+    0x59466B4Du,  // GET_LAST_FRAME_TIME
+};
+
+bool bench_form(const char* form, const std::vector<std::string>& t) {
+    size_t i = 0;
+    for (const char* p = form;;) {
+        while (*p == ' ') ++p;
+        if (!*p) return i == t.size();
+        const char* e = p;
+        while (*e && *e != ' ') ++e;
+        const size_t n = static_cast<size_t>(e - p);
+        if (n == 3 && std::strncmp(p, "...", 3) == 0) return true;
+        if (i >= t.size()) return false;
+        if (!(n == 1 && *p == '*') && (t[i].size() != n || std::strncmp(p, t[i].c_str(), n) != 0)) return false;
+        ++i;
+        p = e;
+    }
+}
+
+bool bench_allowed(const std::vector<std::string>& t) {
+    if (t[0] == "native" && t.size() >= 2) {
+        // the hash as execute() reads it (parse_arg: a plain number); a string, pair or float form is refused
+        const char* s = t[1].c_str();
+        char* end = nullptr;
+        const unsigned long long h = std::strtoull(s, &end, 0);
+        if (end == s || *end || h > 0xffffffffull) return false;
+        // the arguments plain integers only (no s: or p: forms, no floats): a getter is given handles and enums, never a
+        // pointer to write through (the review)
+        for (size_t i = 2; i < t.size(); ++i) {
+            const char* a = t[i].c_str();
+            char* ae = nullptr;
+            (void)std::strtoll(a, &ae, 0);
+            if (ae == a || *ae) return false;
+        }
+        for (uint32_t k : kBenchNatives)
+            if (k == static_cast<uint32_t>(h)) return true;
+        return false;
+    }
+    for (const char* f : kBenchAllow)
+        if (bench_form(f, t)) return true;
+    return false;
+}
+
+std::string join(const std::vector<std::string>& t) {
+    std::string s;
+    for (size_t i = 0; i < t.size(); ++i) s += (i ? " " : "") + t[i];
+    return s;
+}
+
+std::string bench_command(const std::vector<std::string>& t) {
+    if (t.size() >= 2 && t[1] == "clock") {
+        // bench clock: the log's clock (QPC since the mod's start) beside the raw QPC in ms, read together, so a script maps
+        // the simulator's raw QPC times onto the log's
+        LARGE_INTEGER f{}, a{}, b{};
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&a);
+        const double lm = log::now_ms();
+        QueryPerformanceCounter(&b);
+        if (f.QuadPart <= 0) return "ERROR no QPC frequency";
+        const double qm = (static_cast<double>(a.QuadPart) + static_cast<double>(b.QuadPart)) * 0.5 * 1000.0 / static_cast<double>(f.QuadPart);
+        char st[128];
+        std::snprintf(st, sizeof(st), "bench clock: log %.3f ms, qpc %.3f ms", lm, qm);
+        return st;
+    }
+    if (t.size() >= 2 && t[1] == "act") {  // bench act [on|off]
+        if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) {
+            g_bench_act.store(t[2] == "on", std::memory_order_relaxed);
+            log::info("[bench] act %s", t[2].c_str());
+        } else if (t.size() >= 3) {
+            return "ERROR usage: bench act [on|off]";
+        }
+        char st[1200];
+        std::snprintf(st, sizeof(st), "bench act %s, refused %llu (last: %s)", g_bench_act.load(std::memory_order_relaxed) ? "on" : "off",
+                      static_cast<unsigned long long>(g_bench_refused.load(std::memory_order_relaxed)), g_bench_last.c_str());
+        return st;
+    }
+    return "ERROR usage: bench act [on|off] | bench clock";
+}
+
 std::string execute(const std::vector<std::string>& t) {
     const std::string& c = t[0];
+    if (c == "bench") return bench_command(t);  // answered while acting too (act off, act, clock)
+    if (g_bench_act.load(std::memory_order_relaxed) && !bench_allowed(t)) {
+        g_bench_last = join(t);
+        g_bench_refused.fetch_add(1, std::memory_order_relaxed);
+        log::info("[bench] refused %s", g_bench_last.c_str());
+        return "REFUSED (bench): " + g_bench_last;
+    }
     if (c == "ping") return "pong";
     if (c == "status") return "ok";
     if (c == "log") {
@@ -361,10 +535,11 @@ std::string execute(const std::vector<std::string>& t) {
         return st;
     }
     if (c == "lumcheck") return lum_check::run(t.size() >= 2 ? std::atoi(t[1].c_str()) : 8);
-    if (c == "grabburst" && t.size() >= 3) {  // grabburst <prefix> <frames> [crop_w crop_h] [post|scene|vel]
+    if (c == "grabburst" && t.size() >= 3) {  // grabburst <prefix> <frames> [crop_w crop_h] [post|scene|vel] [pereye]
         const int src = t.size() >= 6 ? (t[5] == "scene" ? 1 : t[5] == "vel" ? 2 : 0) : 0;
+        const bool pereye = t.size() >= 7 && t[6] == "pereye";  // (scene/vel: the first eye at pass 1's bind, run 19)
         return burst_grab::grab(t[1], std::atoi(t[2].c_str()), t.size() >= 5 ? std::atoi(t[3].c_str()) : 640,
-                                t.size() >= 5 ? std::atoi(t[4].c_str()) : 360, 10000, src);
+                                t.size() >= 5 ? std::atoi(t[4].c_str()) : 360, 10000, src, pereye);
     }
     if (c == "xr" && t.size() >= 5 && t[1] == "posramp") {  // xr posramp dx dy dz: metres an XR frame (0 0 0 stops)
         xr::set_pos_ramp(std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr));
@@ -389,6 +564,12 @@ std::string execute(const std::vector<std::string>& t) {
         xr::submit_status(st, sizeof(st));
         return st;
     }
+    if (c == "xr" && t.size() >= 2 && t[1] == "sharpen") {  // xr sharpen [0..1]: [XR] Sharpness for the session (run 14)
+        if (t.size() >= 3) xr_blit::set_sharpness(static_cast<float>(std::atof(t[2].c_str())), false);
+        char st[64];
+        std::snprintf(st, sizeof(st), "sharpening %.2f", xr_blit::sharpness());
+        return st;
+    }
     if (c == "xr" && t.size() >= 2 && (t[1] == "status" || t[1] == "resized")) {
         // xr status: the submission's (also the status file's xr_submit); xr resized: the live-resize guard's stop as at
         // a real resize, for the rest of this start (the eyes stop, the cinema screen shows the flat game)
@@ -405,7 +586,7 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "grabui" && t.size() >= 2) return ui_layer::grab(t[1]);
     if (c == "menu") {
-        // menu | menu on|off | menu find <label> | menu scroll <y> | menu grab <path.bmp>
+        // menu | menu on|off | menu find <label> | menu scroll <y> | menu grab <path.bmp> | menu desktop on|off
         if (t.size() >= 3 && t[1] == "grab") {
             std::string path;
             for (size_t i = 2; i < t.size(); ++i) path += (i > 2 ? " " : "") + t[i];
@@ -420,8 +601,12 @@ std::string execute(const std::vector<std::string>& t) {
             for (size_t i = 2; i < t.size(); ++i) label += (i > 2 ? " " : "") + t[i];
             return menu::find(label);
         }
-        if (t.size() >= 2) menu::set_visible(t[1] == "on");
-        char st[200];
+        if (t.size() >= 2 && t[1] == "desktop") {  // (2026-10-29: the session only; "menu desktop" alone: the status)
+            if (t.size() >= 3) menu::set_desktop(t[2] == "on");
+        } else if (t.size() >= 2) {
+            menu::set_visible(t[1] == "on");
+        }
+        char st[512];
         menu::status_text(st, sizeof(st));
         return st;
     }
@@ -444,6 +629,43 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 3 && t[1] == "rideturn") pose::set_stick_turn_riding(t[2] == "on", false);  // run 9 item 4: the session only
         if (t.size() >= 3 && t[1] == "vehicle") pose::set_vehicle_heading(t[2] == "on", false);    // run 10 item 3: the session only
         if (t.size() >= 3 && t[1] == "armed") pose::set_armed_stand(t[2] == "on", false);          // run 10 item 8b: the session only
+        if (t.size() >= 2 && t[1] == "room") {
+            // 2026-10-27 ([XR] RoomScale, the session only): pose room [on|off | fade on|off | judder reset | tune <dead zone>
+            // <stop radius> <min stick> <max stick> <max offset>]: its status (the offset, the walk, blocked, the fade, the take-off)
+            if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) pose::set_room_scale(t[2] == "on", false);
+            if (t.size() >= 4 && t[2] == "fade") pose::set_room_fade(t[3] == "on", false);
+            if (t.size() >= 4 && t[2] == "judder") camera_lever::room_reset_judder();
+            if (t.size() >= 4 && t[2] == "take") pose::set_room_take(t[3] == "on");  // pose room take on|off: the judder's negative control
+            // (2026-10-28) pose room quick <lean slack m> <start lead s>: the lean's slack and the early start (0 0: as before)
+            if (t.size() >= 4 && t[2] == "direct") pose::set_room_direct(t[3] == "on", false);  // (2026-11-02) pose room direct on|off
+            if (t.size() >= 5 && t[2] == "quick") pose::set_room_response(std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr), false);
+            if (t.size() >= 8 && t[2] == "tune")
+                pose::set_room_tuning(std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr), std::strtof(t[5].c_str(), nullptr),
+                                      std::strtof(t[6].c_str(), nullptr), std::strtof(t[7].c_str(), nullptr), false);
+            return pose::room_status();
+        }
+        if (t.size() >= 2 && t[1] == "crouch") {
+            // 2026-10-27 ([XR] PhysicalCrouch, the session only): pose crouch [on|off | calibrate [ms] | tune <crouch share>
+            // <stand share> <hold ms> <standing m> [quick hold ms]]: its status (the drop, H, y_stand, want/have/owned, the presses)
+            if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) pose::set_physical_crouch(t[2] == "on", false);
+            if (t.size() >= 3 && t[2] == "calibrate") pose::calibrate_standing(t.size() >= 4 ? std::strtod(t[3].c_str(), nullptr) : 0.0);
+            if (t.size() >= 7 && t[2] == "tune")
+                pose::set_crouch_tuning(std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr), std::strtof(t[5].c_str(), nullptr),
+                                        std::strtof(t[6].c_str(), nullptr), false, t.size() >= 8 ? std::strtof(t[7].c_str(), nullptr) : -1.0f);
+            return pose::crouch_status();
+        }
+        if (t.size() >= 2 && t[1] == "bodyturn") {
+            // 2026-10-27 ([XR] BodyFollowsTurn, the session only): pose bodyturn [on|off | reset | tune <dead zone deg> <hold ms>
+            // <speed deg/s> [<gain /s> <ease s>] | walk on|off]: its status (the gate, the head over the body, following, the origin's match, the view's yaw and
+            // its largest step with the head still; reset zeroes that step)
+            if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) pose::set_body_follows_turn(t[2] == "on", false);
+            if (t.size() >= 3 && t[2] == "reset") camera_lever::body_turn_reset_view();
+            if (t.size() >= 6 && t[2] == "tune")
+                pose::set_body_turn_tuning(std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr), std::strtof(t[5].c_str(), nullptr), false,
+                                           t.size() >= 8 ? std::strtof(t[6].c_str(), nullptr) : -1.0f, t.size() >= 8 ? std::strtof(t[7].c_str(), nullptr) : -1.0f);
+            if (t.size() >= 4 && t[2] == "walk") pose::set_body_turn_during_walk(t[3] == "on", false);  // (2026-10-28) the walk's gate lifted
+            return pose::body_turn_status();
+        }
         if (t.size() >= 3 && t[1] == "turn")  // pose turn snap|smooth [speed] [snap angle]
             pose::set_turning(t[2] == "snap", t.size() >= 4 ? std::strtof(t[3].c_str(), nullptr) : pose::turn_speed(),
                               t.size() >= 5 ? std::strtof(t[4].c_str(), nullptr) : pose::snap_angle());
@@ -466,8 +688,9 @@ std::string execute(const std::vector<std::string>& t) {
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return holster::command(line);
     }
-    if (c == "hud") {  // hud wrist|quad (writes the user ini)
-        if (t.size() >= 2) xr::set_hud_on_wrist(t[1] == "wrist");
+    if (c == "hud") {  // hud wrist|quad (writes the user ini) | hud shape rect|radar|half (the session)
+        if (t.size() >= 3 && t[1] == "shape") xr::hud_shape_test(t[2] == "rect" ? 0 : t[2] == "half" ? 2 : 1);
+        else if (t.size() >= 2) xr::set_hud_on_wrist(t[1] == "wrist");
         char st[420];
         xr::hud_status(st, sizeof(st));
         return st;
@@ -536,6 +759,11 @@ std::string execute(const std::vector<std::string>& t) {
         }
         return held_prop::status();
     }
+    if (c == "deadeye") {  // deadeye [level 0-3] [sepia on|off] [marks on|off] [barrel on|off] [deg d] [pitch px] [shift x y]: the session, the state
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return deadeye::command(line);
+    }
     if (c == "dual") {  // dual [on|off] [begin <slot> [left|right]] [fire] [end]: the second gun (DualWield)
         std::string line;
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
@@ -546,10 +774,36 @@ std::string execute(const std::vector<std::string>& t) {
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return gestures::command(line);
     }
+    if (c == "bgfocus") {  // bgfocus [on|off]: [Debug] BackgroundFocus (test only), its counts
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return bgfocus::command(line);
+    }
+    if (c == "hogtie") {  // hogtie [on|off]: [Gestures] HogtieClearProps for the session, and the state
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return hogtie::command(line);
+    }
     if (c == "whistle" || c == "wheel") {  // whistle [on|off] [offset r u f] [radius m] [gunhand on|off] [reset]; wheel [on|off] [angle deg] [flipy on|off] [reset] (the session)
         std::string line;
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return c == "whistle" ? whistle::command(line) : wheel::command(line);
+    }
+    if (c == "offhand") {  // offhand [on|off] [dry on|off] [reset]: [Hands] OffHandItems (the session), each hand's item, the stab
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return offhand::command(line);
+    }
+    if (c == "pgo") {  // pgo [set <key> <value>] [save] [reload]: Ped Gunfight Overhaul's settings (the Gunfights page's)
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return pgo::command(line);
+    }
+    if (c == "probe" && t.size() >= 2 && (t[1] == "snap" || t[1] == "fuse" || t[1] == "fuseinfo")) {  // test-only game calls
+        // (research/run33/probes_brief.md; "probe on|off", the frame probe's timers, below)
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return probe::command(line);
     }
     if (c == "gunmelee") {  // gunmelee [on|off] [dry on|off] [reset] [scan [radius]]: the gun-butt melee (GunMelee; the session)
         std::string line;
@@ -660,10 +914,11 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "perf") {
         if (t.size() >= 2 && t[1] == "reset") xr::perf_reset();
-        char st[400], pr[768];
+        char st[400], pr[768], vq[400];
         xr::perf_status(st, sizeof(st));
         xr::perf_probe(pr, sizeof(pr));
-        return std::string(st) + " || " + pr;
+        xr::perf_vq(vq, sizeof(vq));  // (2026-10-29) the checked reads' VirtualQuery over the window (image_mem.h)
+        return std::string(st) + " || " + pr + " || " + vq;
     }
     if (c == "mode") {
         // mode | mode auto on|off | mode cutscene screen|3d
@@ -701,7 +956,9 @@ std::string execute(const std::vector<std::string>& t) {
         camera_lever::request_log();
         return "logging the next scene camera";
     }
-    if (c == "grab" && t.size() >= 2) return frame_grab::grab(t[1]);
+    // grab <path.bmp> [late]: late (2026-10-29), the back buffer as presented: after every frame-end listener (the UI
+    // mirror, the XR frame end and the menu's desktop copy), not before them
+    if (c == "grab" && t.size() >= 2) return frame_grab::grab(t[1], 3000, t.size() >= 3 && t[2] == "late");
     if (c == "grabdepth" && t.size() >= 2) return frame_grab::grab_depth(t[1]);
     if (c == "renderscale" && t.size() >= 2) {
         if (!render_settings::set_fixed_scale(std::strtof(t[1].c_str(), nullptr))) return "ERROR needs [Render] ForceAntiAliasing and 0 or 0.25..1";
@@ -728,9 +985,87 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 4 && t[1] == "views" && t[2] == "size") prepass::views_size(t[3] == "on");
         if (t.size() >= 2 && t[1] == "views") return prepass::views_status();
         if (t.size() >= 3 && t[1] == "inst") prepass::set_instanced(t[2] == "on");  // [Stereo] PrepassInstanced (test only)
+        if (t.size() >= 3 && t[1] == "cut" && t[2] == "holdpending") {  // [Stereo] PrepassCutHoldPending (test only): on|off
+            if (t.size() != 4 || (t[3] != "on" && t[3] != "off")) return "ERROR usage: prepass cut holdpending on|off";
+            if (!prepass::set_cut_hold_pending(t[3] == "on")) return "ERROR prepass cut holdpending: not armed (start with [Stereo] PrepassCutHoldPending=1)";
+            return prepass::status();
+        }
+        if (t.size() >= 3 && t[1] == "cut") prepass::set_walk_cut(t[2]);  // [Stereo] PrepassWalkCut: on|off|force (test only)
+        if (t.size() >= 2 && t[1] == "cuthold") {  // [Stereo] PrepassCutHoldStarted (test only): started|all
+            if (t.size() != 3 || (t[2] != "started" && t[2] != "all")) return "ERROR usage: prepass cuthold started|all";
+            prepass::set_cut_hold_started(t[2] == "started");
+        }
         if (t.size() >= 2 && t[1] == "cull") {  // prepass cull [on|off]: [Stereo] PrepassUnionCull (2026-10-14, test only)
             if (t.size() >= 3) prepass::set_union_cull(t[2] == "on");
             return prepass::cull_status();
+        }
+        // prepass slicebarriers|skipvel [on|off] (run 21 item 4, test only): [Stereo] PrepassSliceBarriers / PrepassSkipVelocityCopy
+        if (t.size() >= 2 && (t[1] == "slicebarriers" || t[1] == "skipvel")) {
+            if (t.size() == 2) return prepass::reductions_status();
+            if (t.size() != 3 || (t[2] != "on" && t[2] != "off")) return "ERROR usage: prepass " + t[1] + " [on|off]";
+            return t[1] == "slicebarriers" ? prepass::set_slice_barriers(t[2] == "on") : prepass::set_skip_velocity(t[2] == "on");
+        }
+        if (t.size() == 2 && t[1] == "singles") return prepass::singles_status();  // (run 18, read only)
+        if (t.size() == 3 && t[1] == "singles" && t[2] == "reset") {  // (a test: the counts from now)
+            prepass::singles_reset();
+            return prepass::singles_status();
+        }
+        // prepass reemit [on|off|skip on|skip off|reset]: [Stereo] RecorderReemit / PrepassRecordSkip (run 18 P2, test only);
+        // bare: the re-emits, the refusals by reason, the bytes written, the drift census and the skips by op
+        if (t.size() >= 2 && t[1] == "reemit") return rec_state::command(t);
+        // prepass cutvel [on|off|d1|d2|d3|reset]: [Stereo] PrepassCutVelocity (run 19, test only); bare: D1's samples by class
+        if (t.size() >= 2 && t[1] == "cutvel") return cut_velocity::command(t);
+        // prepass instprev [on|off|observe|compare [on|off]|notaa on|off|reset]: [Stereo] PrepassInstPrevMirror (run 19, test only)
+        if (t.size() >= 2 && t[1] == "instprev") return inst_prev::command(t);
+        // prepass prevworld [on|off|observe|compare [on|off]|reset|kv]: [Stereo] PrepassPrevWorldMirror (run 19 item 6, test only)
+        if (t.size() >= 2 && t[1] == "prevworld") return prevworld::command(t);
+        // prepass gpu [on|off|reset]: [Stereo] PrepassGpuStages (run 19 item 3, test only): the stages' GPU means since the reset
+        if (t.size() >= 2 && t[1] == "gpu") return gpu_stages::command(t);
+        // prepass e2sc [on|off|compare N|reset|kv]: [Stereo] PrepassEye2Collector (run 20 item 5, test only): eye 2's collector term in pass 1
+        if (t.size() >= 2 && t[1] == "e2sc") return eye2_collector::command(t);
+        // prepass e2lb [on|off|compare N|reset|kv]: [Stereo] PrepassEye2Light (run 21 item 5, test only): eye 2's Light Buffer in pass 1
+        if (t.size() >= 2 && t[1] == "e2lb") return eye2_light::command(t);
+        // prepass e2img [on|off|reset|kv|table]: [Stereo] PrepassEye2Images (run 23, test only): eye 2's images' bindless indices in global_textures; table: the runtime global variable table (read only, also when not installed)
+        if (t.size() >= 2 && t[1] == "e2img") return eye2_images::command(t);
+        // prepass mi [on|off|compare N|reset|kv|control off|nudge|eye1]: [Stereo] MainInstanced (run 25 item 3, test only): the billboard compare
+        if (t.size() >= 2 && t[1] == "mi") return main_inst::command(t);
+        // prepass diag depthlog [N]: (r117 DG4, test only) the next N presents' list calls on the game's depth logged ([depthlog] lines); no N: the state
+        if (t.size() == 4 && t[1] == "diag" && t[2] == "layerlog" && t[3] == "reset") {  // (r117 DG4, test only: the layer messages' log caps from 0)
+            log::reset_limited("d3d12.msg.");
+            return "layerlog: the [d3d12] layer messages' line counts reset";
+        }
+        // prepass diag pixcap <file.wpix> [frames=N]: ([Debug] PixCapturer, test only) PIX's PIXGpuCaptureNextFrames for the next N frames (1)
+        if (t.size() >= 4 && t.size() <= 5 && t[1] == "diag" && t[2] == "pixcap") {
+            unsigned frames = 1;
+            if (t.size() == 5) {
+                const size_t at = t[4].rfind("frames=", 0) == 0 ? 7 : 0;  // (frames=N or a bare N)
+                if (at >= t[4].size() || t[4].find_first_not_of("0123456789", at) != std::string::npos)
+                    return "ERROR prepass diag pixcap <file.wpix> [N|frames=N]";
+                frames = static_cast<unsigned>(std::strtoul(t[4].c_str() + at, nullptr, 10));
+            }
+            return d3d::pixcap(t[3], frames);
+        }
+        if (t.size() >= 3 && t[1] == "diag" && t[2] == "depthlog") {
+            if (t.size() >= 4) {
+                // ("... depthlog N draws A B": also the draws whose per-list ordinal is in [A, B]; without: no draws)
+                d3d::depthlog_draws(t.size() >= 7 && t[4] == "draws" ? std::atoi(t[5].c_str()) : -1, t.size() >= 7 && t[4] == "draws" ? std::atoi(t[6].c_str()) : -1);
+                d3d::depthlog_arm(std::atoi(t[3].c_str()));
+            }
+            return d3d::depthlog_status();
+        }
+        // prepass e2vel [on|off|compare N|control off|nudge|eye1|reset|kv]: [Stereo] PrepassEye2Velocity (run 25 item 4, test only): eye 2's velocity pass in pass 1
+        if (t.size() >= 2 && t[1] == "e2vel") return eye2_velocity::command(t);
+        // prepass p2skip [on|off|kv|reset|control none|nocopy lb|sc|d|all|stale]: [Stereo] Pass2FrontSkip (run 25 item 7's S2, test only): pass 2's front half record-skipped, eye 2's images copied in (P2IN)
+        if (t.size() >= 2 && t[1] == "p2skip") return p2skip::command(t);
+        // prepass fcensus [on|off|reset|dump|kv]: [Stereo] RouteFCensus (run 25 item 8h' step 1, test only, read only): route F's state census, pass 1's CPU caches against pass 2's in DVL call 1's e1
+        if (t.size() >= 2 && t[1] == "fcensus") return fcensus::command(t);
+        // prepass mr [off|observe|reset|kv|dump|control none|nopw]: [Stereo] MainRegion (run 25 item 8d, test only, observe only): pass 1's e1 draws by 8f's would-be verdict, the misses census
+        if (t.size() >= 2 && t[1] == "mr") return main_region::command(t);
+        // prepass pprefresh [on|off|reset|kv]: [Stereo] PrepassPrevProjRefresh (run 25 item 4, test only): eye 2's rage_prev_proj rows 4-7 at pass 1's walk start
+        if (t.size() >= 2 && t[1] == "pprefresh") return prepass::pp_refresh_command(t.size() >= 3 ? t[2] : std::string());
+        if (t.size() >= 2 && t[1] == "wvp") {  // prepass wvp [on|off]: [Stereo] PrepassWvpMirror (run 17, test only); bare: the compare
+            if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) prepass::set_wvp(t[2] == "on");
+            return prepass::wvp_status();
         }
         return prepass::status();
     }
@@ -854,6 +1189,7 @@ std::string execute(const std::vector<std::string>& t) {
         }
         return out;
     }
+    if (c == "scope") return scope::command(t);  // (r55 item 11, [Scope]; "scope game": the run 29 spike's reads)
     if (c == "peek" && t.size() >= 2) {
         // peek <rva> [n]: n (<= 32) floats at RDR.exe+rva, read only after VirtualQuery shows them committed and readable
         uintptr_t a = anchors::base() + static_cast<uintptr_t>(std::strtoull(t[1].c_str(), nullptr, 16));
@@ -904,6 +1240,9 @@ std::string execute(const std::vector<std::string>& t) {
     if (c == "sample") {  // where the busy threads are: "[sample]" lines (RIP histograms; no unwind)
         return diag::sample_threads(t.size() >= 2 ? std::atoi(t[1].c_str()) : 20);
     }
+    if (c == "vq") {  // (2026-10-29, read only) RDR.exe's .data walked, VirtualQuery timed at the anchors' globals, the process's regions (image_mem.h)
+        return image_mem::report();
+    }
     if (c == "recdump") {  // the hang's recorder dump now (reads only): "[hang] rec ..." lines in the log
         diag::dump_recorder();
         return "logged the recorder's state ([hang] rec lines)";
@@ -931,7 +1270,8 @@ void json_escape(const char* in, char* out, size_t len) {
 }
 
 void write_status() {
-    char res[2048], fg[256], census[512], hooks_txt[2048], hooks_esc[2048], rt[160], ring_txt[320], ring[400], cam[400], rset[256],
+    // (run 25) res was 2048, which cut long replies such as "prepass mi kv" at 2046 chars
+    char res[12288], fg[256], census[512], hooks_txt[2048], hooks_esc[2048], rt[160], ring_txt[320], ring[400], cam[400], rset[256],
         mchk[900], dual_txt[768], dual[900], taa_txt[400];
     json_escape(g_result.c_str(), res, sizeof(res));
     json_escape(d3d::framegraph_status(), fg, sizeof(fg));
@@ -950,7 +1290,7 @@ void write_status() {
     vr_mode::status_text(vmode, sizeof(vmode));
     xr::submit_status(xsub, sizeof(xsub));
     taa::status_text(taa_txt, sizeof(taa_txt));
-    char buf[16384];  // every field at its buffer's length fits (the XR status is up to 1024)
+    char buf[32768];  // every field at its buffer's length fits (the XR status is up to 1024; res up to 12288)
     int n = std::snprintf(
         buf, sizeof(buf),
         "{\n  \"pid\": %lu,\n  \"uptime_ms\": %.0f,\n  \"cmd_seq\": %ld,\n  \"cmd_result\": \"%s\",\n"

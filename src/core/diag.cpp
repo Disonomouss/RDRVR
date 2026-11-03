@@ -12,10 +12,13 @@
 #include <vector>
 
 #include "core/anchors.h"
+#include "core/api.h"
 #include "core/config.h"
 #include "core/frame_probe.h"
+#include "core/image_mem.h"
 #include "core/log.h"
 #include "core/state.h"
+#include "core/vr_mode.h"
 
 namespace rdrvr::diag {
 
@@ -23,19 +26,10 @@ namespace {
 struct ImageRange {
     uintptr_t lo = 0, hi = 0, rdata_lo = 0, rdata_hi = 0;
 };
-ImageRange image_range() {
+ImageRange image_range() {  // from the loaded image's own headers (image_mem's, shared with the checked reads' fast path)
     ImageRange r;
-    auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
-    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    r.lo = reinterpret_cast<uintptr_t>(base);
-    r.hi = r.lo + nt->OptionalHeader.SizeOfImage;
-    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
-    for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i)
-        if (std::memcmp(sec[i].Name, ".rdata", 6) == 0) {
-            r.rdata_lo = r.lo + sec[i].VirtualAddress;
-            r.rdata_hi = r.rdata_lo + sec[i].Misc.VirtualSize;
-        }
+    image_mem::image(&r.lo, &r.hi);
+    image_mem::section(".rdata", &r.rdata_lo, &r.rdata_hi);
     return r;
 }
 }  // namespace
@@ -160,12 +154,41 @@ void module_rva(uintptr_t addr, char* out, size_t len) {
 }
 
 // Unwinds up to `max` frames from a context copy (no allocation).
+// The unwind's steps under SEH (2026-10-28, the review): a frame read wrongly (another thread's stack mid-change, a
+// corrupt one in the crash handler) ends the walk instead of faulting; the leaf's return address read guarded, not by
+// IsBadReadPtr (which can take a guard page away)
+PRUNTIME_FUNCTION lookup_guarded(DWORD64 rip, DWORD64* image_base) {
+    __try {
+        return RtlLookupFunctionEntry(rip, image_base, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+bool unwind_guarded(DWORD64 image_base, PRUNTIME_FUNCTION fn, CONTEXT* ctx) {
+    __try {
+        void* handler_data = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx->Rip, fn, ctx, &handler_data, &establisher, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool read_q_guarded(DWORD64 a, DWORD64* out) {
+    __try {
+        *out = *reinterpret_cast<const volatile DWORD64*>(a);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 int unwind(CONTEXT ctx, uintptr_t* out, int max) {
     int n = 0;
     for (; n < max; ++n) {
         out[n] = ctx.Rip;
         DWORD64 image_base = 0;
-        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        PRUNTIME_FUNCTION fn = lookup_guarded(ctx.Rip, &image_base);
         if (fn && g_probe) {  // the hang's recorder dump: this frame's own registers (the callees' unwound)
             const uintptr_t begin = static_cast<uintptr_t>(image_base) + fn->BeginAddress;
             FrameRegs* f = begin == anchors::addr(anchors::Id::ReplayChunk)        ? &g_at_replay
@@ -175,13 +198,13 @@ int unwind(CONTEXT ctx, uintptr_t* out, int max) {
             if (f && !f->seen) *f = {true, g_probe_tid, ctx.Rip, ctx.Rbp, ctx.Rbx, ctx.Rsi, ctx.Rdi, ctx.R14};
         }
         if (!fn) {  // leaf: return address is at [rsp]
-            if (!ctx.Rsp || IsBadReadPtr(reinterpret_cast<void*>(ctx.Rsp), 8)) break;
-            ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+            DWORD64 ret = 0;
+            if (!ctx.Rsp || !read_q_guarded(ctx.Rsp, &ret)) break;
+            ctx.Rip = ret;
             ctx.Rsp += 8;
-        } else {
-            void* handler_data = nullptr;
-            DWORD64 establisher = 0;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+        } else if (!unwind_guarded(image_base, fn, &ctx)) {
+            ++n;
+            break;
         }
         if (!ctx.Rip) {
             ++n;
@@ -231,15 +254,17 @@ LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-void log_threads(const char* why) {
+// only_tid: that thread alone (the script stall's: the game's thread), else every thread of the process
+void log_threads(const char* why, DWORD only_tid = 0) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
     DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
     THREADENTRY32 te{sizeof(te)};
     int logged = 0;
-    log::warn("[hang] %s: thread states follow", why);
+    log::warn("[hang] %s: thread states follow%s", why, only_tid ? " (the game's script thread only)" : "");
     for (BOOL ok = Thread32First(snap, &te); ok && logged < 192; ok = Thread32Next(snap, &te)) {  // run 7: 96 cut the list
         if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        if (only_tid && te.th32ThreadID != only_tid) continue;
         HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
         if (!th) continue;
         uintptr_t frames[10] = {};
@@ -285,6 +310,34 @@ T rdv(uintptr_t a) {
     T v{};
     if (!sraw(a, &v, sizeof(v))) return T{};
     return v;
+}
+
+// A thread's TEB (NtQueryInformationThread's ThreadBasicInformation; the handle needs THREAD_QUERY_INFORMATION). 0
+// when not found.
+uintptr_t teb_of(HANDLE h) {
+    using Query = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+    static const auto qi = reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    struct {
+        LONG status;
+        void* teb;
+        uintptr_t pid, tid, affinity;
+        LONG prio, base;
+    } tbi{};
+    ULONG got = 0;
+    return qi && qi(h, 0, &tbi, sizeof(tbi), &got) >= 0 ? reinterpret_cast<uintptr_t>(tbi.teb) : 0;
+}
+
+// How much of a suspended thread's stack may be read from rsp (2026-10-29, the review of 793f085): its TEB's NT_TIB
+// StackLimit (+0x10) and StackBase (+0x08) read now, while it is suspended, and 0 unless StackLimit <= rsp < StackBase;
+// else [rsp, StackBase), at most cap. A thread caught mid "sub rsp" inside its guard page (below StackLimit) would have
+// the guard page touched by the copy: its bit cleared, that stack could no longer grow (a crash later, and the game's
+// vectored handler runs before any __try); a fiber mid-SwitchToFiber has its TEB's bounds and rsp disagree.
+size_t stack_span(uintptr_t teb, uintptr_t rsp, size_t cap) {
+    uintptr_t base = 0, limit = 0;
+    if (!teb || !sraw(teb + 8, &base, 8) || !sraw(teb + 0x10, &limit, 8)) return 0;
+    if (!limit || limit >= base || rsp < limit || rsp >= base) return 0;
+    const size_t len = static_cast<size_t>(base - rsp);
+    return len > cap ? cap : len;
 }
 
 // A wait handle's state (the handle read at handle_at): a semaphore's count (NtQuerySemaphore), else an event's state
@@ -385,6 +438,10 @@ void log_chunk(const char* what, uintptr_t c) {
 // writer, or a stale chunk queued.
 }  // namespace
 
+namespace {
+void log_busy_stacks(DWORD tid, const char* name, int samples);  // (below, with the "stacks" unwind)
+}  // namespace
+
 std::string sample_threads(int n) {
     n = n < 1 ? 1 : n > 100 ? 100 : n;
     struct Th {
@@ -393,6 +450,7 @@ std::string sample_threads(int n) {
         uint64_t cpu0;
         char name[64];
         std::vector<std::pair<uint64_t, uint64_t>> rips;  // (rip, the qword at rsp)
+        uintptr_t teb;                                     // (0: [rsp] not read)
     };
     std::vector<Th> ths;
     const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
@@ -401,9 +459,11 @@ std::string sample_threads(int n) {
     THREADENTRY32 te{sizeof(te)};
     for (BOOL ok = Thread32First(snap, &te); ok && ths.size() < 256; ok = Thread32Next(snap, &te)) {
         if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        const bool full = h != nullptr;  // (else as before, without the TEB: no [rsp] read)
+        if (!h) h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
         if (!h) continue;
-        Th t{te.th32ThreadID, h, 0, "", {}};
+        Th t{te.th32ThreadID, h, 0, "", {}, full ? teb_of(h) : 0};
         FILETIME c, e, k, u;
         if (GetThreadTimes(h, &c, &e, &k, &u))
             t.cpu0 = (static_cast<uint64_t>(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (static_cast<uint64_t>(u.dwHighDateTime) << 32 | u.dwLowDateTime);
@@ -423,7 +483,8 @@ std::string sample_threads(int n) {
             ctx.ContextFlags = CONTEXT_CONTROL;
             uint64_t top = 0;
             if (GetThreadContext(t.h, &ctx)) {
-                sraw(static_cast<uintptr_t>(ctx.Rsp), &top, sizeof(top));
+                if (stack_span(t.teb, static_cast<uintptr_t>(ctx.Rsp), sizeof(top)) == sizeof(top))  // (inside its stack only)
+                    sraw(static_cast<uintptr_t>(ctx.Rsp), &top, sizeof(top));
                 t.rips.emplace_back(ctx.Rip, top);
             }
             ResumeThread(t.h);
@@ -463,6 +524,7 @@ std::string sample_threads(int n) {
             used += std::snprintf(line + used, sizeof(line) - used, " %s x%d (top %s);", where, hist[i].second, top);
         }
         log::warn("%s", line);
+        if (busy <= 4) log_busy_stacks(t.tid, t.name, 3);  // the first four busy threads' stacks: who calls what they are in
     }
     char out[160];
     std::snprintf(out, sizeof(out), "sampled %zu threads %d times over %.1f s: %d busy (over 10%% of a core) logged as [sample] lines", ths.size(), n, secs, busy);
@@ -558,6 +620,17 @@ DWORD WINAPI watchdog(void*) {
     // HangRecorderDump: the busy threads sampled and the recorder read)
     double win_start = log::now_ms();
     uint64_t win_presents = state::presents.load();
+    // 2026-10-28 (r204 P, r213 M: "script stalled" with Presents going on, every native timing out, no stack): a
+    // diagnostic, off unless [Debug] ScriptStallMs is set (the test inis): once a session, when the script tick has stopped
+    // that long while Presents continue, outside a pause and a loading screen (vr_mode's flags 2, 1), the stack of the
+    // thread the script tick runs on (the game's) is logged. Only that one thread is suspended for its context (not
+    // every thread: less risk of suspending one inside the loader lock); the walk's reads are guarded (unwind). The risk
+    // left: RtlLookupFunctionEntry takes the loader's function-table lock, which the suspended thread could hold (as for
+    // the Present hang's dump); the watchdog would then wait on it
+    const double stall_ms = config::get_int("Debug", "ScriptStallMs", 0);
+    uint64_t stall_ticks = api::script_ticks();
+    double stall_since = log::now_ms();
+    bool stall_reported = false, stall_dumped = false;
     int slow_windows = 0;
     bool slow_reported = false, late_reported = false;
     const double started = log::now_ms();
@@ -583,6 +656,31 @@ DWORD WINAPI watchdog(void*) {
                 if (rec_dump) {
                     log::warn("[hang] %s", sample_threads(20).c_str());
                     dump_recorder();
+                }
+            }
+        }
+        {
+            const uint64_t ticks = api::script_ticks();
+            if (ticks != stall_ticks) {
+                if (stall_reported)
+                    log::info("[hang] script ticks resumed (tick %llu, %.1f s without)", static_cast<unsigned long long>(ticks),
+                              (now - stall_since) / 1000.0);
+                stall_ticks = ticks;
+                stall_since = now;
+                stall_reported = false;  // (resumed: the next stall logs only its line, the dump is once a session)
+            } else if (!stall_reported && ticks > 0 && stall_ms > 0 && now - stall_since > stall_ms && presents > 0 && now - last < 1000.0 &&
+                       !(vr_mode::state_flags() & 3)) {
+                stall_reported = true;
+                char why[160];
+                const DWORD tid = static_cast<DWORD>(api::script_tick_thread());
+                std::snprintf(why, sizeof(why), "no script tick for %.1f s while Presents go on (tick %llu, frame %llu, the script thread %lu)",
+                              (now - stall_since) / 1000.0, static_cast<unsigned long long>(ticks), static_cast<unsigned long long>(presents),
+                              static_cast<unsigned long>(tid));
+                if (!stall_dumped && tid) {
+                    stall_dumped = true;
+                    log_threads(why, tid);
+                } else {
+                    log::warn("[hang] %s (its stack already dumped once this session)", why);
                 }
             }
         }
@@ -790,6 +888,45 @@ int unwind_copy(const CONTEXT& ctx, const uint8_t* copy, uintptr_t lo, size_t le
     }
 }
 
+// The hang sampler's busy thread (2026-10-29: the 4 Hz cycle's render thread sat in NtQueryVirtualMemory and the
+// sampler's RIP and [rsp] did not name the caller): a few of its stacks, each copied while the thread is suspended and
+// unwound after it runs again (as "stacks" does: no lock or allocation while suspended), one [sample] line each with
+// every frame's address (the callers': the return address of the call they are in)
+void log_busy_stacks(DWORD tid, const char* name, int samples) {
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) return;
+    const uintptr_t teb = teb_of(h);
+    if (!teb) {
+        CloseHandle(h);
+        return;
+    }
+    std::vector<uint8_t> copy(kStackCopy);
+    for (int s = 0; s < samples; ++s) {
+        if (s) Sleep(7);
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (SuspendThread(h) == static_cast<DWORD>(-1)) continue;
+        const bool got = GetThreadContext(h, &ctx) != 0;  // while it is suspended: its registers and a copy of its stack
+        size_t len = got ? stack_span(teb, static_cast<uintptr_t>(ctx.Rsp), kStackCopy) : 0;
+        if (len && !sraw(static_cast<uintptr_t>(ctx.Rsp), copy.data(), len)) len = 0;
+        ResumeThread(h);
+        if (!len) continue;
+        constexpr int kFrames = 24;
+        uintptr_t frames[kFrames], at[kFrames];
+        const int nf = unwind_copy(ctx, copy.data(), static_cast<uintptr_t>(ctx.Rsp), len, frames, at, kFrames);
+        char line[1600];
+        int used = std::snprintf(line, sizeof(line), "[sample] tid %lu \"%s\" stack %d/%d:", tid, name, s + 1, samples);
+        for (int i = 0; i < nf && used < static_cast<int>(sizeof(line)) - 140; ++i) {
+            char w[128];
+            module_rva(at[i], w, sizeof(w));
+            used += std::snprintf(line + used, sizeof(line) - used, " %s", w);
+        }
+        if (nf <= 0) std::snprintf(line + used, sizeof(line) - used, " (not unwound)");
+        log::warn("%s", line);
+    }
+    CloseHandle(h);
+}
+
 struct StackJob {
     DWORD tid;
     int n;
@@ -819,23 +956,9 @@ DWORD WINAPI stacks_worker(void* p) {
     static const char* const kPhase[frame_probe::kPhaseCount] = {"outside the scene", "before pass 1", "pass 1",
                                                                   "between the passes", "pass 2", "a mono pass"};
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, job.tid);
-    // the thread's stack top (its TEB's NT_TIB StackBase), the copy's end
-    uintptr_t stack_base = 0;
-    if (h) {
-        using Query = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
-        static const auto qi =
-            reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
-        struct {
-            LONG status;
-            void* teb;
-            uintptr_t pid, tid, affinity;
-            LONG prio, base;
-        } tbi{};
-        ULONG got = 0;
-        if (qi && qi(h, 0, &tbi, sizeof(tbi), &got) >= 0 && tbi.teb)
-            sraw(reinterpret_cast<uintptr_t>(tbi.teb) + 8, &stack_base, 8);
-    }
-    if (!h || !stack_base) {
+    // the thread's TEB: its NT_TIB's stack bounds, read at each sample (stack_span)
+    const uintptr_t teb = h ? teb_of(h) : 0;
+    if (!h || !teb) {
         log::warn("[stack] %s: the thread or its stack not found", job.name);
         if (h) CloseHandle(h);
         g_stacks_busy = false;
@@ -872,12 +995,8 @@ DWORD WINAPI stacks_worker(void* p) {
         // while it is suspended: its registers, the phase and a copy of its stack, nothing else
         const bool got = GetThreadContext(h, &ctx) != 0;
         const int ph = frame_probe::phase();
-        size_t len = 0;
-        if (got && ctx.Rsp < stack_base) {
-            len = static_cast<size_t>(stack_base - ctx.Rsp);
-            if (len > kStackCopy) len = kStackCopy;
-            if (!sraw(static_cast<uintptr_t>(ctx.Rsp), copy.data(), len)) len = 0;
-        }
+        size_t len = got ? stack_span(teb, static_cast<uintptr_t>(ctx.Rsp), kStackCopy) : 0;  // inside its stack only
+        if (len && !sraw(static_cast<uintptr_t>(ctx.Rsp), copy.data(), len)) len = 0;
         ResumeThread(h);
         if (!got || !len || ph < 0 || ph >= frame_probe::kPhaseCount) {
             ++failed;

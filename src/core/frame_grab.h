@@ -10,7 +10,10 @@ namespace rdrvr::frame_grab {
 void init();                                       // frame-end listener
 // Grabs the next presented frame to `path` (relative paths are in the game folder). Blocks up to timeout_ms;
 // returns a one-line result ("wrote <path> 2560x1440 ..." or "ERROR ...").
-std::string grab(const std::string& path, unsigned timeout_ms = 3000);
+// late (2026-10-29): after every frame-end listener (d3d::set_frame_end_last), so the grab holds what the monitor shows:
+// the UI mirror, the eye shape's repaint and the menu's desktop copy (xr.cpp's frame end) included; without it, before
+// them (its listener is among the first).
+std::string grab(const std::string& path, unsigned timeout_ms = 3000, bool late = false);
 // The scene depth of the next frame (copied from the game's own "Depth Resolve" copy), as "RDZ1" + width, height,
 // format + raw 32-bit texels. Absolute path.
 std::string grab_depth(const std::string& path, unsigned timeout_ms = 3000);

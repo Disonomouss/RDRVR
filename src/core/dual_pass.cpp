@@ -11,13 +11,20 @@
 #include <string>
 
 #include "core/anchors.h"
+#include "core/burst_grab.h"
 #include "core/camera_lever.h"
 #include "core/config.h"
 #include "core/d3d_hooks.h"
+#include "core/main_instanced.h"
+#include "core/main_region.h"
 #include "core/eye_shape.h"
 #include "core/frame_probe.h"
 #include "core/ring_probe.h"
 #include "core/hooks.h"
+#include "core/eye2_images.h"
+#include "core/fcensus.h"
+#include "core/gpu_stages.h"
+#include "core/pass2_skip.h"
 #include "core/prepass_arrays.h"
 #include "core/taa.h"
 #include "core/log.h"
@@ -42,6 +49,7 @@ T& global(Id id) {
 }
 
 thread_local int t_pass = 0;               // 1 = first pass of a double frame, 2 = second
+thread_local bool t_in_dvl1 = false;         // (item 8b's walk census) inside DVL call 1 of a double frame's pass
 thread_local bool t_ui_wait_taken = false;  // RenderFrame's UI wait was taken between the passes this frame
 thread_local bool t_double = false;         // this RenderFrame is a double frame (until its own post run ends)
 thread_local bool t_exposure_kept = false;  // this frame's first-eye run adapted the exposure and kept it
@@ -49,6 +57,7 @@ thread_local bool t_skip_adapt = false;     // inside the second eye's run: its 
 thread_local void* t_first_lum = nullptr;   // PostFx+0x80 after the first-eye run: the adapted value both eyes read
 thread_local int t_adapt_draws = 0;         // adaptation passes that ran in this double frame
 thread_local int t_rain_draws = 0;          // rain draws so far in this double frame
+thread_local uint64_t t_double_seq = 0;     // double frames begun on this thread ([Stereo] RouteFCensus's frame key)
 
 enum Split {
     kGrass, kGust, kLights, kForest, kPost, kMasks, kExposure, kRain, kPfxMap, kGodRays, kDamage, kClouds, kSunVis, kHold,
@@ -63,6 +72,7 @@ bool split_default(int i) { return i != kHold && i != kShadowUnion; }
 std::atomic<bool> g_on[kSplitCount];
 std::atomic<uint64_t> g_applied[kSplitCount];
 bool g_masks_hooked = false;
+std::atomic<uint64_t> g_gust_kept{0};  // [Stereo] PrepassWalkCut frames whose gust kept pass 1's shift
 
 // ---- SceneRender's semaphores. The helpers (0x140ebd8c0 wait, 0x140ebd830 release) take the semaphore object; its
 // handle is at +0. SceneRender waits on renderer+0x88 (frame data ready, site 0x5c389d) and releases renderer+0x68
@@ -177,8 +187,13 @@ void shadow_run(int k, ShadowAct act, Run run) {
     g_shadow_union[k].fetch_add(1, std::memory_order_relaxed);
     g_applied[kShadowUnion].fetch_add(1, std::memory_order_relaxed);
 }
+// ([Stereo] MainInstanced, test only; cascades_act) this pass's sun cascades at SceneRender's site: 0 not run yet, 1 the
+// eye's own fit, 2 the union's, 3 skipped (pass 2 reads pass 1's maps and fits)
+thread_local int t_casc_act = 0;
 void hk_CascadeRender(void* cascades, void* a2, void* light_dir, void* a4, uint64_t a5) {
-    const ShadowAct act = shadow_act(kCascades, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const ShadowAct act = shadow_act(kCascades, ret);
+    if (ret == g_shadow_ret[kCascades] && t_pass) t_casc_act = act == ShadowAct::Skip ? 3 : act == ShadowAct::Union ? 2 : 1;
     shadow_run(kCascades, act, [&] { o_CascadeRender(cascades, a2, light_dir, a4, a5); });
 }
 void hk_FacesRender(void* faces, void* a2, void* a3, void* a4) {
@@ -215,6 +230,16 @@ std::atomic<uint64_t> g_grass_level_draws{0};
 void forest_draw(void* forest, char mode);
 
 void hk_ForestDraw(void* forest, char mode) {
+    if (mode == 0 && fcensus::on()) fcensus::forest_e1();  // ([Stereo] RouteFCensus, item 8h' step 1, test only: point F, first)
+    if (mode == 0 && t_in_dvl1) {  // ([Stereo] PrepassGpuStages' walk census, item 8b: e1's end, the call's first mode 0 only)
+        t_in_dvl1 = false;
+        gpu_stages::walk_mark(t_pass, 2);  // (returns at once unless the walk census is on)
+        if (p2skip::installed()) p2skip::probe_e1();  // (item 8c's probe, before the census's point: whatever the flag is now, so an
+                                                      // open stretch always ends here; nothing when none is open and not r0)
+        if (gpu_stages::cpu_on()) gpu_stages::cpu_e1(t_pass);  // (item 8c's CPU census)
+        // ([Stereo] MainRegion, item 8d, observe only) e1's close marker; the main InstPrev mirror closed here (debris kind 3 out of it)
+        if (main_region::armed()) main_region::e1_end(t_pass);
+    }
     char* vp = global<char*>(Id::ViewportCurrent);
     if (mode != 1 || !vp || !camera_lever::level_grass_active()) {
         forest_draw(forest, mode);
@@ -486,14 +511,49 @@ std::atomic<int> g_drawlog{0};  // 0 off, 1 armed (next double frame), 2 logging
 
 void hk_DrawVisList(void* a, void* b, uint32_t* mask, int d, uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h, uintptr_t i,
                     uintptr_t j) {
+    // ([Stereo] MainInstanced, test only; off: one relaxed load) DVL call 1 of a double frame's pass: the main region's
+    // open marker before it, its fallback close after it (decided once: the close follows its open)
+    const bool mi = main_inst::armed() && t_pass != 0 && reinterpret_cast<uintptr_t>(_ReturnAddress()) == main_inst::dvl_ret();
+    if (mi) main_inst::dvl_open(t_pass);
+    // ([Stereo] PrepassGpuStages' walk census, GOAL-single-pass item 8b, test only; off: one relaxed load) segment e's open,
+    // and ForestDraw mode 0 inside this call is e1's end (t_in_dvl1)
+    // (item 8c, test only) the CPU census of the same call ("prepass gpu cpu on")
+    // (item 8c, test only) and Pass2FrontSkip's record-skip probe of pass 2's e1 ("prepass p2skip probe")
+    // ([Stereo] MainRegion, item 8d, test only) and MainRegion's observe: e1's end (its marker) on main_inst's DVL call 1 (mi)
+    const bool gw = ((gpu_stages::walk_on() || gpu_stages::cpu_on() || p2skip::probe_on()) && t_pass != 0 &&
+                     reinterpret_cast<uintptr_t>(_ReturnAddress()) == gpu_stages::walk_ret()) ||
+                    (mi && main_region::armed());
+    const bool gp = gw && p2skip::installed() && p2skip::probe_on();
+    const bool gc = gw && gpu_stages::cpu_on();
+    const bool in_dvl1 = t_in_dvl1;  // (put back after DVL call 1 only: a nested call leaves the flag, and a nested mode 0's clear stands)
+    // ([Stereo] RouteFCensus, item 8h' step 1, test only; off: one relaxed load) route F's state census: every call's nesting,
+    // DVL call 1's open and close (its own in-call state: t_in_dvl1 is set only for the census and probe above)
+    const bool fc = fcensus::on();
+    if (fc) fcensus::dvl_enter(t_pass, t_pass != 0 && reinterpret_cast<uintptr_t>(_ReturnAddress()) == fcensus::dvl_ret(), a);
+    if (gw) {
+        if (gpu_stages::walk_on()) gpu_stages::walk_mark(t_pass, 1);
+        t_in_dvl1 = true;
+    }
+    if (gc) gpu_stages::cpu_open(t_pass);
+    if (gp) p2skip::probe_open();  // (after the census's open: its time includes the probe's own)
     if (g_drawlog.load(std::memory_order_relaxed) != 2 || t_pass == 0) {
         o_DrawVisList(a, b, mask, d, e, f, g, h, i, j);
+        if (fc) fcensus::dvl_leave(t_pass, t_pass != 0 && reinterpret_cast<uintptr_t>(_ReturnAddress()) == fcensus::dvl_ret());
+        if (gp) p2skip::probe_close();
+        if (gc) gpu_stages::cpu_close(t_pass);
+        if (gw) t_in_dvl1 = in_dvl1;
+        if (mi) main_inst::dvl_close(t_pass);
         return;
     }
     uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress()) - anchors::base();
     uint32_t m = mask ? *mask : 0;
     uint64_t c0 = ring_probe::thread_cbvs();
     o_DrawVisList(a, b, mask, d, e, f, g, h, i, j);
+    if (fc) fcensus::dvl_leave(t_pass, t_pass != 0 && reinterpret_cast<uintptr_t>(_ReturnAddress()) == fcensus::dvl_ret());
+    if (gp) p2skip::probe_close();
+    if (gc) gpu_stages::cpu_close(t_pass);
+    if (gw) t_in_dvl1 = in_dvl1;
+    if (mi) main_inst::dvl_close(t_pass);
     log::info("[drawlog] pass %d ret %#llx mask %#x arg4 %#x cbvs %llu", t_pass, static_cast<unsigned long long>(ret), m,
               static_cast<unsigned>(d), static_cast<unsigned long long>(ring_probe::thread_cbvs() - c0));
 }
@@ -918,6 +978,10 @@ bool install() {
 }
 
 int pass() { return t_pass; }
+uint64_t double_seq() { return t_double_seq; }
+int cascades_act() { return t_casc_act; }
+bool masks_hooked() { return g_masks_hooked; }
+uint64_t gust_kept() { return g_gust_kept.load(std::memory_order_relaxed); }
 
 void shadow_status(char* out, size_t len) {
     size_t n = static_cast<size_t>(std::snprintf(out, len, "shadows %s, shadowunion %s, union viewport %s |",
@@ -941,18 +1005,33 @@ void begin_frame(void*) {
     t_exposure_kept = false;
     t_double = true;
     for (bool& d : t_shadow_done) d = false;
+    t_casc_act = 0;  // ([Stereo] MainInstanced: pass 1's own)
     t_adapt_draws = 0;
     t_rain_draws = 0;
+    ++t_double_seq;
     int armed = 1;
     if (g_drawlog.compare_exchange_strong(armed, 2)) log::info("[drawlog] double frame begins");
     std::memcpy(g_gust, reinterpret_cast<void*>(anchors::addr(Id::GustWind)), kGustBytes);
     std::memcpy(g_sunvis, reinterpret_cast<void*>(anchors::addr(Id::SunVisEma)), kSunVisBytes);
     t_pass = 1;
+    if (gpu_stages::on()) gpu_stages::mark(1);  // ([Stereo] PrepassGpuStages, test only: pass 1 begins)
+    if (eye2_images::on()) eye2_images::mark(1);  // ([Stereo] PrepassEye2Images, test only: global_textures and the descriptors' marker)
 }
 
 void between_passes(void* renderer, int) {
-    if (g_on[kPost].load(std::memory_order_relaxed)) first_eye_post(renderer);
-    if (g_on[kGust].load(std::memory_order_relaxed)) {
+    if (gpu_stages::on()) gpu_stages::mark(2);  // ([Stereo] PrepassGpuStages: pass 1's scene ends, before eye 1's post)
+    if (eye2_images::on()) eye2_images::mark(2);  // ([Stereo] PrepassEye2Images: pass 1's upload read back)
+    if (g_on[kPost].load(std::memory_order_relaxed)) {
+        burst_grab::first_post_mark(true);  // (a per-eye grab: its bind-1 copy must fall in this run)
+        first_eye_post(renderer);
+        burst_grab::first_post_mark(false);
+    }
+    // [Stereo] PrepassWalkCut: pass 2's pre-pass cut (prepass_arrays.cpp), decided here; its grass (ForestDraw mode 1,
+    // inside the cut) does not shift the gust again, so pass 1's shift is kept instead of put back (else every frame would
+    // end where it began: the fork review's must-fix 7)
+    const bool cut = g_masks_hooked && prepass::walk_cut_decide();
+    if (cut) g_gust_kept.fetch_add(1, std::memory_order_relaxed);
+    if (g_on[kGust].load(std::memory_order_relaxed) && !cut) {
         std::memcpy(reinterpret_cast<void*>(anchors::addr(Id::GustWind)), g_gust, kGustBytes);
         g_applied[kGust].fetch_add(1, std::memory_order_relaxed);
     }
@@ -960,16 +1039,22 @@ void between_passes(void* renderer, int) {
         std::memcpy(reinterpret_cast<void*>(anchors::addr(Id::SunVisEma)), g_sunvis, kSunVisBytes);
         g_applied[kSunVis].fetch_add(1, std::memory_order_relaxed);
     }
+    t_casc_act = 0;  // ([Stereo] MainInstanced: pass 2's own)
     t_pass = 2;
+    if (gpu_stages::on()) gpu_stages::mark(3);  // ([Stereo] PrepassGpuStages: pass 2 begins)
 }
 
 void end_frame(int) {
+    if (gpu_stages::on()) gpu_stages::mark(4);  // ([Stereo] PrepassGpuStages: pass 2 ends)
+    if (eye2_images::on()) eye2_images::mark(4);  // ([Stereo] PrepassEye2Images: pass 2's upload read back)
+    prepass::walk_cut_end();
     t_pass = 0;
     int logging = 2;
     if (g_drawlog.compare_exchange_strong(logging, 0)) log::info("[drawlog] double frame ends");
 }
 
 void mono_frame() {
+    prepass::walk_cut_end();
     t_exposure_kept = false;
     t_double = false;
 }

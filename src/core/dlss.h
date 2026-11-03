@@ -13,6 +13,7 @@
 // imports are resolved at run time). Kill switch: the first failed mod call turns it off (back to the shared viewport).
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace rdrvr::dlss {
@@ -24,6 +25,12 @@ std::string command(const std::string& line);  // "dlss": the state and counters
 // a double frame, or mono), read on the playback thread; false before any.
 bool last_jitter(float out[2]);
 void set_mv_scale(float k);
+// (r55 item 11, [Scope]) the upscaler's history of one eye's run discarded at its next evaluate (slot 0 the first-eye run,
+// viewport 1; 1 RenderFrame's run of a double frame, the game's viewport 0): an eye's camera jumped (the scope's view in
+// or out). The render thread, before the frame's post runs; recorded with that run (a marker before the game's own
+// constants for viewport 0), so it lands on that frame's evaluate. Nothing without the per-eye hook (DLSS off).
+void request_reset(int slot);
+void reset_counts(uint64_t* vp1, uint64_t* vp0);  // the resets put into the constants so far
 // [XR] EyeShapeDlss: the eye shape applied or ended under DLSS (the render thread, the DRS controller): the options are
 // sent again (the eye's output size, or the game's) at the next post run, before its evaluate
 void shape_changed();  // test aid ("dlss mvscale <k>"): both eyes' mvecScale times k (1 = as the game sets it)

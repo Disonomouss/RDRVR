@@ -16,6 +16,7 @@
 #include "core/hooks.h"
 #include "core/log.h"
 #include "core/prepass_arrays.h"
+#include "core/state.h"
 
 namespace rdrvr::taa {
 namespace {
@@ -192,6 +193,9 @@ void count_cut(const char* p, uintptr_t latch) {
     }
 }
 
+std::atomic<bool> g_reset_req[2] = {};  // (r55 item 11) request_reset's, per post slot
+std::atomic<uint64_t> g_reset_taken{0};
+
 void* hk_AaSlot(void* pfx, void* a2, void* a3, uintptr_t latch) {
     if (pfx) count_cut(static_cast<const char*>(pfx), latch);
     void* out = o_AaSlot(pfx, a2, a3, latch);
@@ -211,6 +215,10 @@ void* hk_AaSlot(void* pfx, void* a2, void* a3, uintptr_t latch) {
     void* next = h.rt[1 - h.t];
     void* eff = at<void*>(p, kTaaEffect);
     bool reset = at<char>(p, kReset) != 0 || !h.valid;
+    if ((slot == 0 || slot == 1) && g_reset_req[slot].exchange(false, std::memory_order_relaxed)) {  // (r55 item 11: the scope)
+        reset = true;
+        g_reset_taken.fetch_add(1, std::memory_order_relaxed);
+    }
     float params[4];
     std::memcpy(params, p + kTaaParams, sizeof(params));
     if (reset) params[0] = params[1] = 0.0f;  // the current frame only
@@ -262,6 +270,11 @@ void hk_TaaUpdate(void* pfx, void* vp, uintptr_t flag) {
 }
 
 }  // namespace
+
+void request_reset(int slot) {
+    if (slot == 0 || slot == 1) g_reset_req[slot].store(true, std::memory_order_relaxed);
+}
+uint64_t requested_resets() { return g_reset_taken.load(std::memory_order_relaxed); }
 
 bool install() {
     if (anchors::stand_down()) return false;
@@ -348,6 +361,11 @@ bool update_on(char* p, void* vp) {
 // gPrevViewProj; then eye 1's TAA state put back (the two blocks the update writes and the NDCToPrevNDC variable, as
 // the rain's call is put back). The snapshot itself is not touched.
 std::atomic<uint64_t> g_eye2_updates{0};
+uint64_t eye2_updates() { return g_eye2_updates.load(std::memory_order_relaxed); }
+// ([Stereo] PrepassEye2Velocity, test only; the render thread) eye 2's NDCToPrevNDC (+0x4b0) as this update made it, kept
+// before eye 1's is put back (research\run25\velocity2.md 2.1); the frame and the update's count it was made at
+float g_e2_ndc[16];
+uint64_t g_e2_ndc_frame = ~0ull, g_e2_ndc_seq = 0;
 void eye2_update(char* p) {
     void* vp2 = camera_lever::eye2_viewport();
     Snap& s2 = g_snap[1];
@@ -360,6 +378,9 @@ void eye2_update(char* p) {
     at<int>(p, kJitterIndex) = t_index_base - 1;
     reinterpret_cast<Persp_t>(anchors::addr(Id::ViewportPerspective))(vp2);  // without jitter, as pass 2 starts it
     update_on(p, vp2);
+    std::memcpy(g_e2_ndc, p + kNdcToPrev, sizeof(g_e2_ndc));  // (PrepassEye2Velocity: eye 2's, before eye 1's is put back)
+    g_e2_ndc_frame = state::presents.load();
+    g_e2_ndc_seq = g_eye2_updates.load(std::memory_order_relaxed) + 1;
     prepass::set_eye2(vp2, p + kPrevBlock + 0xc0);  // +0x4f0: gPrevViewProj
     std::memcpy(p + kJitter, a, sizeof(a));
     std::memcpy(p + kPrevBlock, b, sizeof(b));
@@ -398,6 +419,14 @@ void after_scene_wait(int pass) {
     std::memcpy(p + kJitterDelta, delta, sizeof(delta));
     (mono_update ? g_mono_updates : g_pass_updates).fetch_add(1, std::memory_order_relaxed);
     if (pass == 1 && !mono_update && prepass::views_wanted()) eye2_update(p);
+}
+
+bool eye2_ndc(float* out16, uint64_t* frame, uint64_t* seq) {
+    if (g_e2_ndc_frame == ~0ull) return false;
+    std::memcpy(out16, g_e2_ndc, sizeof(g_e2_ndc));
+    *frame = g_e2_ndc_frame;
+    *seq = g_e2_ndc_seq;
+    return true;
 }
 
 bool skip_scene_rain(uintptr_t ret) {

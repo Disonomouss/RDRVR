@@ -26,6 +26,11 @@ bool active();                    // technique 2 applied and the targets made
 void frame_start();               // render thread, before SceneRender: makes the targets once, when technique 2 is on
 void after_scene_wait(int pass);  // render thread, SceneRender's frame-data wait: 0 mono, 1, 2
 bool skip_scene_rain(uintptr_t ret);  // the rain draw returning to ret is SceneRender's: left to the post
+// ([Stereo] PrepassEye2Velocity, test only; the render thread) eye 2's NDCToPrevNDC (PostFx +0x4b0, 16 floats) as pass 1's
+// eye-2 update (PrepassViews, DLSS or TAA) made it, the frame (state::presents) and the update's count it was made at; false:
+// none made yet
+bool eye2_ndc(float* out16, uint64_t* frame, uint64_t* seq);
+uint64_t eye2_updates();  // (any thread) pass 1's eye-2 TAA updates since the start (PrepassViews; the instprev status)
 bool set_params(const float v[4]);  // TAAParams: still weight, moving weight, velocity scale, sharpening ("taa params")
 void set_shared(bool on);         // positive control: both eyes on one history and one TAA state ("taa shared on")
 // A mono pass whose camera the lever changed (the truth references) gets the update a double pass gets, on its own
@@ -35,6 +40,10 @@ void set_shared(bool on);         // positive control: both eyes on one history 
 void set_mono_pass(bool on);
 void status_text(char* out, size_t len);
 void cut_text(char* out, size_t len);
+// (r55 item 11, [Scope]) the history of one post run discarded at its next resolve (slot 0 the first-eye run, 1 RenderFrame's run
+// of a double frame): an eye's camera jumped (the scope's view in or out). The render thread, before the frame's post runs.
+void request_reset(int slot);
+uint64_t requested_resets();  // the resets taken so far (the scope's status)
 void set_jitter_units(bool on);  // [Render] DlssJitterUnits at run time ("dlss units on|off")  // what discarded the upscaler's history (velocity clears, resets), per post run
 
 }  // namespace rdrvr::taa

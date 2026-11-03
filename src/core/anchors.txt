@@ -186,6 +186,10 @@ ArmBlock                 func   0xd1e640   # FUN_140d1e640(G): the arm block, th
 # --- run 7 item 2: the gun-butt melee (research\round13\gun-melee.md 3, 5.4; Ghidra 2026-10-08)
 ActorHit                 func   0xae1760   # FUN_140ae1760(actor, DamageInfo*): the actor takes a hit (its AI's attacker memory, KO points or health, the hit record its action tree reacts to, the hit event); the fist melee FUN_140d007f0 and KILL_ACTOR_WITH_KILLER's FUN_140ad1f60 call it
 GameTime                 global 0x2314d3c  # float: the game's clock (s) the melee stamps its DamageInfo with (info +0x90, FUN_140d007f0 0x140d01ab6) and FUN_140ae1760 its AI records
+# --- 2026-10-29, [Hands] OffHandItems stage B (research\run28\offhand_items.md 3.2; capstone, Ghidra offline)
+FireProjectileCore       func   0x3ba970   # FUN_1403ba970(actor-pool handle ecx, const char* weapon name, float spread xmm2, Vector3* origin r9, Vector3* target [rsp+0x20]): FIRE_PROJECTILE's core (its handler 0x1403becb0); the named weapon's info by the name map, [[[info +0x30] +0x60]] +0x70 its first fire entry's projectile (+0x60 and [+0x60] unchecked), a projectile from the shared pool 0x142b1d8a0, FUN_140320180, the launch FUN_1403237a0 (weapon type 0, 650 m/s)
+WeaponInfoTree           global 0x2b1d398  # the weapon-info tree's root (node +8 the eWeapon, +0x18 lower, +0x20 higher, +0 the entry; entry +0x20 the weapon info: +0x1b8 a word, set when +0x1ba holds the internal name), as GET_WEAPON_INTERNAL_NAME's handler 0x1402d8d70 walks it
+WeaponNameMapOwner       global 0x2c82388  # [it] +0x10: the weapon infos' name map FUN_1403ba970 looks a name up in (FUN_140590540: buckets [+0x18], their count u32 +0x10, the ELF hash; node +0 the key, +8 the info, +0x10 the next)
 # --- DLSS per eye (research\run6\dlss.md H2-H5; Ghidra, 2026-10-07)
 DeferredAppend           site   0xecc9b0 10 # FUN_140ecc9b0 (recorder, fn, data, size): the deferred recorders' vt+0x2d8, a callback for the playback thread (the data copied)
 DlssEvalCallback         site   0xfced10 5 # the DLSS evaluate callback: mov rdx,rcx; xor ecx,ecx; jmp FUN_140fcf6b0 (slSetTag, slEvaluateFeature on 0x142260478)
@@ -230,8 +234,30 @@ MeleeTrackStart          func   0xd54900   # MeleeAnimationTrack's start (self):
 RecorderDraw             func   0xecd690   # (recorder, topology, index count): records draw packet 0x2c, replayed by RenderThread as DrawIndexedInstanced(count, 1, 0, 0, 0); the recorder's vtable +0x190 (research\run3\deferred_draw.md)
 RecorderDrawAt           func   0xecd4f0   # (recorder, topology, start, count, base vertex): records packet 0x2b, replayed as DrawIndexedInstanced(count, 1, start, base, 0); vtable +0x188
 RecorderVtbl             global 0x105abb8  # the draw recorder's vtable (FUN_140eca8e0's): TLS +0x30 on the recording threads (the game's own D3D thread mode)
+# --- run 19 item 2 (research\run19\velocity.md section 4): [Stereo] PrepassCutVelocity, test only, optional
+VelocityPass             func   0x873920 16 # FUN_140873920(postfx): GenerateVelocityBuffer (a .pdata function, its one caller SceneRender 0x1405c3e74, once a pass): technique 2-5, motion blur +0x5a4 or an upscaler; binds +0x3f0 with +0xf8, a full-screen DrawQuad on rdr2_taa (+0x128), NDCToPrevNDC its variable +0x3c4
+RecorderStamp            global 0x2893480  # DAT_142893480: the recorder's CB stamp (FUN_140ec5fb0 bumps it); a CB's commit FUN_140ecc150 uploads only when its +0x24 differs, else binds its +0x28
+# --- run 19 item 2 (research\run19\instprev.md section 4; Ghidra 2026-10-21): [Stereo] PrepassInstPrevMirror, test only, optional
+PassBind                 func   0x1514d0   # FUN_1401514d0(pass, vs, ps, ?, ?): the pass bind; rmcInstDrawModel 0x87d950 calls it at 0x14087de0e between its publish (c38 set) and the draw's commit
+InstPrevWvp              func   0x132640   # FUN_140132640(vp, out, W): an instance's previous WVP, (W - (vp+0x70 & mask)) x vp+0x200 (no-op unless vp+0x371); called, never hooked
+InstBufCur               global 0x2ac0a20  # DAT_142ac0a20: the instanced draw's current-matrix object (FUN_140159fc0, frame arena)
+InstBufPrev              global 0x2ac0a18  # DAT_142ac0a18: its previous-matrix object (+0x00 n, +0x28 layout, +0x88 CB, +0x140 storage)
+ExtraCbInstMtx           global 0x2ac0c48  # DAT_142ac0c48: rage_instancemtx's CB for the draw (object +0x88), zeroed after the draw
+ExtraCbInstMtxPrev       global 0x2ac0c38  # DAT_142ac0c38: rage_instancemtxprev's CB for the draw (object +0x88), zeroed after the draw
+# --- run 18 item 4 (P2, research\run18\p2.md sections 2, 3, 8): [Stereo] RecorderReemit / PrepassRecordSkip, test only, optional
+RecReemitState           func   0xec7090 20 # FUN_140ec7090(ctx): the record side's re-emit from the ctx (targets x2, depth-stencil, viewport, scissor, program, IB, PSO, IA); ctx +0x120 = 0
+CbCommitted              global 0x2ac0b5f  # DAT_142ac0b5f: the bound pass's CB tables committed (zeroed by every pass bind and the unbind FUN_140151430)
+PassCurrent              global 0x2ac1e68  # DAT_142ac1e68: the current shader pass (0 after the unbind FUN_140151430; BindCache 0x2ac1e60 the persistent one)
+CbList                   global 0x2ac0c58  # DAT_142ac0c58: the bound pass's VS CB list (FUN_14014a770 reads its +0x40; zeroed by the unbind FUN_140151430): the skip's repair clears CbCommitted only with it set
 DrawModelGeometry        func   0x167720   # (shader, model, geometry index, matrix set, ?, byte): one geometry's passes (FUN_1401672d0 begin, the geometry's vtable +8 draw, FUN_1400bfa10 end); FUN_14087f2a0 calls it per geometry of a drawable's model
 MuzzleFxMatrix           func   0x301680   # (W, &matrix ptr, &local): the muzzle flash's followed matrix (FUN_1406b6280 keeps the pointer at fx +0x170): the prop's muzzle bone, else W +0x80 (run 4 item 3: the copy's flash)
+IdleFxMatrixRet          site   0x6b84cb 8 # its return address in FUN_1406b8440 (the held weapon's idle effect: the fire bottle's flame, the torch's; research run 28): FUN_140301680's pointer becomes the effect's followed matrix (fx +0x170) when it is created
+# --- 2026-10-29, [Hands] OffHandTorchLit (research\run28\torch_second_gun.md way (d'); capstone this session)
+IdleFxStart              func   0x6b8440   # FUN_1406b8440(unused rcx, W rdx, const float* offset r8, const float* rot r9): the held weapon's idle effect (RMPTFX def [[W +0x28] +0x3b8] +0x78, [W +0x28] unchecked), found or made keyed by W (FUN_140726b10 on 0x1422e61b8: asked each tick to live); FUN_140304120's default case (the torch, 33) calls it at 0x140304464 (its arguments loaded at 0x140304453-0x14030445d) with the two globals below
+IdleFxOffset             global 0x2c370c0  # the float[3] offset FUN_140304120 passes FUN_1406b8440 for the torch (r8, lea at 0x14030445d)
+IdleFxRot                global 0x22a4650  # the rotation FUN_140304120 passes FUN_1406b8440 for the torch (r9, lea at 0x140304453)
+DeadEyeUpdate            func   0x348980   # (player info): the Dead Eye state machine, each frame on the game thread: +0x3bd multilock (level 2+), +0x3be bit 1 auto-paint (level 2) else the paint button (level 3) (research run 28)
+PppDirtyPtr              global 0x2ac5118   # a pointer to the post-process presets' dirty bytes: [0] the sky update copies the active preset again, [1] reloads every preset from disk (research run 28)
 # --- run 7 item 4: eyes in the headset's own shape (research\run7\eye-shape.md 7; Ghidra 2026-10-08, every func a .pdata entry)
 DrsSubregion             func   0x5c26a0   # FUN_1405c26a0(renderer, W, H): renderer +0x554/+0x558 = round(+0x550 x W, H), then SetSize (used, used, W, H) on the render class (renderer +0x540/+0x548, the lighting +0x878, PostFxSetSizes, the shadow collector, the grass, ExtraSceneTarget)
 DrsController            func   0x5c7d80   # FUN_1405c7d80(renderer): once a frame (RenderFrame 0x1405c88b2, render thread): clears the RTs' +0x2c dirty bytes, then DrsSubregion when the scale or the technique changed
@@ -252,6 +278,7 @@ GraphicsOptions          global 0x22ca340  # rage__GraphicsOptions (graphicsOpti
 WindowSizeW              global 0x225b088  # the client width FUN_140ec38b0 creates the window at (FUN_140ebfa60 sets it from the boot size, 0x14012e642)
 WindowSizeH              global 0x225b08c  # its height
 WindowCreate             func   0xec3770   # (1, fullscreen, ?, ?): the grcWindow made (FUN_140ec38b0 reads WindowSizeW/H); its only caller 0x14012e65d
+BootDeviceInit           func   0x12e420   # the boot device init FUN_14012e420 (main thread; its only caller 0x1401ef134 passes r8): RenderThreadId written at its entry, the sysParams read, then WindowCreate and the device. [Launcher] ShowAtStart holds the game here until the launcher closes (launcher_start.cpp)
 OptionsSave              func   0x158be0   # (): graphicsOptions.xml written from GraphicsOptions (the Graphics menu's applies, ApplyAll at boot)
 EnumDisplaySettingsSlot  global 0x104c870  # RDR.exe's import slot of user32!EnumDisplaySettingsW (the mode list FUN_140f8b9c0 calls through it)
 ModeListRetNext          site   0xf8bc08 8 # the return address of the mode list's next-mode call (EnumDisplaySettingsW(device, i, &mode), i >= 1)
@@ -271,3 +298,59 @@ MiragerDownsample        func   0x678b00 # PostFx vt+0x98 (postfx): the post cha
 # --- 2026-10-12: the audio listeners (research/run12/audio.md)
 AudioUpdateListeners     func   0xde1e60 # (camMtx: the update side's camera, [[CamManager]+8]+0x1d0): the panning listener 0x142c34bf0 (a copy), the volume one 0x142c34bb0, the environment's position; from the main frame (0x1f5954)
 AudioOutputMatrix        func   0xf6baa0 # (voice, send, out): a voice's XAudio2 output matrix from its send's 8 gains (+0x68 sends, 0x28 each: the voice +0, the gains +8, FL FR C LFE BL BR SL SR); a mono voice keeps only the first dst channels (stereo: FL FR, the rear dropped)
+# --- 2026-10-21: the game's focus (research/run16/focus.md): [Debug] BackgroundFocus, test only (the bench's no-focus cycles)
+WindowVtblIsActive       global 0x105a530 # the game window's vtable 0x14105a448, slot +0xe8 (IsActive): holds WindowIsActive
+WindowIsActive           site   0x100df0 8 # the shared getter movzx eax,[rcx+0xad]; ret (+0xad: written only by WM_ACTIVATEAPP, 0x140ec4d8e); never patched
+PadFocusGateCall         site   0xee7f13 8 # FUN_140ee7e20 (the pad update): call [rdx+0xe8]; test al: inactive skips the XInput poll (returns to +6)
+FocusPauseCall           site   0x1f5868 8 # FUN_1401f5820 (the frame update): call [..+0xe8]: inactive opens the pause menu with bFocusPaused (returns to +6)
+# --- run 20 item 5: [Stereo] PrepassEye2Collector (research/run20/p3-textures.md section 5; test only, all three optional)
+DirCollector             func   0x6e58a0   # FUN_1406e58a0(lighting, viewport, r8 unused, r9b the cloud flag, [rsp+0x28] char, [rsp+0x30] unused, [rsp+0x38] the cascade count): segment a's directional collector term (PS_DirectionalShadowWithoutClouds); callers 0x5cbfd0 and 0x5cbad0
+DirCollectorCall         site   0x5cc54d 5 # 0x5cbfd0's call of it (return 0x5cc552): after the cloud flag (0x886a30) and the cascades' globals, the collector locked with the depth (0x5cc395)
+LightStencilRef          global 0x2ad1cdc  # DAT_142ad1cdc (4 bytes): the lighting's stencil reference, set into state 0x19 and zeroed by 0x6e58a0's interior branch (0x1406e5ce3)
+# --- run 21 item 5: [Stereo] PrepassEye2Light (research/run21/p3-light.md section 3; test only, all optional)
+LightFrontHalf           func   0x6e0450   # FUN_1406e0450(lighting, cull view): segment b, the lights into the Light Buffer (0x6e0280 the lists from the cull view and ViewportCurrent; Lock(0, LB, depth) in 0x6e1b60; the +0x5400 copy at its tail); one caller
+LightFrontHalfCall       site   0x5c3e48 5 # SceneRender's call of it (return 0x5c3e4d): lighting = *DAT_142ad1ce0, the cull view at SceneRender's [RBP-0x70]
+CullViewCtor             func   0x191920   # FUN_140191920(cv): the cull view's constructor (0x328 B; base 0x191600); no destructor (SceneRender 0x5c3dd3)
+BuildCullView            func   0x8604a0   # FUN_1408604a0(cv, vp, vp + 0x40): the cull view from a viewport (window, near/far, planes at cv +0x1c0); SceneRender 0x5c3de3
+Footprints               func   0x193060   # FUN_140193060(list): the footprints into the collector (per entry list vt+8(list, ViewportCurrent)); one caller
+FootprintsCall           site   0x5cc5df 5 # 0x5cbfd0's call of it (return 0x5cc5e4), inside the collector lock, after its render states (0x5cc59c..0x5cc5d6)
+LightVolumes             global 0x2ad1d98  # DAT_142ad1d98: the light-volume list (0x70 B entries, +8 ushort count, +10 capacity): appended by 0x6df150 (0x6ffed0), drained only by 0x700ee0 (SceneRender 0x5c4368)
+LightPoolA               global 0x2c8ac98  # DAT_142c8ac98: a light pool (+8 the lights, count at +0x1008), culled by 0x6df150 (each light's rect at +0x60..+0x80)
+LightPoolB               global 0x2c8aca0  # DAT_142c8aca0: the other light pool (+8 the lights, count at +0x808)
+ScissorSet               func   0xec7e90 27 # FUN_140ec7e90(ctx, rect): the recorder context's scissor at +0x148..+0x154, then ctx+0x128 vt+0x80 (0x6dfba0's tail sets it)
+# --- run 23: [Stereo] PrepassEye2Decals (research\run23\decals.md; test only)
+DecalMgr                 global 0x2ac50f0  # DAT_142ac50f0: the collector-decal manager (vtable 0x141cd7ff0: +0x58 the build 0x5e0c30, +0x70 the draw 0x5e0dc0)
+DecalDraw                func   0x5e0dc0   # DecalMgr vt+0x70: wheel tracks 0x6eb9b0, footprints 0x716a10, gravestone text 0x65e210, decals 0x714af0 into the collector
+ImmRingCursor            global 0x2c371c8  # DAT_142c371c8: the immediate ring cursor (0x12e280 executes int3 above 0x2000000)
+# --- run 23: [Stereo] PrepassEye2Images (research\run23\images.md section 5, the allocator route; test only, all optional)
+DescAlloc                func   0xf732b0   # FUN_140f732b0(dev, rec*, heap type, partition, name (unused), count): a descriptor record (0x28 B: +0 type, +4 partition, +8 increment, +0xc size, +0x10 the heap index, +0x14 the partition's, +0x18 CPU, +0x20 GPU) under the CS dev+0x430; a partition's overflow writes to address 3
+GlobalTexturesCb         global 0x2ac10b0  # DAT_142ac10b0: the global_textures CB object (+0 storage, +8 layout: +0x14 the declared size 0xc0, +0x18 mapped, +0x24 the stamp, +0x28 the last CBV's GPU handle); stored by the effect loader 0x14dc16
+GlobalTexTable           global 0x2b07700  # DAT_142b07700: the global variables' texture table, id h at +h*0x48 (+0 ushort the register, +2 byte a texture, +8/+0xc the cache); FUN_140149140 writes storage +4r-0x258 and +4r-0x1f8
+GlobalVarCount           global 0x2b0ba90  # DAT_142b0ba90: the global variables' count (ids 1..n of GlobalTexTable and ShaderGlobalTable; the effect loader 0x14df47 writes it)
+# --- run 25 item 3: [Stereo] MainInstanced, the billboard compare (research\run24\billboard.md sections 3 and 8; test only, all optional)
+MainDvlCall              site   0x5b3e85 5 # RenderVisPhase 0x5b3c60's call of DrawVisList (mask 0xb, return 0x5b3e8a): DVL call 1, buckets 0, 1 and 3 of the main walk (the billboards in bucket 1's post 0x5c1970)
+ShadowCamMtxId           global 0x2c8ad8c  # DAT_142c8ad8c: gCameraMatrix's shader global id (0x87bcd0 resolves it; ShaderGlobalTable[id]: rage_shadowmap_common rows 0-3)
+ShadowPixelSizeId        global 0x2c8ad98  # DAT_142c8ad98: Shadowmap_PixelSize0's shader global id (0x87bcd0; rage_shadowmap_common row 9)
+# --- run 25 item 7's S2: [Stereo] Pass2FrontSkip (research\run25\item7.md sections 5 and 7; Ghidra 2026-10-23, read only; test only, all optional)
+DecalDrawCall            site   0x5cc3d2 13 # 0x5cbfd0's DecalMgr vt+0x70 call: mov rcx,[DecalMgr]; mov rax,[rcx]; call [rax+0x70] (0x1405cc3dc, return 0x5cc3df), after the collector's Lock (0x5cc395) and RenderStateSet(6, 0) (0x5cc3cd)
+FadeValue                site   0x5bc930 45 # FUN_1405bc930() (a leaf): 1 when its byte 0x22e1758 is 0, else clamp((0x22e1754 - 0x22e174c) / 0x22e1750, 0, 1); its four globals read from these bytes
+FadeBranchCall           site   0x5cc4df 30 # 0x5cbfd0's call of FadeValue (return 0x5cc4e4): == 0 -> 0x5c1220(renderer), then the front object's pass (+8) vt+0x18 = 0x1407059e0 (stencil marks into the depth when that pass's +0x87 != 0)
+FrontPassMarks           func   0x7059e0   # FUN_1407059e0(pass): the front pass's vt+0x18 (the fade branch's call): stencil-only marks into the depth (DrawVisList mask 0x10) only when pass +0x87 != 0; compared with the slot at run time
+FrontPassOwner           global 0x2ad35f0  # DAT_142ad35f0: 0x5cbfd0's front object (rbp from 0x1405cc15c: +8 the pass object the fade branch calls, +0x10 the footprint list, +0x18 the cloud object)
+# --- run 25 item 8h' step 1: [Stereo] RouteFCensus, route F's state census (research\run25\item8f_census.md; Ghidra 2026-10-23, read only; test only, all optional)
+DvlPostB0Body            func   0x6ddbe0   # FUN_1406ddbe0(*0x142ad1ce0): bucket 0's post body in DVL call 1, entered by the stub 0x5c1950's jmp (0x5c1968, its only caller: 0x142ac1d47 = 0, 0x142272488 = -1 first); push rbp; push rbx; lea rbp,[rsp-0x608]; .pdata 0x6ddbe0-0x6ddc6c
+DvlPostB1                func   0x5c1970   # FUN_1405c1970(rcx, phase record): bucket 1's post in DVL call 1 (render state 5, the override, sunvis, trees, 0x5c1620, ..., ForestDraw mode 0); mov rax,rsp; sub rsp,0x168; .pdata 0x5c1970-0x5c197a
+# --- 2026-10-27, run 27 item 3: [Holsters] WheelPause (research\run27\wheelpause.md 1.2, 2 and 5.2; read only, optional)
+TimeWarpClock            global 0x2ac2aa0  # DAT_142ac2aa0: a pointer to the clock and its time-warp controller (Dead Eye's; SET_TIME_WARP 0x1406583c0 and CANCEL_TIME_WARP 0x140658400 load it, mov rcx,[rip+..] at 0x1406583d0 / 0x140658404): +0x0c the target scale, +0x10 the base, +0x28 the duration left, +0x30 active (byte)
+# --- 2026-10-28, run 28 item 1c: the Dead Eye X in the headset and the marks by the barrel ([Hands] DeadEyeMarks, DeadEyeBarrelPaint; after optimumbox's fork, v0.8.11.9, commit ac942427, MIT; research\run28\deadeye.md; read with capstone, all optional)
+ReticleHudUpdate         func   0x34bc00   # (player info, ped, T, ?): each tick the reticle's and Dead Eye's UI; the marks' UI (DeadeyeMarksUi at 0x14034c00b) only while channel 0's camera ([[CamManager +8] +0x18] +0x10, read at 0x14034bd09) is the gameplay camera ([CamManager +0x28]); the duel's marks (0x14034bfc9) regardless. Non-leaf (indirect calls)
+DeadeyeMarksUi           func   0x394300   # (T, viewport = [CamManager +0x28] +0x150): each mark of T +0x6050 (node +0 the mark, +8 next; skipped when mark +0x3e bit 4): MarkWorldPos, then ViewportPointVisible shows or hides its "DeadeyeLocks" element and ScreenToUi places it (at most 0x1b elements); the duel's path (+0x30 of [[T +0x10] +0x38] +0xaa8] +0x20 set) FUN_140d07680 per mark. Non-leaf (indirect calls)
+MarkWorldPos             func   0x3dcc50   # (mark, out float4): a Dead Eye mark's world point (its actor's bone and offset). Non-leaf
+ViewportPointVisible     func   0x1335d0   # (viewport, point) -> al: the frustum test (+0x70 the eye, +0x50/+0x40/+0x60 the axes, +0x348/+0x34c the half-angle tangents), 0 outside. A LEAF (rax rcx r8 xmm0-6, xmm6 saved): its callers keep r9-r11 live (0x1403945c2: r9 the element's vtable); only an asm thunk that leaves every register but rax and the flags
+ScreenToUi               func   0x6c59f0   # (out, in): screen pixels (the game's frame) to the UI movies' units. Non-leaf (calls 0x140eb9090)
+TargetingUpdate          func   0x39bec0   # (T = player actor +0xb8; rcx only): each tick the probe along the aim ray, the target (T +0x3900), and a Dead Eye mark when painting is asked (T +0x6084; with +0x6085 set only once its assisted pick r12b was found, 0x14039caaf: the add FUN_14039a3f0 at 0x14039cae7). Non-leaf (indirect calls)
+DeadeyeVisRet            site   0x3945c7   10 # the return from DeadeyeMarksUi's ViewportPointVisible call (movzx edx,al; mov rcx,rbx; call [r9+0x20]: r9 live across the call)
+DeadeyePosRet            site   0x394597   8  # the return from DeadeyeMarksUi's MarkWorldPos call on the DeadeyeLocks path (mov rax,[rbx]; mov dl,1; mov rcx,rbx: nothing volatile live)
+DeadeyePosRet2           site   0x394355   8  # the return from DeadeyeMarksUi's MarkWorldPos call on the duel's path (lea rdx,[rsp+20h]; mov rcx,rbp: nothing volatile live)
+DeadeyeUiRet             site   0x3947fd   8  # the return from DeadeyeMarksUi's ScreenToUi call (movss xmm0,[rbx+9Ch]: nothing volatile live)
+DeadeyeUiRet2            site   0xd076db   8  # the return from FUN_140d07680's ScreenToUi call, the duel's marks (mov rbx,[rip+..]: nothing volatile live)

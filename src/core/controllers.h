@@ -59,5 +59,11 @@ void status_text(char* out, size_t len);
 bool active();  // created, synced, and at least one hand tracked in the last sync
 // A short vibration on one hand (0 left, 1 right), sent with the next sync unless the game's rumble is on. Any thread.
 void pulse(int h, float amplitude, int ms);
+// [Hands] HandSmoothing (2026-11-02, GOAL-older-items item 22; after optimumbox's 0.8.11.11, the idea only): a 1-euro
+// filter on each controller's located poses (the aim's and the grip's), the sync's and the late latch's: its cutoff
+// 1 Hz held still, raised 10 Hz per m/s and 4 Hz per rad/s of the filtered speed: a still hand steady, a moving one
+// keeping up. Off: the poses as the runtime gives them. Any thread.
+bool hand_smoothing();
+void set_hand_smoothing(bool on, bool save);  // save: the user ini
 
 }  // namespace rdrvr::controllers

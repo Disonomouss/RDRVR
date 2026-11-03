@@ -25,6 +25,8 @@ What is installed in the game folder
 - dinput8.dll, RDRVR.Gameplay.red, RDRVR.ini: the mod. RDRVR.ini holds the settings it starts with; what you change
   in the in-headset menu is saved in %LOCALAPPDATA%\RDRVR\RDRVR.user.ini and wins over it.
 - RDRVR_click_*.wav: the empty gun's clicks.
+- RDRVR_Launcher\RDRVR_Launcher.exe: the launcher (the mod's settings on your desktop; it opens as the game starts).
+- RDRVR_Converter\: the shader converter for single-pass stereo (its DXC DLL beside it).
 
 Note: the game sends its crash reports to Rockstar. RDRVR is not affiliated with Rockstar Games or Take-Two.
 Licence: MIT (LICENSE.txt); third-party notices in THIRD-PARTY-NOTICES.txt.

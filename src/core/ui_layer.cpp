@@ -13,11 +13,14 @@
 
 #include "core/anchors.h"
 #include "core/d3d_hooks.h"
+#include "core/d3d_util.h"
+#include "core/deadeye.h"
 #include "core/log.h"
 #include "core/post_target.h"
 #include "core/state.h"
 #include "core/xr.h"
 #include "core/xr_blit.h"
+#include "core/pso.h"
 
 namespace rdrvr::ui_layer {
 namespace {
@@ -129,9 +132,22 @@ const char kShader[] = R"(
 Texture2D<float4> ui : register(t0);
 // src: the UI pixel drawn at the destination's origin (the wrist HUD's crop); hole, hole2: UI pixels left out (x0 y0
 // x1 y1; the wrist HUD's corner, the hand-placed wheel's rect); scale: UI pixels a destination pixel, size: the UI
-// target's (ps_quad_box only)
-cbuffer K : register(b0) { float gamma; float2 src; float pad; float4 hole; float2 scale; float2 size; float4 hole2; };
-bool cut(int2 p) { return (p.x >= hole.x && p.x < hole.z && p.y >= hole.y && p.y < hole.w) || (p.x >= hole2.x && p.x < hole2.z && p.y >= hole2.y && p.y < hole2.w); }
+// target's (ps_quad_box only). mode.x 1: the wrist HUD's shape (2026-10-26, "Subtitles appear partly on wrist and
+// partly on screen"): hole is the ammo counter's box and ell the radar's ellipse (centre x y, radii x y), the wrist
+// HUD being only those; mode.y 1: everything but the shape left out (the wrist's crop), else the shape (the quad).
+// hole3: the Dead Eye X's slots in use (deadeye.cpp; after optimumbox's fork, v0.8.11.9, commit ac942427, MIT), left out
+// of everything drawn from the UI but the X's own sprites
+cbuffer K : register(b0) { float gamma; float2 src; float pad; float4 hole; float2 scale; float2 size; float4 hole2; float4 ell; float4 mode; float4 clip; float4 hole3; };
+bool inrect(int2 p, float4 r) { return p.x >= r.x && p.x < r.z && p.y >= r.y && p.y < r.w; }
+bool cut(int2 p) {
+    bool s = inrect(p, hole);
+    if (mode.x > 0.5) {
+        float2 d = (float2(p) + 0.5 - ell.xy) / max(ell.zw, float2(1, 1));
+        s = (s || dot(d, d) <= 1.0) && inrect(p, clip);  // the shape inside the wrist's crop only (none of it on neither)
+        if (mode.y > 0.5) s = !s;
+    }
+    return s || inrect(p, hole2) || inrect(p, hole3);
+}
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
@@ -196,19 +212,23 @@ ID3D12PipelineState* g_pso_quad_box = nullptr;
 ID3D12PipelineState* g_pso_mirror = nullptr;
 DXGI_FORMAT g_quad_fmt = DXGI_FORMAT_UNKNOWN, g_quad_box_fmt = DXGI_FORMAT_UNKNOWN, g_mirror_fmt = DXGI_FORMAT_UNKNOWN;
 ID3D12DescriptorHeap* g_srv_heap = nullptr;
-ID3D12DescriptorHeap* g_draw_rtv_heap = nullptr;  // [0] the back buffer, [1] the quad image, [2] the wrist image, [3] the wheel's
+ID3D12DescriptorHeap* g_draw_rtv_heap = nullptr;  // [0] the back buffer, [1] the quad image, [2] the wrist image, [3] the wheel's, [4] the Dead Eye X's
 UINT g_rtv_step = 0;
 ID3DBlob* g_vs = nullptr;
 ID3DBlob* g_ps_quad = nullptr;
 ID3DBlob* g_ps_quad_box = nullptr;
 ID3DBlob* g_ps_mirror = nullptr;
-Draw g_draw_mirror, g_draw_quad, g_draw_wrist, g_draw_wheel;
+Draw g_draw_mirror, g_draw_quad, g_draw_wrist, g_draw_wheel, g_draw_marks;
+// [XR] WristHudShape=radar: the wrist HUD's shape (UI pixels): the ammo counter's box x0 y0 x1 y1, the radar's ellipse
+std::mutex g_shape_mutex;
+float g_shape[12] = {};
+std::atomic<bool> g_shape_on{false};
 ID3D12Fence* g_draw_fence = nullptr;
 HANDLE g_draw_event = nullptr;
 uint64_t g_draw_value = 0;
 bool g_draw_failed = false;
 std::atomic<bool> g_drawn_this_frame{false};
-std::atomic<uint64_t> g_mirrors{0}, g_quads{0}, g_draw_skips{0}, g_boxed{0};
+std::atomic<uint64_t> g_mirrors{0}, g_quads{0}, g_draw_skips{0}, g_boxed{0}, g_sprite_draws{0};
 
 using Compile_t = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT,
                                    ID3DBlob**, ID3DBlob**);
@@ -248,6 +268,7 @@ ID3D12PipelineState* make_pso(ID3D12Device* dev, ID3DBlob* ps, DXGI_FORMAT fmt, 
     pd.RTVFormats[0] = fmt;
     pd.SampleDesc.Count = 1;
     ID3D12PipelineState* pso = nullptr;
+    const pso::OwnCreation own_pso;  // (run 19: [Stereo] InstancedShadersAuto leaves the mod's own pipelines alone)
     if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)))) log::error("[ui] pipeline for format %d not created", static_cast<int>(fmt));
     return pso;
 }
@@ -276,7 +297,7 @@ bool ensure_draw(ID3D12Device* dev) {
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 16};  // gamma, src x y, pad, hole x0 y0 x1 y1, scale x y, size x y, hole2 x0 y0 x1 y1
+    params[0].Constants = {0, 0, 32};  // gamma, src x y, pad, hole x0 y0 x1 y1, scale x y, size x y, hole2 x0 y0 x1 y1, ell, mode, clip, hole3
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {1, &range};
@@ -289,10 +310,10 @@ bool ensure_draw(ID3D12Device* dev) {
     if (sig) sig->Release();
     if (err) err->Release();
     D3D12_DESCRIPTOR_HEAP_DESC hs{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    D3D12_DESCRIPTOR_HEAP_DESC hr{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hr{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ok = ok && SUCCEEDED(dev->CreateDescriptorHeap(&hs, IID_PPV_ARGS(&g_srv_heap))) &&
          SUCCEEDED(dev->CreateDescriptorHeap(&hr, IID_PPV_ARGS(&g_draw_rtv_heap))) && make_draw(dev, g_draw_mirror) &&
-         make_draw(dev, g_draw_quad) && make_draw(dev, g_draw_wrist) && make_draw(dev, g_draw_wheel) &&
+         make_draw(dev, g_draw_quad) && make_draw(dev, g_draw_wrist) && make_draw(dev, g_draw_wheel) && make_draw(dev, g_draw_marks) &&
          SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_draw_fence)));
     if (!ok) {
         log::error("[ui] draw objects not created");
@@ -306,27 +327,37 @@ bool ensure_draw(ID3D12Device* dev) {
     return true;
 }
 
+using d3d_util::fence_reached;  // (d3d_util.h: the event reset before it is armed, the value checked after the wait)
+
 // Records one full-screen draw of the UI target into `dst` (in state `dst_state`, returned to it) and submits it.
 // scale: UI pixels a destination pixel (ps_quad_box; else 1).
 // q: the present queue for the game's back buffer (the mirror), xr::image_queue() for an XR image.
+// shape: 0 hole as given; 1 the wrist HUD's shape left out (the quad); 2 all but the wrist HUD's shape left out (its crop)
 bool draw_ui(ID3D12CommandQueue* q, Draw& d, ID3D12PipelineState* pso, ID3D12Resource* dst, DXGI_FORMAT view_fmt, D3D12_RESOURCE_STATES dst_state,
              int rtv_slot, float gamma, const float src[2] = nullptr, const int hole[4] = nullptr, const float scale[2] = nullptr,
-             const int hole2[4] = nullptr) {
-    const float k[16] = {gamma, src ? src[0] : 0.0f, src ? src[1] : 0.0f, 0.0f, hole ? static_cast<float>(hole[0]) : 0.0f,
-                         hole ? static_cast<float>(hole[1]) : 0.0f, hole ? static_cast<float>(hole[2]) : 0.0f,
-                         hole ? static_cast<float>(hole[3]) : 0.0f, scale ? scale[0] : 1.0f, scale ? scale[1] : 1.0f,
+             const int hole2[4] = nullptr, int shape = 0, const int hole3[4] = nullptr) {
+    float sh[12] = {};  // the shape's box, its ellipse, the crop it lies in (UI pixels)
+    if (shape) {
+        std::lock_guard lock(g_shape_mutex);
+        std::memcpy(sh, g_shape, sizeof(sh));
+    }
+    const float* hb = shape ? sh : nullptr;  // the box replaces hole
+    const float k[32] = {gamma, src ? src[0] : 0.0f, src ? src[1] : 0.0f, 0.0f,
+                         hb ? hb[0] : hole ? static_cast<float>(hole[0]) : 0.0f, hb ? hb[1] : hole ? static_cast<float>(hole[1]) : 0.0f,
+                         hb ? hb[2] : hole ? static_cast<float>(hole[2]) : 0.0f, hb ? hb[3] : hole ? static_cast<float>(hole[3]) : 0.0f,
+                         scale ? scale[0] : 1.0f, scale ? scale[1] : 1.0f,
                          static_cast<float>(g_w), static_cast<float>(g_h), hole2 ? static_cast<float>(hole2[0]) : 0.0f,
                          hole2 ? static_cast<float>(hole2[1]) : 0.0f, hole2 ? static_cast<float>(hole2[2]) : 0.0f,
-                         hole2 ? static_cast<float>(hole2[3]) : 0.0f};
+                         hole2 ? static_cast<float>(hole2[3]) : 0.0f,
+                         sh[4], sh[5], sh[6], sh[7], shape ? 1.0f : 0.0f, shape == 2 ? 1.0f : 0.0f, 0.0f, 0.0f, sh[8], sh[9], sh[10], sh[11],
+                         hole3 ? static_cast<float>(hole3[0]) : 0.0f, hole3 ? static_cast<float>(hole3[1]) : 0.0f,
+                         hole3 ? static_cast<float>(hole3[2]) : 0.0f, hole3 ? static_cast<float>(hole3[3]) : 0.0f};
     ID3D12Device* dev = state::device.load();
     if (!q || !dev || !pso) return false;
     int s = d.slot;
-    if (g_draw_fence->GetCompletedValue() < d.slot_value[s]) {
-        g_draw_fence->SetEventOnCompletion(d.slot_value[s], g_draw_event);
-        if (WaitForSingleObject(g_draw_event, 50) != WAIT_OBJECT_0) {
-            g_draw_skips.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
+    if (!fence_reached(g_draw_fence, d.slot_value[s], g_draw_event, 50)) {
+        g_draw_skips.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
     if (FAILED(d.alloc[s]->Reset()) || FAILED(d.list->Reset(d.alloc[s], pso))) return false;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_draw_rtv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -350,7 +381,7 @@ bool draw_ui(ID3D12CommandQueue* q, Draw& d, ID3D12PipelineState* pso, ID3D12Res
     d.list->ResourceBarrier(dst_transition ? 2 : 1, b);
     d.list->SetGraphicsRootSignature(g_root);
     d.list->SetDescriptorHeaps(1, &g_srv_heap);
-    d.list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(sizeof(k) / sizeof(k[0])), k, 0);  // all 16 (hole2 too)
+    d.list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(sizeof(k) / sizeof(k[0])), k, 0);  // all 32 (hole2, the shape, hole3 too)
     d.list->SetGraphicsRootDescriptorTable(1, g_srv_heap->GetGPUDescriptorHandleForHeapStart());
     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_RESOURCE_DESC dd = dst->GetDesc();
@@ -395,7 +426,10 @@ void mirror() {
         g_pso_mirror = make_pso(dev, g_ps_mirror, f, true);
         g_mirror_fmt = f;
     }
-    if (draw_ui(state::present_queue.load(), g_draw_mirror, g_pso_mirror, bb, f, D3D12_RESOURCE_STATE_PRESENT, 0, xr_blit::game_gamma(1.0f)))
+    int de_band[4];
+    const bool de = deadeye::band(de_band);  // the Dead Eye X's slots: drawn in the headset where the marks are, not here
+    if (draw_ui(state::present_queue.load(), g_draw_mirror, g_pso_mirror, bb, f, D3D12_RESOURCE_STATE_PRESENT, 0, xr_blit::game_gamma(1.0f), nullptr,
+                nullptr, nullptr, nullptr, 0, de ? de_band : nullptr))
         g_mirrors.fetch_add(1, std::memory_order_relaxed);
     bb->Release();
 }
@@ -490,8 +524,7 @@ std::string grab(const std::string& path, unsigned timeout_ms) {
         g_grab_phase = 0;
         return "ERROR no frame drew the UI (NOT MEASURED)";
     }
-    g_fence->SetEventOnCompletion(g_fence_value, g_fence_event);
-    if (WaitForSingleObject(g_fence_event, 3000) != WAIT_OBJECT_0) {
+    if (!fence_reached(g_fence, g_fence_value, g_fence_event, 3000)) {
         g_grab_phase = 0;
         return "ERROR the copy timed out (NOT MEASURED)";
     }
@@ -548,15 +581,27 @@ ID3D12PipelineState* quad_pso(ID3D12Device* dev, DXGI_FORMAT fmt, bool box) {
     return g_pso_quad;
 }
 
-bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4], const int hole2[4]) {
+void set_wrist_shape(bool on, const float box[4], const float ell[4], const float crop[4]) {
+    if (on && box && ell && crop) {
+        std::lock_guard lock(g_shape_mutex);
+        std::memcpy(g_shape, box, 4 * sizeof(float));
+        std::memcpy(g_shape + 4, ell, 4 * sizeof(float));
+        std::memcpy(g_shape + 8, crop, 4 * sizeof(float));
+    }
+    g_shape_on.store(on && box && ell && crop, std::memory_order_release);
+}
+
+bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4], const int hole2[4], const int hole3[4]) {
     ID3D12Device* dev = state::device.load();
     if (!has_ui() || !dev || !ensure_draw(dev)) return false;
     const D3D12_RESOURCE_DESC dd = dst->GetDesc();
     if (!dd.Width || !dd.Height || dd.Width > g_w || dd.Height > g_h) return false;
     const bool box = dd.Width != g_w || dd.Height != g_h;
     const float scale[2] = {static_cast<float>(g_w) / static_cast<float>(dd.Width), static_cast<float>(g_h) / static_cast<float>(dd.Height)};
+    // the wrist HUD's hole: its shape when one is set (the corner's other UI, a subtitle, stays on the quad)
+    const int shape = hole && g_shape_on.load(std::memory_order_acquire) ? 1 : 0;
     bool ok = draw_ui(xr::image_queue(), g_draw_quad, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 1, xr_blit::game_gamma(1.0f),
-                      nullptr, hole, box ? scale : nullptr, hole2);
+                      nullptr, hole, box ? scale : nullptr, hole2, shape, hole3);
     if (ok) g_quads.fetch_add(1, std::memory_order_relaxed);
     if (ok && box) g_boxed.fetch_add(1, std::memory_order_relaxed);
     return ok;
@@ -572,9 +617,75 @@ bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw
     const bool box = dd.Width != cw || dd.Height != ch;
     const float src[2] = {static_cast<float>(x0), static_cast<float>(y0)};
     const float scale[2] = {static_cast<float>(cw) / static_cast<float>(dd.Width), static_cast<float>(ch) / static_cast<float>(dd.Height)};
+    const int shape = !which && g_shape_on.load(std::memory_order_acquire) ? 2 : 0;  // the wrist: its shape only
     return draw_ui(xr::image_queue(), which ? g_draw_wheel : g_draw_wrist, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET,
                    which ? 3 : 2, xr_blit::game_gamma(1.0f), src,
-                   nullptr, box ? scale : nullptr);
+                   nullptr, box ? scale : nullptr, nullptr, shape);
+}
+
+// The Dead Eye X (deadeye.cpp; after optimumbox's fork, v0.8.11.9, commit ac942427, MIT: his draw_sprites): `dst` (in
+// RENDER_TARGET, an acquired XR image) cleared to transparent, then each sprite's rect drawn from the UI target about
+// its slot, box-filtered at its scale, in the quad's form (linear premultiplied). One list of its own (the [4] view).
+bool draw_sprites(ID3D12Resource* dst, DXGI_FORMAT fmt, const Sprite* sp, int n) {
+    ID3D12Device* dev = state::device.load();
+    ID3D12CommandQueue* q = xr::image_queue();
+    if (!has_ui() || !dev || !q || !dst || !ensure_draw(dev)) return false;
+    ID3D12PipelineState* pso = quad_pso(dev, fmt, true);
+    if (!pso) return false;
+    Draw& d = g_draw_marks;
+    const int s = d.slot;
+    if (!fence_reached(g_draw_fence, d.slot_value[s], g_draw_event, 50)) {
+        g_draw_skips.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (FAILED(d.alloc[s]->Reset()) || FAILED(d.list->Reset(d.alloc[s], pso))) return false;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_draw_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += 4 * static_cast<SIZE_T>(g_rtv_step);
+    D3D12_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = fmt;
+    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    dev->CreateRenderTargetView(dst, &rv, rtv);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.pResource = g_ui;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    d.list->ResourceBarrier(1, &b);
+    const float clear[4] = {0, 0, 0, 0};
+    d.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    d.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    d.list->SetGraphicsRootSignature(g_root);
+    d.list->SetDescriptorHeaps(1, &g_srv_heap);
+    d.list->SetGraphicsRootDescriptorTable(1, g_srv_heap->GetGPUDescriptorHandleForHeapStart());
+    d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+    const LONG w = static_cast<LONG>(dd.Width), h = static_cast<LONG>(dd.Height);
+    D3D12_VIEWPORT vp{0, 0, static_cast<float>(dd.Width), static_cast<float>(dd.Height), 0, 1};
+    d.list->RSSetViewports(1, &vp);
+    const float gamma = xr_blit::game_gamma(1.0f);
+    for (int i = 0; i < n; ++i) {
+        const Sprite& t = sp[i];
+        const D3D12_RECT sc{t.dst[0] < 0 ? 0 : t.dst[0], t.dst[1] < 0 ? 0 : t.dst[1], t.dst[2] > w ? w : t.dst[2], t.dst[3] > h ? h : t.dst[3]};
+        if (sc.right <= sc.left || sc.bottom <= sc.top || !(t.scale > 0.0f)) continue;
+        // ps_quad_box's UI point for a destination pixel is src + pixel * scale: the rect's corner on the crop's; no
+        // hole, no shape (every cut rect empty)
+        const float k[32] = {gamma, t.src[0] - static_cast<float>(t.dst[0]) * t.scale, t.src[1] - static_cast<float>(t.dst[1]) * t.scale, 0.0f,
+                             0, 0, 0, 0, t.scale, t.scale, static_cast<float>(g_w), static_cast<float>(g_h), 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        d.list->SetGraphicsRoot32BitConstants(0, 32, k, 0);
+        d.list->RSSetScissorRects(1, &sc);
+        d.list->DrawInstanced(3, 1, 0, 0);
+    }
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    d.list->ResourceBarrier(1, &b);
+    if (FAILED(d.list->Close())) return false;
+    d3d::submit_internal(q, d.list);
+    d.slot_value[s] = ++g_draw_value;
+    q->Signal(g_draw_fence, g_draw_value);
+    d.slot = (s + 1) % kSlots;
+    g_sprite_draws.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 void status_text(char* out, size_t len) {

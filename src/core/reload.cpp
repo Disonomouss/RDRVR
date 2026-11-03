@@ -8,11 +8,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 
 #include "core/anchors.h"
 #include "core/api.h"
 #include "core/config.h"
+#include "core/dual.h"
 #include "core/hooks.h"
 #include "core/log.h"
 #include "core/pose.h"
@@ -30,6 +32,11 @@ std::atomic<bool> g_empty_pending{false};  // an empty trigger asked for a reloa
 enum Source { kAfterShot, kOnDraw, kCommand, kOther, kSources };
 const char* const kSourceNames[kSources] = {"after the last round", "on the draw", "button or empty trigger", "other"};
 std::atomic<uint64_t> g_held[kSources], g_passed{0}, g_trigger_held{0}, g_switch_held{0}, g_inserted{0};
+// (2026-10-27, DualWieldCrossReload's review) the mod's last spare-changing native (note_spare_native): its id, the script
+// tick when it was queued, the tick it ran on (0 not known yet); the game's reload flag last seen (its actor state tick)
+std::mutex g_sp_mx;
+uint64_t g_sp_id = 0, g_sp_q = 0, g_sp_ran = 0;
+std::atomic<uint64_t> g_reload_seen{0}, g_sp_waits{0};
 
 bool raw(uintptr_t a, void* out, size_t n) {
     __try {
@@ -183,7 +190,7 @@ bool fill_clip(const RdrvrActorState& st) {
     uint32_t bits = 0;
     std::memcpy(&bits, &n, sizeof(bits));  // a float read with movss
     const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(static_cast<uint32_t>(st.weapon)), bits};
-    api::queue_native(0xCC69DCC1, args, 3, 0, nullptr);  // ACTOR_ADD_WEAPON_AMMO
+    note_spare_native(api::queue_native(0xCC69DCC1, args, 3, 0, nullptr));  // ACTOR_ADD_WEAPON_AMMO
     g_inserted.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
     return true;
 }
@@ -201,9 +208,104 @@ bool insert_round(const RdrvrActorState& st) {
     // the count is a float read with movss (an integer 1 would be a denormal): 1.0f's bits
     const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(static_cast<uint32_t>(st.weapon)),
                               0x3F800000ull};
-    api::queue_native(0xCC69DCC1, args, 3, 0, nullptr);  // ACTOR_ADD_WEAPON_AMMO
+    note_spare_native(api::queue_native(0xCC69DCC1, args, 3, 0, nullptr));  // ACTOR_ADD_WEAPON_AMMO
     g_inserted.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+int insert_rounds(const RdrvrActorState& st, int n) {
+    if (!g_hand.load(std::memory_order_relaxed) || !st.valid || !st.actor || !is_gun(st.weapon) || n < 1) return 0;
+    if (st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) return 0;
+    const float m = std::floor(std::fmin(std::fmin(static_cast<float>(n), st.clip_max - st.clip), st.spare) + 0.01f);
+    if (!(m >= 1.0f) || m > 200.0f) return 0;
+    uint32_t bits = 0;
+    std::memcpy(&bits, &m, sizeof(bits));  // a float read with movss
+    const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(static_cast<uint32_t>(st.weapon)), bits};
+    note_spare_native(api::queue_native(0xCC69DCC1, args, 3, 0, nullptr));  // ACTOR_ADD_WEAPON_AMMO
+    g_inserted.fetch_add(static_cast<uint64_t>(m), std::memory_order_relaxed);
+    return static_cast<int>(m);
+}
+
+namespace {
+uint64_t fbits(float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof(u));  // a float read with movss
+    return u;
+}
+}  // namespace
+
+bool set_clip(const RdrvrActorState& st, int n) {
+    if (!g_hand.load(std::memory_order_relaxed) || !st.valid || !st.actor || !is_gun(st.weapon) || n < 0) return false;
+    if (st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) return false;
+    if (static_cast<float>(n) > st.clip - 0.5f) return false;  // lower only
+    const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(static_cast<uint32_t>(st.weapon)),
+                              fbits(static_cast<float>(n))};
+    note_spare_native(api::queue_native(0x8266C617, args, 3, 0, nullptr));  // ACTOR_SET_WEAPON_AMMO
+    return true;
+}
+
+bool lose_round(const RdrvrActorState& st, int ammo_type) {
+    if (!g_hand.load(std::memory_order_relaxed) || !st.valid || !st.actor || !is_gun(st.weapon)) return false;
+    if (st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) return false;
+    if (st.clip < 0.5f || ammo_type < 0 || ammo_type > 16 || !std::isfinite(st.spare) || st.spare < 0.0f) return false;
+    if (!spare_natives_done() || !spare_seen(st) || !reload_quiet(st)) return false;  // (an absolute spare: from a settled one only)
+    // (the review) the spare written back is the inventory's own as read now, not the actor state's tick-old copy: a
+    // pickup since that read kept. No relative native is verified for it (ACTOR_ADD_INV_AMMO's handler with a negative
+    // count is unread), so a pickup in the very tick the two natives run would still be overwritten [I]
+    float spare = st.spare, cap = 0.0f;
+    if (!dual::inv_entry(ammo_type, &spare, &cap)) return false;
+    const int n = static_cast<int>(std::floor(st.clip + 0.01f)) - 1;
+    const uint64_t a1[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(static_cast<uint32_t>(st.weapon)),
+                            fbits(static_cast<float>(n < 0 ? 0 : n))};
+    note_spare_native(api::queue_native(0x8266C617, a1, 3, 0, nullptr));  // ACTOR_SET_WEAPON_AMMO: one lower, its round to the spare
+    if (spare < 9999.0f) {  // (an endless spare: nothing to take back)
+        const uint64_t a2[4] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(ammo_type), fbits(spare), 0ull};
+        note_spare_native(api::queue_native(0x4372593E, a2, 4, 0, nullptr));  // ACTOR_SET_INV_AMMO: the spare as it was
+    }
+    return true;
+}
+
+void note_spare_native(uint64_t id) {
+    if (!id) return;
+    std::lock_guard lock(g_sp_mx);
+    g_sp_id = id;
+    g_sp_q = api::script_ticks();
+    g_sp_ran = 0;
+}
+void watch_reload_flag(const RdrvrActorState& st) {
+    if (st.valid && (st.weapon_flags & RDRVR_WEAPON_RELOADING)) g_reload_seen.store(st.tick, std::memory_order_relaxed);
+}
+namespace {
+bool sp_ran_locked() {  // under g_sp_mx: the last noted native has run (its tick in g_sp_ran)
+    if (!g_sp_id) return true;
+    if (!g_sp_ran) {
+        // (the re-review) its result, else the api's mark of the posted results (a result dropped by the clear of unread
+        // ones: run all the same; the tick then the latest posted, at or after its own), else 60 ticks
+        RdrvrNativeResult r{};
+        uint64_t t = 0;
+        if (api::wait_native(g_sp_id, &r, 0)) g_sp_ran = r.tick ? r.tick : g_sp_q + 1;
+        else if (api::result_posted(g_sp_id, &t)) g_sp_ran = t ? t : g_sp_q + 1;
+        else if (api::script_ticks() > g_sp_q + 60) g_sp_ran = g_sp_q + 60;  // (no plugin result at all: run long since)
+    }
+    return g_sp_ran != 0;
+}
+}  // namespace
+bool spare_natives_done() {
+    std::lock_guard lock(g_sp_mx);
+    const bool ok = sp_ran_locked();
+    if (!ok) g_sp_waits.fetch_add(1, std::memory_order_relaxed);
+    return ok;
+}
+bool spare_seen(const RdrvrActorState& st) {
+    std::lock_guard lock(g_sp_mx);
+    return sp_ran_locked() && (!g_sp_id || st.tick > g_sp_ran);
+}
+bool reload_quiet(const RdrvrActorState& st) {
+    watch_reload_flag(st);
+    const uint64_t rs = g_reload_seen.load(std::memory_order_relaxed);
+    const bool ok = st.valid && !(rs && st.tick <= rs + 3);  // the game's own reload under way or just over
+    if (!ok) g_sp_waits.fetch_add(1, std::memory_order_relaxed);
+    return ok;
 }
 
 std::string command(const std::string& line) {
@@ -217,19 +319,22 @@ std::string command(const std::string& line) {
         if (w == "button") set_button(on);
         if (w == "two") set_two_handed(on);
         if (w == "switch") g_switch = on;  // this session only
+        // (2026-10-27) squeeze off|one|full: [Reload] ChestSqueeze for the session (r37_crossreload's control)
+        if (w == "squeeze") set_chest_squeeze(v == "off" ? 0 : v == "full" ? 2 : 1, false);
     }
     RdrvrActorState st{};
     const bool have = api::actor_state(&st);
     char b[480];
     std::snprintf(b, sizeof(b),
                   "hand %d auto %d button %d two %d switch %d | held: after shot %llu, on draw %llu, command %llu, empty trigger %llu, "
-                  "switch %llu; passed %llu; inserted %llu | weapon %d clip %.0f/%.0f spare %.0f flags %#x",
+                  "switch %llu; passed %llu; inserted %llu | weapon %d clip %.0f/%.0f spare %.0f flags %#x | squeeze %d | spare waits %llu",
                   g_hand.load() ? 1 : 0, g_auto.load() ? 1 : 0, g_button.load() ? 1 : 0, g_two.load() ? 1 : 0, g_switch.load() ? 1 : 0,
                   static_cast<unsigned long long>(g_held[kAfterShot].load()), static_cast<unsigned long long>(g_held[kOnDraw].load()),
                   static_cast<unsigned long long>(g_held[kCommand].load()), static_cast<unsigned long long>(g_trigger_held.load()),
                   static_cast<unsigned long long>(g_switch_held.load()), static_cast<unsigned long long>(g_passed.load()),
                   static_cast<unsigned long long>(g_inserted.load()), have ? st.weapon : -1, have ? st.clip : 0.0f, have ? st.clip_max : 0.0f,
-                  have ? st.spare : 0.0f, have ? st.weapon_flags : 0u);
+                  have ? st.spare : 0.0f, have ? st.weapon_flags : 0u, g_squeeze.load(),
+                  static_cast<unsigned long long>(g_sp_waits.load()));
     (void)kSourceNames;
     return b;
 }

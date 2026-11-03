@@ -35,10 +35,29 @@ void set_dst_size(uint32_t w, uint32_t h);
 struct Frame {
     uint32_t cw, ch, iw, ih, dw, dh;
 };
+// (r55 item 11, [Scope] Enabled; research/run29/scope.md 6) the scope's pictures: eye e's staging image (its whole content:
+// the scope's narrow pass in that eye, square in angle) drawn round into dst[e] (that eye's scope quad image: acquired, in
+// RENDER_TARGET, size x size, format fmt; nullptr: none), premultiplied, alpha[e] its opacity (the fade in and out), a
+// fine cross with three posts when `reticle`; and each eye's own fade toward black over set_fade's (eye_fade: 1 black: the
+// scope eye's projection, or the other eye darkened). drawn[e]: set by blit (that picture recorded with the eyes).
+struct Scope {
+    ID3D12Resource* dst[2] = {nullptr, nullptr};
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    uint32_t size = 0;
+    float alpha[2] = {0.0f, 0.0f};
+    bool reticle = true;
+    float eye_fade[2] = {0.0f, 0.0f};
+    bool hide[2] = {false, false};  // the scope's own eye(s): no rounds drawn into it
+    bool drawn[2] = {false, false};
+};
 // Draws both staging textures into dst[0], dst[1] (in RENDER_TARGET, as acquired) and submits on `queue`. A list's
 // allocator is reused only after the GPU has passed it (fence); if it has not within 50 ms the frame is skipped.
-// frame: nullptr = the whole staging texture into the whole image (the default, without EyeShape).
-bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma, const Frame* frame = nullptr);
+// frame: nullptr = the whole staging texture into the whole image (the default, without EyeShape). scope: nullptr (the
+// default) = as before, bit for bit.
+bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma, const Frame* frame = nullptr, Scope* scope = nullptr);
+// the scope pictures drawn, and the frames a scope picture was asked for but not drawn (its pipeline not made)
+void scope_counts(uint64_t* drawn, uint64_t* failed);
+bool scope_pipeline_failed();  // the scope picture's pipeline could not be made (its one attempt failed)
 // [XR] EyeShape: the monitor's back buffer `bb` (in PRESENT) repainted with the left eye's content (the top-left cw x ch
 // of its staging texture) scaled to fit and centred (black beside it), in the game's final gamma. The presenting thread,
 // at the frame end, before the UI mirror draws over it.
@@ -58,6 +77,13 @@ void cinema_status(uint64_t* resamples, uint32_t* w, uint32_t* h);
 float game_gamma(float def);
 // Positive control: a fixed Gamma instead of the game's ("xr gamma <value>"); 0 = the game's again ("xr gamma live").
 void set_gamma_override(float g);
+// [XR] Sharpness (run 14, after optimumbox's 0.8.10.4): AMD CAS in the eye blit, 0 (off: as before, bit for bit) to 1
+float sharpness();
+void set_sharpness(float v, bool save);  // save: also written to the user ini (the menu; "xr sharpen" is the session's)
+// [XR] RoomScale (2026-10-27): the eye images faded toward black, 0 (none: as before, bit for bit) to 1 (black); the
+// quads (the UI, the wrist HUD, the cinema) are not. Any thread; the next blit takes it.
+void set_fade(float f);
+float fade();
 void status_text(char* out, size_t len);
 
 }  // namespace rdrvr::xr_blit

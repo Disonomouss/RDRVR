@@ -208,9 +208,12 @@ struct GmBone {
     const char* name;  // static: the native keeps the pointer only for the call
     float r;           // the bone's sphere (m)
 };
-const GmBone kGmBones[] = {{"head", 0.12f}, {"spine03", 0.20f}, {"spine01", 0.18f}, {"pelvis", 0.18f}};
+// (2026-11-02, GOAL-older-items item 5; round 14, the user: the gun-butt melee "does not work at all"; cycle N18: the
+// Schofield's swings missed by 2 cm at 1.5 and 2 m/s, the Winchester's hit) the neck too, and the strike point's sphere
+// 8 cm (was 6: a pistol's short frame)
+const GmBone kGmBones[] = {{"head", 0.12f}, {"neck", 0.09f}, {"spine03", 0.20f}, {"spine01", 0.18f}, {"pelvis", 0.18f}};
 constexpr int kGmBoneCount = static_cast<int>(sizeof(kGmBones) / sizeof(kGmBones[0]));
-constexpr float kGmStrikeR = 0.06f;  // the strike point's own sphere
+constexpr float kGmStrikeR = 0.08f;  // the strike point's own sphere
 
 // where (0 - 1) the segment a -> a + d enters the sphere (c, r): 0 when a is already inside; -1 when it does not
 float gm_enter(const float* a, const float* d, const float* c, float r) {
@@ -277,6 +280,9 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
     // the nearest a strike segment came to a tested bone's sphere (its surface; run 8 item 1), the speed and the bone
     float miss_d = 1e9f, miss_s = 0.0f;
     int miss_b = -1;
+    // (2026-11-03, round 73 check 3, the user: "Does not work, only tried on non holstile civillians"; their log: every swing
+    // "no one near") the actors the sphere found and why each was passed over, for a swing's scan finding no one to hit
+    int n_fit = 0, n_dead = 0, n_animal = 0, n_rag = 0, n_cut = 0, n_nobones = 0;
     for (int i = 0; i < n; ++i) {
         const uint32_t h = static_cast<uint32_t>(invoke(0x34F0AD96, {objs[i]}));  // GET_ACTOR_FROM_OBJECT
         if (!h || h == a.actor) continue;
@@ -286,7 +292,7 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
         const bool human = (invoke(0x882C84DC, {hh}) & 0xff) != 0;  // IS_ACTOR_HUMAN
         const bool rag = (invoke(0x3918D335, {hh}) & 0xff) != 0;    // IS_ACTOR_RAGDOLL
         const bool cut = (invoke(0x776999DB, {hh}) & 0xff) != 0;    // ACTOR_IS_GRABBED_BY_CUTSCENE
-        const bool fit = alive && human && !rag && !cut;
+        const bool fit = alive && (human || (a.flags & RDRVR_GUN_MELEE_NONHUMAN)) && !rag && !cut;  // (step 5: the off-hand stab's zombies)
         alignas(16) float bpos[kGmBoneCount][4] = {};
         bool bok[kGmBoneCount] = {};
         if (scan || fit)
@@ -304,13 +310,25 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
             char line[256];
             std::snprintf(line, sizeof(line),
                           "gunmelee scan: actor 0x%x %.2f m away at (%.2f %.2f %.2f): alive %d human %d ragdoll %d cutscene %d; bones head %d (%.2f %.2f %.2f) "
-                          "spine03 %d spine01 %d pelvis %d",
+                          "neck %d spine03 %d spine01 %d pelvis %d",
                           h, d, pos[0], pos[1], pos[2], alive ? 1 : 0, human ? 1 : 0, rag ? 1 : 0, cut ? 1 : 0, bok[0] ? 1 : 0, bpos[0][0], bpos[0][1], bpos[0][2],
-                          bok[1] ? 1 : 0, bok[2] ? 1 : 0, bok[3] ? 1 : 0);
+                          bok[1] ? 1 : 0, bok[2] ? 1 : 0, bok[3] ? 1 : 0, bok[4] ? 1 : 0);
             g_api->log(0, line);
             continue;
         }
-        if (!fit) continue;
+        if (!fit) {
+            n_dead += alive ? 0 : 1;
+            n_animal += alive && !human ? 1 : 0;
+            n_rag += alive && human && rag ? 1 : 0;
+            n_cut += alive && human && !rag && cut ? 1 : 0;
+            continue;
+        }
+        ++n_fit;
+        {
+            bool any = false;
+            for (int b = 0; b < kGmBoneCount; ++b) any = any || bok[b];
+            if (!any) ++n_nobones;
+        }
         for (int b = 0; b < kGmBoneCount; ++b) {
             if (!bok[b]) continue;
             for (int k = 0; k < npts; ++k) {
@@ -359,6 +377,17 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
         return done(near_h, RDRVR_GUN_MELEE_SCANNED, 0xff);
     }
     if (!best.h) {
+        res->vec[2] = static_cast<float>(n_fit);
+        static ULONGLONG passed_log_ms = 0;  // (once a second at most) the actors found and passed over
+        if (seen && (n_fit == 0 || n_nobones) && GetTickCount64() - passed_log_ms > 1000) {
+            passed_log_ms = GetTickCount64();
+            char line[220];
+            std::snprintf(line, sizeof(line),
+                          "gunmelee: %u actor(s) within %.1f m of the strike, none hit: %d to hit (%d without bones), passed over: dead %d, animals %d, "
+                          "ragdolls %d, held by a cutscene %d",
+                          seen, radius, n_fit, n_nobones, n_dead, n_animal, n_rag, n_cut);
+            g_api->log(0, line);
+        }
         if (miss_b >= 0) {  // how near it came (run 8 item 1)
             res->vec[0] = miss_s;
             res->vec[1] = static_cast<float>(miss_b);
