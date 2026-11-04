@@ -65,9 +65,9 @@ void watcher() {
             if (want) {
                 g_ropes.fetch_add(1, std::memory_order_relaxed);
                 g_target = t;
-                log::info("[hogtie] %d on the lasso: the holsters' props hidden (the game's hogtie check sweeps between you)", t);
+                log::info("[hogtie] %d on the lasso: the mod's props hidden (the game's hogtie check sweeps between you)", t);
             } else {
-                log::info("[hogtie] the lasso empty: the holsters' props shown again");
+                log::info("[hogtie] the lasso empty: the mod's props shown again");
             }
         }
     }
@@ -78,7 +78,7 @@ void watcher() {
 void init() {
     g_on = config::get_bool("Gestures", "HogtieClearProps", true);
     std::thread(watcher).detach();
-    log::info("[hogtie] the holsters' props hidden while someone is on the lasso (HogtieClearProps) %d", g_on.load() ? 1 : 0);
+    log::info("[hogtie] the mod's props hidden while someone is on the lasso (HogtieClearProps) %d", g_on.load() ? 1 : 0);
 }
 
 std::string command(const std::string& line) {

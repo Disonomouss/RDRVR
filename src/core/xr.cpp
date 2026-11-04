@@ -2428,6 +2428,13 @@ void set_hud_on_wrist(bool on) {
     config::set("XR", "Hud", on ? "wrist" : "quad");
 }
 
+bool hud_shape_radar() { return g_hud_shape.load(); }
+void set_hud_shape_radar(bool radar) {
+    if (g_hud_shape.exchange(radar) != radar) log::info("[xr] the wrist HUD: %s", radar ? "the radar's ellipse and the ammo counter" : "the whole rect");
+    push_hud_shape(1.0f);
+    config::set("XR", "WristHudShape", radar ? "radar" : "rect");
+}
+
 bool wrist_hud_shown() { return g_wr_visible.load(std::memory_order_relaxed); }
 void hud_shape_test(int mode) {  // the session only: 0 the rect, 1 the radar's shape, 2 its ellipse at half size (a test)
     g_hud_shape = mode != 0;

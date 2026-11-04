@@ -318,7 +318,8 @@ bool size_of(int c, int s, uint32_t cw, uint32_t ch, uint32_t* w, uint32_t* h, c
             return false;
         }
         const double a = static_cast<double>(sw) / sh;
-        if (a < 1.74 || a > 1.80) {
+        // ([Debug] RenderAnyAspect, a test: 2026-11-04, a user's 32:9 monitor's wrist radar measured in the simulator)
+        if ((a < 1.74 || a > 1.80) && !config::get_bool("Debug", "RenderAnyAspect", false)) {
             if (why) std::snprintf(why, why_len, "%ux%u is not 16:9 (the wrist HUD and the window expect it)", sw, sh);
             return false;
         }

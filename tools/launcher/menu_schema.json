@@ -121,6 +121,11 @@
         {"type": "header", "label": "HUD"},
         {"type": "bool", "label": "HUD on the left wrist", "section": "XR", "key": "Hud", "on": "wrist", "off": "quad", "default": "wrist", "repo_ini_default": "quad", "restart": false,
          "help": "The radar and the ammo counter on the back of your left hand (the right when left-handed), shown when you look at it like a watch. Prompts stay on the floating screen."},
+        {"type": "choice", "label": "What goes to the wrist", "section": "XR", "key": "WristHudShape",
+         "options": [{"value": "radar", "label": "The radar and ammo count"}, {"value": "rect", "label": "The whole corner"}],
+         "default": "radar", "restart": false,
+         "requires": "enabled only when Hud=wrist",
+         "help": "What goes to the wrist. The radar and ammo count only: anything else in that corner, such as a subtitle, stays on the floating screen. The whole corner: the screen's lower-left corner as a rectangle."},
         {"type": "bool", "label": "A double tap of Y at the wrist opens the satchel", "section": "Controls", "key": "WristSatchel", "on": "1", "off": "0", "default": "1", "repo_ini_default": "0", "restart": false,
          "requires": "enabled only when Hud=wrist",
          "help": "With the wrist HUD in view, two quick presses of Y open John's satchel; B closes it. A single press still reaches the game, a third of a second late. Holding Y opens this menu either way."},
@@ -885,7 +890,6 @@
     {"section": "Reload", "key": "EmptyClickWav", "values": "empty | path to a 16-bit PCM WAV", "default": "", "help": "Your own empty-gun click for every weapon (also EmptyClickRevolver / EmptyClickRifle / EmptyClickShotgun per family, default RDRVR_click_<family>.wav)."},
     {"section": "Reload", "key": "OutOfAmmoSwitch", "values": "1 | 0", "default": "0", "help": "With the hand reload: let the game switch weapons when the gun in hand is out of rounds."},
     {"section": "Gestures", "key": "GunMeleeLethal", "values": "0 | 1", "default": "0", "help": "Gun-butt melee: 0 knocks out, 1 takes health."},
-    {"section": "XR", "key": "WristHudShape", "values": "radar | rect", "default": "radar", "help": "The radar and the ammo count only: anything else in that corner, such as a subtitle, stays on the screen. The whole corner: as before."},
     {"section": "Reload", "key": "CarriedPumpSpeed", "values": "0.5..5.0", "default": "1.5", "help": "How fast the carrying hand must snap back and forward along the barrel to pump the carried Pump-action. Lower: easier, but a quick move of that hand may pump it."}
   ]
 }

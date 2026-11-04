@@ -111,6 +111,10 @@ void force_frame_resized();
 // you look at it (the radar's corner of the UI, [XR] WristHudRect; the prompts stay on the quad). Writes the user ini.
 bool hud_on_wrist();
 void set_hud_on_wrist(bool on);
+// [XR] WristHudShape (the menu's Display tab, 2026-11-04): radar (true: the radar's ellipse and the ammo counter on the
+// wrist, the corner's other UI on the quad) or rect (the whole WristHudRect). Writes the user ini. Any thread.
+bool hud_shape_radar();
+void set_hud_shape_radar(bool radar);
 void hud_status(char* out, size_t len);  // "hud [wrist|quad]"
 // Moves the frame loop to the presenting thread (submission) or back to the idle loop, at the next idle-frame boundary.
 void set_submit(bool on);

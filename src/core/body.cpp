@@ -1820,6 +1820,9 @@ std::atomic<bool> g_fallback_cfg{true};  // [Reload] GripFallback
 GripRel g_grips[kGripW][2];  // [eWeapon][0 lowered, 1 aiming]
 GripRel g_grip_tpl[2];       // the last grip learned on any long gun
 int g_grip_src = 0;          // what the current grip is: 0 the weapon's, 1 the template, 2 the built-in, 3 a sibling's
+// (item 29, a test) "skel grip gate <m>": the learning's reach from the gun's IK offsets for the session (6 cm; the Carcano's
+// hand never came within it in the simulator: its shipped hold learned with a wider one)
+std::atomic<float> g_learn_gate{0.06f};
 std::atomic<int> g_grip_src_pub{-1}, g_grip_pose_pub{-1};  // for grip_source_name (other threads)
 std::atomic<bool> g_sawed_grip{true};  // [Reload] SawedOffGrip (run 8 item 2)
 std::atomic<bool> g_steady_grip{true};  // [Reload] SteadyRing (run 8 item 2): a learned grip the mean of its first 30 samples, then kept
@@ -1841,6 +1844,180 @@ FingerRel g_thumb_snap[kThumbSnapW][2];
 std::atomic<uint64_t> g_sthumb_frames{0}, g_thumb_snaps{0};
 std::atomic<uint32_t> g_front_seen[kGripW] = {};  // bit 0/1: the lowered/aiming hold learned; bit 2/3: its fingers
 std::atomic<uint64_t> g_front_finger_frames{0};
+// (2026-11-04, GOAL-older-items item 29, the user: "They seem to be constantly changing slightly and sometimes when I grab
+// the foregrip, the hand is in a different pose and/or position") each long gun's front-hand holds kept across sessions.
+// A hold learned (SteadyRing's 30 samples) is saved in the user ini, [Grips] FrontHold.<gun>.<Lowered|Aiming>: its place
+// in the gun's frame, then its axes; FrontFingers.<gun>.<pose>: the fingers learned with it (a mask of the bones, then
+// each bone's turn, a quaternion x y z w, and place, mm, relative to the wrist). Read back at the start and kept as read:
+// the lowered hold's mean moved up to 14 mm between sessions, and a gun not yet learned in a session borrowed its other
+// pose's hold, another gun's or the built-in, with the game's live fingers. "skel grips forget": learned afresh.
+bool g_grip_saved[kGripW][2] = {};  // the draw mutex's: read from the ini, or saved this session
+// (item 29, round 83) a gun's own hold used only once complete: saved (read from the ini, or saved this session), or its
+// 30 samples in (the review: none with valid fingers, so never saved), or SteadyRing off (learned each frame). The draw
+// mutex's.
+bool grip_ready(int w, int pose) {
+    return w >= 0 && w < kGripW && g_grips[w][pose].valid &&
+           (g_grip_saved[w][pose] || g_grip_n[w][pose] >= 30 || !g_steady_grip.load(std::memory_order_relaxed));
+}
+const char* const kGripPoseKey[2] = {"Lowered", "Aiming"};
+void quat_of(const float* R, float* q) {  // R row-major (R[r * 3 + c]), rigid; q x y z w
+    const float tr = R[0] + R[4] + R[8];
+    if (tr > 0.0f) {
+        const float k = 0.5f / std::sqrt(tr + 1.0f);
+        q[3] = 0.25f / k;
+        q[0] = (R[7] - R[5]) * k;
+        q[1] = (R[2] - R[6]) * k;
+        q[2] = (R[3] - R[1]) * k;
+    } else if (R[0] > R[4] && R[0] > R[8]) {
+        const float k = 2.0f * std::sqrt(1.0f + R[0] - R[4] - R[8]);
+        q[3] = (R[7] - R[5]) / k;
+        q[0] = 0.25f * k;
+        q[1] = (R[1] + R[3]) / k;
+        q[2] = (R[2] + R[6]) / k;
+    } else if (R[4] > R[8]) {
+        const float k = 2.0f * std::sqrt(1.0f + R[4] - R[0] - R[8]);
+        q[3] = (R[2] - R[6]) / k;
+        q[0] = (R[1] + R[3]) / k;
+        q[1] = 0.25f * k;
+        q[2] = (R[5] + R[7]) / k;
+    } else {
+        const float k = 2.0f * std::sqrt(1.0f + R[8] - R[0] - R[4]);
+        q[3] = (R[3] - R[1]) / k;
+        q[0] = (R[2] + R[6]) / k;
+        q[1] = (R[5] + R[7]) / k;
+        q[2] = 0.25f * k;
+    }
+}
+void mat_of(const float* q, float* R) {  // quat_of's inverse (q made unit)
+    const float l = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    const float x = q[0] / l, y = q[1] / l, z = q[2] / l, w = q[3] / l;
+    const float m[9] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w),
+                        2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+                        2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)};
+    std::memcpy(R, m, sizeof(m));
+}
+struct FrontGripSave {
+    std::string hold_key, hold, fingers_key, fingers;
+};
+DWORD WINAPI save_front_grip_work(void* p) {  // a thread-pool work item: the ini written off the render thread
+    FrontGripSave* sv = static_cast<FrontGripSave*>(p);
+    config::set("Grips", sv->hold_key.c_str(), sv->hold);
+    if (!sv->fingers.empty()) config::set("Grips", sv->fingers_key.c_str(), sv->fingers);
+    delete sv;
+    return 0;
+}
+// under the draw mutex: gun w's hold for pose (0 lowered, 1 aiming) and its fingers, if learned, queued to be saved;
+// returns the fingers' turns' worst round trip through the saved quaternions (the matrices' largest entry difference),
+// -1 without fingers
+float save_front_grip(int w, int pose) {
+    const char* tok = holster::weapon_token(w);
+    if (!*tok) return -1.0f;
+    float worst = -1.0f;
+    const GripRel& g = g_grips[w][pose];
+    const FingerRel& fr = g_front_fingers[w][pose];
+    FrontGripSave* sv = new FrontGripSave;
+    const std::string base = std::string(".") + tok + "." + kGripPoseKey[pose];
+    sv->hold_key = "FrontHold" + base;
+    sv->fingers_key = "FrontFingers" + base;
+    char b[1000];
+    std::snprintf(b, sizeof(b), "%.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f", g.p[0], g.p[1], g.p[2], g.O[0], g.O[1], g.O[2], g.O[3],
+                  g.O[4], g.O[5], g.O[6], g.O[7], g.O[8]);
+    sv->hold = b;
+    if (fr.valid) {
+        unsigned mask = 0;
+        for (int i = 0; i < 15; ++i)
+            if (fr.has[i]) mask |= 1u << i;
+        int at = std::snprintf(b, sizeof(b), "%x", mask);
+        for (int i = 0; i < 15 && at > 0 && at < static_cast<int>(sizeof(b)) - 80; ++i) {
+            float q[4] = {0, 0, 0, 1};
+            if (fr.has[i]) {
+                quat_of(fr.M[i], q);
+                float back[9];
+                mat_of(q, back);
+                for (int k = 0; k < 9; ++k) worst = std::fmax(worst, std::fabs(back[k] - fr.M[i][k]));
+            }
+            at += std::snprintf(b + at, sizeof(b) - at, " %.4f %.4f %.4f %.4f %.1f %.1f %.1f", q[0], q[1], q[2], q[3], fr.t[i][0] * 1000.0f,
+                                fr.t[i][1] * 1000.0f, fr.t[i][2] * 1000.0f);
+        }
+        sv->fingers = b;
+    }
+    if (!QueueUserWorkItem(save_front_grip_work, sv, WT_EXECUTEDEFAULT)) delete sv;
+    return worst;
+}
+// at the start (the config's load): the saved holds and fingers read, kept as read (no re-learning)
+void load_front_grips() {
+    std::string got;
+    std::lock_guard lock(g_draw_mutex);
+    for (int w = 8; w <= 34; ++w) {
+        if (w > 20 && w != 31 && w != 34) continue;
+        const char* tok = holster::weapon_token(w);
+        if (!*tok) continue;
+        for (int pose = 0; pose < 2; ++pose) {
+            const std::string base = std::string(".") + tok + "." + kGripPoseKey[pose];
+            const std::string hs = config::get_string("Grips", ("FrontHold" + base).c_str(), "");
+            float v[12];
+            if (hs.empty() || sscanf_s(hs.c_str(), "%f %f %f %f %f %f %f %f %f %f %f %f", v, v + 1, v + 2, v + 3, v + 4, v + 5, v + 6, v + 7, v + 8, v + 9,
+                                       v + 10, v + 11) != 12)
+                continue;
+            bool ok = true;
+            for (float x : v) ok = ok && std::isfinite(x);
+            if (!ok || v[0] * v[0] + v[1] * v[1] + v[2] * v[2] > 1.0f) continue;
+            // (the review) the axes a rotation (a hand-edited line's refused)
+            const float* O = v + 3;
+            for (int i = 0; i < 3 && ok; ++i)
+                for (int j = i; j < 3 && ok; ++j) {
+                    const float d = O[i] * O[j] + O[3 + i] * O[3 + j] + O[6 + i] * O[6 + j];
+                    ok = std::fabs(d - (i == j ? 1.0f : 0.0f)) < 0.02f;
+                }
+            if (!ok) continue;
+            GripRel& g = g_grips[w][pose];
+            g = GripRel{};
+            std::memcpy(g.p, v, sizeof(g.p));
+            std::memcpy(g.O, O, sizeof(g.O));
+            g.valid = true;
+            g_grip_tpl[pose] = g;  // (the review) the template as a learned hold would set it
+            g_front_seen[w].fetch_or(1u << pose, std::memory_order_relaxed);
+            got += std::string(" ") + tok + "." + kGripPoseKey[pose];
+            const std::string fs = config::get_string("Grips", ("FrontFingers" + base).c_str(), "");
+            const char* c = fs.c_str();
+            char* e = nullptr;
+            const unsigned long mask = std::strtoul(c, &e, 16);
+            if (fs.empty() || e == c) {
+                got += "(learning its fingers)";
+                continue;  // (the review) without its fingers: the hold used, both learned again (and saved)
+            }
+            c = e;
+            FingerRel fr;
+            int bones = 0;
+            for (int i = 0; i < 15 && ok; ++i) {
+                float x[7];
+                for (int k = 0; k < 7 && ok; ++k) {
+                    x[k] = std::strtof(c, &e);
+                    ok = e != c && std::isfinite(x[k]);
+                    c = e;
+                }
+                if (!ok || !(mask & (1ul << i))) continue;
+                ok = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3] > 0.5f;  // (the review) a unit quaternion
+                if (!ok) break;
+                mat_of(x, fr.M[i]);
+                for (int k = 0; k < 3; ++k) fr.t[i][k] = x[4 + k] * 0.001f;
+                fr.has[i] = true;
+                ++bones;
+            }
+            fr.valid = ok && bones >= 10;
+            if (!fr.valid) {
+                got += "(learning its fingers)";
+                continue;
+            }
+            g_front_fingers[w][pose] = fr;
+            g_grip_n[w][pose] = 30;  // SteadyRing: kept
+            g_grip_saved[w][pose] = true;
+            g_front_seen[w].fetch_or(4u << pose, std::memory_order_relaxed);
+            got += "+fingers";
+        }
+    }
+    if (!got.empty()) log::info("[body] the front hand's holds read from the user ini (FrontHold, FrontFingers):%s", got.c_str());
+}
 // a hand's fingers relative to its wrist in a bone set (12 floats a bone: [R | t] row-major), none for a collapsed hand
 // [Hands] CarryByForegrip: the front hand's fingers on the foregrip, fully two-handed (the draw mutex's)
 FingerRel g_carry_fingers;
@@ -6441,9 +6618,10 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                         dh += (rel[k] - hs->ik_hold[k]) * (rel[k] - hs->ik_hold[k]);
                     }
                     const bool has_ik = hs->ik[0] != 0.0f || hs->ik[1] != 0.0f || hs->ik[2] != 0.0f;
+                    const float gate = g_learn_gate.load(std::memory_order_relaxed), gate2 = gate * gate;
                     static int pair_weapon = -1, pair_frames = 0;  // the actor state's weapon and the sample's gun, together
                     static uintptr_t pair_W = 0;
-                    if (f.weapon != pair_weapon || hs->W != pair_W) {
+                    if (f.weapon != pair_weapon || hs->W != pair_W || mir || f.carry_j >= 0) {  // (the review: 5 clean frames after either)
                         pair_weapon = f.weapon;
                         pair_W = hs->W;
                         pair_frames = 0;
@@ -6480,7 +6658,9 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                     };
                     if (keep) {
                         // the grip and its pose kept while the front hand holds the gun
-                    } else if (pair_frames >= 5 && has_ik && std::fmin(da, dh) < 0.06f * 0.06f) {
+                    } else if (pair_frames >= 5 && has_ik && std::fmin(da, dh) < gate2 && !mir && f.carry_j < 0) {
+                        // (item 29, round 83: the user's Pump-action learned a hold 5 cm off the simulator's, only after
+                        // it was held in John's left and carried: neither is the game's own two-handed hold, never learned)
                         if (f.two_blend > 0.0f) {  // "skel lag": learning while the front hand holds the gun
                             ++g_two_learns;
                             if (learned != g_grip_pose) ++g_two_flips;
@@ -6518,11 +6698,20 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                                     bits |= 4u << slot_pose;
                                 }
                                 g_front_seen[f.weapon].fetch_or(bits, std::memory_order_relaxed);
+                                // (item 29) the 30th sample: the hold and its fingers saved, once
+                                // (the review) only with its fingers: a hold read back is kept as read, its fingers then never learned
+                                if (steady && n == 30 && !g_grip_saved[f.weapon][slot_pose] && g_front_fingers[f.weapon][slot_pose].valid) {
+                                    g_grip_saved[f.weapon][slot_pose] = true;
+                                    const float rt = save_front_grip(f.weapon, slot_pose);
+                                    log::info("[two] the %s's %s hold learned (%.5f %.5f %.5f), fingers %d (their turns' round trip %.5f): saved in "
+                                              "the user ini", holster::weapon_token(f.weapon), kGripPoseKey[slot_pose], gr.p[0], gr.p[1], gr.p[2],
+                                              g_front_fingers[f.weapon][slot_pose].valid ? 1 : 0, rt);
+                                }
                             }
                         }
                         g_grip_learns.fetch_add(1, std::memory_order_relaxed);
-                    } else if (!has_ik || std::fmin(da, dh) >= 0.06f * 0.06f) {
-                        const bool own = f.weapon >= 0 && f.weapon < kGripW && (g_grips[f.weapon][0].valid || g_grips[f.weapon][1].valid);
+                    } else if (!has_ik || std::fmin(da, dh) >= gate2 || mir || f.carry_j >= 0) {
+                        const bool own = grip_ready(f.weapon, 0) || grip_ready(f.weapon, 1);  // (the review: as the hold's choice)
                         // no grip learned this frame: the game's aim state picks the pose; a gun with no grip of its own
                         // (it borrows one) keeps the aiming pose (run 8 item 2: the aim flag slid its ring 3-10 cm)
                         const int pose = own || !g_sawed_grip.load(std::memory_order_relaxed) ? flag_pose : 1;
@@ -6540,24 +6729,21 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                 // [Weapon.<Gun>] FrontHandPose: the gun's fixed hold, else the game's state's
                 const int fixed_pose = f.weapon >= 0 && f.weapon < kGripW ? g_front_pose[f.weapon].load(std::memory_order_relaxed) : 0;
                 const int pose_use = fixed_pose == 1 ? 0 : fixed_pose == 2 ? 1 : g_grip_pose;
+                // (item 29, round 83: "the grip changed to one much lower and with a different hand pose") a gun's own
+                // hold once complete (saved: read from the ini, or its 30 samples in), never one still learning
                 if (f.weapon >= 0 && f.weapon < kGripW) {
-                    if (g_grips[f.weapon][pose_use].valid)
+                    if (grip_ready(f.weapon, pose_use))
                         want = &g_grips[f.weapon][pose_use], src = 0;
-                    else if (g_grips[f.weapon][1 - pose_use].valid)
+                    else if (grip_ready(f.weapon, 1 - pose_use))
                         want = &g_grips[f.weapon][1 - pose_use], src = 0;
                 }
                 // the Sawed-off (15): the game never holds it two-handed, so it learns no grip; the Double-barrel's
                 // as learned in the simulator (the same bones and IK offsets), before the template (the last long
                 // gun's, in that gun's own frame: the ring sat elsewhere each session)
                 if (!want && f.weapon == 15 && g_sawed_grip.load(std::memory_order_relaxed)) want = &g_grip_sawed[pose_use], src = 3;
-                if (!want && g_fallback_cfg.load(std::memory_order_relaxed)) {
-                    if (g_grip_tpl[pose_use].valid)
-                        want = &g_grip_tpl[pose_use], src = 1;
-                    else if (g_grip_tpl[1 - pose_use].valid)
-                        want = &g_grip_tpl[1 - pose_use], src = 1;
-                    else
-                        want = &g_grip_builtin[pose_use], src = 2;
-                }
+                // (item 29, round 83) never the template (the last gun learned: the Pump-action's grip moved with
+                // whichever gun came before it, 82 of its 162 grabs in the user's logs): the built-in, the same each time
+                if (!want && g_fallback_cfg.load(std::memory_order_relaxed)) want = &g_grip_builtin[pose_use], src = 2;
                 // a fallback: the hand kept where it took hold along the barrel (its z in the gun's frame, at the hold's start)
                 static bool z_locked = false;
                 static float lock_z = 0.0f;
@@ -6620,6 +6806,19 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                     static bool held_before = false;
                     static float p0[3] = {};
                     const bool held_now = use && f.two_blend > 0.0f;
+                    if (held_now && !held_before && f.weapon >= 0 && f.weapon < kGripW) {
+                        // (item 29) which hold and fingers a grab of the foregrip took (a grab "in a different pose")
+                        const int fpi = fixed_pose > 0 ? fixed_pose - 1 : -1;
+                        const bool own = src == 0 && want == &g_grips[f.weapon][pose_use];
+                        const bool other = src == 0 && !own;
+                        log::info("[two] the front hand takes the %s's foregrip: the %s hold (%s), %s fingers, at (%.3f %.3f %.3f)",
+                                  holster::weapon_token(f.weapon), kGripPoseKey[other ? 1 - pose_use : pose_use],
+                                  own || other ? (g_grip_saved[f.weapon][other ? 1 - pose_use : pose_use] ? "the gun's, saved" : "the gun's, learning")
+                                  : src == 1 ? "the last gun's, the hand where it took hold"
+                                  : src == 3 ? "the Double-barrel's"
+                                             : "the built-in, the hand where it took hold",
+                                  fpi >= 0 && g_front_fingers[f.weapon][fpi].valid ? "the hold's" : "the game's live", use->p[0], use->p[1], use->p[2]);
+                    }
                     if (held_now && (!held_before || g_two_drift_rebase)) {
                         std::memcpy(p0, use->p, sizeof(p0));
                         g_two_drift_rebase = false;
@@ -7575,7 +7774,8 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
        // left, the transplant), blended from the game's by the two-handed hold
         const bool mir_now = f.mirror && f.xfer && f.gun_j == 0 && f.item_side == 1;
         const int fp = f.weapon >= 0 && f.weapon < kGripW ? g_front_pose[f.weapon].load(std::memory_order_relaxed) : 0;
-        const FingerRel* fr = fp > 0 ? &g_front_fingers[f.weapon][fp - 1] : nullptr;
+        // (the review) only a complete hold's: a learning one's are rewritten each sample
+        const FingerRel* fr = fp > 0 && grip_ready(f.weapon, fp - 1) ? &g_front_fingers[f.weapon][fp - 1] : nullptr;
         const float b = f.two_blend > 1.0f ? 1.0f : f.two_blend;
         const int wb = g_rig.wrist[0];
         const int wb1 = g_rig.wrist[1];
@@ -9113,6 +9313,9 @@ bool builtin_gun_rel(int w, float* out) {
 // the learned holds saved: once a session per gun, and only with FixedGunGrip on (run 7 item 6's review: off, the hook
 // wrote the user ini on every re-equip)
 std::atomic<bool> g_gun_rel_saved[holster::kWeapons] = {};
+// (item 29) a hold read from the user ini is kept as read: not eased again, not saved again (each session's easing of
+// the game's rounded matrices rewrote every GunHand line by 0.01-0.1 mm)
+std::atomic<bool> g_gun_rel_read[kGripW] = {};
 struct GunRelSave {
     int w;
     float m[16];
@@ -9145,6 +9348,8 @@ void load_gun_rels() {
         g.m[15] = 1.0f;
         ortho_rows(g.m);
         g.valid = rigid_axes(g.m) && g.m[12] * g.m[12] + g.m[13] * g.m[13] + g.m[14] * g.m[14] < 1.0f;
+        g_gun_rel_read[w] = g.valid;
+        if (g.valid) (w <= 7 ? g_gun_rel_tpl_side : g_gun_rel_tpl) = g;  // (the review) as a learned hold sets it
         if (g.valid) log::info("[body] FixedGunGrip: the %s's aiming hold read from the user ini", holster::weapon_token(w));
     }
 }
@@ -9213,7 +9418,7 @@ void fixed_grip(int side, float* src, int item_w) {
     }
     GunRel& g = g_gun_rel[w];
     // steady aiming: learn (an easing); [Reload] SnapToDrawnGun: not through the fire clip (it moves the gun in the hand)
-    if (aiming && af > 20 && (g_fg_learn.load(std::memory_order_relaxed) || !g.valid) && rigid_axes(rel) && rel[12] * rel[12] + rel[13] * rel[13] + rel[14] * rel[14] < 1.0f &&
+    if (aiming && af > 20 && ((g_fg_learn.load(std::memory_order_relaxed) && !g_gun_rel_read[w].load(std::memory_order_relaxed)) || !g.valid) && rigid_axes(rel) && rel[12] * rel[12] + rel[13] * rel[13] + rel[14] * rel[14] < 1.0f &&
         !(fix_on && g_snap_drawn_cfg.load(std::memory_order_relaxed) && in_fire_clip())) {
         if (!g.valid) {
             std::memcpy(g.m, rel, sizeof(rel));
@@ -12975,6 +13180,7 @@ bool install() {
         g_fixed_sidearm = config::get_bool("Hands", "FixedSidearmGrip", false);
         g_follow_auto = config::get_bool("Debug", "FollowLog", true);
         load_gun_rels();
+        load_front_grips();
         g_copy_grip_cfg = config::get_bool("Hands", "CopyGrip", true);
         g_carry_ease_ms = std::clamp(config::get_float("Hands", "CarryEaseMs", 150.0f), 0.0f, 1000.0f);  // (2026-10-31, step 3, R10)
         g_same_frame_cfg = config::get_bool("Reload", "TwoHandedSteady", true);
@@ -13848,10 +14054,48 @@ std::string command(const std::string& line) {
                       g_rig.mirror_ok ? "the finger mirror on" : "the finger mirror off");
         return b;
     }
+    if (sub == "grips" && (line.find(" forget") != std::string::npos || line.find(" reread") != std::string::npos)) {
+        // skel grips forget (item 29): the front hand's holds learned afresh, the saved ones removed from the user ini;
+        // skel grips reread (a test): this session's dropped and the saved ones read again (as a new session)
+        const bool forget = line.find(" forget") != std::string::npos;
+        std::vector<std::string> keys;
+        {
+            std::lock_guard lock(g_draw_mutex);
+            for (int w = 8; w < kGripW; ++w)
+                for (int pose = 0; pose < 2; ++pose) {
+                    g_grips[w][pose] = GripRel{};
+                    g_front_fingers[w][pose] = FingerRel{};
+                    g_grip_n[w][pose] = 0;
+                    g_grip_saved[w][pose] = false;
+                    const char* tok = holster::weapon_token(w);
+                    if (*tok && forget)
+                        for (const char* k : {"FrontHold", "FrontFingers"}) {
+                            const std::string key = std::string(k) + "." + tok + "." + kGripPoseKey[pose];
+                            if (!config::get_string("Grips", key.c_str(), "").empty()) keys.push_back(key);
+                        }
+                }
+            for (int w = 8; w < kGripW; ++w) g_front_seen[w] = 0;
+        }
+        for (const auto& k : keys) config::set("Grips", k.c_str(), "");
+        if (!forget) {
+            load_front_grips();
+            int n = 0;
+            {
+                std::lock_guard lock(g_draw_mutex);
+                for (int w = 8; w < kGripW; ++w) n += (g_grip_saved[w][0] ? 1 : 0) + (g_grip_saved[w][1] ? 1 : 0);
+            }
+            return "the front hand's holds read again from the user ini: " + std::to_string(n) + " holds";
+        }
+        return "the front hand's holds forgotten (" + std::to_string(keys.size()) + " saved keys emptied): each learned afresh";
+    }
     if (sub == "grips" && (line.find(" steadyring on") != std::string::npos || line.find(" steadyring off") != std::string::npos)) {
         // skel grips steadyring on|off: SteadyRing (the session); the samples counted afresh
         g_steady_grip = line.find(" steadyring on") != std::string::npos;
-        std::memset(g_grip_n, 0, sizeof(g_grip_n));
+        {
+            std::lock_guard lock(g_draw_mutex);  // (the review: a saved hold kept as it is, its count at 30)
+            for (int w = 0; w < kGripW; ++w)
+                for (int pz = 0; pz < 2; ++pz) g_grip_n[w][pz] = g_grip_saved[w][pz] ? 30 : 0;
+        }
         return std::string("the learned grips ") + (g_steady_grip.load() ? "steadied (the mean of 30, then kept)" : "re-learned each frame");
     }
     if (sub == "stock") {  // skel stock: the controllers' line while the physical stock holds a long gun (read only, a test)
@@ -14846,6 +15090,13 @@ std::string command(const std::string& line) {
         if (line.find(" learn off") != std::string::npos) g_fg_learn = false;
         if (line.find(" side on") != std::string::npos) g_fixed_sidearm = true;  // skel grip side on|off: FixedSidearmGrip
         if (line.find(" side off") != std::string::npos) g_fixed_sidearm = false;
+        if (const size_t gp = line.find(" gate "); gp != std::string::npos) {  // skel grip gate <m> (item 29, a test, the session)
+            const float g = std::strtof(line.c_str() + gp + 6, nullptr);
+            if (g >= 0.02f && g <= 0.2f) g_learn_gate = g;
+            char gb[96];
+            std::snprintf(gb, sizeof(gb), "skel grip: the learning's gate %.3f m", g_learn_gate.load());
+            return gb;
+        }
         FixedGripDiag d;
         GunRel g;
         {

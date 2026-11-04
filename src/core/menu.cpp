@@ -910,6 +910,14 @@ void page_display() {
               "it like a watch. Prompts stay on the floating screen."))
         xr::set_hud_on_wrist(wrist);
     sub_begin(wrist);  // 2026-10-09: [Controls] WristSatchel
+    {  // 2026-11-04: [XR] WristHudShape (a player's piece of the radar's rim floating above the wrist: rect to compare)
+        const bool rd = xr::hud_shape_radar();
+        const char* kShapeTip = "What goes to the wrist. The radar and ammo count only: anything else in that corner, such as a subtitle, "
+                                "stays on the floating screen. The whole corner: the screen's lower-left corner as a rectangle.";
+        if (radio("The radar and ammo count##wrist shape radar", rd, kShapeTip) && !rd) xr::set_hud_shape_radar(true);
+        ImGui::SameLine();
+        if (radio("The whole corner##wrist shape rect", !rd, kShapeTip) && rd) xr::set_hud_shape_radar(false);
+    }
     bool ws = controls::wrist_satchel();
     if (check("A double tap of Y at the wrist opens the satchel", &ws,
               "With the wrist HUD in view, two quick presses of Y open John's satchel; B closes it. A single press still reaches the "

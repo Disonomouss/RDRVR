@@ -71,12 +71,12 @@ bool diag_on();
 void diag_draw(uintptr_t drawable, const float* pos, uint64_t pass, const float* m = nullptr);  // m: the record's 4x4 (axes rows 0-2)
 std::string diag_command(const std::string& arg);
 int live_objects();  // made and not yet destroyed
-// Any thread: on, no holster slot's object is made or kept and none counts as shown, so the game's own holstered gun
-// shows; the wants are kept for when it is off. hogtie.cpp: while someone is on the player's lasso (the game's hogtie
+// Any thread: on, no object of a clearable slot (2026-11-04: every one but the census's) is made or kept and none
+// counts as shown, so the game's own holstered gun shows; the wants are kept for when it is off. hogtie.cpp: while someone is on the player's lasso (the game's hogtie
 // check sweeps between the two, and these free objects are in its way; after optimumbox's 0.8.11.8). 2026-10-27: the
 // shells' pool too (the row stands at the chest, in the sweep's way; round_draw's own shells stand in meanwhile).
 void set_clear(bool on);
-bool holster_wanted();  // a holster's gun or model (or, 2026-10-27, the shells' pool) is wanted now (hogtie.cpp polls the lasso only then)
+bool holster_wanted();  // a clearable slot's prop (a holster's gun or model, the pool, the round, the copy, the off hand's item) is wanted now (hogtie.cpp polls the lasso only then)
 // Slot s's prop drawn (a draw of it moved) within the last 100 ms. Any thread.
 bool shown(int s);
 // The pool (2026-10-27), the game thread (the holsters' update, before frame): `objects` of `fragment` kept (0 or

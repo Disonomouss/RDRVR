@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.12 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.12.1 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -397,6 +397,20 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   - Undead Nightmare: its weapons work with the holsters, the grip, the free hand and dual wielding.
 - New in 0.8.12 (used in the developer's Quest 3): a **Gunfights** tab while Ped Gunfight Overhaul 1.1.5 is installed
   (see the [Menu guide](#menu-guide)).
+- 0.8.12.1, a hotfix (your 0.8.12 settings are kept; no reset):
+  - Fixed (used in the developer's Quest 3): the hogtie. In 0.8.12 the game's "hogtie" press failed on someone on your
+    lasso: the mod's props (the guns shown at your holsters, the shells, the item in your other hand) were in the way of
+    the game's check. They are now hidden while someone is on your lasso on foot, and show again a second after the
+    rope is empty (`[Gestures] HogtieClearProps`, on).
+  - Fixed (used in the developer's Quest 3): the front hand's grip on a long gun. The Pump-action's and the Carcano's
+    could change to a lower one with a different hand pose mid-session (the hand borrowed another gun's hold, or one
+    still being learned). Every long gun's own hold now ships with the mod and is used from the first grab, and the
+    Pump-action's and the Carcano's foregrip places are set anew on them (and the Pump-action's foregrip ring for the
+    left hand moved 1 cm). A foregrip place you set yourself on those two in 0.8.12 was set on the borrowed hold: set
+    it again if the hand sits wrong. The gun hand's saved holds are no longer rewritten by a fraction of a millimetre at
+    each start.
+  - New (tried in the developer's simulator): **What goes to the wrist** (the Display tab, under "HUD on the left
+    wrist"): the radar and ammo count only (the default), or the whole corner of the screen as before 0.8.12.
 
 ## Requirements
 
@@ -414,7 +428,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.12.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.12.1.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -489,7 +503,8 @@ The picture, single pass, the resolution the game renders at for your headset, p
 | **Now: ...** | Shows the size the game is running at now, or why it uses its own size. | – |
 | **Preset: Quality / Balanced / Performance** (new in 0.8.4) | One click sets the eye shape, DLSS's quality, Automatic's cap, the eye scale (`[XR] EyeScale`), the shared shadows and the refresh rate. Quality: DLSS at DLAA, Automatic at your runtime's full size. Balanced: DLSS Quality, Automatic at most 2880 pixels tall. Performance: DLSS Performance (without DLSS, the eyes at 0.85 of the size), at most 2208 tall, 72 Hz where your headset offers it. The eye shape, DLSS and the resolution apply after a restart, the refresh rate at once. A note suggests Balanced or Performance when gameplay keeps missing frames. | None chosen |
 | **Headset refresh rate** (new in 0.8.4) | The runtime's, or one of your headset's refresh rates, where your VR runtime lets the mod choose (otherwise the row says to set it in your headset's or runtime's own settings). A frame that misses the rate drops the runtime to half the rate; 72 or 80 holds steadier on a slower PC. | The runtime's |
-| **HUD on the left wrist** | Puts the radar and the ammo counter on the back of your left hand (the right when left-handed) like a watch: turn the palm down and look at it to see them. Prompts, subtitles and the rest of that corner of the screen stay on the floating screen (since 0.8.12). | On |
+| **HUD on the left wrist** | Puts the radar and the ammo counter on the back of your left hand (the right when left-handed) like a watch: turn the palm down and look at it to see them. Prompts, subtitles and the rest of that corner of the screen stay on the floating screen (since 0.8.12; with "The whole corner" below, all of that corner goes to the wrist). | On |
+| ↳ **What goes to the wrist: The radar and ammo count / The whole corner** (new in 0.8.12.1) | The radar and the ammo counter only, anything else in that corner (a subtitle) staying on the floating screen; or the screen's whole lower-left corner as a rectangle. | The radar and ammo count |
 | ↳ **A double tap of Y at the wrist opens the satchel** (new in 0.7.0) | With the wrist HUD in view, two quick presses of Y open John's satchel and B closes it. A single press still reaches the game as Y, about a third of a second late. | On |
 | **Cutscenes: On the cinema screen / In 3D** | Cutscenes on a floating 16:9 screen, or in 3D around you from the cutscene camera with your head's turning added (you can switch mid-cutscene). | In 3D |
 | ↳ **3D separation** | The cutscenes' 3D depth as a fraction of your eye distance (1.00 = your own; lower is flatter), 0.05 per press. | 1.00 |

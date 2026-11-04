@@ -38,9 +38,10 @@ const char* const kObjName[kSlots] = {"rdrvr_round",     "rdrvr_second_gun", "rd
                                       "rdrvr_shell_12",  "rdrvr_shell_13",   "rdrvr_free_30",   "rdrvr_free_31"};
 static_assert(kPoolFirst + kPoolMax <= kSlots, "the pool's slots");
 bool in_pool(int i) { return i >= kPoolFirst && i < kPoolFirst + kPoolMax; }
-// the slots hogtie.cpp's clear takes away: the holsters' guns and models (not the round or the dual wield's copy in
-// the hand: the review) and, 2026-10-27, the shells' pool (the row at the chest)
-bool clearable(int i) { return (i >= kHolsterSlot && i < kCensusSlot) || in_pool(i); }
+// the slots hogtie.cpp's clear takes away: 2026-11-04 every one but the census's, as optimumbox's (the user, 0.8.12 on
+// the other PC: "Hogtie is broken again"): the holsters' guns and models, the shells' pool (the row at the chest), the
+// round, the off hand's item, and the dual wield's copy (its draw then moved onto the free hand, body.cpp: still seen)
+bool clearable(int i) { return i != kCensusSlot; }
 
 uint64_t fbits(float f) {
     uint32_t u;
