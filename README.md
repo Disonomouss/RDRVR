@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.12.1 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.12.2 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -411,6 +411,10 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
     each start.
   - New (tried in the developer's simulator): **What goes to the wrist** (the Display tab, under "HUD on the left
     wrist"): the radar and ammo count only (the default), or the whole corner of the screen as before 0.8.12.
+- 0.8.12.2, a hotfix (your settings are kept; no reset):
+  - Fixed (used in the developer's Quest 3): a long gun carried by its foregrip. Letting go of the gun's grip while
+    swinging it two-handed (for a few seconds or more) left the gun a few centimetres off the carrying hand, the hand
+    holding air beside it, for as long as it was carried. The carried gun now stays where it was in your hand.
 
 ## Requirements
 
@@ -428,7 +432,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.12.1.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.12.2.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to

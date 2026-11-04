@@ -1307,6 +1307,23 @@ TwoHandT g_two_T;
 // front target of now (carry_rigid), the same still moment the carrying hand's hold comes from. Under g_two_T_seq too
 TwoHandT g_two_T_still;
 bool g_two_T_moving = false;  // the latest capture's controllers not still
+// (2026-11-04, the user: "Can we lock the hand and gun to each other's position? When you move your foregrip during the
+// carry transition it ends up away from the gun's model holding air") the gun as drawn, and the front controller's
+// target, in the very draw frame the carrying hand's hold (g_carry_prel, g_carry_orel: the snapped hand on that drawn gun,
+// in that target's frame) was learned in: the hand-over's P, so the carried gun and the hand drawn at the hold keep the
+// relation they were drawn with, the hand on the grip. The game thread's captures (g_two_T, g_two_T_still) are another
+// moment's: a let-go while moving 3 s or more took a moving one, the drawn gun lagging its controllers (r299: 4 cm, 10
+// degrees). The draw writes it (slot 0, under its own seqlock: the game thread writes g_two_T_seq); W 0: none (a new grip,
+// two-handed without the snap)
+TwoHandT g_two_T_learn;
+std::atomic<uint32_t> g_two_L_seq{0};
+std::atomic<uint64_t> g_two_T_learn_used{0};  // the hand-overs that took it ("skel carry")
+void two_learn_set(const TwoHandT* t) {  // t null: cleared
+    g_two_L_seq.fetch_add(1, std::memory_order_acq_rel);  // odd while writing
+    if (t) g_two_T_learn = *t;
+    else g_two_T_learn.W = 0;
+    g_two_L_seq.fetch_add(1, std::memory_order_release);
+}
 std::atomic<uint64_t> g_two_T_still_used{0};  // the hand-overs that took the still capture ("skel carry")
 std::atomic<uint32_t> g_two_T_seq{0};
 std::atomic<uint64_t> g_two_T_takes{0}, g_carry_placements{0}, g_carry_refused{0};
@@ -6421,6 +6438,8 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
     float pub_gun_R[9] = {}, pub_gun_o[3] = {};
     bool pub_mgun = false;  // (step 7, r80 G4) the mirrored long gun's frame
     float pub_mgun_R[9] = {}, pub_mgun_o[3] = {};
+    bool drawn_gun_ok = false;  // (2026-11-04) the drawn long gun's frame the front hand snaps onto (world), for g_two_T_learn
+    float drawn_gun_R[9] = {}, drawn_gun_o[3] = {};
     bool pub_fore = false;  // the foregrip point for the body points (world), set below
     float pub_fore_p[3] = {};
     int grasp_h = -1;  // (2026-10-28) [Reload] PartHandSnap: John's hand on a part (its fingers closed on it, below), its weight
@@ -6889,6 +6908,11 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                             g2_ok = false;
                         }
                     }
+                    if (slot == 0) {  // (2026-11-04) the frame the snap below is onto, for the carry's hand-over
+                        drawn_gun_ok = true;
+                        std::memcpy(drawn_gun_R, Gd, sizeof(drawn_gun_R));
+                        for (int k = 0; k < 3; ++k) drawn_gun_o[k] = gd_o[k] + off[k];
+                    }
                     if (!mir && slot == 0) {  // run 6 item 9g: the drawn gun's own frame, for its parts' zones (world)
                         pub_gun = true;
                         std::memcpy(pub_gun_R, Gd, sizeof(pub_gun_R));
@@ -7022,6 +7046,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
             if (h == fh && f.carry_j < 0 && f.two_blend > 0.0f && !snap_ok && g_carry_rel_ok[h]) {
                 g_carry_rel_ok[h] = false;  // two-handed without the snap: no hold to keep (the controller's own)
                 ++g_carry_clears;
+                two_learn_set(nullptr);
             }
             // (2026-10-30, round 55, item 8; r297: the carried gun's place on the bone came out the same moving or still,
             // yet the carrying hand ended up to 9 degrees and 4 cm off its controller) learned only while the front controller
@@ -7045,6 +7070,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                 if (f.carry_j < 0 && ((f.two_blend > 0.0f && s_blend_was[h] <= 0.0f) || f.weapon != s_weapon_was[h]) && g_carry_rel_ok[h]) {
                     g_carry_rel_ok[h] = false;  // (a new grip: no hold of the last one kept)
                     ++g_carry_clears;
+                    two_learn_set(nullptr);
                 }
                 s_blend_was[h] = f.two_blend;
                 s_weapon_was[h] = f.weapon;
@@ -7077,6 +7103,26 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                 for (int i = 0; i < 3; ++i) g_carry_prel[h][i] = M_ctl[i] * d[0] + M_ctl[3 + i] * d[1] + M_ctl[6 + i] * d[2];  // M^T d
                 carry_learn = true;
                 ++g_carry_learns;
+                // (2026-11-04) the drawn gun and this target with it: the hand-over's P (g_two_T_learn). The gun's axes as
+                // rows (the game's matrix: Gd's columns), its fourth column 0 (place_carry keeps the game's own)
+                if (drawn_gun_ok && hs) {
+                    TwoHandT L;
+                    L.W = hs->W;
+                    for (int i = 0; i < 3; ++i) {
+                        for (int k = 0; k < 3; ++k) L.P[i * 4 + k] = drawn_gun_R[k * 3 + i];
+                        L.P[i * 4 + 3] = 0.0f;
+                        L.P[12 + i] = drawn_gun_o[i];
+                    }
+                    L.P[15] = 1.0f;
+                    L.fj = h;
+                    std::memcpy(L.hand0, f.ik_t[h], sizeof(L.hand0));
+                    std::memcpy(L.rot0, f.ik_r[h], sizeof(L.rot0));
+                    L.hand0_ok = true;
+                    L.ms = log::now_ms();
+                    two_learn_set(&L);
+                } else {
+                    two_learn_set(nullptr);  // (the hold learned without its gun: the game thread's captures, as before)
+                }
             } else if (carrying) {
                 ++g_carry_holds;
                 hand_turn(h, f.ik_r[h], M_ctl);
@@ -12778,7 +12824,20 @@ bool two_hand_P(uintptr_t W, float P[16], float hand0[3], float rot0[9], int fj)
         // (the review: carried rigidly to the latest capture's front target here, so the hand-over's own use of P, the
         // take-back point on the gun, sees the gun at the hand of now)
         float Pm[16];
-        if (moving && cs.W == W && cs.hand0_ok && cs.fj == c.fj && c.ms - cs.ms <= 3000.0 && carry_rigid(cs.P, cs.hand0, cs.rot0, c.hand0, c.rot0, Pm)) {
+        // (2026-11-04) the draw's record of the hold's own frame first: the gun as drawn with the hand on it, in the
+        // target of that frame, carried rigidly to the latest capture's target (as the still capture is)
+        TwoHandT lr;
+        bool l_ok = false;
+        for (int lt = 0; lt < 8 && !l_ok; ++lt) {
+            const uint32_t l0 = g_two_L_seq.load(std::memory_order_acquire);
+            if (l0 & 1) continue;
+            lr = g_two_T_learn;
+            l_ok = g_two_L_seq.load(std::memory_order_acquire) == l0;
+        }
+        if (l_ok && lr.W == W && lr.hand0_ok && lr.fj == c.fj && carry_rigid(lr.P, lr.hand0, lr.rot0, c.hand0, c.rot0, Pm)) {
+            std::memcpy(c.P, Pm, sizeof(c.P));
+            g_two_T_learn_used.fetch_add(1, std::memory_order_relaxed);
+        } else if (moving && cs.W == W && cs.hand0_ok && cs.fj == c.fj && c.ms - cs.ms <= 3000.0 && carry_rigid(cs.P, cs.hand0, cs.rot0, c.hand0, c.rot0, Pm)) {
             std::memcpy(c.P, Pm, sizeof(c.P));
             g_two_T_still_used.fetch_add(1, std::memory_order_relaxed);
         }
@@ -15215,13 +15274,14 @@ std::string command(const std::string& line) {
                       cb[1][1], cb[1][2], g_att_bone[0].load(), g_att_bone[1].load(), cT_ok ? "" : "FAILED ", ct[0], ct[1], ct[2]);
         char b2[520];
         std::snprintf(b2, sizeof(b2), " | carried parts drawn %llu | two-handed not captured: left-held %llu, not finite %llu; no front hand %llu, fourth column not finite %llu"
-                      " | put-away at the front hand %llu, old %d (olddelta %d), trace %d | settled passed over moving %llu, still captures used %llu"
+                      " | put-away at the front hand %llu, old %d (olddelta %d), trace %d | settled passed over moving %llu, still captures used %llu, the hold's own frames used %llu"
                       " | eased %llu (%.0f ms, the last start %.3f m off)",
                       static_cast<unsigned long long>(g_carry_part_draws.load()), static_cast<unsigned long long>(g_two_T_left.load()),
                       static_cast<unsigned long long>(g_two_T_nonfinite.load()), static_cast<unsigned long long>(g_two_T_nohand.load()),
                       static_cast<unsigned long long>(g_two_T_col4.load()), static_cast<unsigned long long>(g_carry_puts.load()), g_carry_old.load() ? 1 : 0, g_carry_olddelta.load() ? 1 : 0,
                       log::now_ms() < g_carry_trace_until.load() ? 1 : 0, static_cast<unsigned long long>(g_carry_settle_moving.load()),
-                      static_cast<unsigned long long>(g_two_T_still_used.load()), static_cast<unsigned long long>(g_carry_eased.load()),
+                      static_cast<unsigned long long>(g_two_T_still_used.load()), static_cast<unsigned long long>(g_two_T_learn_used.load()),
+                      static_cast<unsigned long long>(g_carry_eased.load()),
                       g_carry_ease_ms.load(), g_carry_ease_d.load());
         char b3[200];  // the put-away's updates out of the game's hand by the item's state (1 stowed, 2 holstered, 3 drawn)
         std::snprintf(b3, sizeof(b3), " | put-away states 0:%llu 1:%llu 2:%llu 3 in hand:%llu 3 not:%llu 3 unread:%llu other:%llu",
