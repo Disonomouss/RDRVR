@@ -155,16 +155,33 @@ float g_limit_seen = -1.0f;  // the limiter's period as first read (s)
 
 // The swap chain object at D3dDeviceSingleton +0x48: its vt+0x18 is the Present wrapper FUN_140f8b380, which yields until
 // +0x9c seconds have passed since the last frame (0: no limit) and then presents (research\sps, 2026-10-10).
-void game_frame_limit(const char* arg, char* out, size_t len) {
+namespace {
+float* limit_slot() {
     char* const* dev_slot = reinterpret_cast<char* const*>(anchors::addr(anchors::Id::D3dDeviceSingleton));
     char* dev = readable(dev_slot, 8) ? *dev_slot : nullptr;
     char* sc = dev && readable(dev + 0x48, 8) ? *reinterpret_cast<char**>(dev + 0x48) : nullptr;
     void* const* vt = sc && readable(sc, 0xa0) ? *reinterpret_cast<void* const* const*>(sc) : nullptr;
-    if (!vt || !readable(vt, 0x20) || reinterpret_cast<uintptr_t>(vt[3]) != anchors::addr(anchors::Id::PresentWrapper)) {
+    if (!vt || !readable(vt, 0x20) || reinterpret_cast<uintptr_t>(vt[3]) != anchors::addr(anchors::Id::PresentWrapper)) return nullptr;
+    return reinterpret_cast<float*>(sc + 0x9c);
+}
+}  // namespace
+
+float game_frame_limit_value() {
+    if (!anchors::addr(anchors::Id::D3dDeviceSingleton) || !anchors::addr(anchors::Id::PresentWrapper)) return -1.0f;
+    __try {
+        float* limit = limit_slot();
+        return limit ? *limit : -1.0f;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1.0f;
+    }
+}
+
+void game_frame_limit(const char* arg, char* out, size_t len) {
+    float* limit = limit_slot();
+    if (!limit) {
         std::snprintf(out, len, "ERROR the swap chain object not found (no device, or not the Present wrapper's)");
         return;
     }
-    float* limit = reinterpret_cast<float*>(sc + 0x9c);
     if (g_limit_seen < 0) {
         const float v = *limit;
         if (v != 0.0f && (v < 1.0f / 150.0f || v > 1.0f / 29.0f)) {

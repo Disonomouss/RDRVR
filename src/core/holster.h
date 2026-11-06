@@ -304,7 +304,7 @@ void set_unarmed_after_holster(bool on);  // also written to the user ini
 // gun's foregrip it stays carried by that hand ([Hands] CarryByForegrip); DualWield's second gun and the copy too
 bool hold_to_keep();
 void set_hold_to_keep(bool on, bool save);  // save: also written to the user ini (the menu; "holster hold on|off" is the session's)
-// that controller's grip is HoldToKeep's hold on its gun, away from the holsters and holding no rounds (gestures.cpp: the
+// that controller's grip is HoldToKeep's hold on its gun, holding no rounds (in a holster's zone too: 2026-11-05) (gestures.cpp: the
 // gun's swing is not held off as a holster's grip)
 bool grip_keeps(int h);
 constexpr int kZones = 8;  // RightHip, Back, Belt, Knife, Ammo (the chest: a round to reload, reload.h), LeftHip, LeftShoulder, LowerBack

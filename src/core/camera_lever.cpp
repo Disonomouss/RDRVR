@@ -199,6 +199,30 @@ std::mutex g_recentre_mutex;
 bool g_recentred = false;
 std::atomic<uint32_t> g_recentre_gen{0};
 float g_q0[4] = {0, 0, 0, 1}, g_p0[3] = {0, 0, 0};  // recentre: yaw-only orientation and position (LOCAL)
+// (2026-11-06, GOAL-remaining 6c: the snap turn in third person) a yaw (degrees) added to the eye cameras over the game
+// camera's: pose turns the view to the snap's target at once while the game camera, turned by the stick, catches up
+std::atomic<float> g_view_yaw_off{0.0f};
+std::atomic<float> g_view_yaw_frame{0.0f};  // (the review) latched once a frame (hk_SceneRender): both eyes the same yaw
+// (round 93 check 3, the user: "The camera flicks over then back slightly and moves smoothly to where it flicked to") the
+// snap's view held at its end: the yaw taken in hk_SceneRender from that frame's own camera (pose's was from an older one:
+// the view fell behind the camera's speed-up and caught up in its slow-down), and the place where the camera will stand
+// once turned: John's place plus the camera's offset from him at the snap's start turned by the step (the follow camera
+// turns about itself first and swings round John after, SC1's path: no centre to turn the view about holds it still)
+std::atomic<bool> g_vyt_on{false};
+std::atomic<float> g_vyt_target{0.0f}, g_vyt_weight{0.0f};
+std::atomic<bool> g_view_shift_ok{false};  // this frame's eyes turned about the game camera and moved by the shift (x, z)
+std::atomic<float> g_view_shift_x{0.0f}, g_view_shift_z{0.0f};
+float g_vyt_start[6] = {};  // render thread: the snap's start: the camera (x, z), John (x, z), the heading, the target
+bool g_vyt_start_ok = false;
+std::atomic<uint32_t> g_vyt_gen{0};  // (round 95) a fresh snap (not chained): the start taken again
+uint32_t g_vyt_start_gen = 0;        // render thread: the start's
+std::atomic<uint32_t> g_vyt_reref{0};  // (the review) a chained step: the held view's moves measured afresh, the start kept
+uint32_t g_vyt_reref_seen = 0;         // render thread
+// the snap's drawn centre eye against its first frame while held: the heading's and the place's largest moves, and the
+// camera's distance from the held place at the last held frame (eased out after) (r147)
+std::atomic<float> g_vyt_dev_deg{0.0f}, g_vyt_dev_m{0.0f}, g_vyt_end_m{0.0f};
+float g_vyt_ref[3] = {};  // render thread: the first frame's heading, x, z
+bool g_vyt_ref_ok = false;
 // [XR] RoomScale (2026-10-27; the user: "Implement roomscale and physical crouch", research/run27/roomscale.md B2): while
 // the room-scale walk owns John's walk, every metre his anchored camera moves is taken off the head's offset by moving
 // g_p0 (room_shift_origin), so the eye's world place moves only with the head and John walks in under it. The take-off
@@ -318,6 +342,8 @@ void recentre_from(const xr::EyeView* v) {
 bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false, bool may_recentre = true) {
     xr::EyeView v[2];
     if (!(peek ? xr::eye_views_peek(v) : xr::eye_views(v))) return false;
+    float mid[3];  // (6c's pivot: the head's centre, the eyes' midpoint)
+    for (int k = 0; k < 3; ++k) mid[k] = 0.5f * (v[0].position[k] + v[1].position[k]);
     if (eye == 2) {  // the centre: the eyes' midpoint, the left eye's orientation
         for (int k = 0; k < 3; ++k) v[0].position[k] = 0.5f * (v[0].position[k] + v[1].position[k]);
         eye = 0;
@@ -355,6 +381,37 @@ bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false, boo
         out[4 + k] = m[1] * a[k] + m[4] * b[k] + m[7] * c[k];  // new up = column 1
         out[8 + k] = m[2] * a[k] + m[5] * b[k] + m[8] * c[k];  // new back = column 2
         out[12 + k] = cam[12 + k] + prel[0] * a[k] + prel[1] * b[k] + prel[2] * c[k];
+    }
+    // (6c, the third person snap) the view turned about up by the frame's yaw, about the head's centre (the review: not the
+    // recentre origin, which would slide the eyes sideways by the head's distance from it); the heading (atan2 of the back
+    // row's x, z) goes up by it
+    const float yo = g_view_yaw_frame.load(std::memory_order_relaxed);
+    if (yo != 0.0f) {
+        float C[3], sh[2] = {0.0f, 0.0f};
+        if (g_view_shift_ok.load(std::memory_order_relaxed)) {  // (round 93) the snap's: about the game camera, then moved
+            C[0] = cam[12];
+            C[2] = cam[14];
+            sh[0] = g_view_shift_x.load(std::memory_order_relaxed);
+            sh[1] = g_view_shift_z.load(std::memory_order_relaxed);
+        } else {
+            float dc[3] = {0.0f, 0.0f, 0.0f};
+            if (g_xr_head_position.load(std::memory_order_relaxed)) {
+                const float wi = ws_inv();
+                for (int k = 0; k < 3; ++k) dc[k] = (mid[k] - p0[k]) * wi;
+            }
+            const float pc[3] = {r0[0] * dc[0] + r0[1] * dc[1] + r0[2] * dc[2], r0[3] * dc[0] + r0[4] * dc[1] + r0[5] * dc[2],
+                                 r0[6] * dc[0] + r0[7] * dc[1] + r0[8] * dc[2]};
+            for (int k = 0; k < 3; ++k) C[k] = cam[12 + k] + pc[0] * a[k] + pc[1] * b[k] + pc[2] * c[k];
+        }
+        const float r = yo * 0.0174532925f, cs = std::cos(r), sn = std::sin(r);
+        for (int row = 0; row < 12; row += 4) {
+            const float x = out[row], z = out[row + 2];
+            out[row] = x * cs + z * sn;
+            out[row + 2] = -x * sn + z * cs;
+        }
+        const float px = out[12] - C[0], pz = out[14] - C[2];
+        out[12] = C[0] + px * cs + pz * sn + sh[0];
+        out[14] = C[2] - px * sn + pz * cs + sh[1];
     }
     return true;
 }
@@ -702,6 +759,69 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
         g_active.store(true, std::memory_order_relaxed);
     }
     t_frame_yaw = g_yaw.load(std::memory_order_relaxed);
+    {  // (6c: once a frame) the test's yaw, or the snap's from this frame's camera (round 93)
+        float yo = g_view_yaw_off.load(std::memory_order_relaxed);
+        bool shift = false;
+        const bool snap = g_vyt_on.load(std::memory_order_relaxed) && cam;
+        if (snap) {
+            const float h = std::atan2(cam[8], cam[10]) * 57.2957795f, tgt = g_vyt_target.load(std::memory_order_relaxed),
+                        w = g_vyt_weight.load(std::memory_order_relaxed);
+            yo = std::remainder(tgt - h, 360.0f) * w;
+            RdrvrActorState st{};
+            if (api::actor_state(&st) && std::isfinite(st.pos[0] + st.pos[2])) {
+                const uint32_t gen = g_vyt_gen.load(std::memory_order_relaxed);
+                if (!g_vyt_start_ok || g_vyt_start_gen != gen) {  // a snap's start (a chained one keeps it: round 95)
+                    const float s0[6] = {cam[12], cam[14], st.pos[0], st.pos[2], h, tgt};
+                    std::memcpy(g_vyt_start, s0, sizeof(s0));
+                    g_vyt_start_ok = true;
+                    g_vyt_start_gen = gen;
+                    g_vyt_ref_ok = false;  // its moves measured afresh (the review: also a snap begun during an ease)
+                    g_vyt_dev_deg.store(0.0f, std::memory_order_relaxed);
+                    g_vyt_dev_m.store(0.0f, std::memory_order_relaxed);
+                    g_vyt_end_m.store(0.0f, std::memory_order_relaxed);
+                }
+                // the camera's place once turned: John now, plus its offset from him at the start turned by the step
+                const float r = std::remainder(tgt - g_vyt_start[4], 360.0f) * 0.0174532925f, cs = std::cos(r), sn = std::sin(r);
+                const float ox = g_vyt_start[0] - g_vyt_start[2], oz = g_vyt_start[1] - g_vyt_start[3];
+                const float ex = st.pos[0] + ox * cs + oz * sn, ez = st.pos[2] - ox * sn + oz * cs;
+                g_view_shift_x.store((ex - cam[12]) * w, std::memory_order_relaxed);
+                g_view_shift_z.store((ez - cam[14]) * w, std::memory_order_relaxed);
+                if (w >= 1.0f) g_vyt_end_m.store(std::hypot(ex - cam[12], ez - cam[14]), std::memory_order_relaxed);
+                shift = true;
+            }
+        } else {
+            g_vyt_start_ok = false;
+        }
+        g_view_shift_ok.store(shift, std::memory_order_relaxed);
+        g_view_yaw_frame.store(yo, std::memory_order_relaxed);
+        float m[16];
+        if (snap && g_vyt_weight.load(std::memory_order_relaxed) >= 1.0f && xr_eye_camera(cam, 2, m, true, false)) {
+            const float vh = std::atan2(m[8], m[10]) * 57.2957795f;
+            if (const uint32_t rr = g_vyt_reref.load(std::memory_order_relaxed); rr != g_vyt_reref_seen) {
+                g_vyt_reref_seen = rr;
+                g_vyt_ref_ok = false;
+                g_vyt_dev_deg.store(0.0f, std::memory_order_relaxed);
+                g_vyt_dev_m.store(0.0f, std::memory_order_relaxed);
+            }
+            if (!g_vyt_ref_ok) {
+                g_vyt_ref[0] = vh, g_vyt_ref[1] = m[12], g_vyt_ref[2] = m[14];
+                g_vyt_ref_ok = true;
+            }
+            const float dh = std::fabs(std::remainder(vh - g_vyt_ref[0], 360.0f));
+            const float dm = std::hypot(m[12] - g_vyt_ref[1], m[14] - g_vyt_ref[2]);
+            if (dh > g_vyt_dev_deg.load(std::memory_order_relaxed)) g_vyt_dev_deg.store(dh, std::memory_order_relaxed);
+            if (dm > g_vyt_dev_m.load(std::memory_order_relaxed)) g_vyt_dev_m.store(dm, std::memory_order_relaxed);
+            static int s_trace = 0;  // (the snap's path, its first 60 frames a session: the orbit's centre)
+            if (s_trace < 60) {
+                ++s_trace;
+                log::info("[cam] snap path: heading %.2f, camera (%.3f %.3f %.3f), shift %d (%.3f %.3f), drawn (%.3f %.3f) heading %.2f",
+                          std::atan2(cam[8], cam[10]) * 57.2957795f, cam[12], cam[13], cam[14], shift ? 1 : 0, g_view_shift_x.load(),
+                          g_view_shift_z.load(), m[12], m[14], vh);
+            }
+        } else if (!snap) {
+            g_vyt_ref_ok = false;
+        }
+    }
     struct Timed {  // once a frame (no clock reads in the draws under it)
         double t0 = log::now_ms();
         ~Timed() {
@@ -1352,6 +1472,49 @@ bool level_grass_active() {
            g_double.load(std::memory_order_relaxed);
 }
 
+void set_view_yaw_offset(float deg) { g_view_yaw_off.store(std::isfinite(deg) ? deg : 0.0f, std::memory_order_relaxed); }
+float view_yaw_offset() { return g_view_yaw_off.load(std::memory_order_relaxed); }
+void set_view_yaw_target(bool on, float target_deg, float weight, bool fresh) {
+    if (on && fresh) g_vyt_gen.fetch_add(1, std::memory_order_relaxed);
+    if (!on) {  // (the review) the target and weight left as they were: a frame read between the stores never sees target 0
+        g_vyt_on.store(false, std::memory_order_relaxed);
+        return;
+    }
+    g_vyt_target.store(target_deg, std::memory_order_relaxed);
+    g_vyt_weight.store(weight, std::memory_order_relaxed);
+    g_vyt_on.store(on, std::memory_order_relaxed);
+}
+void view_yaw_rereference() { g_vyt_reref.fetch_add(1, std::memory_order_relaxed); }
+void view_yaw_target_moves(float* deg, float* m, float* end_m) {
+    *deg = g_vyt_dev_deg.load(std::memory_order_relaxed);
+    *m = g_vyt_dev_m.load(std::memory_order_relaxed);
+    *end_m = g_vyt_end_m.load(std::memory_order_relaxed);
+}
+float view_yaw_frame() { return g_view_yaw_frame.load(std::memory_order_relaxed); }
+bool view_heading(float* deg) {  // the centre eye's camera as drawn now (peeked), its heading as game_heading's (degrees)
+    if (!g_game_cam_valid.load(std::memory_order_relaxed)) return false;
+    float cam[16], m[16];
+    std::memcpy(cam, g_game_cam, sizeof(cam));
+    if (!xr_eye_camera(cam, 2, m, true, false)) return false;
+    *deg = std::atan2(m[8], m[10]) * 57.2957795f;
+    return true;
+}
+bool game_camera(float out[16]) {
+    if (!g_game_cam_valid.load(std::memory_order_relaxed)) return false;
+    float b[16];
+    for (int t = 0; t < 3; ++t) {  // (the render thread rewrites it each frame: two equal copies, not a torn one)
+        std::memcpy(out, g_game_cam, sizeof(b));
+        std::memcpy(b, g_game_cam, sizeof(b));
+        if (std::memcmp(out, b, sizeof(b)) == 0) return true;
+    }
+    return false;
+}
+bool game_place(float* x, float* z) {
+    if (!g_game_cam_valid.load(std::memory_order_relaxed)) return false;
+    *x = g_game_cam[12];
+    *z = g_game_cam[14];
+    return true;
+}
 bool game_heading(float* bx, float* bz) {
     if (!g_game_cam_valid.load(std::memory_order_relaxed)) return false;
     *bx = g_game_cam[8];

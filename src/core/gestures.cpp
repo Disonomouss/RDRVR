@@ -524,7 +524,11 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
     if (speed > speed_peak) speed_peak = speed;
     // the exclusion windows (their edges each frame, so the windows run whatever the speed)
     // ([Holsters] HoldToKeep: the gun hand's grip held as the gun's hold away from the holsters is no holster's grip)
-    const bool cons = (holster::grip_consumed(gun_h) && !holster::grip_keeps(gun_h)) || (holster::gun_at_zone() && hands::get(gun_h).grip > 0.5f);
+    // (2026-11-05, round 87 check 1: "Works but I had trouble using it a few times": 34 of the user's swings refused as
+    // "holster", the gun held through a holster's zone on its way back) with HoldToKeep a zone with the grip held is no
+    // put-away (the let-go is): the zone counts only without it
+    const bool cons = (holster::grip_consumed(gun_h) && !holster::grip_keeps(gun_h)) ||
+                      (!holster::hold_to_keep() && holster::gun_at_zone() && hands::get(gun_h).grip > 0.5f);
     if (holster_was && !cons) holster_ms = now;
     holster_was = cons;
     float part[3];
@@ -783,6 +787,169 @@ void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
 }
 }  // namespace ohs
 
+// ---- (2026-11-05, round 88: "Hits don't register with a dual wielded copy gun"; "melee for right handed side arm and long
+// guns felt good") the second gun in the other hand ([Hands] DualWield, the copy too): its own swing, as gm's pistol (its
+// frame at the drawn hand, its barrel 0.15 m ahead; a long gun, the Sawed-off copy: its butt and barrel along the hand's
+// ray, as gm's family 2), the same rule for a hit and the same scan. Not while the menu is open, in Dead Eye or the
+// game's reload, riding or driving, in the draw's 0.7 s, with its controller's grip at a holster (as gm: HoldToKeep's
+// own hold excepted), or while it is open or its rounds are in the other hand (0.4 s after: the review, the flick that
+// shuts it). GunMelee on; out of first person, or the second gun put back, it is forgotten.
+namespace dgs {
+std::mutex mu;
+gm::Point pt[2];
+bool armed = false, struck = false, counted = false, have_prev = false;
+int weapon = -1, ctrl = -1;
+float prev[2][3] = {}, peak = 0.0f, speed_now = 0.0f;
+uint64_t req = 0;
+double req_ms = 0.0, ready_ms = -1e12, action_ms = -1e12;
+bool action_was = false;
+uint64_t n_armed = 0, n_scans = 0, n_hits = 0, n_dry = 0, n_refused = 0, n_none = 0, n_timeouts = 0, n_held_off = 0;
+char last[200] = "none";
+
+void reset() {
+    armed = struck = counted = have_prev = false;
+    peak = 0.0f;
+    for (gm::Point& p : pt) p.count = 0, p.ok = false;
+}
+void frame(double now, const body::BodyPoints* bp, const RdrvrActorState* st) {
+    const dual::State ds = gun_melee::enabled() && bp && st ? dual::state() : dual::State{};
+    const bool on = ds.on && ds.ready && !ds.carry && ds.john >= 0 && ds.john <= 1 && ds.ctrl >= 0 && ds.ctrl <= 1 && reload::is_gun(ds.weapon) &&
+                    st->actor;
+    if (!on && !req && !armed && weapon < 0) return;  // none out: this check only
+    std::lock_guard lock(mu);
+    if (req) {
+        RdrvrNativeResult r{};
+        if (api::wait_native(req, &r, 0)) {
+            req = 0;
+            ++n_scans;
+            const uint32_t outcome = static_cast<uint32_t>(r.value >> 32) & 0xff, code = static_cast<uint32_t>(r.value >> 40) & 0xff;
+            if (outcome == RDRVR_GUN_MELEE_HIT) {
+                const bool made = code == RDRVR_MELEE_HIT_OK, dry = code == RDRVR_MELEE_HIT_DRY;
+                made ? ++n_hits : dry ? ++n_dry : ++n_refused;
+                if (made || dry) {
+                    struck = true;
+                    if (ctrl >= 0) controllers::pulse(ctrl, made ? 0.8f : 0.4f, 30);
+                }
+                std::snprintf(last, sizeof(last), "%s 0x%x at (%.2f %.2f %.2f), the core's answer %u", made ? "hit" : dry ? "dry hit" : "refused",
+                              static_cast<uint32_t>(r.value), r.vec[0], r.vec[1], r.vec[2], code);
+                log::info("[gunmelee] the second gun's swing: %s", last);
+            } else if (outcome == RDRVR_GUN_MELEE_NONE) {
+                ++n_none;
+            }
+        } else if (now - req_ms > gm::kReqMs) {
+            api::cancel_op(req);
+            req = 0;
+            ++n_timeouts;
+        }
+    }
+    if (!on || ds.weapon != weapon || ds.ctrl != ctrl) {
+        if (req) {  // (as ohs) put back or another: its scan still queued is dropped
+            api::cancel_op(req);
+            req = 0;
+        }
+        reset();
+        weapon = on ? ds.weapon : -1;
+        ctrl = on ? ds.ctrl : -1;
+        ready_ms = now;  // (a draw: its window)
+        speed_now = 0.0f;
+        if (!on) return;
+    }
+    const int jh = ds.john;
+    if (!bp->hand_ok[jh] || !bp->cam_ok) {
+        reset();
+        return;
+    }
+    const float* R = bp->target_rot[jh];
+    const float bt[3] = {0.0f, 0.174f, -0.985f};
+    float u[3], wp[2][3];
+    for (int k = 0; k < 3; ++k) u[k] = R[k * 3] * bt[0] + R[k * 3 + 1] * bt[1] + R[k * 3 + 2] * bt[2];
+    const bool long_gun = reload::is_long_gun(weapon);
+    const float stock = gun_melee::config().stock;
+    for (int k = 0; k < 3; ++k) {
+        wp[0][k] = long_gun ? bp->hand[jh][k] - u[k] * (stock - 0.10f) : bp->hand[jh][k];
+        wp[1][k] = bp->hand[jh][k] + u[k] * (long_gun ? 0.35f : 0.15f);
+    }
+    for (int k = 0; k < 2; ++k) {
+        gm::Point& p = pt[k];
+        float rel[3], turn = 0.0f;
+        if (!camera_lever::world_to_local_rel(bp->cam, wp[k], rel, &turn)) {
+            p.count = 0;
+            p.ok = false;
+            continue;
+        }
+        std::memcpy(p.last_world, p.ok ? p.world : wp[k], sizeof(p.last_world));
+        std::memcpy(p.world, wp[k], sizeof(p.world));
+        p.ok = true;
+        Sample& s = p.hist[p.head];
+        s.ms = now;
+        std::memcpy(s.p, rel, sizeof(rel));
+        s.turn = turn;
+        p.head = (p.head + 1) % kSamples;
+        if (p.count < kSamples) ++p.count;
+    }
+    float v[2][3] = {}, sp[2] = {}, speed = 0.0f;
+    bool measured = false;
+    for (int k = 0; k < 2; ++k) {
+        if (!pt[k].ok || !gm::point_velocity(pt[k], now, 60.0, v[k], &sp[k])) continue;
+        measured = true;
+        if (sp[k] > speed) speed = sp[k];
+    }
+    speed_now = speed;
+    const gun_melee::Config cfg = gun_melee::config();
+    if (armed && speed > peak) peak = speed;
+    if (measured && speed < gm::kRearm) {
+        if (armed && !struck) log::info("[gunmelee] the second gun's swing over: peak %.1f m/s, no hit", peak);
+        armed = struck = counted = false;
+    }
+    // (its controller's grip at a holster: drawing or putting it back; HoldToKeep's own hold excepted, as gm)
+    const bool held = holster::grip_consumed(ctrl) && !holster::grip_keeps(ctrl);
+    const bool act = actions::second_open() || holster::rounds_for_second();
+    if (action_was && !act) action_ms = now;
+    action_was = act;
+    const bool blocked = menu::visible() || (st->flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING)) ||
+                         (st->weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) || now - ready_ms < gm::kDrawMs || held || act ||
+                         now - action_ms < gm::kActionMs;
+    if (blocked) {
+        if (speed > cfg.arm && !counted) counted = true, ++n_held_off;
+        armed = have_prev = false;
+        return;
+    }
+    if (!armed && !struck && !counted && speed > cfg.arm) {
+        armed = true;
+        have_prev = false;
+        peak = speed;
+        ++n_armed;
+        log::info("[gunmelee] the second gun's swing armed at %.1f m/s (weapon %d, %s, John's %s hand)", speed, weapon, long_gun ? "by the hand's ray" : "a pistol",
+                  jh ? "right" : "left");
+    }
+    if (!armed || struck || req || anchors::stand_down()) return;
+    float bx = 0.0f, bz = 1.0f;
+    camera_lever::game_heading(&bx, &bz);
+    const float right[3] = {bz, 0.0f, -bx}, back[3] = {bx, 0.0f, bz};
+    RdrvrGunMeleeArgs a{};
+    for (int k = 0; k < 2; ++k) {
+        const float* from = have_prev ? prev[k] : pt[k].last_world;
+        for (int i = 0; i < 3; ++i) {
+            a.seg[k][0][i] = from[i];
+            a.seg[k][1][i] = pt[k].world[i];
+            a.vel[k][i] = right[i] * v[k][0] + (i == 1 ? v[k][1] : 0.0f) + back[i] * v[k][2];
+        }
+    }
+    a.guard = static_cast<uint64_t>(anchors::addr(anchors::Id::ScriptThreadCurrent));
+    a.actor = static_cast<uint32_t>(st->actor);
+    a.weapon = weapon;
+    a.flags = static_cast<uint16_t>(RDRVR_GUN_MELEE_POINT2);
+    a.radius_cm = gm::kRadiusCm;
+    a.speed = cfg.by_peak && peak >= cfg.speed ? 0.5f * cfg.speed : cfg.speed;
+    uint64_t args[12];
+    std::memcpy(args, &a, sizeof(args));
+    req = api::queue_op(RDRVR_NATIVE_GUN_MELEE, args, 12, nullptr);
+    req_ms = now;
+    for (int k = 0; k < 2; ++k) std::memcpy(prev[k], pt[k].world, sizeof(prev[k]));
+    have_prev = true;
+}
+}  // namespace dgs
+
 void frame() {
     static double next_ok[2] = {0, 0}, lasso_out_until = 0, yank_ok = 0;
     const double now = log::now_ms();
@@ -796,6 +963,7 @@ void frame() {
         }
         gm::frame(now, nullptr, nullptr);  // [Gestures] GunMelee: the swing forgotten
         ohs::frame(now, nullptr, nullptr);  // [Hands] OffHandItems: the knife's stab forgotten
+        dgs::frame(now, nullptr, nullptr);  // the second gun's swing forgotten
         // the guard down (its update not run here: third person, a cutscene, a load), so the right trigger's RT is not
         // held back meanwhile (the 0.8.6 review)
         if (g_guard_up.exchange(false, std::memory_order_relaxed)) log::info("[gestures] guard down (out of first person)");
@@ -830,6 +998,7 @@ void frame() {
     }
     gm::frame(now, &bp, &st);  // [Gestures] GunMelee (off: one flag check)
     ohs::frame(now, &bp, &st);  // [Hands] OffHandItems: the off hand's knife (none held: one check)
+    dgs::frame(now, &bp, &st);  // the second gun's own swing (none out: one check)
     guard_frame(now, st);       // [Gestures] Guard (run 10 item 7)
     // forward: where the head faces, in the local frame (positive yaw turns left)
     float hy = 0.0f;
@@ -1305,6 +1474,18 @@ std::string offhand_strike_status() {
     return b;
 }
 
+std::string second_gun_strike_status() {
+    std::lock_guard lock(dgs::mu);
+    char b[400];
+    std::snprintf(b, sizeof(b), "the second gun's swing: weapon %d controller %d, speed %.2f m/s, armed %d (peak %.2f), struck %d | armed %llu, scans %llu, "
+                  "hits %llu, dry %llu, refused %llu, none %llu, timeouts %llu, held off %llu | last: %s",
+                  dgs::weapon, dgs::ctrl, dgs::speed_now, dgs::armed ? 1 : 0, dgs::peak, dgs::struck ? 1 : 0, static_cast<unsigned long long>(dgs::n_armed),
+                  static_cast<unsigned long long>(dgs::n_scans), static_cast<unsigned long long>(dgs::n_hits), static_cast<unsigned long long>(dgs::n_dry),
+                  static_cast<unsigned long long>(dgs::n_refused), static_cast<unsigned long long>(dgs::n_none),
+                  static_cast<unsigned long long>(dgs::n_timeouts), static_cast<unsigned long long>(dgs::n_held_off), dgs::last);
+    return b;
+}
+
 std::string command(const std::string& line) {
     std::istringstream in(line);
     std::string c, w, v;
@@ -1457,12 +1638,23 @@ std::string gun_melee_command(const std::string& line) {
             for (uint64_t& n : gm::n_suppressed) n = 0;
             gm::speed_peak = 0.0f;
             gm::cost_ns = gm::cost_frames = 0;
+            std::lock_guard lock2(dgs::mu);
+            dgs::n_armed = dgs::n_scans = dgs::n_hits = dgs::n_dry = dgs::n_refused = dgs::n_none = dgs::n_timeouts = dgs::n_held_off = 0;
+        }
+        if (w == "damage") {  // damage <v>: GunMeleeDamage, the session only (the knock-out points a hit takes)
+            std::string v;
+            if (in >> v) gun_melee::set_damage(static_cast<float>(std::atof(v.c_str())), false);
+        }
+        if (w == "force") {  // force <push>: GunMeleeForce, the session only (75 = the game's punch)
+            std::string v;
+            if (in >> v) gun_melee::set_force(static_cast<float>(std::atof(v.c_str())), false);
         }
         if (w == "speed") {  // speed <m/s> [peak|contact]: the hit speed and its rule, the session only (run 8 item 1)
             std::string v, rule;
             if (in >> v) gun_melee::set_speed(static_cast<float>(std::atof(v.c_str())), false);
             if (in >> rule) gun_melee::set_by_peak(rule != "contact");
         }
+        if (w == "second") return second_gun_strike_status();  // gunmelee second: the second gun's own swing
         if (w == "scan") {
             float r = 5.0f;
             std::string v;

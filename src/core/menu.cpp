@@ -65,6 +65,21 @@
 
 namespace rdrvr::menu {
 namespace {
+// (2026-11-05, the user's pictures: a ring of the radar left on the floating screen, at any cut-out size) the HUD as the
+// mod has it, 5 s after the press (the menu closed, the wrist looked at): ui_layer::grab, which waits for a frame to
+// draw the UI, on its own thread; RDRVR_hud.rde in the game folder (the UI target, its alpha the HUD's ink)
+std::atomic<bool> g_hud_grab_busy{false};
+DWORD WINAPI hud_grab_thread(void*) {
+    Sleep(5000);
+    wchar_t wp[MAX_PATH];
+    log::path_in_game_dir(L"RDRVR_hud.rde", wp, MAX_PATH);
+    char path[MAX_PATH * 2] = {};
+    WideCharToMultiByte(CP_ACP, 0, wp, -1, path, sizeof(path), nullptr, nullptr);
+    const std::string r = ui_layer::grab(path, 3000);
+    log::info("[menu] the HUD's picture: %s", r.c_str());
+    g_hud_grab_busy = false;
+    return 0;
+}
 
 constexpr int kW = 1024, kH = 768, kSlots = 3, kSrvs = 64;
 constexpr float kQuadW = 1.0f, kQuadH = kQuadW * kH / kW, kDistance = 1.2f;
@@ -917,6 +932,29 @@ void page_display() {
         if (radio("The radar and ammo count##wrist shape radar", rd, kShapeTip) && !rd) xr::set_hud_shape_radar(true);
         ImGui::SameLine();
         if (radio("The whole corner##wrist shape rect", !rd, kShapeTip) && rd) xr::set_hud_shape_radar(false);
+        {  // 2026-11-05: [XR] WristHudRadarNudge (the user: a player's piece of the ring left on the floating screen); shown with
+            // the whole corner too, greyed (round 87: the user had the whole corner and could not find them)
+            if (!rd) note("The radar cut-out's arrows work with \"The radar and ammo count\".");
+            ImGui::BeginDisabled(!rd);
+            float nv[3];
+            xr::hud_radar_nudge(nv);
+            const char* kNudgeTip = "Moves or resizes the part of the screen that goes to the wrist as the radar, in small steps. If a "
+                                    "piece of the radar's ring stays on the floating screen, move it toward that piece or make it larger.";
+            bool ch = nudge1("Radar cut-out: left / right##wrist radar right", &nv[0], 0.2f, -3.0f, 3.0f, "%+.1f%%", kNudgeTip);
+            ch |= nudge1("Radar cut-out: up / down##wrist radar down", &nv[1], 0.2f, -3.0f, 3.0f, "%+.1f%%", kNudgeTip);
+            ch |= nudge1("Radar cut-out: size##wrist radar size", &nv[2], 2.0f, 80.0f, 130.0f, "%.0f%%", kNudgeTip);
+            if (ch) xr::set_hud_radar_nudge(nv[0], nv[1], nv[2], true);
+            ImGui::EndDisabled();
+            if (ImGui::Button(g_hud_grab_busy.load() ? "Saving the HUD's picture in 5 s...###hud grab" : "Save a picture of the HUD (for the mod's author)###hud grab") &&
+                !g_hud_grab_busy.exchange(true)) {
+                HANDLE th = CreateThread(nullptr, 0, hud_grab_thread, nullptr, 0, nullptr);
+                if (th) CloseHandle(th);
+                else g_hud_grab_busy = false;
+            }
+            track("hud grab");
+            help("Saves the HUD as the mod receives it, 5 s after the press (close the menu and show the radar meanwhile), to "
+                 "RDRVR_hud.rde in the game's folder: it shows where your radar and its ring are.");
+        }
     }
     bool ws = controls::wrist_satchel();
     if (check("A double tap of Y at the wrist opens the satchel", &ws,
@@ -1123,6 +1161,19 @@ void page_comfort() {
         config::set("Comfort", "SnapAngle", std::to_string(static_cast<int>(angle)));
     }
     sub_end();
+    {  // (round 98, the user: the third person snap "Works great, add it to the menu with the ability to change how many
+       // degrees the snap turns") [Comfort] ThirdPersonSnap, ThirdPersonSnapAngle
+        bool tp = pose::third_person_snap();
+        if (check("Snap turns in third person", &tp,
+                  "With First person off, the right stick turns the view in one step at once while the game's camera catches up "
+                  "underneath. Not while aiming or on a mounted gun."))
+            pose::set_third_person_snap(tp, true);
+        sub_begin(tp);
+        float ta = pose::third_person_snap_angle();
+        if (nudge1("Third person snap angle", &ta, 5.0f, 10.0f, 90.0f, "%.0f deg", "How far each third person snap turns the view (a press 5 degrees)."))
+            pose::set_third_person_snap_angle(ta, true);
+        sub_end();
+    }
 
     heading("Riding");
     int steer = pose::steer_by_head() ? 1 : 0;
@@ -1608,6 +1659,11 @@ void page_holsters() {
 
 void page_guns() {
     heading("The gun in hand");
+    if (aim::bullet_trails_available()) {  // 2026-11-06 ([Hands] BulletTrails; the user: "an option to disable bullet trails")
+        bool bt = aim::bullet_trails();
+        if (check("Bullet trails", &bt, "The streaks bullets leave in the air (everyone's shots). Off: no trails."))
+            aim::set_bullet_trails(bt, true);
+    }
     {  // 2026-10-07: the reticle where the shot lands
         bool rt = aim::reticle_on();
         if (check("Reticle where the shot lands", &rt,
@@ -1846,6 +1902,13 @@ void page_guns() {
               "Gripping the holster the gun was drawn from gives a second of that same gun; the other hip still gives your other "
               "sidearm."))
         dual::set_same_at_its_holster(sh);
+    bool cd = dual::copy_damage() || config::get_bool("Hands", "CopyOwnDamage", true);  // (2026-11-04, item 4; on by default 2026-11-05)
+    if (check("The copy hits as the gun it shows", &cd,
+              dual::copy_damage_hooked()
+                  ? "The copy's shots do the damage of the gun it shows (the other sidearm's), not the gun in hand's."
+                  : "The copy's shots do the damage of the gun it shows (the other sidearm's), not the gun in hand's. Turned on, it "
+                    "works from the next start of the game (its hook is installed at the start)."))
+        dual::set_copy_damage(cd);
     sub_end();
     sub_end();
 
@@ -2184,13 +2247,52 @@ void page_reloading() {
         if (check("Fan the hammer with your other hand", &fh,
                   "Sweep your other hand's palm back across the hammer to cock it; keep the trigger pulled and each sweep fires."))
             actions::set_fan_hammer(fh);
+        {  // (2026-11-06, another player: the fanning zone "larger/more sensitive") [Reload] FanZoneRadius and FanSpeed
+            sub_begin(fh);
+            float zr = actions::fan_zone_radius() * 100.0f;
+            if (nudge1("Fanning zone size", &zr, 1.0f, 2.0f, 30.0f, "%.0f cm",
+                       "How near the hammer your other hand's sweep must pass (a ball this far round it). Larger is easier to hit, "
+                       "and a resting hand fires sooner. 8 cm by default."))
+                actions::set_fan_zone_radius(zr * 0.01f, true);
+            float sp = actions::fan_speed();
+            if (nudge1("Fanning speed", &sp, 0.1f, 0.2f, 6.0f, "%.1f m/s",
+                       "How fast the sweep must be to cock the hammer. Lower is more sensitive. 1.0 m/s by default."))
+                actions::set_fan_speed(sp, true);
+            bool sz = actions::show_fan_zone();  // [Reload] ShowFanZone (2026-11-06, the user: "an option to see the zone")
+            if (check("Show the fanning zone", &sz,
+                      "A ring round the hammer as big as the zone: bright while a sweep would cock it, lit while your hand is in it, faint "
+                      "while your hand must leave it before the next sweep counts."))
+                actions::set_show_fan_zone(sz, true);
+            sub_end();
+        }
         sub_end();
     }
     bool lp = actions::lever_parts();
     if (check("Lever guns: the lever drawn as you work it", &lp, "The lever drawn opening and closing as you work it, with the game's lever sounds."))
         actions::set_lever_parts(lp);
-    {  // the lever: by the right stick held, the gun down then up (2026-11-02, GOAL-older-items item 3: the only way now)
-        note("Lever guns: hold the right stick down, move the gun down to open the lever and up to shut it; the gun stays put meanwhile.");
+    {  // the lever: by the right stick held, the gun down then up (2026-11-02, GOAL-older-items item 3); (2026-11-06, the
+       // user: "simpler lever action use", the stick's flick and the gun's back) or by a roll of the gun hand, the stick's
+       // flick or the gun's flick down and up
+        const int lc = actions::lever_control();
+        const char* const kLeverTip =
+            "Stick held, gun down and up: hold the right stick down, move the gun down to open the lever and up to shut it; the gun "
+            "stays put meanwhile. Roll the gun: after a shot, roll your gun hand a little left or right to open the lever, and back "
+            "to shut it. Flick the stick: after a shot, a flick of the right stick down works the lever. Flick the gun: after a shot, "
+            "flick the gun down and back up (with the lever drawn: the flick down opens it, the flick up shuts it).";
+        note("Lever guns:");
+        if (radio("Stick held, gun down and up##lever", lc == 4, kLeverTip)) actions::set_lever_control(4, true);
+        ImGui::SameLine();
+        if (radio("Roll the gun##lever", lc == 5, kLeverTip)) actions::set_lever_control(5, true);
+        ImGui::SameLine();
+        if (radio("Flick the stick##lever", lc == 1, kLeverTip)) actions::set_lever_control(1, true);
+        ImGui::SameLine();
+        if (radio("Flick the gun##lever", lc == 0, kLeverTip)) actions::set_lever_control(0, true);
+        sub_begin(lc == 5);
+        float rd = actions::lever_roll_deg();
+        if (nudge1("Roll to open", &rd, 1.0f, 8.0f, 60.0f, "%.0f deg",
+                   "How far the gun hand rolls (either way) to open the lever. Rolling back most of the way shuts it. 20 degrees by default."))
+            actions::set_lever_roll_deg(rd, true);
+        sub_end();
         bool vs = actions::volcanic_stick();  // [Reload] VolcanicControl (2026-10-26)
         if (check("Volcanic: its lever by a flick of the right stick", &vs,
                   "After each shot, a flick of the right stick down works the Volcanic's lever, whatever the lever guns use."))
@@ -2430,6 +2532,14 @@ void page_gestures() {
     float hs = gun_melee::config().speed;
     if (nudge1("Hit speed", &hs, 0.25f, 1.0f, 6.0f, "%.2f m/s", "How fast the swing must be to hit (a press 0.25 m/s)."))
         gun_melee::set_speed(hs, true);
+    // 2026-11-05 (the user: "a force scale for the melee ... knock npcs over"): the push ([Gestures] GunMeleeForce) never
+    // fells anyone (r136: eight punches' push, moved 0.46 m, standing); the knock-out points do (a hit taking all 100: down,
+    // 1.9 m, knocked out): [Gestures] GunMeleeDamage, the points a hit takes at the hit speed (a hard swing doubles them)
+    float hd = gun_melee::config().damage;
+    if (nudge1("Hit strength", &hd, 5.0f, 5.0f, 200.0f, "%.0f",
+               "How much of a person's knock-out a hit takes (100 knocks them down in one hit; a hard swing doubles it). The "
+               "game's own: 10."))
+        gun_melee::set_damage(hd, true);
     sub_end();
 
     heading("Signs");  // run 8 item 4, run 10 items 5 and 7: [Gestures] Whistle, TipHat, Guard
@@ -2469,11 +2579,8 @@ void page_controls() {
     if (check("Left-handed", &lh, "Swaps the controllers: the left trigger fires and the right stick moves."))
         controls::set_left_handed(lh);
     sub_begin(lh);
-    bool gih = body::gun_in_gun_hand();
-    if (check("The gun in John's left hand", &gih,
-              "John holds the gun in his left hand, each arm on its own controller. Off: his right arm reaches to your left "
-              "controller (the arms cross)."))
-        body::set_gun_in_gun_hand(gih);
+    // (2026-11-05: "The gun in John's left hand" removed, always on left-handed: off crossed the arms)
+    // (2026-11-05: left-handed, the holsters stay where they are; the user: the mirror option "not needed")
     sub_end();
 
     heading("The trigger and the aim");

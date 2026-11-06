@@ -32,6 +32,16 @@ struct Claim {
     char* data = nullptr;
 };
 thread_local Claim t_claim;
+// (2026-11-06, cycle RG1's freeze: the playback thread waited at the head with the chunk's count 0, its frames above
+// the head stub not unwound) the head's last entry, for the hang dump (the playback thread writes it, beside its
+// own counters)
+struct Where {
+    char* volatile chunk = nullptr;
+    int* volatile offset = nullptr;
+    char* volatile claim = nullptr;
+    volatile long budget = 0;
+};
+Where g_where;
 std::atomic<int> g_k{-1};
 bool g_installed = false;
 // the playback thread's own counters (one writer; read torn at worst by the status)
@@ -65,6 +75,10 @@ uint64_t hk_ReplayChunk(void* chunk, void* ctx, int* offset, uint64_t terminator
 extern "C" char* rdrvr_rb_next(char* chunk, int* offset) {
     using namespace rdrvr::playback;
     Claim& c = t_claim;
+    g_where.chunk = chunk;
+    g_where.offset = offset;
+    g_where.claim = c.chunk;
+    g_where.budget = c.budget;
     if (c.chunk != chunk || c.budget <= 0) {
         volatile long* count = reinterpret_cast<volatile long*>(chunk + 0x10);
         const int k = g_k.load(std::memory_order_relaxed);
@@ -145,6 +159,15 @@ void install() {
 }
 
 bool installed() { return g_installed; }
+
+bool where(void** chunk, int** offset, void** claim_chunk, long* budget) {
+    if (!g_where.chunk) return false;
+    *chunk = g_where.chunk;
+    *offset = g_where.offset;
+    *claim_chunk = g_where.claim;
+    *budget = g_where.budget;
+    return true;
+}
 int batch() { return g_installed ? g_k.load() : -1; }
 
 bool set_batch(int k) {

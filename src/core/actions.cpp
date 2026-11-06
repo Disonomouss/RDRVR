@@ -183,6 +183,68 @@ std::atomic<bool> g_lever_hold{false};  // the right stick held down now (filter
 std::atomic<bool> g_lever_hold_lock{false};
 double g_lever_shut_ms = -1e12;
 constexpr double kHoldReleaseMs = 200.0;
+// 5 roll (2026-11-06, the user: "simpler lever action use. Rotate hand slightly left or right to pull lever down and back
+// to pull it up"): the gun hand's roll about its pointing axis (the aim pose's -z, near the barrel: the roll of a yaw,
+// pitch, roll reading, so aiming up, down or round leaves it) turned LeverRollDeg either way opens the lever and it stays
+// open; turned back (within 40% of that of where it started, or half of it back from the farthest it went) shuts it.
+// Measured from the roll farthest from now in the last kRollWindowMs since the lever was to work, so a slow drift of the
+// hold over seconds opens nothing; the stick is free
+std::atomic<float> g_roll_deg{20.0f};  // [Reload] LeverRollDeg
+constexpr double kRollWindowMs = 600.0, kRollMinOpenMs = 100.0;
+struct CantSample {
+    float c;
+    double ms;
+};
+CantSample g_cant[128];
+int g_cant_n = 0;
+float g_roll_ref = 0.0f, g_roll_sign = 0.0f, g_roll_now = 0.0f;  // the opened roll's start and side; the roll now (degrees)
+float g_roll_peak = 0.0f;  // the farthest the opened roll went from its start (degrees, its side)
+double g_roll_open_ms = 0;
+float roll_wrap(float d) { return std::remainder(d, 360.0f); }
+// this frame's stroke: 1 the roll out (opens), -1 back (shuts), 0 none; open: the lever (or the Buffalo's) open now, work:
+// it is to work now (else the window starts again)
+// (the review) an open lever keeps its roll through frames it is not to work (Dead Eye); one open with no roll of its own
+// (taken back from a carry, a mode changed) waits for a roll out, then shuts on the roll back
+void roll_forget() {
+    g_cant_n = 0;
+    g_roll_sign = 0.0f;
+}
+int roll_step(const hands::Hand& gh, double now, bool open, bool work) {
+    if (!work) {
+        if (!open) roll_forget();
+        return 0;
+    }
+    if (!gh.valid) return 0;
+    const float* q = gh.rot;
+    // the roll of a yaw, pitch, roll reading: the angle of the x axis' up component against the y axis' (tracking space)
+    const float xu = 2.0f * (q[0] * q[1] + q[3] * q[2]), yu = 1.0f - 2.0f * (q[0] * q[0] + q[2] * q[2]);
+    const float c = std::atan2(xu, yu) * 57.2957795f, thr = g_roll_deg.load(std::memory_order_relaxed);
+    g_roll_now = c;
+    if (open && g_roll_sign != 0.0f) {
+        const float rel = roll_wrap(c - g_roll_ref) * g_roll_sign;
+        if (rel > g_roll_peak) g_roll_peak = rel;
+        return now - g_roll_open_ms >= kRollMinOpenMs && (rel <= 0.4f * thr || g_roll_peak - rel >= 0.5f * thr) ? -1 : 0;
+    }
+    if (!open) g_roll_sign = 0.0f;  // (no stale side for a lever opened later otherwise)
+    g_cant[g_cant_n % 128] = {c, now};
+    ++g_cant_n;
+    const int n = g_cant_n < 128 ? g_cant_n : 128;
+    float from = c, dmax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float d = std::fabs(roll_wrap(c - g_cant[i].c));
+        if (now - g_cant[i].ms <= kRollWindowMs && d > dmax) {
+            dmax = d;
+            from = g_cant[i].c;
+        }
+    }
+    if (dmax < thr) return 0;
+    g_roll_ref = from;
+    g_roll_sign = roll_wrap(c - from) > 0.0f ? 1.0f : -1.0f;
+    g_roll_peak = dmax;
+    g_roll_open_ms = now;
+    g_cant_n = 0;
+    return open ? 0 : 1;  // (open already: the roll out made; its roll back shuts it)
+}
 // [Reload] VolcanicControl (2026-10-26): "lever" (as LeverControl) or "stick": the Volcanic's lever worked by a flick of
 // the right stick down after each shot, whatever LeverControl says (LeverControl=stick's working, for that pistol)
 std::atomic<bool> g_volc_stick{false};
@@ -239,6 +301,14 @@ float g_fan_prev[3] = {};  // the hand against the zone at the last body points 
 double g_fan_prev_ms = 0;  // those points' time (bp.ms)
 double g_fan_last_ms = 0;  // the last sweep (a 200 ms pause before the next arms: the drawn hand settling back crossed it twice)
 bool g_fan_armed = true, g_fan_frame = false;  // (the zone from the drawn gun's frame)
+// [Reload] ShowFanZone (2026-11-06, the user: "Turning fanning zone size up made it harder to cock. Can you add an option
+// to see the zone represented somehow"; off by default): the zone drawn as a ring (holster.cpp's markers), its state the
+// sweep's now. g_fan_seen_ms: the last frame the zone was placed (the frame thread's, as the zone)
+std::atomic<bool> g_fan_show{false};
+double g_fan_seen_ms = 0;
+// (the same report) after a sweep the hand re-arms once it is this far beyond the zone's edge (was 1.3 times the
+// radius: 2.4 cm at the 8 cm default, but 4.5 cm past a 15 cm zone, a short stroke never re-armed)
+constexpr float kFanRearm = 0.024f;
 std::atomic<uint64_t> g_fans{0}, g_fan_shots{0};
 // (2026-10-26, the user: fanning as real fanning, each sweep a shot) a fanned shot the game did not take (its own fire
 // interval not over) waits: the held pull let go for a frame and pulled again every kFanRetryMs until the game fires
@@ -675,6 +745,7 @@ std::atomic<float> g_cb_lift{0.0f}, g_cb_slide{0.0f};
 std::atomic<uint64_t> g_cb_handovers{0}, g_cb_restores{0};
 // the bolt's shut zone in the drawn gun's own frame (x right, y up, z back), learned in hand: [0] the Bolt Action, [1] the Carcano
 float g_bolt_zone_gun[3][3] = {};
+bool g_bolt_mframe = false;  // (2026-11-04, item 3) the bolt's zone this frame from a left-held gun's mirrored frame
 bool g_bolt_zone_gun_ok[3] = {false, false, false};
 int bolt_slot(int w) { return w == 13 ? 0 : w == 20 ? 1 : w == 31 ? 2 : -1; }
 BoltState bolt_get() {
@@ -855,6 +926,7 @@ bool body_hand(int c, float* out) {
 }
 
 void reset_gun(int w, float clip) {
+    roll_forget();  // (LeverControl=roll, the review: no roll kept from another gun, nor this one's before a carry)
     if (kind_of(g_weapon) == kBolt) {  // [Reload] CarriedBolt: the bolt as it left the hand (a carry takes it on)
         g_bsave = bolt_get();
         g_bsave_weapon = g_weapon;
@@ -2679,6 +2751,7 @@ void frame() {
             const float rel[3] = {ogb[0] - g_fan_zone[0], ogb[1] - g_fan_zone[1], ogb[2] - g_fan_zone[2]};  // the hand against the hammer
             g_fan_d = std::sqrt(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
             g_fan_frame = bp.gun_frame_ok;
+            g_fan_seen_ms = now;
             if (bp.ms == g_fan_prev_ms) goto fan_done;  // the same body points as last frame: nothing new
             {
                 float v[3] = {0, 0, 0};
@@ -2701,7 +2774,7 @@ void frame() {
                     const float c[3] = {g_fan_prev[0] + s[0] * t, g_fan_prev[1] + s[1] * t, g_fan_prev[2] + s[2] * t};
                     dmin = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
                 }
-                if (g_fan_d > g_fan_r * 1.3f && dmin > g_fan_r && now - g_fan_last_ms > 200.0) g_fan_armed = true;
+                if (g_fan_d > g_fan_r + kFanRearm && dmin > g_fan_r && now - g_fan_last_ms > 200.0) g_fan_armed = true;
                 if (have && g_fan_armed && dmin < g_fan_r && g_fan_v >= g_fan_speed && g_fan_back >= 0.5f * g_fan_v && !menu::visible()) {
                 g_fan_armed = false;
                 g_fan_last_ms = now;
@@ -2865,10 +2938,22 @@ void frame() {
         if (w == 20 && bp.gun_frame_ok)
             for (int i = 0; i < 3; ++i)
                 for (int j = 0; j < 3; ++j) z0[i] += bp.gun_frame_R[i * 3 + j] * kZoneShift20[j];
-        g_bolt_z0_gun_ok = bp.gun_frame_ok;
-        for (int j = 0; j < 3 && bp.gun_frame_ok; ++j) {
+        // (2026-11-04, GOAL-next-items item 3; the user: "Carcano: held in the left hand, the right hand working the bolt gets
+        // no hand pose and doesn't snap to the bolt") a bolt gun in John's left hand: only its mirrored frame is drawn (a
+        // rotation, the model's points unmirrored: C15f), and the zone about the left wrist's target is not at its bolt: the
+        // knob itself in that frame, as the second gun's (its snap below then on the knob)
+        const bool bmf = !bp.gun_frame_ok && bp.gun_mframe_ok;
+        const float* BR = bmf ? bp.gun_mframe_R : bp.gun_frame_R;
+        const float* BO = bmf ? bp.gun_mframe_o : bp.gun_frame_o;
+        if (bmf) {
+            const float* kn = w == 20 ? kKnob20 : kKnob13a;  // (the Explosive Rifle's the Bolt Action's)
+            for (int i = 0; i < 3; ++i) z0[i] = BO[i] + BR[i * 3] * kn[0] + BR[i * 3 + 1] * kn[1] + BR[i * 3 + 2] * kn[2];
+        }
+        g_bolt_z0_gun_ok = bp.gun_frame_ok || bmf;
+        g_bolt_mframe = bmf;
+        for (int j = 0; j < 3 && (bp.gun_frame_ok || bmf); ++j) {
             g_bolt_z0_gun[j] = 0.0f;
-            for (int i = 0; i < 3; ++i) g_bolt_z0_gun[j] += bp.gun_frame_R[i * 3 + j] * (z0[i] - bp.gun_frame_o[i]);
+            for (int i = 0; i < 3; ++i) g_bolt_z0_gun[j] += BR[i * 3 + j] * (z0[i] - BO[i]);
         }
         // [Reload] CarriedBolt: that zone in the drawn gun's own frame, learned for the carry: held in the gun hand alone (the
         // two-handed hold turns the drawn gun off the gun hand's target), not through John's fire clip (the drawn gun is
@@ -2904,6 +2989,7 @@ void frame() {
         g_bolt_grip = false;
         g_grip_was = hands::get(off_h).grip > 0.6f;
         g_bolt_z0_gun_ok = false;  // (the review: the status never a stale zone)
+        g_bolt_mframe = false;
     }
     // [Reload] BoltParts: the drawn bolt (a hand away or not tracked: as it was left)
     g_bolt_lift.store(bparts ? blift : 0.0f, std::memory_order_relaxed);
@@ -2915,6 +3001,13 @@ void frame() {
     float bdrawn = brz ? g_breech_amt.load(std::memory_order_relaxed) : 0.0f;  // as left
     g_breech_want[0] = g_breech_want[1] = false;
     if (brz && deadeye) g_lever_req = false;  // (C4, the review: a stick flick in Dead Eye not kept for after)
+    // [Reload] LeverControl=roll: the gun hand's roll this frame, for the lever guns and the Buffalo (1 opens, -1 shuts)
+    const bool roll_gun = k == kLever || (brz && brz->gesture == 0);
+    const int roll = lever_mode_of(w) == 5 && roll_gun
+                         ? roll_step(gh, now, k == kLever ? g_lever_open : g_breech_open,
+                                     !deadeye && (k == kLever ? g_needs || g_lever_open
+                                                              : g_breech_open || ((g_needs || !g_breech_round.load(std::memory_order_relaxed)) && now - g_breech_shut_ms >= 200.0)))
+                         : 0;
     if (brz && !deadeye) {
         const GunSounds* gs = gun_sounds(w);
         bool want_open = g_breech_open, moved = false;
@@ -2926,10 +3019,10 @@ void frame() {
             const bool bheld = bmode != 4 || g_lever_hold.load(std::memory_order_relaxed);
             const bool bstick = bmode == 1 && g_lever_req.exchange(false);
             const bool can_open = !g_breech_open && (g_needs || !g_breech_round.load(std::memory_order_relaxed)) && now - g_breech_shut_ms >= 200.0;
-            const bool down = can_open && bmode != 1 && bheld && g_w[0] <= -g_lever_speed;
+            const bool down = can_open && bmode != 1 && bmode != 5 && bheld && g_w[0] <= -g_lever_speed;
             g_breech_flicks = down ? g_breech_flicks + 1 : 0;
-            if (g_breech_flicks >= 2 || (can_open && bstick)) want_open = true;  // two two-frame steps: not the shut's own back swing
-            else if (g_breech_open && now - g_breech_ms >= 150.0 && (bmode == 1 ? bstick : bheld && g_w[0] >= g_lever_speed)) want_open = false;
+            if (g_breech_flicks >= 2 || (can_open && (bstick || (bmode == 5 && roll > 0)))) want_open = true;  // two two-frame steps: not the shut's own back swing
+            else if (g_breech_open && now - g_breech_ms >= 150.0 && (bmode == 1 ? bstick : bmode == 5 ? roll < 0 : bheld && g_w[0] >= g_lever_speed)) want_open = false;
         } else if (pts && bp.hand_ok[gj] && bp.hand_ok[oj]) {
             // the zone: the part's handle as drawn, in the drawn gun's own frame (else about the gun hand, the model's
             // origin taken 8 cm ahead of the wrist along the barrel)
@@ -3574,14 +3667,18 @@ void frame() {
         bool held = false, bolt = false;
         // (2026-11-02, the review of GOAL-older-items item 20: a pistol publishes no drawn long gun's frame; its slide's
         // handle is in its own gun's frame, body.cpp draws the hand onto it)
-        if (g_part_snap_cfg.load(std::memory_order_relaxed) && pts && (bp.gun_frame_ok || (pparts_on && g_pgrip)) && !deadeye) {
-            if (bp.gun_frame_ok && k == kBolt && bparts && g_bolt_grip && g_bolt_ctrl == off_h) {  // the zone is world: into the gun's frame
+        // (2026-11-04, item 3) a bolt gun in John's left hand: its mirrored frame (body.cpp draws the hand onto it, as there)
+        const bool smf = !bp.gun_frame_ok && bp.gun_mframe_ok && g_bolt_mframe;
+        const float* SR = smf ? bp.gun_mframe_R : bp.gun_frame_R;
+        const float* SO = smf ? bp.gun_mframe_o : bp.gun_frame_o;
+        if (g_part_snap_cfg.load(std::memory_order_relaxed) && pts && (bp.gun_frame_ok || smf || (pparts_on && g_pgrip)) && !deadeye) {
+            if ((bp.gun_frame_ok || smf) && k == kBolt && bparts && g_bolt_grip && g_bolt_ctrl == off_h) {  // the zone is world: into the gun's frame
                 // (C36, the review) less the gun's PartOffset (the zone's, in the hand's axes): the hand on the drawn handle, as
                 // the other parts' snaps
                 const float* po = g_part_off[gj];
                 for (int j = 0; j < 3; ++j)
                     for (int i = 0; i < 3; ++i)
-                        pg[j] += bp.gun_frame_R[i * 3 + j] * (g_bolt_zone[i] - rgt[i] * po[0] - up[i] * po[1] - u[i] * po[2] - bp.gun_frame_o[i]);
+                        pg[j] += SR[i * 3 + j] * (g_bolt_zone[i] - rgt[i] * po[0] - up[i] * po[1] - u[i] * po[2] - SO[i]);
                 // (2026-11-03, round 74, the user: "Carcano rifle bolt hand pose is too far from the bolt"; cycle N36: the handle
                 // 6.2 cm from the knob on both bolt guns, the zone being where the hand takes it, not the knob) the knob in the
                 // closed hand: the handle moved by the knob's place less the shut zone's (both the gun's frame), its stroke kept
@@ -3589,7 +3686,7 @@ void frame() {
                     const float* kn = w == 20 ? kKnob20 : kKnob13a;  // (the Explosive Rifle's the Bolt Action's)
                     for (int j = 0; j < 3; ++j) {
                         float pw = 0.0f;  // the gun's PartOffset (the zone's, in the hand's axes) in the gun's frame
-                        for (int i = 0; i < 3; ++i) pw += bp.gun_frame_R[i * 3 + j] * (rgt[i] * po[0] + up[i] * po[1] + u[i] * po[2]);
+                        for (int i = 0; i < 3; ++i) pw += SR[i * 3 + j] * (rgt[i] * po[0] + up[i] * po[1] + u[i] * po[2]);
                         const float c = kn[j] - (g_bolt_z0_gun[j] - pw);
                         if (std::isfinite(c)) pg[j] += c;
                     }
@@ -3642,24 +3739,28 @@ void frame() {
     // hold: the gun's flicks with the stick held down)
     const bool stick_flick = k == kLever && g_lever_req.exchange(false);
     const bool held = lmode == 4 && g_lever_hold.load(std::memory_order_relaxed);
-    const bool lv_down = lmode == 1 ? stick_flick : lmode == 4 ? held && g_w[0] <= -g_lever_speed : g_w[0] <= -g_lever_speed;
+    const bool lv_down = lmode == 1 ? stick_flick : lmode == 4 ? held && g_w[0] <= -g_lever_speed : lmode == 5 ? roll > 0 : g_w[0] <= -g_lever_speed;
     if (lmode == 1 && stick_flick && g_needs && parts && !g_lever_open) g_lever_stick_close_ms = now + kStickCloseMs;
     const bool lv_up = lmode == 1   ? (g_lever_open && g_lever_stick_close_ms > 0 && now >= g_lever_stick_close_ms)
                        : lmode == 4 ? held && g_w[0] >= g_lever_speed
+                       : lmode == 5 ? roll < 0
                                     : g_w[0] >= g_lever_speed;
     if (lmode == 1 && k == kLever && !parts && stick_flick && g_needs && !deadeye) {  // undrawn: the stick's flick works it at once
         g_needs = false;
         g_cycles.fetch_add(1, std::memory_order_relaxed);
         controllers::pulse(gun_h, 0.6f, 20);
         log::info("[actions] lever (%d): worked by the stick's flick", w);
-    } else if (k == kLever && (parts || lmode == 4) && !deadeye) {  // hold, drawn or not: two strokes, the lever open between them
+    } else if (k == kLever && (parts || lmode == 4 || lmode == 5) && !deadeye) {  // hold or roll, drawn or not: two strokes, the lever open between them
         if (!g_lever_open && g_needs && lv_down) {
             g_lever_open = true;
             g_hammer_down = false;
             g_lever_down_ms = now;
             if (pts && bp.hand_ok[gj]) play_at(gun_sounds(w) ? gun_sounds(w)->open : nullptr, bp.hand[gj]);
             controllers::pulse(gun_h, 0.35f, 15);
-            log::info("[actions] lever (%d): opened by %s (%.1f rad/s)", w, lmode == 1 ? "the stick's flick" : lmode == 4 ? "a flick down, the stick held" : "a flick down", g_w[0]);
+            if (lmode == 5)
+                log::info("[actions] lever (%d): opened by a roll (cant %.1f deg from %.1f)", w, g_roll_now, g_roll_ref);
+            else
+                log::info("[actions] lever (%d): opened by %s (%.1f rad/s)", w, lmode == 1 ? "the stick's flick" : lmode == 4 ? "a flick down, the stick held" : "a flick down", g_w[0]);
         } else if (g_lever_open && lv_up) {
             g_lever_open = false;
             g_lever_stick_close_ms = 0;
@@ -3668,7 +3769,8 @@ void frame() {
             g_cycles.fetch_add(1, std::memory_order_relaxed);
             g_lever_shut_ms = now;
             controllers::pulse(gun_h, 0.6f, 20);
-            log::info("[actions] lever (%d): closed %s (%.0f ms open), chambered", w, lmode == 1 ? "after the stick's flick" : lmode == 4 ? "by a flick up, the stick held" : "by a flick up",
+            log::info("[actions] lever (%d): closed %s (%.0f ms open), chambered", w,
+                      lmode == 1 ? "after the stick's flick" : lmode == 4 ? "by a flick up, the stick held" : lmode == 5 ? "by the roll back" : "by a flick up",
                       now - g_lever_down_ms);
         }
     } else if (k == kLever && g_needs && !deadeye && lmode != 1) {  // lever actions: a flick of the gun hand, muzzle down then up, within the window
@@ -3829,16 +3931,25 @@ void init() {
         const float r = config::get_float("Reload", "FanZoneRadius", 0.08f), s = config::get_float("Reload", "FanSpeed", 1.0f);
         g_fan_r = r >= 0.02f && r <= 0.3f ? r : 0.08f;
         g_fan_speed = s >= 0.2f && s <= 6.0f ? s : 1.0f;
+        g_fan_show = config::get_bool("Reload", "ShowFanZone", false);
     }
     g_open_cyl = config::get_bool("Reload", "OpenCylinder", false);
     g_lever_parts = config::get_bool("Reload", "LeverParts", false);
     {
         // (2026-11-02, GOAL-older-items item 3; the user: the hold "is the best one. Remove the other options") the lever by
-        // the right stick held, the gun down then up (hold), the only way now: no menu row nor ini entry; the key is read
-        // only for the tests' inis (their scripted flicks: flick, stick, lock, front), with [Debug] LeverModes=1 (the review:
-        // a LeverControl a player once saved from the old menu would win, with no row left to change it)
-        const std::string lc = config::get_bool("Debug", "LeverModes", false) ? config::get_string("Reload", "LeverControl", "hold") : std::string("hold");
-        g_lever_mode = lc == "stick" ? 1 : lc == "lock" ? 2 : lc == "front" ? 3 : lc == "hold" ? 4 : 0;
+        // the right stick held, the gun down then up (hold); (2026-11-06, the user: "simpler lever action use ... Also add back
+        // option for stick flick down") or the roll, or the stick's flick; (2026-11-06, the user: "Add back old option that
+        // worked lever just by hand flick") or the gun's flick: the menu's four. The others (lock, front) only for the tests'
+        // inis, with [Debug] LeverModes=1 (the review: one a player once saved from the old menu would win, with no row left
+        // to change it)
+        const std::string lc = config::get_string("Reload", "LeverControl", "hold");
+        if (lc == "roll") g_lever_mode = 5;
+        else if (lc == "stick") g_lever_mode = 1;
+        else if (lc == "flick") g_lever_mode = 0;
+        else if (!config::get_bool("Debug", "LeverModes", false)) g_lever_mode = 4;
+        else g_lever_mode = lc == "lock" ? 2 : lc == "front" ? 3 : lc == "hold" ? 4 : 0;
+        const float rd = config::get_float("Reload", "LeverRollDeg", 20.0f);
+        g_roll_deg = std::isfinite(rd) && rd >= 8.0f && rd <= 60.0f ? rd : 20.0f;
     }
     g_volc_stick = config::get_string("Reload", "VolcanicControl", "lever") == "stick";
     g_rev_mode = config::get_string("Reload", "RevolverControl", "open") == "cock" ? 1 : 0;
@@ -4961,6 +5072,39 @@ void set_lever_parts(bool on) {
     config::set("Reload", "LeverParts", on ? "1" : "0");
 }
 int lever_control() { return g_lever_mode.load(std::memory_order_relaxed); }
+void reset_lever_mode_state() {  // a mode changed: nothing left open or held by the old one
+    {
+        std::lock_guard lock(g_mutex);
+        g_lever_open = false;
+        g_lever_stick_close_ms = 0;
+    }
+    if (g_lever_mode.load() != 2) g_lever_lock = false;
+    if (g_lever_mode.load() != 3) g_lever_front = false;
+    if (g_lever_mode.load() != 4) g_lever_hold_lock = false;
+    roll_forget();
+}
+void set_lever_control(int mode, bool save) {
+    if (mode != 0 && mode != 1 && mode != 4 && mode != 5) return;
+    if (g_lever_mode.exchange(mode) != mode) {
+        log::info("[actions] the lever guns: %s", mode == 5   ? "worked by a roll of the gun hand"
+                                                  : mode == 1 ? "worked by the stick's flick"
+                                                  : mode == 0 ? "worked by the gun's flick down and up"
+                                                              : "worked by the gun's moves, the stick held");
+        reset_lever_mode_state();
+    }
+    if (save) config::set("Reload", "LeverControl", mode == 5 ? "roll" : mode == 1 ? "stick" : mode == 0 ? "flick" : "hold");
+}
+float lever_roll_deg() { return g_roll_deg.load(std::memory_order_relaxed); }
+void set_lever_roll_deg(float deg, bool save) {
+    if (!std::isfinite(deg)) return;
+    deg = deg < 8.0f ? 8.0f : deg > 60.0f ? 60.0f : deg;
+    g_roll_deg = deg;
+    if (save) {
+        char b[16];
+        std::snprintf(b, sizeof(b), "%.0f", deg);
+        config::set("Reload", "LeverRollDeg", b);
+    }
+}
 bool volcanic_stick() { return g_volc_stick.load(std::memory_order_relaxed); }
 void set_volcanic_stick(bool on) {
     if (g_volc_stick.exchange(on) != on) log::info("[actions] the Volcanic's lever by: %s", on ? "the stick's flick" : "LeverControl");
@@ -4980,6 +5124,30 @@ bool fan_hammer() { return g_fan.load(std::memory_order_relaxed); }
 void set_fan_hammer(bool on) {
     if (g_fan.exchange(on) != on) log::info("[actions] the hammer fanned by the other hand: %s", on ? "on" : "off");
     config::set("Reload", "FanHammer", on ? "1" : "0");
+}
+float fan_zone_radius() { return g_fan_r; }
+void set_fan_zone_radius(float m, bool save) {
+    g_fan_r = m < 0.02f ? 0.02f : m > 0.3f ? 0.3f : m;  // (a float: read whole on the frame thread)
+    log::info("[actions] the fanning zone %.3f m round the hammer", g_fan_r);
+    if (save) config::set("Reload", "FanZoneRadius", std::to_string(g_fan_r).substr(0, 5));
+}
+bool show_fan_zone() { return g_fan_show.load(std::memory_order_relaxed); }
+void set_show_fan_zone(bool on, bool save) {
+    if (g_fan_show.exchange(on) != on) log::info("[actions] the fanning zone %s", on ? "shown" : "hidden");
+    if (save) config::set("Reload", "ShowFanZone", on ? "1" : "0");
+}
+bool fan_zone(float pos[3], float* radius, int* state) {
+    if (!g_fan_show.load(std::memory_order_relaxed) || log::now_ms() - g_fan_seen_ms > 100.0) return false;
+    std::memcpy(pos, g_fan_zone, sizeof(g_fan_zone));
+    *radius = g_fan_r;
+    *state = g_fan_d < g_fan_r ? 1 : !g_needs ? 3 : g_fan_armed ? 0 : 2;
+    return true;
+}
+float fan_speed() { return g_fan_speed; }
+void set_fan_speed(float mps, bool save) {
+    g_fan_speed = mps < 0.2f ? 0.2f : mps > 6.0f ? 6.0f : mps;
+    log::info("[actions] the fanning sweep from %.2f m/s", g_fan_speed);
+    if (save) config::set("Reload", "FanSpeed", std::to_string(g_fan_speed).substr(0, 4));
 }
 int hammer_weapon(float* hammer) {
     const int w = g_on.load(std::memory_order_relaxed) ? g_rev_weapon.load(std::memory_order_relaxed) : -1;
@@ -5135,18 +5303,30 @@ std::string command(const std::string& line) {
             g_lever_parts = v != "off";
             continue;
         }
-        if (w == "levercontrol") {  // levercontrol flick|stick|lock|front: [Reload] LeverControl for the session
+        if (w == "levercontrol") {  // levercontrol flick|stick|lock|front|hold|roll: [Reload] LeverControl for the session
             std::string v;
             in >> v;
-            g_lever_mode = v == "stick" ? 1 : v == "lock" ? 2 : v == "front" ? 3 : v == "hold" ? 4 : 0;
-            {  // as set_lever_control
-                std::lock_guard lock(g_mutex);
-                g_lever_open = false;
-                g_lever_stick_close_ms = 0;
-            }
-            if (g_lever_mode.load() != 2) g_lever_lock = false;
-            if (g_lever_mode.load() != 3) g_lever_front = false;
-            if (g_lever_mode.load() != 4) g_lever_hold_lock = false;
+            g_lever_mode = v == "stick" ? 1 : v == "lock" ? 2 : v == "front" ? 3 : v == "hold" ? 4 : v == "roll" ? 5 : 0;
+            reset_lever_mode_state();
+            continue;
+        }
+        if (w == "leverroll") {  // leverroll <deg>: [Reload] LeverRollDeg for the session
+            float v = 0.0f;
+            in >> v;
+            set_lever_roll_deg(v, false);
+            continue;
+        }
+        if (w == "fanshow") {  // fanshow on|off: [Reload] ShowFanZone for the session
+            std::string v;
+            in >> v;
+            set_show_fan_zone(v == "on", false);
+            continue;
+        }
+        if (w == "fanzone" || w == "fanspeed") {  // fanzone <m> | fanspeed <m/s>: FanZoneRadius, FanSpeed for the session
+            float v = 0.0f;
+            in >> v;
+            if (w == "fanzone") set_fan_zone_radius(v, false);
+            else set_fan_speed(v, false);
             continue;
         }
         if (w == "revolvercontrol") {  // revolvercontrol open|cock: [Reload] RevolverControl for the session
@@ -5437,9 +5617,9 @@ std::string command(const std::string& line) {
         o += b;
     }
     if (all || gk == kLever) {
-        std::snprintf(b, sizeof(b), " | lever parts %d open %d drawn %.2f hammer %.2f mode %d (volcanic stick %d) held %d gun held %d", g_lever_parts.load() ? 1 : 0,
-                      g_lever_open ? 1 : 0, g_lever_amt.load(), g_hammer_amt.load(), lever_mode_of(g_weapon), g_volc_stick.load() ? 1 : 0,
-                      g_lever_hold.load() ? 1 : 0, g_lever_hold_lock.load() ? 1 : 0);
+        std::snprintf(b, sizeof(b), " | lever parts %d open %d drawn %.2f hammer %.2f mode %d (volcanic stick %d) held %d gun held %d roll %.0f cant %.1f from %.1f",
+                      g_lever_parts.load() ? 1 : 0, g_lever_open ? 1 : 0, g_lever_amt.load(), g_hammer_amt.load(), lever_mode_of(g_weapon),
+                      g_volc_stick.load() ? 1 : 0, g_lever_hold.load() ? 1 : 0, g_lever_hold_lock.load() ? 1 : 0, g_roll_deg.load(), g_roll_now, g_roll_ref);
         o += b;
     }
     if (all || gk == kRevolver || gk == kTopBreak) {

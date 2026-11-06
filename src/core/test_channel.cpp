@@ -348,6 +348,21 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 4 && t[2] == "fold" && (t[3] == "on" || t[3] == "off")) camera_lever::set_audio_rear_fold(t[3] == "on");
         return camera_lever::audio_status();
     }
+    if (c == "cam" && t.size() >= 2 && t[1] == "heading") {  // (2026-11-06, GOAL-remaining 6c) the game camera's heading, degrees
+        float bx = 0.0f, bz = 0.0f;
+        if (!camera_lever::game_heading(&bx, &bz)) return "ERROR no game camera yet";
+        char b[96];
+        float vh = 0.0f;
+        const bool vok = camera_lever::view_heading(&vh);
+        char b2[160];
+        std::snprintf(b2, sizeof(b2), "game camera heading %.2f deg (back row %.4f %.4f) | view heading %s%.2f, the view's yaw %.2f", std::atan2(bx, bz) * 57.2957795f,
+                      bx, bz, vok ? "" : "(none) ", vh, camera_lever::view_yaw_offset());
+        return b2;
+    }
+    if (c == "cam" && t.size() >= 3 && t[1] == "viewyaw") {  // cam viewyaw <deg>: the view's yaw over the game camera (6c's test)
+        camera_lever::set_view_yaw_offset(std::strtof(t[2].c_str(), nullptr));
+        return "view yaw " + t[2];
+    }
     if (c == "cam" && t.size() >= 2 && t[1] == "fp") {  // cam fp [on|off|mark|check]: [Body] FirstPersonMoments (the session)
         if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) camera_lever::set_first_person_moments(t[2] == "on");
         if (t.size() >= 3 && (t[2] == "mark" || t[2] == "check")) return camera_lever::fp_check(t[2] == "mark");
@@ -610,6 +625,11 @@ std::string execute(const std::vector<std::string>& t) {
         menu::status_text(st, sizeof(st));
         return st;
     }
+    if (c == "pose" && t.size() >= 3 && t[1] == "tpsnapangle") {  // pose tpsnapangle <deg>: ThirdPersonSnapAngle for the session (round 98)
+        pose::set_third_person_snap_angle(std::strtof(t[2].c_str(), nullptr), false);
+        return "third person snap angle " + std::to_string(static_cast<int>(pose::third_person_snap_angle()));
+    }
+    if (c == "pose" && t.size() >= 2 && t[1] == "tpsnap") return pose::tps_command(t.size() >= 3 ? t[2] : "");
     if (c == "pose" && (t.size() == 1 || t[1] != "xr" && t[1] != "off")) {
         // pose | pose anchor on|off  ("pose xr" / "pose off" are the eye-camera switch above)
         if (t.size() >= 3 && t[1] == "anchor") pose::set_anchor(t[2] == "on");
@@ -688,10 +708,12 @@ std::string execute(const std::vector<std::string>& t) {
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return holster::command(line);
     }
-    if (c == "hud") {  // hud wrist|quad (writes the user ini) | hud shape rect|radar|half (the session)
+    if (c == "hud") {  // hud wrist|quad (writes the user ini) | hud shape rect|radar|half (the session) | hud nudge <right%> <down%> <size%> (the session)
         if (t.size() >= 3 && t[1] == "shape") xr::hud_shape_test(t[2] == "rect" ? 0 : t[2] == "half" ? 2 : 1);
-        else if (t.size() >= 2) xr::set_hud_on_wrist(t[1] == "wrist");
-        char st[420];
+        else if (t.size() >= 2 && (t[1] == "nudge" || t[1] == "shape")) {  // (too few values: the status only, never the wrist switch)
+            if (t.size() >= 5 && t[1] == "nudge") xr::set_hud_radar_nudge(std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr), false);
+        } else if (t.size() >= 2) xr::set_hud_on_wrist(t[1] == "wrist");
+        char st[512];
         xr::hud_status(st, sizeof(st));
         return st;
     }
@@ -716,6 +738,7 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 3 && t[1] == "gate") held_prop::set_gate(std::strtof(t[2].c_str(), nullptr));  // run 10 item 2 (the session)
         if (t.size() >= 3 && t[1] == "puts") held_prop::set_puts(std::atoi(t[2].c_str()));  // 2026-10-12 (the session)
         if (t.size() >= 3 && t[1] == "twins") held_prop::set_twins(t[2] == "on");  // 2026-10-12 (the session)
+        if (t.size() >= 3 && t[1] == "census" && (t[2] == "world" || t[2] == "own")) held_prop::set_census_matched(t[2] == "own");  // item 13's test
         if (t.size() >= 3 && t[1] == "show") {
             // run 11 item 1 (the props census): props show <fragment|off> [distance m] [height m] [spin deg] [tilt deg]: the
             // fragment made in the census slot before John (his heading, level), its axes X right, Y forward, Z up turned
@@ -1166,6 +1189,97 @@ std::string execute(const std::vector<std::string>& t) {
             out += b;
         }
         return out;
+    }
+    if (c == "gpcam") {  // (2026-11-06, GOAL-remaining 6c, read only) the gameplay camera object, [CamManager +0x28], and the one on channel 0
+        auto readable = [](uintptr_t a, size_t n) {
+            MEMORY_BASIC_INFORMATION mi{};
+            return a && VirtualQuery(reinterpret_cast<void*>(a), &mi, sizeof(mi)) && mi.State == MEM_COMMIT &&
+                   (mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) &&
+                   !(mi.Protect & PAGE_GUARD) && a + n <= reinterpret_cast<uintptr_t>(mi.BaseAddress) + mi.RegionSize;
+        };
+        const uintptr_t ga = anchors::addr(anchors::Id::CamManager);
+        if (!ga || !readable(ga, 8)) return "ERROR no camera manager";
+        const uintptr_t cm = *reinterpret_cast<const uintptr_t*>(ga);
+        if (!cm || !readable(cm, 0x30)) return "ERROR camera manager not readable";
+        const uintptr_t gp = *reinterpret_cast<const uintptr_t*>(cm + 0x28);
+        // gpcam turn <deg> (r140: +0x7e4 holds the follow camera's heading in radians): the heading moved by <deg>, only when
+        // +0x7e4 reads the game camera's heading now (within 3 deg), so a moved field is never written
+        // (rdrvr_CameraFovUpdate 0x140378500: +0x7e4 = **(L +0x68) + **(L +0x18) + **(L +0x48), L = [[[[cam +0x620] +0x10]
+        // +0x10] +8], rebuilt each frame) gpcam parts: the three; gpcam turnpart <0|1|2> <deg>: one of them moved by <deg>
+        float* part[3] = {nullptr, nullptr, nullptr};
+        {
+            uintptr_t q = gp;
+            const uint32_t offs[4] = {0x620, 0x10, 0x10, 8};
+            for (uint32_t o2 : offs) q = q && readable(q + o2, 8) ? *reinterpret_cast<const uintptr_t*>(q + o2) : 0;
+            const uint32_t po[3] = {0x68, 0x18, 0x48};
+            for (int i = 0; i < 3 && q; ++i) {
+                const uintptr_t pp = readable(q + po[i], 8) ? *reinterpret_cast<const uintptr_t*>(q + po[i]) : 0;
+                part[i] = pp && readable(pp, 4) ? reinterpret_cast<float*>(pp) : nullptr;
+            }
+        }
+        if (t.size() >= 2 && t[1] == "parts") {
+            char e[200];
+            std::snprintf(e, sizeof(e), "heading parts %.4f %.4f %.4f (at %llx %llx %llx), +0x7e4 %.4f", part[0] ? *part[0] : NAN, part[1] ? *part[1] : NAN,
+                          part[2] ? *part[2] : NAN, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(part[0])),
+                          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(part[1])), static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(part[2])),
+                          gp && readable(gp + 0x7e4, 4) ? *reinterpret_cast<const float*>(gp + 0x7e4) : NAN);
+            return e;
+        }
+        // gpcam addabs <deg> <hex address>...: each float there (within 0x1000 of part 0, read as an angle within 2 pi) moved by
+        // <deg> together (r143: the part's neighbours that follow the heading)
+        if (t.size() >= 4 && t[1] == "addabs") {
+            if (!part[0]) return "ERROR no part 0";
+            const uintptr_t p0 = reinterpret_cast<uintptr_t>(part[0]);
+            const float step = std::strtof(t[2].c_str(), nullptr) * 0.0174532925f;
+            float* at[32];
+            int n = 0;
+            for (size_t i = 3; i < t.size() && n < 32; ++i) {
+                const uintptr_t a = static_cast<uintptr_t>(std::strtoull(t[i].c_str(), nullptr, 16));
+                if (a % 4 || (a > p0 ? a - p0 : p0 - a) > 0x1000 || !readable(a, 4)) return "ERROR " + t[i] + " not near part 0";
+                float* f = reinterpret_cast<float*>(a);
+                if (!std::isfinite(*f) || std::fabs(*f) > 6.4f) return "ERROR " + t[i] + " not an angle";
+                at[n++] = f;
+            }
+            std::string r = "moved";
+            for (int i = 0; i < n; ++i) {
+                const float v = *at[i];
+                *at[i] = std::remainder(v + step, 6.2831853f);
+                char e[48];
+                std::snprintf(e, sizeof(e), " %.3f->%.3f", v, *at[i]);
+                r += e;
+            }
+            return r;
+        }
+        if (t.size() >= 4 && t[1] == "turnpart") {
+            const int i = std::atoi(t[2].c_str());
+            if (i < 0 || i > 2 || !part[i] || !std::isfinite(*part[i])) return "ERROR no such part";
+            const float before = *part[i];
+            *part[i] = std::remainder(before + std::strtof(t[3].c_str(), nullptr) * 0.0174532925f, 6.2831853f);
+            char e[96];
+            std::snprintf(e, sizeof(e), "heading part %d %.4f -> %.4f", i, before, *part[i]);
+            return e;
+        }
+        if (t.size() >= 3 && t[1] == "turn") {
+            if (!gp || !readable(gp + 0x7e4, 4)) return "ERROR no gameplay camera";
+            float bx = 0.0f, bz = 0.0f;
+            if (!camera_lever::game_heading(&bx, &bz)) return "ERROR no game camera heading";
+            float* hp = reinterpret_cast<float*>(gp + 0x7e4);
+            const float now = *hp, cam = std::atan2(bx, bz);
+            float diff = std::remainder(now - cam, 6.2831853f);
+            if (!std::isfinite(now) || std::fabs(diff) > 0.0524f) {
+                char e[120];
+                std::snprintf(e, sizeof(e), "ERROR +0x7e4 reads %.4f, the camera's heading %.4f: not written", now, cam);
+                return e;
+            }
+            const float want = std::remainder(now + std::strtof(t[2].c_str(), nullptr) * 0.0174532925f, 6.2831853f);
+            *hp = want;
+            char e[120];
+            std::snprintf(e, sizeof(e), "gameplay camera heading %.4f -> %.4f rad", now, want);
+            return e;
+        }
+        char b[96];
+        std::snprintf(b, sizeof(b), "gameplay camera %llx (manager %llx)", static_cast<unsigned long long>(gp), static_cast<unsigned long long>(cm));
+        return b;
     }
     if (c == "peekabs" && t.size() >= 2) {
         // peekabs <hex address> [n] [q]: n (<= 128) floats (q: 64-bit words in hex) at an absolute address, read only after

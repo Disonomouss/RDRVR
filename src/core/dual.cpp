@@ -166,6 +166,28 @@ float g_copy_restore = 0.0f;  // the gun in hand's clip before the copy's shot (
 // game's own gate, as before)
 std::atomic<bool> g_copy_rate{true};
 float g_copy_last = -1.0e9f;  // the game thread's: the copy's last shot (game time)
+// (2026-11-04, GOAL-next-items item 4; the user: "making the second gun equipped when dual weilding have its own damage")
+// [Hands] CopyOwnDamage (off): the copy's bullet is the gun in hand's (its weapon object fires it), so its hit carries
+// that gun's damage. Giving the projectile the shown gun's type made its hits do none (cycles N73, N74: "dual copywt
+// on"). Instead each hit of the copy's shot is scaled, in the actor hit (FUN_140ae1760, the hook HitLog uses: a bullet's
+// DamageInfo kind 0x24, its weapon +0xc4, its damage +0xcc), by the shown gun's damage over the gun in hand's (each
+// weapon's first variant's tuning +0x1fc: r127, the Cattleman 14.5 and the Double-action 17, as their hits read). The
+// copy's hit is the one of the gun in hand's weapon in the copy's shot's own tick (N74: the hit's game time its shot's),
+// by the local player (the attacker's actor-pool handle +0xd4, its actor's +0x118 & 3, as gun_melee's check), and only
+// the first such hit (a sidearm's one bullet; the review: not the gun in hand's shot a frame later, nor an NPC's)
+std::atomic<bool> g_copy_dmg{false};
+std::atomic<float> g_cd_scale{1.0f}, g_cd_gt{-1.0e9f};
+std::atomic<int> g_cd_weapon{-1};
+std::atomic<uint64_t> g_cd_shots{0}, g_cd_hits{0};
+// a weapon info's first variant's tuning damage (+0x1fc); false: not read or not plausible
+bool tuning_damage(uintptr_t info, float* out) {
+    uintptr_t td = 0;
+    float v = 0.0f;
+    if (!info || !rd(info + 0x30, &td) || !td || !rd(td + 0x1fc, &v)) return false;
+    if (!std::isfinite(v) || v <= 0.0f || v > 1000.0f) return false;
+    *out = v;
+    return true;
+}
 float g_copy_t130 = 0.0f;  // the gun in hand's W +0x130 before the copy's shot (put back after the weapon tick)
 bool g_copy_t130_set = false;
 std::atomic<float> g_copy_iv{-1.0f}, g_copy_hand_iv{-1.0f};  // the last intervals used (s): the copy's, the gun in hand's
@@ -471,6 +493,20 @@ bool fire_copy(uintptr_t item, uintptr_t W, int weapon) {  // true: held for the
     }
     g_copy_armed = W;
     g_copy_restore = c0;
+    if (g_copy_dmg.load(std::memory_order_relaxed)) {  // [Hands] CopyOwnDamage: this shot's scale, for its hits this tick
+        const int shown = copy_model();
+        float gtn = 0.0f, dh = 0.0f, ds = 0.0f;
+        uintptr_t hinfo = 0;
+        float s = 1.0f;
+        if (shown >= 0 && shown != weapon && rd(W + 0x28, &hinfo) && tuning_damage(hinfo, &dh) && tuning_damage(offhand::info_of(shown), &ds))
+            s = ds / dh;
+        if (rd(anchors::addr(anchors::Id::GameTime), &gtn) && std::isfinite(gtn)) {
+            g_cd_scale.store(s, std::memory_order_relaxed);
+            g_cd_weapon.store(weapon, std::memory_order_relaxed);
+            g_cd_gt.store(gtn, std::memory_order_release);
+            g_cd_shots.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (own) {  // (the trigger set W +0x130 to now: the gun in hand's own put back after the weapon tick)
         g_copy_last = gt;
         g_copy_t130 = t130;
@@ -1099,6 +1135,30 @@ ActorHit_t o_actor_hit = nullptr;
 std::atomic<bool> g_hitlog{false};
 std::atomic<uint64_t> g_hitlog_n{0};
 void hk_actor_hit(uintptr_t actor, uint8_t* info) {
+    if (g_copy_dmg.load(std::memory_order_relaxed) && info) {  // [Hands] CopyOwnDamage (above)
+        const uintptr_t ip = reinterpret_cast<uintptr_t>(info);
+        int32_t kind = -1, wpn = -1;
+        float dmg = 0.0f, gt = 0.0f;
+        const float t0 = g_cd_gt.load(std::memory_order_acquire), s = g_cd_scale.load(std::memory_order_relaxed);
+        auto by_player = [&]() {  // the attacker's actor-pool handle -> its actor (the slot's generation checked): the local player
+            uint32_t ah = 0;
+            uintptr_t apool = 0, act = 0;
+            uint16_t sgen = 0;
+            uint8_t f118 = 0;
+            if (!rd(ip + 0xd4, &ah) || !ah || ah == 0xffffffffu || !rd(anchors::addr(anchors::Id::ActorPool), &apool) || !apool) return false;
+            const uintptr_t slot = apool + static_cast<uintptr_t>(ah & 0xffff) * 0x10;
+            return rd(slot + 8, &sgen) && sgen == static_cast<uint16_t>(ah >> 16) && rd(slot, &act) && act && rd(act + 0x118, &f118) && (f118 & 3) == 3;
+        };
+        float t0x = t0;
+        if (rd(ip, &kind) && kind == 0x24 && rd(ip + 0xc4, &wpn) && wpn == g_cd_weapon.load(std::memory_order_relaxed) && rd(ip + 0xcc, &dmg) &&
+            std::isfinite(dmg) && dmg > 0.0f && rd(anchors::addr(anchors::Id::GameTime), &gt) && gt >= t0 && gt - t0 < 0.001f &&
+            std::isfinite(s) && s > 0.05f && s < 20.0f && std::fabs(s - 1.0f) > 1e-3f && by_player() &&
+            g_cd_gt.compare_exchange_strong(t0x, -1.0e9f, std::memory_order_acq_rel) && wr<float>(ip + 0xcc, dmg * s)) {
+            const uint64_t n = g_cd_hits.fetch_add(1, std::memory_order_relaxed);
+            if (n < 20) log::info("[wield] the copy's hit (weapon %d) as the gun it shows: damage %.2f -> %.2f (x%.3f)", wpn, static_cast<double>(dmg),
+                                  static_cast<double>(dmg * s), static_cast<double>(s));
+        }
+    }
     if (g_hitlog.load(std::memory_order_relaxed) && info) {
         int32_t kind = -1, wpn = -1, zone = -1;
         uint32_t flags = 0, att = 0;
@@ -1379,10 +1439,19 @@ bool install() {
                              &o_weapon_tick);
     ok &= hooks::install("RDR muzzle flash matrix (the copy)", reinterpret_cast<void*>(anchors::addr(anchors::Id::MuzzleFxMatrix)), hk_muzzle_fx,
                          &o_muzzle_fx);
-    if (config::get_bool("Debug", "HitLog", false) && anchors::addr(anchors::Id::ActorHit) && !anchors::stand_down()) {  // (research: not ok's)
-        g_hitlog = hooks::install("RDR actor hit (the hit log)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ActorHit)), hk_actor_hit,
-                                  &o_actor_hit);
-        log::info("[wield] the hit log: %s", g_hitlog.load() ? "on (every actor hit logged)" : "NOT installed");
+    g_copy_dmg = config::get_bool("Hands", "CopyOwnDamage", true);  // (2026-11-04, item 4; on by default 2026-11-05, the user)
+    const bool hitlog_cfg = config::get_bool("Debug", "HitLog", false);
+    if ((hitlog_cfg || g_copy_dmg.load()) && anchors::addr(anchors::Id::ActorHit) && !anchors::stand_down()) {  // (research: not ok's)
+        // (the hook also scales the copy's hits: installed with either, the lines only with HitLog)
+        const bool inst = hooks::install("RDR actor hit (the hit log, the copy's damage)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ActorHit)),
+                                         hk_actor_hit, &o_actor_hit);
+        g_hitlog = inst && hitlog_cfg;
+        log::info("[wield] the actor hit hook: %s (the hit log %d, the copy's own damage %d)", inst ? "installed" : "NOT installed", g_hitlog.load() ? 1 : 0,
+                  g_copy_dmg.load() ? 1 : 0);
+        if (!inst) g_copy_dmg = false;
+    } else if (g_copy_dmg.load()) {
+        g_copy_dmg = false;
+        log::warn("[wield] the copy's own damage off: no actor hit anchor");
     }
     return ok;
 }
@@ -1396,6 +1465,14 @@ bool same_at_its_holster() { return g_same_at_its.load(std::memory_order_relaxed
 void set_same_at_its_holster(bool on) {
     if (g_same_at_its.exchange(on) != on) log::info("[wield] the gun's own holster gives a second of it: %s", on ? "on" : "off");
     config::set("Hands", "DualWieldSameAtItsHolster", on ? "1" : "0");
+}
+bool copy_damage() { return g_copy_dmg.load(std::memory_order_relaxed); }
+bool copy_damage_hooked() { return o_actor_hit != nullptr; }
+void set_copy_damage(bool on) {
+    if (on && !o_actor_hit) log::info("[wield] the copy's own damage: on from the next start (its hook is installed at the start)");
+    if (g_copy_dmg.exchange(on && o_actor_hit != nullptr) != (on && o_actor_hit != nullptr))
+        log::info("[wield] the copy's hits as the gun it shows: %s", on ? "on" : "off");
+    config::set("Hands", "CopyOwnDamage", on ? "1" : "0");
 }
 void set_own_model(bool on) {
     if (g_own_model.exchange(on) != on) log::info("[wield] the copy shows the other sidearm's model: %s", on ? "on" : "off");
@@ -1916,6 +1993,35 @@ std::string command(const std::string& line) {
             if (in >> v) g_copy_wt = v == "on";
             char b[100];
             std::snprintf(b, sizeof(b), "copywt %d: launches %llu", g_copy_wt.load() ? 1 : 0, static_cast<unsigned long long>(g_copy_wt_n.load()));
+            return b;
+        } else if (w == "tuning") {
+            // (2026-11-04, GOAL-next-items item 4, research) dual tuning <weapon> [from] [n]: n (32, <= 64) floats of that weapon's
+            // first variant's tuning table (the one ChamberTime is read from, +0xd4), from byte `from` (hex), each read by rd
+            int wp = -1;
+            std::string fs;
+            int nf = 32;  // (the test channel's replies end near 512 characters)
+            in >> wp >> fs >> nf;
+            const uintptr_t info = wp >= 0 ? offhand::info_of(wp) : 0;
+            uintptr_t td = 0;
+            if (!info || !rd(info + 0x30, &td) || !td) return "no tuning";
+            const uintptr_t from = fs.empty() ? 0 : static_cast<uintptr_t>(std::strtoull(fs.c_str(), nullptr, 16));
+            if (nf < 1 || nf > 64) nf = 64;
+            std::string out = "tuning " + std::to_string(wp) + ":";
+            char b[40];
+            for (int i = 0; i < nf; ++i) {
+                float v = 0.0f;
+                if (!rd(td + from + static_cast<uintptr_t>(i) * 4, &v)) break;
+                std::snprintf(b, sizeof(b), " %llx=%.4g", static_cast<unsigned long long>(from + i * 4), static_cast<double>(v));
+                out += b;
+            }
+            return out;
+        } else if (w == "copydmg") {  // dual copydmg [on|off]: [Hands] CopyOwnDamage for the session (the hook needed); its counters
+            std::string v;
+            if (in >> v && o_actor_hit) g_copy_dmg = v == "on";
+            char b[200];
+            std::snprintf(b, sizeof(b), "copydmg %d (hooked %d): shots %llu, hits scaled %llu, the last scale %.3f (weapon %d)", g_copy_dmg.load() ? 1 : 0,
+                          o_actor_hit ? 1 : 0, static_cast<unsigned long long>(g_cd_shots.load()), static_cast<unsigned long long>(g_cd_hits.load()),
+                          static_cast<double>(g_cd_scale.load()), g_cd_weapon.load());
             return b;
         } else if (w == "hitlog") {  // dual hitlog [on|off]: [Debug] HitLog's lines (its hook installed at startup only)
             std::string v;

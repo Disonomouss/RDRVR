@@ -115,6 +115,10 @@ void set_hud_on_wrist(bool on);
 // wrist, the corner's other UI on the quad) or rect (the whole WristHudRect). Writes the user ini. Any thread.
 bool hud_shape_radar();
 void set_hud_shape_radar(bool radar);
+// [XR] WristHudRadarNudge (2026-11-05, the menu's arrows under the shape): the radar's cut-out moved right and down
+// (percent of the screen, -3 to 3) and sized (percent, 80-130). save: the user ini too. Any thread.
+void hud_radar_nudge(float out[3]);
+void set_hud_radar_nudge(float right, float down, float size, bool save);
 void hud_status(char* out, size_t len);  // "hud [wrist|quad]"
 // Moves the frame loop to the presenting thread (submission) or back to the idle loop, at the next idle-frame boundary.
 void set_submit(bool on);

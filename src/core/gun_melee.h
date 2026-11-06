@@ -37,9 +37,17 @@ bool dry_run();                   // GunMeleeDryRun
 void set_dry(bool on, bool save);      // save: the user ini too (the menu); "gunmelee dry on|off" is the session's
 // GunMeleeSpeed (the menu's "Hit speed", 1-6 m/s): the arm speed kept below it, the heavy speed above it
 void set_speed(float mps, bool save);
+// GunMeleeForce (2026-11-05, the menu's "Hit force"): the hit's push along the swing, 0 to eight punches (kPunchForce
+// each, the game's own punch scale); save: the user ini too
+constexpr float kPunchForce = 75.0f;
+void set_force(float f, bool save);
+void set_damage(float d, bool save);  // GunMeleeDamage (0.1-1000): the knock-out points (or health, lethal) a hit takes at the hit speed
 void set_by_peak(bool on);  // GunMeleeByPeak for the session (the test channel's "gunmelee speed <v> peak|contact")
 // RdrvrApi::gun_melee_hit (API v7): the plugin's script tick only (refused elsewhere). Returns an RdrvrMeleeHitCode.
 int hit(const RdrvrMeleeHit* h);
+// RdrvrApi::actor_handles (API v8): every live actor's object handle (the objects pool walked; the plugin's script tick
+// only). Returns how many were written (up to cap), -1 not now or the pool not as this build has it.
+int actor_handles(uint32_t* out, int cap);
 // aim.cpp's punch start (the game thread, inside the game's call, the player's melee controller M): the game's own
 // melee force scale [[M +0x10] +0xd4] read (SEH) and logged, the GunMeleeForce calibration (research 6.3.6). GunMelee only.
 void note_punch(uintptr_t m);

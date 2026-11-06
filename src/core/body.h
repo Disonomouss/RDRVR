@@ -44,7 +44,7 @@ struct HandCfg {
 // wrist to where it is drawn): false when no player set was corrected in the last 250 ms. Any thread. h: 0 left, 1 right.
 bool hand_correction(int h, float A[9], float a[3], bool* ik);
 // What the game holds in its hand g (0 left, 1 right: the hand it hangs the item on) as drawn: that wrist's
-// correction, or, left-handed with [Hands] GunInGunHand, the transplant onto John's left hand (a rigid move: the gun
+// correction, or, left-handed, the transplant onto John's left hand (a rigid move: the gun
 // sits on the left controller as it sits on the right one right-handed). The aim, the held prop. Any thread.
 bool item_correction(int g, float A[9], float a[3], bool* ik, double* ad = nullptr);  // ad: a in double (the world's coordinates are large)
 // The same with the item's game matrix (W +0x80) of the build it was drawn with, and its weapon object W, from one
@@ -52,7 +52,7 @@ bool item_correction(int g, float A[9], float a[3], bool* ik, double* ad = nullp
 // animation's clip). False without that hand's sample. The game's matrix: no GunKick in it. (GOAL-weapons-handling item
 // 1b, after optimumbox's fork, v0.8.11.10, MIT.) Any thread. frame: the body frame it was published in. False also for
 // an item hung on the game's other hand than g (the sample's side): the aim's g = 1, so an item on the game's left hand
-// keeps the old live read. Left-handed with GunInGunHand the game still hangs the gun on its right hand (the
+// keeps the old live read. Left-handed the game still hangs the gun on its right hand (the
 // transplant is g = 1's correction), so the fix applies there too [I: static reading, research/run28/aimfix.md].
 bool item_gun(int g, float A[9], float a[3], bool* ik, float gun[16], uintptr_t* W, uint64_t* frame = nullptr);
 // Item 1b's check (read only): the gun in hand's root (bone 0, or its rigid record) as last drawn in an eye's pass (not
@@ -94,7 +94,8 @@ bool drawn_second(float R[9], float o[3], uint64_t* frame, bool* copy);
 void set_drawn_second_capture(bool on);
 void set_drawn_second_scope(bool on);
 void set_drawn_second_bolt(bool on);  // (step 4, answer 2) actions' capture of it (a long bolt second gun's knob)  // (step 4, S5) the scope's own capture of the second gun's root (apart from the test's)
-// [Hands] GunInGunHand (left-handed: each arm on its own controller, the gun in John's left hand), TransplantFingers
+// [Hands] GunInGunHand (left-handed: each arm on its own controller, the gun in John's left hand; always on since
+// 2026-11-05, its ini key not read: the test channel's "skel gun gunhand" only), TransplantFingers
 // (0 unchanged, 1 the gun hand takes the gripping hand's curl and the other the game's empty hand's, 2 the other open)
 bool gun_in_gun_hand();
 void set_gun_in_gun_hand(bool on);  // also written to the user ini
@@ -171,7 +172,7 @@ struct BodyPoints {
     // moved by [Reload] ForegripOffset (world)
     bool fore_ok = false;
     float fore[3] = {};
-    int gun = 1;               // John's gun hand (0 left-handed with GunInGunHand)
+    int gun = 1;               // John's gun hand (0 left-handed)
     uint64_t frame = 0;        // the body frame these were published in (2026-10-29: aim.cpp's barrelstep2 pairs by it)
     // run 5 (RoundInHand): each hand's thumb and index fingertip joints as drawn (thumb_03, finger_13; world)
     bool tips_ok[2] = {false, false};

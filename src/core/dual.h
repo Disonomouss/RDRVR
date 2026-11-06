@@ -66,6 +66,11 @@ void set_copy_as_prop(bool on, bool save);  // save: also written to the user in
 // holster (the one it was drawn from) takes a second of that gun, its own model (another hip: the other sidearm's)
 bool same_at_its_holster();
 void set_same_at_its_holster(bool on);  // also written to the user ini
+// (2026-11-04, GOAL-next-items item 4) [Hands] CopyOwnDamage: the copy's hits scaled to the shown gun's damage; its hook
+// is installed at the start only (with it on, or [Debug] HitLog): turned on later, it works after a restart
+bool copy_damage();
+bool copy_damage_hooked();
+void set_copy_damage(bool on);  // also written to the user ini
 const char* sidearm_fragment(int weapon);  // a sidearm's model (its fragment's name), or nullptr
 // A sidearm model's muzzle locator in its own axes (m): its offset from the root bone, read from the fragments (run 5)
 bool sidearm_muzzle(int weapon, float out[3]);

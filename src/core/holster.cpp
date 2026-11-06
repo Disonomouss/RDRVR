@@ -210,6 +210,10 @@ double g_shown_ms = 0.0;
 // for a world move put on an offset (under g_zone_mutex)
 float g_link_rgt[3] = {1.0f, 0.0f, 0.0f}, g_link_fwd[3] = {0.0f, 0.0f, -1.0f};
 bool g_link_lefty = false;
+// (2026-11-05, the user: "Left handed mode switches the left and right holsters, doesn't need to do that", then "remove
+// mirror holsters option, not needed") left-handed, the holsters stay where they are; mirrored only by the test
+// channel's "holster mirror on" (the session: the old layout, a test's control)
+std::atomic<bool> g_mirror_lefty{false};
 std::atomic<bool> g_ring_gun_axes{true};
 std::atomic<bool> g_steady_ring{true};  // [Reload] SteadyRing (run 8 item 2): the ring's place on the gun locked after the draw
 std::atomic<uint64_t> g_ring_locks{0};  // [Reload] RingInGunAxes (run 8 item 2): the ring's offset along the drawn gun's axes
@@ -1078,7 +1082,7 @@ void holster_frame() {
     }
     auto zone_rounds = [&](int z) { return z == kAmmoZone; };
     auto any_here = [&](int z) { return any_item && z >= 0 && z < kZones && gun_zone(zones[z]); };
-    const bool lefty = controls::left_handed();
+    const bool lefty = controls::left_handed() && g_mirror_lefty.load(std::memory_order_relaxed);  // (the layout mirrored)
     const float hd = pose::torso_heading_deg() * 0.0174532925f;  // run 9: the horse's, not the ride's turned view
     const float fwd[3] = {-std::sin(hd), 0.0f, -std::cos(hd)}, right[3] = {std::cos(hd), 0.0f, -std::sin(hd)}, up[3] = {0, 1, 0};
     // the holsters' own frame: the body's, or turned with the headset ([Holsters] TurnWithHead, below)
@@ -2554,6 +2558,38 @@ void holster_frame() {
             }
         }
         const bool reheld = grip_down[h] && ho_ms[h] > 0.0 && now_ms - ho_ms[h] < 300.0;  // (HandOverLetGoMs' blip)
+        // (2026-11-04, GOAL-next-items item 2; the user: the Pump-action fired, carried and pumped one-handed: "you cannot
+        // grab the grip again"; not in the simulator) a grip within 25 cm of the carried gun's take-back point that does not
+        // take it back, pressed there or brought there already held (the review): said with why (at most one each 2 s, 50 a
+        // session); the distance from the take-back point, or within 60 cm of the carrying hand when there is none (take_ok 0)
+        static bool tb_held_in[2] = {false, false};  // (the review: cleared between carries)
+        if (!ds.carry) tb_held_in[h] = false;
+        if (ds.carry && h != ds.ctrl && bp.hand_ok[jh] && !carry_near(h, jh)) {  // (not the carrying hand's own grip)
+            static double said_ms = -1e9;
+            static int said = 0;
+            bool* held_in = tb_held_in;
+            const bool carrier_ok = ds.john >= 0 && ds.john <= 1 && bp.hand_ok[ds.john];
+            const float* ref = take_ok ? take_w : carrier_ok ? bp.hand[ds.john] : nullptr;
+            float d2 = 1e9f;
+            if (ref) {
+                d2 = 0.0f;
+                for (int k = 0; k < 3; ++k) d2 += (gb[jh][k] - ref[k]) * (gb[jh][k] - ref[k]);
+            }
+            const float rad = take_ok ? 0.25f : 0.6f;  // (from the carrying hand: the gun's grip 30-50 cm from it)
+            const bool close_by = d2 < rad * rad;  // (not `near`: a Windows macro)
+            const bool held_enter = grip_down[h] && !pressed && close_by && !held_in[h];
+            held_in[h] = grip_down[h] && close_by;
+            if (((pressed && close_by) || held_enter) && said < 50 && now_ms - said_ms >= 2000.0) {
+                said_ms = now_ms;
+                ++said;
+                log::info("[holster] the %s hand's grip (%s) %.3f m from the carried gun's %s (weapon %d), not taken back: the point %d "
+                          "(returning %d, the carrying hand tracked %d), the carrying controller %d, in hand %d, the action wants this "
+                          "grip %d, from the gun's frame %d, the menu %d",
+                          h ? "right" : "left", pressed ? "pressed" : "already held", std::sqrt(d2), take_ok ? "take-back point" : "carrying hand",
+                          ds.carry_weapon, take_ok ? 1 : 0, dual::carry_returning() ? 1 : 0, carrier_ok ? 1 : 0, h == ds.ctrl ? 1 : 0,
+                          in_hand ? 1 : 0, actions::grip_wanted(h) ? 1 : 0, take_gun ? 1 : 0, menu::visible() ? 1 : 0);
+            }
+        }
         if ((pressed || reheld) && carry_near(h, jh) && !menu::visible()) {
             ho_ms[h] = 0.0;
             // [Hands] CarryByForegrip: the empty hand at the carried gun's grip takes it back: drawn at once into this hand
@@ -3444,7 +3480,8 @@ void holster_frame() {
             }
         }
         for (int h = 0; h < 2; ++h) {
-            g_keeping[h].store(keep[h] != 0 && grip_down[h] && !round_held[h] && in_z[h] < 0, std::memory_order_relaxed);
+            // (2026-11-05, round 87: a swing back through a holster's zone, the grip held, was refused as a put-away) in a zone too
+            g_keeping[h].store(keep[h] != 0 && grip_down[h] && !round_held[h], std::memory_order_relaxed);
             g_keep_pub[h].store(keep[h], std::memory_order_relaxed);
             g_keep_w_pub[h].store(keep[h] ? keep_w[h] : -1, std::memory_order_relaxed);
             g_keep_up_pub[h].store(keep[h] && up_since[h] >= 0.0 ? static_cast<float>(now_ms - up_since[h]) : -1.0f, std::memory_order_relaxed);
@@ -3792,7 +3829,10 @@ void holster_frame() {
     const bool zones_shown = (g_show_zones.load(std::memory_order_relaxed) && ring_places) || placing;
     const bool dots_shown = g_show_dots.load(std::memory_order_relaxed),
                points_shown = g_show_points.load(std::memory_order_relaxed) && ring_places;
-    if ((zones_shown || dots_shown || points_shown) && bp.cam_ok) {
+    float fan_pos[3], fan_r = 0.0f;
+    int fan_st = 0;
+    const bool fan_shown = actions::fan_zone(fan_pos, &fan_r, &fan_st);  // [Reload] ShowFanZone (2026-11-06)
+    if ((zones_shown || dots_shown || points_shown || fan_shown) && bp.cam_ok) {
         Markers& mk = g_markers;
         std::memcpy(mk.cam, bp.cam, sizeof(mk.cam));
         mk.n = 0;
@@ -3849,7 +3889,12 @@ void holster_frame() {
             add(load_sec, lr_sec, kRing, kGunIdle, kZones + 1);
         }
         // the action's want: the revolver open (where rounds go in), the bolt's zone, the lever or pump gun
-        if (points_shown && ahint == 2) add(hint_pos, 0.05f, kRing, kHeld, kZones + 4);
+        // the fanning zone: bright while a sweep would cock it, the hand's colour in it, faint while the hand must leave it
+        // first, the gun's while the hammer is back (its own ring then, not the hint's 5 cm one)
+        // (the review: the chain's head, so no hint ring of the same id beside it)
+        if (fan_shown)
+            add(fan_pos, fan_r, kRing, fan_st == 0 ? kHeld : fan_st == 1 ? kHandIn : fan_st == 2 ? kNear : kGunIdle, kZones + 4);
+        else if (points_shown && ahint == 2) add(hint_pos, 0.05f, kRing, kHeld, kZones + 4);
         else if (points_shown && ahint && ahint != 5) add(load_pt, ahint == 1 ? 0.06f : 0.04f, kRing, kHeld, kZones + 4);
         else if (points_shown && chint == 2) add(chint_pos, 0.05f, kRing, kHeld, kZones + 4);  // (round 52) the carried bolt
         for (int h = 0; h < 2 && dots_shown; ++h) {
@@ -5166,7 +5211,8 @@ void set_show_weapon_points(bool on, bool save) {
     if (save) config::set("Holsters", "ShowWeaponPoints", on ? "1" : "0");
 }
 bool markers(Markers* out) {
-    if (!g_show_zones.load(std::memory_order_relaxed) && !g_show_dots.load(std::memory_order_relaxed) && !g_show_points.load(std::memory_order_relaxed))
+    if (!g_show_zones.load(std::memory_order_relaxed) && !g_show_dots.load(std::memory_order_relaxed) && !g_show_points.load(std::memory_order_relaxed) &&
+        !actions::show_fan_zone())
         return false;
     std::lock_guard lock(g_hdiag_mutex);
     if (!g_markers_valid || log::now_ms() - g_markers_ms > 100.0) return false;
@@ -5828,7 +5874,9 @@ std::string command(const std::string& line) {
         std::snprintf(sw, sizeof(sw), "(holsters %d, hand dots %d, weapon points %d, near %d, steady %d, placing %d, placed %llu) ",
                       g_show_zones.load() ? 1 : 0, g_show_dots.load() ? 1 : 0, g_show_points.load() ? 1 : 0, g_zones_near.load() ? 1 : 0,
                       g_steady_zones.load() ? 1 : 0, g_place.load() ? 1 : 0, static_cast<unsigned long long>(g_placed.load()));
-        if (!markers(&mk)) return std::string("rings ") + sw + (g_show_zones.load() || g_show_dots.load() || g_show_points.load() ? "on, no markers yet" : "off");
+        if (!markers(&mk))
+            return std::string("rings ") + sw +
+                   (g_show_zones.load() || g_show_dots.load() || g_show_points.load() || actions::show_fan_zone() ? "on, no markers yet" : "off");
         std::string r = std::string("rings ") + sw + "on, " + std::to_string(mk.n) + " markers:";
         static const char* const kState[5] = {"idle", "hand in", "held", "gun", "near"};
         for (int i = 0; i < mk.n; ++i) {
@@ -5962,6 +6010,12 @@ std::string command(const std::string& line) {
                       g_model_name, mo[0], mo[1], mo[2], mr[0], mr[1], mr[2], held_prop::shown(held_prop::kModelSlot) ? 1 : 0,
                       held_prop::shown(held_prop::kModelSlot + 1) ? 1 : 0);
         return b;
+    }
+    if (v == "mirror") {  // holster mirror [on|off]: [Holsters] MirrorLeftHanded for the session (the user ini never written)
+        std::string x;
+        if (in >> x && g_mirror_lefty.exchange(x == "on") != (x == "on"))
+            log::info("[holster] left-handed: the holsters %s (the session)", x == "on" ? "mirrored" : "where they are");
+        return std::string("mirror ") + (g_mirror_lefty.load() ? "1" : "0") + ", left-handed " + (controls::left_handed() ? "1" : "0");
     }
     if (v == "hold") {  // holster hold [on|off] [letgo <ms>|letgo default]: [Holsters] HoldToKeep for the session (the user ini
         // never written; letgo: the let-go's debounce, 50-1000 ms, a test's aid, kHoldLetGoMs by default); each controller's

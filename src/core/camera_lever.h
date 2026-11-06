@@ -85,6 +85,25 @@ void set_level_w2s(bool on);
 void set_billboard_sign(bool toward);
 // The game camera's back row x and z (its heading) from this frame's scene camera; false before the first frame.
 bool game_heading(float* bx, float* bz);
+bool game_place(float* x, float* z);
+// (round 94, the user: "No reticle visible in third person") that camera whole (the eye cameras' base in third person,
+// where the drawn body's points are not published); false before the first frame. Any thread
+bool game_camera(float out[16]);  // (round 93) that camera's place across (x, z); false before the first frame
+// (2026-11-06, GOAL-remaining 6c) a yaw (degrees) the eye cameras take over the game camera's, for the third person snap;
+// the centre eye's heading as drawn (game_heading's convention, degrees)
+void set_view_yaw_offset(float deg);
+float view_yaw_offset();
+// (round 93) the snap's view held at `target_deg` (game_heading's convention) and at the camera's place once turned (John's
+// place plus its start offset turned by the step), times `weight` (its ease out), from each frame's own camera at the
+// render; off: the offset above again
+// (round 95) fresh: a new snap (its start taken from this frame's camera); else a chained one keeps the start
+void set_view_yaw_target(bool on, float target_deg, float weight, bool fresh = false);
+// the last snap's drawn centre eye while held: its heading's and its place's largest moves from its first frame; and
+// the game camera's distance from the held place at the last held frame (what the ease takes out)
+void view_yaw_target_moves(float* deg, float* m, float* end_m);
+void view_yaw_rereference();  // (round 95) a chained step: those moves measured from it
+float view_yaw_frame();  // the yaw the eye cameras took this frame (degrees)
+bool view_heading(float* deg);
 void set_vi_level(bool on);
 // R5 cutscenes in 3D (DESIGN 3.7): the XR eye cameras keep the head's rotation and each eye's offset from the head's
 // centre (times `separation`), without the head's translation, so a cutscene shot is looked around in, not walked in.

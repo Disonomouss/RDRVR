@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 
-#define RDRVR_API_VERSION 7u
+#define RDRVR_API_VERSION 8u
 #define RDRVR_WEAPONS 40  // eWeapon 0..37 (WeaponModel), padded
 
 #ifdef __cplusplus
@@ -36,8 +36,9 @@ typedef enum RdrvrNativeOp {
     // collisions with the player back on (half a second later). value = 1 done, 0 gone.
     RDRVR_NATIVE_GRAB_END = 4,
     // v7, [Gestures] GunMelee: one scan in one tick. args: an RdrvrGunMeleeArgs
-    // copied over args[0..11]. The object iterator on the ambient layout (type 15, a sphere of radius_cm about seg[0][1])
-    // collects up to 10 actors (16 for a scan) and is destroyed before anything else runs; each live, human actor that
+    // copied over args[0..11]. The actors within radius_cm of seg[0][1] (v8: of the core's actor_handles; without them
+    // the object iterators on the layouts, type 15, in that sphere, each destroyed before anything else runs) are
+    // collected, up to 10 (16 for a scan); each live, human actor that
     // is not ragdolled, not the player and not held by a cutscene has its head, spine03, spine01 and pelvis tested as
     // spheres against the strike segments; the earliest entry moving into the bone at `speed` or more goes to the core's
     // gun_melee_hit (the game's hit is made there, in this tick). Result: value = the victim's handle (0 none) |
@@ -141,7 +142,8 @@ typedef struct RdrvrCameraJob {
     float forward;                // metres along the heading
     uint32_t orient_mode;         // SET_CAMERA_ORIENTATION's heading component: 0 z, 1 y, 2 x, 3 -y
     uint32_t no_idles;            // 1: SET_ACTOR_CAN_PLAY_BORED_IDLES(player, 0) while enabled (round 5c: idles moved the body)
-    uint32_t hide_reticle;        // 1: SET_RETICLE_DRAW_DISABLED_BY_SCRIPT while enabled (shots leave the barrel)
+    uint32_t hide_reticle;        // 1: SET_RETICLE_DRAW_DISABLED_BY_SCRIPT while enabled (shots leave the barrel); 2: also while
+                                  // not (third person in VR, the mod's reticle drawn instead)
     // riding (the core's [Horse]): with `saddle`, the camera sits above the mount's own root (the horse's position: no
     // gait bounce in it, unlike the rider's) by saddle_height, saddle_forward along the mount's heading, its height
     // low-passed over saddle_tau seconds; with heading_from_mount, it faces the mount's heading (stick steering).
@@ -212,6 +214,10 @@ typedef struct RdrvrApi {
     // Returns an RdrvrMeleeHitCode.
     int (*gun_melee_hit)(const RdrvrMeleeHit* hit);
     void (*end_script_tick)(uint64_t tick);                      // v7: after the tick's requests ran
+    // v8 (2026-11-05, the gun melee on townspeople): every live actor's object handle (the game's objects pool, walked
+    // by reads; the handles as GET_ACTOR_FROM_OBJECT's), written up to cap; the plugin's tick only. Returns the count,
+    // -1 not available (outside the tick, or the pool not as this build has it).
+    int (*actor_handles)(uint32_t* out, int cap);
 } RdrvrApi;
 
 typedef const RdrvrApi* (*RdrvrGetApiFn)(void);

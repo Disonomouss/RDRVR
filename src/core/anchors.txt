@@ -163,6 +163,7 @@ ForestManager            global 0x2ac5038
 UiManager                global 0x2c45610
 PostFxSingleton          global 0x2ad2130
 ObjectsPool              global 0x2c45808
+ObjectsAlloc             global 0x2c823a8   # the objects pool's slot allocator (FUN_14058b830, from FUN_1402e9f80): +0 u16 count, +8 the slots (ObjectsPool's), a slot's +0xa u16 nonzero = free
 # --- G-C body (ENGINE-NOTES "Head and hat hidden")
 DrawVisEntity            func   0x640120   # (ctx, entity record, pass, bucket, ...): record [0x10] drawable, [0x12] grmMatrixSet
 ActorPool                global 0x2c457f8
@@ -354,3 +355,5 @@ DeadeyePosRet            site   0x394597   8  # the return from DeadeyeMarksUi's
 DeadeyePosRet2           site   0x394355   8  # the return from DeadeyeMarksUi's MarkWorldPos call on the duel's path (lea rdx,[rsp+20h]; mov rcx,rbp: nothing volatile live)
 DeadeyeUiRet             site   0x3947fd   8  # the return from DeadeyeMarksUi's ScreenToUi call (movss xmm0,[rbx+9Ch]: nothing volatile live)
 DeadeyeUiRet2            site   0xd076db   8  # the return from FUN_140d07680's ScreenToUi call, the duel's marks (mov rbx,[rip+..]: nothing volatile live)
+ClothDisplayWrite        func   0xa5b800   # the character cloth's display write (FUN_140a5b800, 2026-11-06): the verlet cloth's points (+0xf0) into the coat's display mesh in the bone matrix's frame; [Body] ClothPins shifts John's around it
+BulletTrailFx            func   0x6b8c70   # a projectile's "BULLETTRAIL" effect made or moved (FUN_1406b8c70, its one caller the projectile's update FUN_140327140): [Hands] BulletTrails=0 skips it

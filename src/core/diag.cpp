@@ -17,6 +17,7 @@
 #include "core/frame_probe.h"
 #include "core/image_mem.h"
 #include "core/log.h"
+#include "core/playback.h"
 #include "core/state.h"
 #include "core/vr_mode.h"
 
@@ -601,6 +602,22 @@ void dump_recorder() {
         log::warn("[hang] rec: the replayed chunk %#llx is %s, read offset %#x", static_cast<unsigned long long>(X),
                   X == H ? "the head" : X == W ? "the writer" : "neither the head nor the writer", ofs);
         log_chunk("replayed", X);
+        const uintptr_t xd = rdv<uintptr_t>(X + 0x18);
+        if (xd && ofs >= 0) hex_dump("replayed about the read offset", xd + (ofs > 0x80 ? ofs - 0x80 : 0), 0x100);
+    }
+    // the batched head (playback.h): the replay's own frame is above the head stub, which the unwind does not pass; its
+    // last entry says the chunk and the read offset instead (RG1, 2026-11-06)
+    void *pc = nullptr, *pcl = nullptr;
+    int* po = nullptr;
+    long pb = 0;
+    if (!g_at_replay.seen && playback::where(&pc, &po, &pcl, &pb)) {
+        const uintptr_t X = reinterpret_cast<uintptr_t>(pc);
+        const int ofs = rdv<int>(reinterpret_cast<uintptr_t>(po));
+        log::warn("[hang] rec: the playback head's last entry: chunk %#llx (%s), read offset %#x; the claim's chunk %#llx, %ld claimed "
+                  "and not handed out",
+                  static_cast<unsigned long long>(X), X == H ? "the head" : X == W ? "the writer" : "neither the head nor the writer", ofs,
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pcl)), pb);
+        if (X != H && X != W) log_chunk("replayed", X);
         const uintptr_t xd = rdv<uintptr_t>(X + 0x18);
         if (xd && ofs >= 0) hex_dump("replayed about the read offset", xd + (ofs > 0x80 ? ofs - 0x80 : 0), 0x100);
     }

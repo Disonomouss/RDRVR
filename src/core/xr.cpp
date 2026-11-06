@@ -854,9 +854,15 @@ float g_hud_rect[4] = {0.02f, 0.60f, 0.34f, 0.96f};  // (2026-10-26: top 0.63 cu
 // [XR] WristHudShape (2026-10-26): radar (the default): the wrist takes only the radar's ellipse ([XR] WristHudRadar:
 // centre x y, radii x y) and the ammo counter's box ([XR] WristHudAmmo: x0 y0 x1 y1), fractions of the screen, measured
 // in the UI target (cycle r142: the radar x 0.053-0.306, y 0.700-0.935; the counter x 0.052-0.087, y 0.625-0.690); rect:
-// the whole WristHudRect, as before
+// the whole WristHudRect, as before. (2026-11-05: a player's piece of the radar's ring floating on the quad, "the edge
+// that was visible moved when I rotated": the radar's ink, its rings at every heading (r128), spans x 0.0535-0.3062, y
+// 0.7119-0.9382, the centre y 0.825, not 0.8175: it reached 0.978 of the ellipse, a 2% margin; centred and 0.150 wide
+// it reaches 0.90, nothing else of the HUD in the added band, in any grab since r142)
 std::atomic<bool> g_hud_shape{true};  // (the test channel sets it too)
-float g_hud_radar[4] = {0.1795f, 0.8175f, 0.1380f, 0.1300f}, g_hud_ammo[4] = {0.040f, 0.612f, 0.135f, 0.700f};
+float g_hud_radar[4] = {0.1795f, 0.8250f, 0.1500f, 0.1300f}, g_hud_ammo[4] = {0.040f, 0.612f, 0.135f, 0.700f};
+// [XR] WristHudRadarNudge (2026-11-05, the user, for the player whose piece of the ring stayed on the quad): the radar's
+// ellipse moved right and down (percent of the screen) and its size (percent), from the menu's arrows, on WristHudRadar
+std::atomic<float> g_hud_nudge[3] = {0.0f, 0.0f, 100.0f};
 XrSwapchain g_wr_sc = XR_NULL_HANDLE;
 std::vector<ID3D12Resource*> g_wr_images;
 int g_wr_x0 = 0, g_wr_y0 = 0;        // the crop in the UI target's pixels
@@ -922,7 +928,9 @@ bool make_ui_swapchain() {
 void push_hud_shape(float k) {
     const float W = static_cast<float>(g_ui_tw), Hh = static_cast<float>(g_ui_th);
     const float box[4] = {g_hud_ammo[0] * W, g_hud_ammo[1] * Hh, g_hud_ammo[2] * W, g_hud_ammo[3] * Hh};
-    const float ell[4] = {g_hud_radar[0] * W, g_hud_radar[1] * Hh, g_hud_radar[2] * W * k, g_hud_radar[3] * Hh * k};
+    const float s = k * g_hud_nudge[2].load() * 0.01f;
+    const float ell[4] = {(g_hud_radar[0] + g_hud_nudge[0].load() * 0.01f) * W, (g_hud_radar[1] + g_hud_nudge[1].load() * 0.01f) * Hh,
+                          g_hud_radar[2] * W * s, g_hud_radar[3] * Hh * s};
     const float crop[4] = {static_cast<float>(g_wr_x0), static_cast<float>(g_wr_y0), static_cast<float>(g_wr_x0) + static_cast<float>(g_wr_cw),
                            static_cast<float>(g_wr_y0) + static_cast<float>(g_wr_ch)};
     ui_layer::set_wrist_shape(g_hud_shape.load() && W > 0.0f && g_wr_cw > 0, box, ell, crop);
@@ -2403,6 +2411,8 @@ void init() {
     r = config::get_string("XR", "WristHudRadar", "");
     if (!r.empty() && sscanf_s(r.c_str(), "%f %f %f %f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[2] > 0.01f && v[3] > 0.01f)
         std::memcpy(g_hud_radar, v, sizeof(v));
+    r = config::get_string("XR", "WristHudRadarNudge", "");
+    if (!r.empty() && sscanf_s(r.c_str(), "%f %f %f", &v[0], &v[1], &v[2]) == 3) set_hud_radar_nudge(v[0], v[1], v[2], false);
     r = config::get_string("XR", "WristHudAmmo", "");
     if (!r.empty() && sscanf_s(r.c_str(), "%f %f %f %f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] < v[2] && v[1] < v[3])
         std::memcpy(g_hud_ammo, v, sizeof(v));
@@ -2418,8 +2428,9 @@ void force_frame_resized() {
 
 bool hud_on_wrist() { return g_hud_wrist.load(); }
 void hud_status(char* out, size_t len) {
-    std::snprintf(out, len, "hud %s (shape %s), wrist swapchain %ux%u from (%d, %d), shown frames %llu, hidden frames %llu, now %s, top (%.2f %.2f %.2f) | the hand's wheel %ux%u from (%d, %d), frames %llu",
-                  g_hud_wrist.load() ? "wrist" : "quad", g_hud_shape.load() ? "radar" : "rect", g_wr_w, g_wr_h, g_wr_x0, g_wr_y0, static_cast<unsigned long long>(g_wr_frames.load()),
+    std::snprintf(out, len, "hud %s (shape %s, the radar nudged %+.1f %+.1f %.0f%%), wrist swapchain %ux%u from (%d, %d), shown frames %llu, hidden frames %llu, now %s, top (%.2f %.2f %.2f) | the hand's wheel %ux%u from (%d, %d), frames %llu",
+                  g_hud_wrist.load() ? "wrist" : "quad", g_hud_shape.load() ? "radar" : "rect", g_hud_nudge[0].load(), g_hud_nudge[1].load(),
+                  g_hud_nudge[2].load(), g_wr_w, g_wr_h, g_wr_x0, g_wr_y0, static_cast<unsigned long long>(g_wr_frames.load()),
                   static_cast<unsigned long long>(g_wr_hidden.load()), g_wr_shown ? "shown" : "hidden", g_wr_up[0].load(), g_wr_up[1].load(),
                   g_wr_up[2].load(), g_wh_w, g_wh_h, g_wh_x0, g_wh_y0, static_cast<unsigned long long>(g_wh_frames.load()));
 }
@@ -2433,6 +2444,21 @@ void set_hud_shape_radar(bool radar) {
     if (g_hud_shape.exchange(radar) != radar) log::info("[xr] the wrist HUD: %s", radar ? "the radar's ellipse and the ammo counter" : "the whole rect");
     push_hud_shape(1.0f);
     config::set("XR", "WristHudShape", radar ? "radar" : "rect");
+}
+
+void hud_radar_nudge(float out[3]) {
+    for (int i = 0; i < 3; ++i) out[i] = g_hud_nudge[i].load();
+}
+void set_hud_radar_nudge(float right, float down, float size, bool save) {
+    auto clampf = [](float x, float lo, float hi) { return std::isfinite(x) ? std::fmin(hi, std::fmax(lo, x)) : 0.5f * (lo + hi); };
+    const float v[3] = {clampf(right, -3.0f, 3.0f), clampf(down, -3.0f, 3.0f), clampf(size, 80.0f, 130.0f)};
+    for (int i = 0; i < 3; ++i) g_hud_nudge[i] = v[i];
+    if (g_wr_cw > 0) push_hud_shape(1.0f);  // (at the start: the wrist swapchain pushes it when made)
+    log::info("[xr] the wrist HUD's radar cut-out moved right %+.1f%%, down %+.1f%% of the screen, its size %.0f%%", v[0], v[1], v[2]);
+    if (!save) return;
+    char b[64];
+    std::snprintf(b, sizeof(b), "%.1f %.1f %.0f", v[0], v[1], v[2]);
+    config::set("XR", "WristHudRadarNudge", b);
 }
 
 bool wrist_hud_shown() { return g_wr_visible.load(std::memory_order_relaxed); }

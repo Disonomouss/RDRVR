@@ -48,6 +48,201 @@ bool g_auto_height = true, g_have_scale = false;
 float g_measured_head = 0;
 double g_last_ms = 0;
 bool g_snap = false;
+// [Comfort] ThirdPersonSnap (2026-11-06, GOAL-remaining 6c; another player: "Snap turn ... in third person"; off by
+// default): with First person off, in VR, a push of the controllers' right stick past 0.7 turns the view by SnapAngle
+// at once: the game camera is driven by the stick toward the step (it eases and coasts: r139, so the stick brakes ahead
+// of it), and meanwhile the eye views are turned by what it has still to go (camera_lever's view yaw), so the player
+// sees one step. The player's own stick is held off the game until it arrives (1.5 s at most). (Round 93 check 3: the
+// view's yaw is taken at the render from that frame's camera and turned about John: camera_lever::set_view_yaw_target)
+std::atomic<bool> g_tps_cfg{false};
+// (round 98, the user: "Works great, add it to the menu with the ability to change how many degrees the snap turns")
+// [Comfort] ThirdPersonSnapAngle: the third person step, apart from the first person SnapAngle (10-90 deg)
+std::atomic<float> g_tps_angle{30.0f};
+bool g_tps_active = false, g_tps_latched = false, g_tps_owns_view = false;  // (owns: the view's yaw is the snap's to clear)
+float g_tps_target = 0.0f, g_tps_prev_h = 0.0f;
+double g_tps_start_ms = 0.0, g_tps_prev_ms = 0.0, g_tps_fade_ms = -1.0, g_tps_fade_len = 200.0;
+// (round 93 check 3) the game camera's place at the last frame: the hold ends once the camera stands still too (SF1: by a
+// wall it swings out 0.9 m as it turns), and the ease out is longer the farther it stopped from the held place
+float g_tps_prev_p[2] = {};
+constexpr double kTpsTimeoutMs = 2500.0;
+// (round 96, the user: "Still pulls back slightly", in the open) the camera taken as stopped only nearly still for three
+// frames running (was under 0.3 m/s once: it could still be creeping); and each hand-over logged with how far the camera
+// went on in the second after it
+int g_tps_still_n = 0;
+double g_tps_after_ms = -1.0;
+float g_tps_after_p[2] = {}, g_tps_after_h = 0.0f, g_tps_after_dm = 0.0f, g_tps_after_dh = 0.0f, g_tps_after_err = 0.0f, g_tps_after_off = 0.0f;
+bool g_tps_after_blink = false;
+// (round 95, the user: "Still moves back but much less so. You also can't snap turn again until it has moved back") a
+// camera stopped well off the held place (by a wall it cannot swing out: 0.9 m at the spawn building's door) is handed
+// over in a blink (the eyes faded to black over kBlinkOutMs, the view put back on the camera there, faded in over
+// kBlinkInMs) rather than eased across; a little off, the ease as before. A push while a snap holds or eases chains
+// another step from its target at once (the held place's start kept)
+constexpr double kBlinkOutMs = 70.0, kBlinkInMs = 90.0;
+constexpr float kBlinkM = 0.15f, kBlinkDeg = 1.5f;
+double g_tps_blink_ms = -1.0;
+float g_tps_blink = 0.0f;  // the snap's own fade now (rs_set_fade keeps the larger of it and the room's)
+// (the review) the blink's phases: 0 fading out; 1 black, the view put on the camera, held 2 frames (the view's change
+// reaches the render a frame after the fade); 2 fading in from g_tps_blink_in_ms
+int g_tps_blink_phase = 0, g_tps_blink_black = 0;
+double g_tps_blink_in_ms = 0.0;
+float rs_fade_now();  // room scale's own fade (below)
+std::atomic<uint64_t> g_tps_snaps{0}, g_tps_done{0}, g_tps_timeouts{0}, g_tps_blinks{0}, g_tps_chained{0};
+std::atomic<float> g_tps_last_err{0.0f}, g_tps_last_ms{0.0f};
+float tps_wrap(float d) { return std::remainder(d, 360.0f); }
+void tps_set_blink(float f) {
+    g_tps_blink = f;
+    xr_blit::set_fade(std::fmax(f, rs_fade_now()));  // (room scale's own writes keep the larger too: rs_set_fade)
+}
+void tps_stop_blink() {  // the snap stopped: no blink left behind
+    if (g_tps_blink_ms >= 0.0 || g_tps_blink > 0.0f) tps_set_blink(0.0f);
+    g_tps_blink_ms = -1.0;
+}
+// one frame of the snap: pad.rx replaced while it runs, the view's yaw offset set
+void tps_frame(xinput::PadState& pad, double now) {
+    float bx = 0.0f, bz = 0.0f;
+    if (!camera_lever::game_heading(&bx, &bz)) {
+        g_tps_active = false;
+        if (g_tps_owns_view) camera_lever::set_view_yaw_target(false, 0.0f, 0.0f);
+        g_tps_owns_view = false;
+        g_tps_fade_ms = -1.0;  // (the review: no ease left to turn the view on again unowned)
+        tps_stop_blink();
+        return;
+    }
+    const float h = std::atan2(bx, bz) * 57.2957795f;
+    const float sx = pad.rx / 32767.0f;
+    if (g_tps_after_ms >= 0.0) {  // (round 96) the second after a hand-over: how far the camera went on
+        float ax = 0.0f, az = 0.0f;
+        if (camera_lever::game_place(&ax, &az))
+            g_tps_after_dm = std::fmax(g_tps_after_dm, std::hypot(ax - g_tps_after_p[0], az - g_tps_after_p[1]));
+        g_tps_after_dh = std::fmax(g_tps_after_dh, std::fabs(tps_wrap(h - g_tps_after_h)));
+        if (now - g_tps_after_ms >= 1000.0 || g_tps_active) {
+            log::info("[pose] third person snap handed over %s: the camera %.2f deg short, %.3f m from the held place; in the %s after, it "
+                      "moved on %.3f m and turned %.2f deg",
+                      g_tps_after_blink ? "in a blink" : "by the ease", g_tps_after_err, g_tps_after_off, g_tps_active ? "time (a new snap)" : "second",
+                      g_tps_after_dm, g_tps_after_dh);
+            g_tps_after_ms = -1.0;
+        }
+    }
+    if (g_tps_latched && std::fabs(sx) < 0.3f) g_tps_latched = false;
+    if (!g_tps_latched && std::fabs(sx) > 0.7f && g_tps_blink_ms < 0.0) {  // (r139: the stick right lowers the heading)
+        // (round 95) chained: a snap holding or easing the view goes on from its target, its held place's start kept
+        const bool chain = g_tps_active || (g_tps_fade_ms >= 0.0 && g_tps_owns_view);
+        const float step = g_tps_angle.load(std::memory_order_relaxed);
+        g_tps_target = tps_wrap((chain ? g_tps_target : h) + (sx > 0.0f ? -step : step));
+        g_tps_active = g_tps_latched = true;
+        g_tps_start_ms = now;
+        if (!chain) {
+            g_tps_prev_h = h;
+            g_tps_prev_ms = now;
+        }
+        camera_lever::set_view_yaw_target(true, g_tps_target, 1.0f, !chain);
+        g_tps_owns_view = true;
+        g_tps_snaps.fetch_add(1, std::memory_order_relaxed);
+        if (chain) {
+            g_tps_chained.fetch_add(1, std::memory_order_relaxed);
+            camera_lever::view_yaw_rereference();  // (the review: the held view's moves measured from the new step)
+        }
+    }
+    if (!g_tps_active) {
+        if (std::fabs(sx) > 0.3f) pad.rx = 0;  // (the review: a push held on, or one short of 0.7, never turns it smoothly)
+        if (g_tps_blink_ms >= 0.0) {  // (round 95) the hand-over in a blink: black, the view put on the camera, back
+            const double t = now - g_tps_blink_ms;
+            float f = 1.0f;
+            if (g_tps_blink_phase == 0 && t < kBlinkOutMs) {
+                f = static_cast<float>(t / kBlinkOutMs);
+            } else if (g_tps_blink_phase == 0) {  // full black: the view put back on the camera here
+                if (g_tps_owns_view) camera_lever::set_view_yaw_target(false, 0.0f, 0.0f);
+                g_tps_owns_view = false;
+                g_tps_blink_phase = 1;
+                g_tps_blink_black = 0;
+            } else if (g_tps_blink_phase == 1) {
+                if (++g_tps_blink_black >= 2) {
+                    g_tps_blink_phase = 2;
+                    g_tps_blink_in_ms = now;
+                }
+            } else {
+                f = 1.0f - static_cast<float>((now - g_tps_blink_in_ms) / kBlinkInMs);
+            }
+            if (f <= 0.0f) {
+                tps_stop_blink();
+            } else {
+                tps_set_blink(f);
+            }
+            return;
+        }
+        if (g_tps_fade_ms >= 0.0) {
+            const float f = 1.0f - static_cast<float>((now - g_tps_fade_ms) / g_tps_fade_len);
+            if (f > 0.0f) {
+                camera_lever::set_view_yaw_target(true, g_tps_target, f);
+                g_tps_owns_view = true;  // (the review: its yaw cleared by whatever stops the snap)
+            } else {
+                camera_lever::set_view_yaw_target(false, 0.0f, 0.0f);
+                g_tps_owns_view = false;
+                g_tps_fade_ms = -1.0;
+            }
+        }
+        return;
+    }
+    g_tps_fade_ms = -1.0;  // (a new snap begun during the ease: it takes the view)
+    const float err = tps_wrap(g_tps_target - h);
+    const double dt = (now - g_tps_prev_ms) * 0.001;
+    const float vel = dt > 0.002 ? tps_wrap(h - g_tps_prev_h) / static_cast<float>(dt) : 0.0f;  // degrees a second
+    float px = 0.0f, pz = 0.0f, pv = 0.0f;  // the game camera's place and its speed (m/s)
+    if (camera_lever::game_place(&px, &pz) && dt > 0.002) pv = std::hypot(px - g_tps_prev_p[0], pz - g_tps_prev_p[1]) / static_cast<float>(dt);
+    g_tps_prev_p[0] = px;
+    g_tps_prev_p[1] = pz;
+    g_tps_prev_h = h;
+    g_tps_prev_ms = now;
+    // (round 94, the user: "a moment after the camera changes, it moves back slightly in the direction it came from": the
+    // camera stopped 3 deg short and the ease turned the view back by them) within 1.3 deg (R98: 1 timed out), nearly still; the stick's least
+    // push (0.6) still drives it on while more than that is left
+    const bool turned = std::fabs(err) < 1.3f && std::fabs(vel) < 4.0f, timeout = now - g_tps_start_ms > kTpsTimeoutMs;
+    g_tps_still_n = turned && pv < 0.08f ? g_tps_still_n + 1 : 0;
+    if ((g_tps_still_n >= 3 && now - g_tps_start_ms > 50.0) || timeout) {
+        g_tps_still_n = 0;
+        (timeout ? g_tps_timeouts : g_tps_done).fetch_add(1, std::memory_order_relaxed);
+        g_tps_last_err.store(err, std::memory_order_relaxed);
+        g_tps_last_ms.store(static_cast<float>(now - g_tps_start_ms), std::memory_order_relaxed);
+        g_tps_active = false;
+        float md = 0.0f, mm = 0.0f, me = 0.0f;
+        camera_lever::view_yaw_target_moves(&md, &mm, &me);
+        g_tps_after_blink = me > kBlinkM || std::fabs(err) > kBlinkDeg;
+        if (g_tps_after_blink) {  // (round 95) well off: in a blink
+            g_tps_blink_ms = now;
+            g_tps_blink_phase = 0;
+            g_tps_fade_ms = -1.0;
+            g_tps_blinks.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_tps_fade_ms = now;  // (SN1: a little short: the view eased onto the camera over 0.2 s, not popped)
+            g_tps_fade_len = 200.0;
+        }
+        g_tps_after_ms = now;
+        g_tps_after_p[0] = px;
+        g_tps_after_p[1] = pz;
+        g_tps_after_h = h;
+        g_tps_after_dm = g_tps_after_dh = 0.0f;
+        g_tps_after_err = err;
+        g_tps_after_off = me;
+        pad.rx = 0;
+        return;
+    }
+    if (turned) {  // turned, the camera still moving: the stick let go, the view held
+        pad.rx = 0;
+        camera_lever::set_view_yaw_target(true, g_tps_target, 1.0f);
+        g_tps_owns_view = true;
+        return;
+    }
+    // the stick from what is left to go, less what the camera will still coast (its speed over ~0.25 s), 15 deg a full push
+    const float pred = err - vel * 0.25f;
+    float u = -pred / 15.0f;
+    u = u < -1.0f ? -1.0f : u > 1.0f ? 1.0f : u;
+    // (SN1: under 0.4 of a push the game's camera stops 3-4 deg short) at least 0.6 while still on the way
+    if (std::fabs(pred) > 0.8f && std::fabs(u) < 0.6f) u = u < 0.0f || (u == 0.0f && pred > 0.0f) ? -0.6f : 0.6f;
+    pad.rx = static_cast<int16_t>(u * 32767.0f);
+    // (round 93 check 3) the view held at the target and the camera's end place: from each frame's own camera, at the render
+    camera_lever::set_view_yaw_target(true, g_tps_target, 1.0f);
+    g_tps_owns_view = true;
+}
 uint64_t g_turns = 0, g_walk_frames = 0;
 float g_last_head_yaw = 0;
 // riding ([Horse]): steering by the stick (the view faces the horse, the stick steers it) or by the head (as on foot:
@@ -75,18 +270,69 @@ bool armed_cond(const RdrvrActorState& st, double now) {
     if (!g_armed_stand.load(std::memory_order_relaxed) ||
         (st.flags & (RDRVR_ACTOR_CROUCHING | RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_IN_COVER)))
         return false;
-    return reload::is_gun(st.weapon) || (st.weapon < 0 && now - controls::last_lt_ms() < 1500.0);
+    // (2026-11-04, GOAL-next-items item 1, the review) the knife's and the torch's guard as the fists' (their LT)
+    const bool guard_hand = st.weapon < 0 || st.weapon == 22 || st.weapon == 33;
+    return reload::is_gun(st.weapon) || (guard_hand && now - controls::last_lt_ms() < 1500.0);
+}
+// 2026-11-04 (GOAL-next-items item 1, the user: "He still does this with melee, throwables and the lasso"): held too with
+// any other item in hand (the knife, the torch, the lasso, a throwable; not the mounted guns 26-28), standing as above,
+// but only for the stance's own drop: a deeper one (a kneel to skin or to hogtie, with the knife or the lasso in hand)
+// lets the view down with John, and keeps it down (the held height then follows him) until his head is back within the
+// stance's 15 cm of the height held before it (the review: compared with the live held height, the hold caught the view
+// again 15 cm over the kneeling head once it had followed that far); then held again and eased back up to that height
+// (the item's stance leaves the head 6 cm under it: only a rise to the head would leave the view low). Released at 10 cm,
+// above the 15 cm it latched at, and never latched again on its release frame (the review: one line for both, a head
+// hovering there pumped the view, and a same-frame latch took the lowered height as its reference)
+constexpr float kItemHoldMaxM = 0.15f, kItemBackM = 0.10f;
+std::atomic<uint64_t> g_hold_items{0}, g_hold_items_deep{0};  // frames held for an item; frames let down (deeper)
+bool g_item_down = false;     // let down by a deeper drop, until back up
+float g_item_ref = 0.0f;      // the height held before it
+float g_item_restore = 0.0f;  // back up: the height the view is eased to (0: none)
+std::atomic<bool> g_item_restoring{false};  // g_item_restore set (the still body eases back to its own height meanwhile)
+bool g_hold_by_item = false;  // the last hold an item's (its after-window capped as it was)
+bool item_cond(const RdrvrActorState& st) {
+    return g_armed_stand.load(std::memory_order_relaxed) && st.weapon >= 0 && !reload::is_gun(st.weapon) &&
+           (st.weapon < 26 || st.weapon > 28) &&
+           !(st.flags & (RDRVR_ACTOR_CROUCHING | RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_IN_COVER));
 }
 std::atomic<bool> g_hold_now{false};  // the frame's verdict (the still body reads it: body.cpp)
 std::atomic<uint64_t> g_hold_after{0};  // frames held after the stance ended (the head still low)
 double g_hold_release_ms = 0.0;
 bool armed_hold(const RdrvrActorState& st, float up, float held, double now) {
-    bool h = armed_cond(st, now);
+    bool h = armed_cond(st, now), by_item = false;
+    // (the review) a guard's or a gun's own after-window still running: a deep head is its easing back, not a kneel
+    const bool other_after = !g_hold_by_item && g_hold_release_ms > 0.0 && now - g_hold_release_ms < 8000.0;
+    if (!h && item_cond(st)) {
+        bool released = false;
+        if (g_item_down && up >= g_item_ref - kItemBackM) {  // stood up again: held, eased back to the height before
+            g_item_down = false;
+            g_item_restore = g_item_ref;
+            released = true;
+        }
+        const bool deep = up < held - kItemHoldMaxM && !released;
+        if (!g_item_down && deep && !other_after) {
+            g_item_down = true;
+            g_item_ref = held;
+            g_item_restore = 0.0f;
+        }
+        if (g_item_down) {
+            g_hold_release_ms = 0.0;  // (not held after it either: the kneel's way down is John's)
+            g_hold_items_deep.fetch_add(1, std::memory_order_relaxed);
+        } else if (!deep) {  // (deep within another's after-window: left to that window below)
+            h = by_item = true;
+            g_hold_items.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (!item_cond(st)) {
+        g_item_down = false;
+        g_item_restore = 0.0f;
+    }
+    g_item_restoring.store(g_item_restore > 0.0f, std::memory_order_relaxed);
     if (h) {
         g_hold_release_ms = now;
+        g_hold_by_item = by_item;
     } else if (g_hold_release_ms > 0.0 && g_armed_stand.load(std::memory_order_relaxed) &&
                !(st.flags & (RDRVR_ACTOR_CROUCHING | RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_IN_COVER)) &&
-               now - g_hold_release_ms < 8000.0 && up < held - 0.005f) {
+               now - g_hold_release_ms < 8000.0 && up < held - 0.005f && !(g_hold_by_item && up < held - kItemHoldMaxM)) {
         h = true;  // the stance easing back: held until the head is back up
         g_hold_after.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -880,7 +1126,8 @@ struct RsCmd {
     bool on = false;
     float lx = 0.0f, ly = 0.0f;  // -1..1, the body's frame (x right, y forward)
 };
-void rs_set_fade(float f) { xr_blit::set_fade(f); }  // (cycle r159: written every frame, not on a change only: never a fade left behind)
+void rs_set_fade(float f) { xr_blit::set_fade(std::fmax(f, g_tps_blink)); }  // (round 95: the snap's blink kept)
+float rs_fade_now() { return g_rs_fade_pub.load(std::memory_order_relaxed); }  // (cycle r159: written every frame, not on a change only: never a fade left behind)
 void rs_clear_fade() {  // the option off, a gate, the anchor gone: exactly 0, every frame, and no easing or start kept
     g_rs_fade_cur = 0.0f;
     g_rs_b0 = 0.0f;
@@ -1618,7 +1865,10 @@ void on_frame_end(uint64_t) {
     job.forward = g_forward;
     job.orient_mode = static_cast<uint32_t>(g_orient_mode);
     job.no_idles = g_no_idles ? 1 : 0;
-    job.hide_reticle = g_hide_reticle ? 1 : 0;
+    // (2026-11-06, GOAL-remaining 6c) bit 2: in third person (First person off, in VR) with the mod's reticle on, the game's
+    // flat one hidden too (drawn on the HUD's quad it sits at the quad's depth, not the target's: doubled)
+    job.hide_reticle = (g_hide_reticle ? 1u : 0u) |
+                       (!want && aim::third_person_reticle_live() && camera_lever::eyes_follow_head() && xr::submitting() && vr_mode::gameplay_stereo() ? 2u : 0u);
     job.weapons = (holster::weapon_choice() ? 1u : 0u) | (g_keep_cam.load(std::memory_order_relaxed) ? 2u : 0u);
     if (aim::gameplay_camera_current()) job.weapons |= 8u;  // no script's camera holds channel 0: the anchor may take it back
     if (want) {
@@ -1807,10 +2057,15 @@ void on_frame_end(uint64_t) {
             }
             job.height = g_height_s + g_lift;
         } else if (hold) {  // run 10 item 8b: the height held (its last value), only a rise let through (a crouch left with the gun out)
-            const float up = up_now;
+            // (2026-11-04, item 1) back up from a kneel with an item in hand: eased to the height held before it
+            const float up = g_item_restore > 0.0f ? std::fmax(up_now, g_item_restore) : up_now;
             if (up > g_height_s && up < 2.5f) {
                 const float a = 1.0f - std::exp(-dt / (g_height_tau > 0.01f ? g_height_tau : 0.01f));
                 g_height_s += (up - g_height_s) * a;
+            }
+            if (g_item_restore > 0.0f && g_height_s >= g_item_restore - 0.002f) {
+                g_item_restore = 0.0f;
+                g_item_restoring.store(false, std::memory_order_relaxed);
             }
             job.height = g_height_s + g_lift;
         } else if (g_height_follow && g_have_scale && api::actor_state(&st) && st.head_valid) {
@@ -1854,6 +2109,19 @@ void on_frame_end(uint64_t) {
             pad.ly = stick(rs_cmd.ly);
         }
     }
+    // [Comfort] ThirdPersonSnap: First person off, in VR, the controllers' stick
+    if (!want && controllers && g_tps_cfg.load(std::memory_order_relaxed) && xr::submitting() && vr_mode::gameplay_stereo() &&
+        !g_mounted_held_shared.load(std::memory_order_relaxed) && !aim::aiming()) {  // (the review: a turret, the aim, Dead Eye)
+        tps_frame(pad, log::now_ms());
+    } else if (g_tps_active || g_tps_owns_view) {  // (SN1: only the snap's own yaw cleared, never a test's)
+        g_tps_active = false;
+        camera_lever::set_view_yaw_target(false, 0.0f, 0.0f);
+        g_tps_owns_view = false;
+        g_tps_fade_ms = -1.0;  // (the review: an ease cut short is not resumed after)
+        tps_stop_blink();
+    } else if (g_tps_blink_ms >= 0.0) {
+        tps_stop_blink();
+    }
     static bool rs_drove = false;  // the room drove the gamepad's source last frame (its toggles not logged each walk)
     if (rs_cmd.on && !controllers) {  // a gamepad alone: the room's stick as the mod's source (the merge takes the further stick)
         xinput::PadState rp;
@@ -1887,8 +2155,13 @@ void init() {
     g_height_follow = config::get_bool("Body", "EyeHeightFollow", true);
     g_height_tau = config::get_float("Body", "HeightSmoothing", 0.35f);
     g_snap = config::get_string("Comfort", "TurnMode", "smooth") == "snap";
+    g_tps_cfg = config::get_bool("Comfort", "ThirdPersonSnap", false);
     g_turn_speed = config::get_float("Comfort", "TurnSpeed", 90.0f);
     g_snap_angle = config::get_float("Comfort", "SnapAngle", 30.0f);
+    {
+        const float ta = config::get_float("Comfort", "ThirdPersonSnapAngle", 30.0f);
+        g_tps_angle = std::isfinite(ta) ? std::fmin(90.0f, std::fmax(10.0f, ta)) : 30.0f;
+    }
     g_steer_head = config::get_string("Horse", "Steering", "stick") == "head";
     g_saddle = config::get_bool("Horse", "SaddleAnchor", true);
     g_saddle_tau = config::get_float("Horse", "SaddleSmoothing", 0.15f);
@@ -1937,6 +2210,29 @@ void set_turning(bool snap, float speed_deg_s, float snap_deg) {
     log::info("[pose] turning: %s (%.0f deg/s, snap %.0f deg)", snap ? "snap" : "smooth", speed_deg_s, snap_deg);
 }
 bool snap_turning() { return g_snap; }
+bool third_person_snap() { return g_tps_cfg.load(std::memory_order_relaxed); }
+void set_third_person_snap(bool on, bool save) {
+    if (g_tps_cfg.exchange(on) != on) log::info("[pose] snap turns in third person: %s", on ? "on" : "off");
+    if (save) config::set("Comfort", "ThirdPersonSnap", on ? "1" : "0");
+}
+float third_person_snap_angle() { return g_tps_angle.load(std::memory_order_relaxed); }
+void set_third_person_snap_angle(float deg, bool save) {
+    deg = std::isfinite(deg) ? std::fmin(90.0f, std::fmax(10.0f, deg)) : 30.0f;
+    if (g_tps_angle.exchange(deg) != deg) log::info("[pose] the third person snap: %.0f deg", deg);
+    if (save) config::set("Comfort", "ThirdPersonSnapAngle", std::to_string(static_cast<int>(deg)));
+}
+std::string tps_command(const std::string& v) {  // "pose tpsnap [on|off]": [Comfort] ThirdPersonSnap for the session, its counters
+    if (v == "on" || v == "off") g_tps_cfg = v == "on";
+    char b[380];
+    float md = 0.0f, mm = 0.0f, me = 0.0f;
+    camera_lever::view_yaw_target_moves(&md, &mm, &me);
+    std::snprintf(b, sizeof(b), "third person snap %d: snaps %llu, arrived %llu, timed out %llu, the last %.1f deg off after %.0f ms, the view's yaw now %.1f, "
+                  "the drawn view moved %.2f deg %.3f m while held, the camera %.3f m from it at the end, blinks %llu, chained %llu",
+                  g_tps_cfg.load() ? 1 : 0, static_cast<unsigned long long>(g_tps_snaps.load()), static_cast<unsigned long long>(g_tps_done.load()),
+                  static_cast<unsigned long long>(g_tps_timeouts.load()), g_tps_last_err.load(), g_tps_last_ms.load(), camera_lever::view_yaw_frame(), md, mm, me, static_cast<unsigned long long>(g_tps_blinks.load()),
+                  static_cast<unsigned long long>(g_tps_chained.load()));
+    return b;
+}
 float turn_speed() { return g_turn_speed; }
 float snap_angle() { return g_snap_angle; }
 
@@ -1953,6 +2249,7 @@ void set_armed_stand(bool on, bool save) {
     if (save) config::set("Body", "ArmedStance", on ? "stand" : "game");
 }
 bool holds_armed_height(const RdrvrActorState&) { return g_hold_now.load(std::memory_order_relaxed); }  // the frame's verdict
+bool item_restoring() { return g_item_restoring.load(std::memory_order_relaxed); }
 uint64_t hold_after_frames() { return g_hold_after.load(std::memory_order_relaxed); }
 bool vehicle_heading() { return g_vehicle_heading.load(); }
 void set_vehicle_heading(bool on, bool save) {
@@ -2322,7 +2619,7 @@ void status_text(char* out, size_t len) {
                   "anchor %s (%s), heading %.1f deg, head yaw %.1f, eye height %.3f%s, turns %llu, walk frames %llu | actor %s (%.2f %.2f %.2f) "
                   "heading %.1f, camera %d at (%.2f %.2f %.2f), tick %llu | mount %d (%.2f %.2f %.2f) heading %.1f, saddle %s h %.2f f %.2f, "
                   "steer %s, ride turn %d %.1f deg (turns %llu), ride frames %llu, jitter %.4f m/tick (camera height %.4f) over %llu | "
-                  "armed hold %d (after the stance %llu, LT %.0f ms ago), the head's height %.4f",
+                  "armed hold %d (after the stance %llu, LT %.0f ms ago), the head's height %.4f; an item in hand held %llu, let down %llu",
                   g_anchor.load() ? "on" : "off", g_active ? "active" : "idle", g_heading, g_last_head_yaw, g_height,
                   g_have_scale ? " (head bone)" : g_auto_height ? " (not yet measured)" : " (ini)",
                   static_cast<unsigned long long>(g_turns), static_cast<unsigned long long>(g_walk_frames), have ? "" : "none",
@@ -2333,7 +2630,8 @@ void status_text(char* out, size_t len) {
                   static_cast<unsigned long long>(g_ride_frames), g_jit_n ? std::sqrt(g_jit_sum / static_cast<double>(g_jit_n)) : 0.0,
                   g_jit_n ? std::sqrt(g_jit_abs / static_cast<double>(g_jit_n)) : 0.0,
                   static_cast<unsigned long long>(g_jit_n), g_hold_now.load() ? 1 : 0,
-                  static_cast<unsigned long long>(g_hold_after.load()), log::now_ms() - controls::last_lt_ms(), g_height_s);
+                  static_cast<unsigned long long>(g_hold_after.load()), log::now_ms() - controls::last_lt_ms(), g_height_s,
+                  static_cast<unsigned long long>(g_hold_items.load()), static_cast<unsigned long long>(g_hold_items_deep.load()));
 }
 
 }  // namespace rdrvr::pose

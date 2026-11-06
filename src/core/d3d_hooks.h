@@ -170,8 +170,12 @@ inline bool nested(Nest m) {
 // The calls passed so far, per method ("nested: barriers N, binds N, ..."; 0 without the layer).
 void nested_status(char* out, size_t len);
 // R5 pacing: while set, the game's Present runs with sync interval 0, so vsync does not hold the game to the desktop's
-// refresh and xrWaitFrame paces it (the game's own frame limiter still applies).
+// refresh and xrWaitFrame paces it (the game's own frame limiter still applies). [XR] PacingTearing (off): with a sync
+// interval taken off, DXGI_PRESENT_ALLOW_TEARING added where the swap chain allows it (windowed: no wait on the monitor).
 void set_present_unsynced(bool on);
+// For the cutscene log: the game's last Present (its sync interval << 16 | its flags' low 16 bits; 0xffffffff none
+// yet), the Presents whose sync interval was taken off, and those given the tearing flag.
+void game_present_state(uint32_t* last, uint64_t* unsynced, uint64_t* tearing_added);
 
 // The game making its frame again (its Graphics menu's resolution; research\run7\eye-shape.md, the resize row: the
 // render class's targets are made again and named, then ResizeBuffers, then the "Main Backbuffer" RTs): called with

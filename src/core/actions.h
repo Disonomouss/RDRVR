@@ -121,6 +121,12 @@ void set_lever_parts(bool on);  // also written to the user ini
 // 0 flick (the gun down then up), 1 stick (a flick of the right stick down; the Volcanic's VolcanicControl=stick too), 2 lock
 // (the gun's flick, the drawn gun's orientation held while the other hand's trigger is held: lever_lock(), body.cpp), 3 front
 int lever_control();
+// (2026-11-06, the user: "simpler lever action use", the stick's flick and the gun's back) the menu's four: 4 hold, 5 roll
+// (the gun hand rolled LeverRollDeg either way opens the lever, rolled back shuts it), 1 stick, 0 flick (the gun flicked
+// down then up); also written to the user ini
+void set_lever_control(int mode, bool save);
+float lever_roll_deg();  // [Reload] LeverRollDeg (8 - 60, 20 by default)
+void set_lever_roll_deg(float deg, bool save);
 // [Reload] VolcanicControl (2026-10-26): the Volcanic's lever by a flick of the right stick down (as LeverControl=stick)
 bool volcanic_stick();
 void set_volcanic_stick(bool on);  // also written to the user ini
@@ -143,6 +149,20 @@ int thumb_on_hammer(float* weight, float* hammer);
 // hammer cocks it; with the gun's trigger held, the shot goes at once (fanning)
 bool fan_hammer();
 void set_fan_hammer(bool on);  // also written to the user ini
+// (2026-11-06, another player: "fanning the revolver hit box to be larger/more sensitive") the hammer's zone, [Reload]
+// FanZoneRadius (0.02-0.3 m round the hammer), and the sweep's speed, [Reload] FanSpeed (0.2-6 m/s); set_ also writes the
+// user ini when save
+float fan_zone_radius();
+void set_fan_zone_radius(float m, bool save);
+float fan_speed();
+void set_fan_speed(float mps, bool save);
+// [Reload] ShowFanZone (2026-11-06, the user: "an option to see the zone represented"; off by default): the zone drawn as
+// a ring while fanning could act (a single action in hand, RevolverControl=cock). fan_zone: its place (world), radius and
+// state (0 the hammer down and a sweep would cock it, 1 the hand in it, 2 the hand to leave it first, 3 the hammer
+// back); false while it is hidden or not placed within 100 ms. The frame end's thread (as action_hint)
+bool show_fan_zone();
+void set_show_fan_zone(bool on, bool save);  // save: also written to the user ini
+bool fan_zone(float pos[3], float* radius, int* state);
 bool lever_lock();                 // the drawn gun's orientation held now (any thread)
 // 3 front (run 14): the gun's flicks; held two-handed with the lever waiting, body.cpp carries the gun in the front hand
 bool lever_front();                // the lever waits to be worked under LeverControl=front (any thread)

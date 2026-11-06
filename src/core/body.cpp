@@ -187,6 +187,7 @@ struct Rig {
     // (round 6: assuming the root's rest pose at the origin put every pivot a metre low). A joint is drawn at
     // M_b j_b + t_b in the set's space.
     std::vector<float> jbind;  // 3 per bone
+    std::vector<float> local16;  // (round 97) each bone's default local matrix (16 floats: axis rows, then the translation)
 };
 Rig g_rig;
 std::atomic<uint32_t> g_rig_gen{0};  // build_rig's count: a filter entry is for one rig
@@ -238,6 +239,7 @@ bool build_rig(uintptr_t data, const std::string& up_name) {
         std::vector<float> grot(static_cast<size_t>(count) * 9, 0.0f);
         if (rd(data + 0x20, &locals) && locals && readable(locals, static_cast<size_t>(count) * 0x40)) {
             const float* L = reinterpret_cast<const float*>(locals);
+            g_rig.local16.assign(L, L + static_cast<size_t>(count) * 16);
             for (int i = 0; i < count; ++i) {
                 const float* l = L + i * 16;
                 float rl[9];  // column form: the transpose of the stored axis rows
@@ -590,6 +592,7 @@ struct Frame {
     float stretch_max = 1.0f;  // the arm stretch's cap ([Hands] ArmStretch; 1 = off)
     float collapse = 1e-7f;    // [Body] CollapseScale: a hidden bone's matrix scale (its vertices onto its target)
     bool collapse_root = true;  // the root bone (0) hidden with the rest in the show modes
+    bool cloth_follows = true;  // [Body] ClothFollows: the root drawn with the pelvis's correction (the game's cloth on it)
     bool still_cloth = true;   // [Body] HiddenNoFlutter: no cloth flutter on the player's draws while parts are hidden
     bool no_flutter = true;    // [Body] NoFlutter: none on every player draw (2026-11-02, after optimumbox's)
     float yaw = 0;        // radians about the world's up through the root: the facing lock
@@ -604,6 +607,8 @@ struct Frame {
     float still_t[3] = {}, still_t_prev[3] = {};
     float view_h = 0;  // the view's heading (radians; faces (-sin h, -cos h)): the still diagnostic's axes
     std::vector<float> attach_pos;  // the attachment bones' world positions (3 each, the order of g_rig.attach)
+    float pelvis_w[3] = {};         // (item 13, [Body] WorldPropsStay) the pelvis's world position
+    bool pelvis_ok = false;
     HeldSample held[kHeldRing];     // the item in hand's game matrices, the last builds
     HeldSample sec[kHeldRing];      // [Hands] DualWield: the second gun's placed matrices, the last builds
     HeldSample copy[kHeldRing];     // [Hands] DualWieldCopy: the copy's placed matrices (C), the last builds
@@ -753,6 +758,26 @@ struct Corr {
     float A[9];
     float a[3];
 };
+// [Body] ClothPins (2026-11-06, GOAL-remaining item 2; the user: the coat "still moves as if it was following Johns idle
+// animations"): the game's character cloth hangs from the game's skinned pose: its pin update (FUN_140a5add0, cycle
+// DB4) copies the cloth mesh's skinned positions into the verlet cloth's pinned points (both point arrays, +0xf0 and
+// +0x100) and tethers the rest to theirs. After it, John's cloth's pins are moved by the drawn body's correction (the
+// pelvis's below, the upper spine's above, blended by height over the waist): the coat hangs from the drawn John. The
+// whole-coat ClothFollows stands down meanwhile (the coat would be corrected twice). Off by default until a headset round.
+// The cloth may update on a worker ("UpdateClothTask"): the two corrections are published per frame under a lock, with
+// the time they were made
+std::atomic<bool> g_cloth_pins_cfg{false};
+struct ClothCorr {
+    Corr lo, hi;     // the pelvis's and the upper spine's world corrections (game pose -> drawn)
+    double ms = -1e12;
+    bool ok = false;
+};
+std::mutex g_cloth_corr_mutex;
+ClothCorr g_cloth_corr;  // under g_cloth_corr_mutex
+std::atomic<uint64_t> g_cloth_pin_calls{0}, g_cloth_pin_fixed{0}, g_cloth_pin_stale{0}, g_cloth_pin_others{0}, g_cloth_pin_bad{0};
+std::atomic<float> g_cloth_pin_move{0.0f};  // the last shifted cloth's largest point move (m)
+std::atomic<bool> g_cloth_pin_hooked{false};  // the display write's hook installed (else ClothFollows stays, ClothPins idle)
+std::atomic<uintptr_t> g_john_cloth_ctrl{0};  // the controller last found John's ("skel body clothsrc": its skinned source)
 // run 5 (held_prop): the world correction that moves a draw now at (Rc: its axes as columns, pc) onto the wanted pose
 // (12 floats: the axes X, Y, Z, then the position): A = Rt Rc^T, a = pt - A pc
 // run 5 item 3 ([Reload] OpenCylinder) and run 6 item 9a: the gun in hand's parts drawn (the table below)
@@ -1190,6 +1215,14 @@ struct PropBone {
     // and a head prop's facing (its matrix's first axis) at its last match: John's hat turns with his head a few degrees
     // a frame, an NPC's hat of the same model in a fist fight faces him; by the model alone it was hidden as his
     float ax[3] = {0.0f, 0.0f, 0.0f};
+    // (2026-11-04, GOAL-next-items item 7) its bone as last said to hold, and the run of draws on the bone of now
+    int stable = -2, run_bone = -1, run_n = 0;
+    // (2026-11-05, item 13, [Body] WorldPropsStay) where the draw and its bone's attachment point were when last judged
+    // (both in the world): a prop of John's moves with its bone; one that stays put while its bone moves is the world's
+    bool ref = false, world = false;
+    float p0[3] = {}, b0[3] = {};
+    int still_n = 0;           // the frames in a row it stayed put with its bone moved (10: the world's; a frame's lag is not)
+    uint64_t still_frame = 0;  // the last frame counted
 };
 // The item in hand, known by its game matrix (round 7: "the gun in hand turns invisible for a bit now and then"; the
 // nearest attachment bone in the game's pose was often a holster, the hip or the head, hidden with the body in the
@@ -1287,6 +1320,22 @@ size_t g_sec_next = 0;
 std::atomic<uint32_t> g_sec_ring_seq{0};
 std::atomic<uintptr_t> g_skel_game{0};
 std::atomic<int> g_att_bone[2] = {-1, -1};
+// (round 97, the user's picture: the copy held by its grip, its barrel turned 90 deg sideways, with the wardrobe's
+// "Change Outfits" prompt up; "The gun will only face the wrong way if you are looking in certain directions") each
+// hand's attachment bone's default local matrix and its parent: the copy and the second gun hang from the parent's live
+// matrix times that, not from the attachment's own live one, which the game turns for its interactions (the hand's
+// correction follows the wrist, not it). g_att_seq: odd while written
+struct AttBind {
+    float local[16];
+    int bone, parent;  // (the review: the bound matrix used only for the bone it is for)
+    bool ok;
+};
+AttBind g_att_bind[2] = {};
+std::atomic<uint32_t> g_att_seq{0};
+std::atomic<bool> g_att_bind_on{true};  // ("skel copy bind on|off": the test's, the live attachment as before)
+std::atomic<float> g_att_bind_deg[2] = {-1.0f, -1.0f};  // the live attachment against the bound one at the last placement (deg; -1 none)
+std::atomic<uint64_t> g_att_bound_n{0}, g_att_live_n{0};  // placements by the bound matrix, by the live one (no bound one)
+std::atomic<float> g_att_bind_max[2] = {};  // the largest since the last [lag] line (its log: when over 20 deg)
 std::atomic<uint64_t> g_sec_placements{0}, g_sec_refused{0}, g_sec_draws{0};
 std::atomic<int> g_sec_why{0};  // the last refusal: 1 no hand, 2 no hand bone, 3 no grip locator, 4 no hand correction, 5 a write fault
 // [Hands] CarryByForegrip: the long gun in hand held two-handed, as placed this update in the front hand's corrected
@@ -2159,7 +2208,7 @@ FingerRel curled(const FingerRel& x, int h, float k, float cap) {
 // (r273's pictures, the turns about each joint: at 1 two fingertips stood straight out past the bolt, at 1.4 one, at 1.8 the
 // fingers closed round it; r272's knob check: its tips' middle 8 mm from the knob)
 std::atomic<float> g_grasp_curl_k{1.8f};  // "skel grasp curl <k>" (the session, tuning by the pictures): curled()'s k on the bolt's pose
-const FingerRel* grasp_pose(int h, FingerRel* scratch, int* src) {
+const FingerRel* grasp_pose(int h, FingerRel* scratch, int* src, int weapon) {
     *src = 0;
     if (h < 0 || h > 1) return nullptr;
     if (h == 0 && g_carry_fingers.valid) {
@@ -2180,6 +2229,23 @@ const FingerRel* grasp_pose(int h, FingerRel* scratch, int* src) {
         *src = 2;
         return scratch;
     }
+    // (2026-11-04, GOAL-next-items item 3: a bolt gun held only in John's left hand learns no foregrip fingers, nor a pinch:
+    // the right hand on its bolt had none) the gun's own front hold's fingers ([Grips] FrontFingers, shipped for every long
+    // gun since 0.8.12.1: John's left hand closed on its foregrip), mirrored for his right
+    if (weapon >= 0 && weapon < kGripW)
+        for (int pose = 0; pose < 2; ++pose) {
+            const FingerRel& fr = g_front_fingers[weapon][pose];
+            if (!fr.valid || !grip_ready(weapon, pose)) continue;  // (the review: never a hold still being learned)
+            if (h == 0) {
+                *src = 5;
+                return &fr;
+            }
+            if (g_rig.mirror_ok) {
+                *scratch = mirrored_rel(fr);
+                *src = 6;
+                return scratch;
+            }
+        }
     return nullptr;
 }
 // (r230: the knob at the wrist, InteractOffset 0, a hand's width from the fist in the pictures) where an object sits in
@@ -2231,6 +2297,8 @@ uint64_t g_grip_cur_frame = 0;  // when the game changes its pose, e.g. into its
 float g_snap_miss = -1.0f;  // the drawn front wrist from the snap target (m), the last snapped draw
 std::atomic<uint64_t> g_snaps{0}, g_grip_learns{0};
 std::vector<PropBone> g_prop_bones;
+double g_prop_rematch_ms = 0.0;  // (item 7's line, under g_draw_mutex)
+int g_prop_rematch_said = 0;
 uint64_t g_body_frame = 0;
 // "skel carry trace" (tests/sim/r32_carry_move.py; the review: the placements alone missed what the draw adds): the long
 // gun as last drawn in an eye's pass, the frame's first such draw (1 the gun in hand, 2 the carried gun's put-away, 3 the
@@ -5321,6 +5389,7 @@ bool piece_pose(const float* s, int count, int i, float loc[3], float rel[9]) {
 // False: drawn as the game draws it
 bool g_corr_world_valid = false;  // (g_corr_world: slot 0 has computed it)
 std::atomic<bool> g_shadow_body{true};
+float g_cloth_diag[2] = {};  // (slot 0, under g_draw_mutex) mm: the root's origin and the pelvis joint moved by their corrections
 struct ShadowDiag {  // ("skel pieces": under g_draw_mutex) the outside draws with the eyes' correction, the last one's pelvis
     uint64_t draws = 0, stale = 0, frame = 0;
     float pelvis[3] = {}, ax[3] = {};  // its pelvis joint and first axis as drawn (world)
@@ -6964,7 +7033,9 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                         mul3(Gd, QO, barrel_O);
                         barrel_ok = true;
                     }
-                    if (!mir && f.part_blend > 0.0f) {  // [Reload] PartHandSnap: the part's handle in this frame's drawn gun
+                    // (2026-11-04, GOAL-next-items item 3) in a mirrored, left-held gun too: actions.cpp publishes its bolt's
+                    // handle in that gun's frame (the mirrored frame: a rotation, the model's points unmirrored), as Gd is here
+                    if ((!mir || (f.part_bolt && f.long_gun)) && f.part_blend > 0.0f) {  // [Reload] PartHandSnap: the part's handle in this frame's drawn gun
                         for (int k = 0; k < 3; ++k) part_pt[k] = gd_o[k] + Gd[k * 3] * f.part_p[0] + Gd[k * 3 + 1] * f.part_p[1] + Gd[k * 3 + 2] * f.part_p[2];
                         std::memcpy(part_G, Gd, sizeof(part_G));
                         part_ok = true;
@@ -7021,7 +7092,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                 // wrist); without a pose, and the other parts, the interaction spot as before
                 FingerRel gscr;
                 int gsrc = 0;
-                const FingerRel* gp = part_hold ? grasp_pose(h, &gscr, &gsrc) : nullptr;
+                const FingerRel* gp = part_hold ? grasp_pose(h, &gscr, &gsrc, f.weapon) : nullptr;
                 if (gp && grasp_point(h, *gp, gq))
                     for (int k = 0; k < 3; ++k) part_off[k] = part_Md[k * 3] * gq[0] + part_Md[k * 3 + 1] * gq[1] + part_Md[k * 3 + 2] * gq[2];
                 else
@@ -7561,6 +7632,26 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         jdrawn(0, j);
         corr_point(g_corr[0], j, root_corr);
     }
+    // [Body] ClothFollows (2026-11-05, GOAL-next-items item 11, the user: "any of johns outfits that have a jacket. The
+    // jacket/coat doesn't move with the rest of the model"): a coat's cloth (the duster's model 30: not skinned, 422
+    // vertices, the game's cloth simulated from its own pose) is drawn at the root's matrix (bone 0, which every change
+    // above leaves as the game's), so the lock, the shift and the still body left it where the game's body was (cycle
+    // OF2: the body moved 0.5 m back, the coat stayed). The root takes the pelvis's correction, after its drawn point
+    // above (the holsters' zones keep it); the eyes' set, the world copies (the shadow, the props) and the set copies with it
+    const bool cloth_root = f.cloth_follows && g_rig.pelvis > 0 && g_rig.pelvis < n;
+    if (cloth_root) g_corr[0] = g_corr[g_rig.pelvis];
+    if (slot == 0 && g_rig.pelvis > 0 && g_rig.pelvis < n) {  // "skel body cloth": the root's origin and the pelvis joint moved
+        const float t0[3] = {s[3], s[7], s[11]};
+        float pj[3], pq[3], rq[3];
+        jdrawn(g_rig.pelvis, pj);
+        corr_point(g_corr[g_rig.pelvis], pj, pq);
+        corr_point(g_corr[0], t0, rq);
+        auto len = [](const float* a, const float* b) {
+            return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+        };
+        g_cloth_diag[0] = 1000.0f * len(rq, t0);
+        g_cloth_diag[1] = 1000.0f * len(pq, pj);
+    }
     // apply; the head bones collapse to the head joint as the head bone's correction puts it
     float ph[3], phc[3];
     jdrawn(g_rig.head, ph);
@@ -7600,15 +7691,16 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         }
     }
     const float eps = f.collapse;
-    for (int b = (f.show && f.collapse_root) ? 0 : 1; b < n; ++b) {
+    for (int b = (f.show && f.collapse_root) || cloth_root ? 0 : 1; b < n; ++b) {
         float* m = s + b * 12;
-        const Corr& c = g_corr[b];  // the root's is the identity
+        const Corr& c = g_corr[b];  // the root's is the identity, or the pelvis's (ClothFollows)
         const float mb[9] = {m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]};
         float nm[9];
         mul3(c.A, mb, nm);
         const float* target = phc;
         bool collapse = f.hide && g_rig.in_head[b];
-        if (f.show && !(f.show == 1 ? g_rig.in_elbow[b] : g_rig.in_wrist[b])) {
+        // (the root, there for ClothFollows: collapsed only with CollapseRoot, as before; the review of 2a100d1)
+        if (f.show && (b != 0 || f.collapse_root) && !(f.show == 1 ? g_rig.in_elbow[b] : g_rig.in_wrist[b])) {
             collapse = true;
             target = g_rig.side[b] >= 0 ? side_pt[g_rig.side[b]] : root_pt;
         }
@@ -7915,7 +8007,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         int src = 0;
         if (grasp_h >= 0 && grasp_b > 0.0f) {
             FingerRel mir, tight;
-            const FingerRel* fr = grasp_pose(grasp_h, &mir, &src);
+            const FingerRel* fr = grasp_pose(grasp_h, &mir, &src, f.weapon);
             // (round 40) the foregrip's fingers closed further round the bolt's knob (curled(); 1: as learned)
             if (const float ck = g_grasp_curl_k.load(std::memory_order_relaxed); fr && std::fabs(ck - 1.0f) > 1e-3f) {
                 tight = curled(*fr, grasp_h, ck, 1.75f);
@@ -8350,6 +8442,14 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         }
         g_corr_world_valid = true;
         g_corr_frame = g_body_frame;
+        if (g_cloth_pins_cfg.load(std::memory_order_relaxed) && g_rig.pelvis >= 0 && g_rig.pelvis < n) {  // ([Body] ClothPins)
+            const int top = g_rig.chain[3] >= 0 && g_rig.chain[3] < n ? g_rig.chain[3] : g_rig.pelvis;
+            std::lock_guard lk(g_cloth_corr_mutex);
+            g_cloth_corr.lo = g_corr_world[g_rig.pelvis];
+            g_cloth_corr.hi = g_corr_world[top];
+            g_cloth_corr.ms = log::now_ms();
+            g_cloth_corr.ok = true;
+        }
         for (int h = 0; h < 2; ++h) {  // [Hands] StaleGunFix: the targets it was made with
             g_corr_ik_ok[h] = f.ik[h];
             std::memcpy(g_corr_ikt[h], f.ik_t[h], sizeof(g_corr_ikt[h]));
@@ -8576,6 +8676,15 @@ std::atomic<bool> g_wind_still_cfg{true};
 std::atomic<bool> g_no_flutter_cfg{true};
 std::atomic<float> g_collapse_cfg{1e-7f};
 std::atomic<bool> g_collapse_root_cfg{true};
+std::atomic<bool> g_cloth_follows_cfg{true};  // [Body] ClothFollows (2026-11-05, item 11; transform_set)
+// [Body] WorldPropsStay (2026-11-05, item 13, the user: "When you are opening a chest, if you turn with the right stick,
+// the chest moves with you"; "Chest turns with John", a house's chest): a rigid draw within 15 cm of one of John's
+// attachment bones is taken for a prop on him and drawn with that bone's correction (the facing lock's turn to the view,
+// the shift); a chest he opens is within it of his hips (the simulator: a strongbox at 0.8-1.2 m by hip_r, root and
+// spine02_Attachment). John's props move with their bones; a world object does not: once its bone has moved 2 cm from
+// where both were and the draw not 1 mm, it is the world's, drawn as the game has it (again his if it moves 1 cm).
+std::atomic<bool> g_world_props_cfg{true};
+std::atomic<uint64_t> g_world_props{0};  // the props found to be the world's (the status)
 bool wind_param(int* id, uintptr_t* at) {
     const uintptr_t pid = anchors::addr(anchors::Id::WindParamsId), tab = anchors::addr(anchors::Id::ShaderGlobalTable);
     uintptr_t cb = 0, map = 0;
@@ -8801,6 +8910,54 @@ bool hand_correction_d(int h, float A[9], float a[3], bool* ik, double* ad, doub
 }
 
 
+// (round 97) John's hand j's attachment matrix for a second gun or the copy: its parent's live matrix times its default
+// local one (g_att_bind), else the live attachment `live` as read. The game thread (SEH-guarded reads)
+bool rigid_axes(const float* m);
+void mul44r(const float* a, const float* bm, float* out);
+void attach_matrix(int j, int ab, uintptr_t mtx, const float* live, float* out) {
+    std::memcpy(out, live, 16 * sizeof(float));
+    AttBind b;
+    if (!g_att_bind_on.load(std::memory_order_relaxed) || !seq_copy(g_att_seq, &b, &g_att_bind[j], sizeof(b)) || !b.ok || b.bone != ab) {
+        g_att_live_n.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // (the review) world matrices: their axes checked, not their place (rigid_rows wants a locator's, under 1 m); affine
+    // 4x3: the game keeps other data in the fourth column, so the product takes it as 0 0 0 1
+    alignas(16) float P[16], L[16], M[16];
+    if (!raw(mtx + static_cast<uintptr_t>(b.parent) * 0x40, P, sizeof(P))) {
+        g_att_live_n.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::memcpy(L, b.local, sizeof(L));
+    L[3] = L[7] = L[11] = 0.0f;
+    L[15] = 1.0f;
+    P[3] = P[7] = P[11] = 0.0f;
+    P[15] = 1.0f;
+    if (!rigid_axes(P) || !rigid_axes(L)) {
+        g_att_live_n.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    mul44r(L, P, M);
+    if (!rigid_axes(M)) {
+        g_att_live_n.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_att_bound_n.fetch_add(1, std::memory_order_relaxed);
+    float l9[9], m9[9];
+    for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 3; ++k) {
+            l9[r * 3 + k] = live[r * 4 + k];
+            m9[r * 3 + k] = M[r * 4 + k];
+        }
+    float tr = 0.0f;
+    for (int i = 0; i < 9; ++i) tr += l9[i] * m9[i];
+    float c = 0.5f * (tr - 1.0f);
+    c = c < -1.0f ? -1.0f : c > 1.0f ? 1.0f : c;
+    const float dg = std::acos(c) * 57.2957795f;
+    g_att_bind_deg[j].store(dg, std::memory_order_relaxed);
+    if (dg > g_att_bind_max[j].load(std::memory_order_relaxed)) g_att_bind_max[j].store(dg, std::memory_order_relaxed);
+    std::memcpy(out, M, sizeof(M));
+}
 // [Hands] DualWield: the second gun placed in John's free hand j as the game places a gun in hand (FUN_1402fe6d0:
 // W +0x80 = the model's grip locator x the hand bone's world matrix; the right grip at locators +0xc0, the left at
 // +0x100), then that hand's correction (as the gun in hand's). W +0x80 itself takes it, so the gun's muzzle and barrel
@@ -8815,9 +8972,10 @@ bool place_secondary(uintptr_t W, float* m, int j) {
     const int ab = g_att_bone[j].load(std::memory_order_relaxed);
     const uintptr_t skel = g_skel_game.load(std::memory_order_relaxed);
     uintptr_t mtx = 0, L = 0;
-    alignas(16) float B[16], G[16], src[16], out[16];
-    if (ab < 0 || !skel || !raw(skel + 0x28, &mtx, sizeof(mtx)) || !mtx || !raw(mtx + static_cast<uintptr_t>(ab) * 0x40, B, sizeof(B)))
+    alignas(16) float B0[16], B[16], G[16], src[16], out[16];
+    if (ab < 0 || !skel || !raw(skel + 0x28, &mtx, sizeof(mtx)) || !mtx || !raw(mtx + static_cast<uintptr_t>(ab) * 0x40, B0, sizeof(B0)))
         return refuse(2);
+    attach_matrix(j, ab, mtx, B0, B);  // (round 97) the hand's attachment from its parent and its rest offset
     if (!raw(W + 0x338, &L, sizeof(L)) || !L || !raw(L + (j ? 0xc0 : 0x100), G, sizeof(G)) || !rigid_rows(G)) return refuse(3);
     grip_times(G, B, src);
     float A[9], a[3];
@@ -9179,6 +9337,29 @@ void mul44r(const float* a, const float* bm, float* out) {  // row vectors: out 
 // place_secondary makes a second gun's matrix (the model's grip locator for that hand x the hand's attachment bone, then
 // that hand's correction), never written to the game; T = P^-1 C (row vectors) goes to dual.cpp for the shot and the
 // flash. The game thread inside the item update; SEH-guarded reads, no system calls.
+// (round 95, the user: the Cattleman copy from the left hip "changed direction" near buildings; their log: the copy's shot
+// went up and back, 179401) a copy turned over 45 deg from the gun in hand after it was within 20: which of its parts
+// moved since the last good placement (the gun in hand's grip locator for that hand, John's hand bone, the hand's
+// correction), the angle each turned; logged with the 10 s [lag] line. The game thread's statics
+std::atomic<uint64_t> g_ct_n{0};
+std::atomic<float> g_ct_t{0.0f}, g_ct_dg{-1.0f}, g_ct_db{-1.0f}, g_ct_da{-1.0f};
+std::atomic<int> g_ct_ab{-1}, g_ct_j{-1};
+float g_ct_G[9] = {}, g_ct_B[9] = {}, g_ct_A[9] = {};
+bool g_ct_ok = false, g_ct_bad = false;
+// (round 98, the user: "Not fixed"; no attachment turn logged) the bad placement's parts as they were: the gun's grip
+// locator (3 rows, the place), the hand's correction (3 rows), the copy in John's game hand (the attachment's frame:
+// src x B^-1 = G) against the gun in hand in its; written before g_ct_n's release, read after its acquire
+float g_ct_bad_G[12] = {}, g_ct_bad_A[9] = {}, g_ct_bad_B[9] = {};
+float g_ct_last_G[12] = {}, g_ct_last_A[9] = {}, g_ct_last_B[9] = {};  // the last placement's ("skel copy parts": a test's read)
+int g_ct_good_j = -1, g_ct_good_ab = -1;  // (the review) the good placement's hand and bone, and its placement count
+uint64_t g_ct_good_n = 0;
+float rot_angle9(const float* P, const float* Q) {  // the angle (deg) between two rotations given as 3x3 (either layout)
+    float tr = 0.0f;
+    for (int i = 0; i < 9; ++i) tr += P[i] * Q[i];
+    float c = 0.5f * (tr - 1.0f);
+    c = c < -1.0f ? -1.0f : c > 1.0f ? 1.0f : c;
+    return std::acos(c) * 57.2957795f;
+}
 bool place_copy(uintptr_t W, const float* P, int j) {
     auto refuse = [](int why) {
         g_copy_refused.fetch_add(1, std::memory_order_relaxed);
@@ -9189,9 +9370,10 @@ bool place_copy(uintptr_t W, const float* P, int j) {
     const int ab = g_att_bone[j].load(std::memory_order_relaxed);
     const uintptr_t skel = g_skel_game.load(std::memory_order_relaxed);
     uintptr_t mtx = 0, L = 0;
-    alignas(16) float B[16], G[16], src[16], C[16], Pinv[16], T[16];
-    if (ab < 0 || !skel || !raw(skel + 0x28, &mtx, sizeof(mtx)) || !mtx || !raw(mtx + static_cast<uintptr_t>(ab) * 0x40, B, sizeof(B)))
+    alignas(16) float B0[16], B[16], G[16], src[16], C[16], Pinv[16], T[16];
+    if (ab < 0 || !skel || !raw(skel + 0x28, &mtx, sizeof(mtx)) || !mtx || !raw(mtx + static_cast<uintptr_t>(ab) * 0x40, B0, sizeof(B0)))
         return refuse(2);
+    attach_matrix(j, ab, mtx, B0, B);  // (round 97) the hand's attachment from its parent and its rest offset
     if (!raw(W + 0x338, &L, sizeof(L)) || !L || !raw(L + (j ? 0xc0 : 0x100), G, sizeof(G)) || !rigid_rows(G)) return refuse(3);
     grip_times(G, B, src);
     float A[9], a[3];
@@ -9229,6 +9411,47 @@ bool place_copy(uintptr_t W, const float* P, int j) {
             for (int k = 0; k < 3; ++k) T[12 + k] += d[0] * C[k] + d[1] * C[4 + k] + d[2] * C[8 + k];  // d C (row vectors)
             std::memcpy(mshift, d, sizeof(mshift));
             g_copy_muzzle_moved.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    {  // (round 95) the copy turned off the gun in hand: its parts' turns since the last good placement
+        const float tz = T[10] < -1.0f ? -1.0f : T[10] > 1.0f ? 1.0f : T[10];
+        const float tdeg = std::acos(tz) * 57.2957795f;
+        float g9[9], b9[9];
+        for (int r = 0; r < 3; ++r)
+            for (int k = 0; k < 3; ++k) {
+                g9[r * 3 + k] = G[r * 4 + k];
+                b9[r * 3 + k] = B[r * 4 + k];
+            }
+        for (int r = 0; r < 3; ++r)
+            for (int k = 0; k < 3; ++k) g_ct_last_G[r * 3 + k] = G[r * 4 + k];
+        for (int k = 0; k < 3; ++k) g_ct_last_G[9 + k] = G[12 + k];
+        std::memcpy(g_ct_last_A, A, sizeof(g_ct_last_A));
+        std::memcpy(g_ct_last_B, b9, sizeof(g_ct_last_B));
+        if (tdeg < 20.0f) {
+            std::memcpy(g_ct_G, g9, sizeof(g9));
+            std::memcpy(g_ct_B, b9, sizeof(b9));
+            std::memcpy(g_ct_A, A, sizeof(g_ct_A));
+            g_ct_ok = true;
+            g_ct_bad = false;
+            g_ct_good_j = j;
+            g_ct_good_ab = ab;
+            g_ct_good_n = g_copy_placements.load(std::memory_order_relaxed);
+        } else if (tdeg > 45.0f && !g_ct_bad) {
+            g_ct_bad = true;
+            // compared only with a good placement of the same hand and bone within the last 600 placements (seconds)
+            g_ct_ok = g_ct_ok && g_ct_good_j == j && g_ct_good_ab == ab && g_copy_placements.load(std::memory_order_relaxed) - g_ct_good_n < 600;
+            g_ct_t.store(tdeg, std::memory_order_relaxed);
+            g_ct_dg.store(g_ct_ok ? rot_angle9(g_ct_G, g9) : -1.0f, std::memory_order_relaxed);
+            g_ct_db.store(g_ct_ok ? rot_angle9(g_ct_B, b9) : -1.0f, std::memory_order_relaxed);
+            g_ct_da.store(g_ct_ok ? rot_angle9(g_ct_A, A) : -1.0f, std::memory_order_relaxed);
+            g_ct_ab.store(ab, std::memory_order_relaxed);
+            g_ct_j.store(j, std::memory_order_relaxed);
+            for (int r = 0; r < 3; ++r)
+                for (int k = 0; k < 3; ++k) g_ct_bad_G[r * 3 + k] = G[r * 4 + k];
+            for (int k = 0; k < 3; ++k) g_ct_bad_G[9 + k] = G[12 + k];
+            std::memcpy(g_ct_bad_A, A, sizeof(g_ct_bad_A));
+            std::memcpy(g_ct_bad_B, b9, sizeof(g_ct_bad_B));
+            g_ct_n.fetch_add(1, std::memory_order_release);
         }
     }
     g_copy_seq.fetch_add(1, std::memory_order_acq_rel);  // odd while writing
@@ -10335,6 +10558,62 @@ struct PropDiag {
     bool pinned;
 };
 PropDiag g_prop_diag[8];
+std::atomic<uint64_t> g_pistol_bone_hides{0};
+// (2026-11-06, the review: a rigid hide and an unmatched hide by distance alone could take a glass on a counter or
+// another's holstered gun at John's hip, and the unmatched one entered the prop memory as the pistol bone's; neither
+// fired in the simulator (HB1)) the draws left shown within 25 cm of the pistol bone while the right hip shows ours,
+// counted per path (0 the record path matched to another bone, 1 matched to none, 2 a rigid draw); the log below says
+// which they are
+std::atomic<uint64_t> g_pistol_left_shown[3];
+// (2026-11-05, GOAL-remaining item 1: after round 91 the Cattleman turns, other revolvers show a lagging copy at the hip,
+// the Schofield one at the chest) the draws near the pistol bone left shown while the right hip shows ours: which path,
+// the nearest attachment bone and its distance, the drawable (the first 12 a session, one a second at most)
+std::atomic<int> g_pistol_near_said{0};
+double g_pistol_near_ms = -1e12;  // (the draw thread's)
+// the attachment bone nearest p in the game's pose (g_frame.attach_pos), its squared distance; -1 none
+int nearest_attach(const float* p, float* d2_out) {
+    const std::vector<float>& ap = g_frame.attach_pos;
+    int best = -1;
+    float bd = 1e30f;
+    for (size_t i = 0; i < g_rig.attach.size() && i * 3 + 2 < ap.size(); ++i) {
+        const int ab = g_rig.attach[i];
+        if (ab >= 0 && ab < static_cast<int>(g_rig.in_wrist.size()) && g_rig.in_wrist[ab]) continue;  // (as the prop match: not the hands')
+        const float dx = p[0] - ap[i * 3], dy = p[1] - ap[i * 3 + 1], dz = p[2] - ap[i * 3 + 2];
+        const float d = dx * dx + dy * dy + dz * dz;
+        if (d < bd) {
+            bd = d;
+            best = ab;
+        }
+    }
+    if (d2_out) *d2_out = bd;
+    return best;
+}
+float pistol_bone_d2(const float* p) {  // the squared distance from p to the pistol bone (game pose), 1e30 unknown
+    const std::vector<float>& ap = g_frame.attach_pos;
+    for (size_t i = 0; i < g_rig.attach.size() && i * 3 + 2 < ap.size(); ++i)
+        if (g_rig.attach[i] == g_rig.holster[0] && g_rig.holster[0] >= 0) {
+            const float dx = p[0] - ap[i * 3], dy = p[1] - ap[i * 3 + 1], dz = p[2] - ap[i * 3 + 2];
+            return dx * dx + dy * dy + dz * dz;
+        }
+    return 1e30f;
+}
+void note_pistol_near(int kind, uintptr_t drawable, const float* p, int pass) {
+    static const char* const kPath[3] = {"record", "record, unmatched", "rigid"};
+    const char* path = kPath[kind];
+    const float d2 = pistol_bone_d2(p);
+    if (d2 > 0.25f * 0.25f) return;
+    g_pistol_left_shown[kind].fetch_add(1, std::memory_order_relaxed);
+    if (g_pistol_near_said.load(std::memory_order_relaxed) >= 12) return;
+    const double now = log::now_ms();
+    if (now - g_pistol_near_ms < 1000.0) return;
+    g_pistol_near_ms = now;
+    g_pistol_near_said.fetch_add(1, std::memory_order_relaxed);
+    float bd2 = 0.0f;
+    const int nb = nearest_attach(p, &bd2);
+    log::info("[props] a draw %.3f m from the pistol bone left shown (the %s path, drawable %llx, pass %d): its nearest attachment %s at %.3f m",
+              std::sqrt(d2), path, static_cast<unsigned long long>(drawable & 0xffffffull), pass, nb >= 0 ? bone_name(g_rig.data, nb).c_str() : "-",
+              std::sqrt(bd2));
+}  // (2026-11-05) the game's gun on its pistol bone hidden while the right hip shows ours
 std::atomic<uint64_t> g_belt_twins{0};  // the game's holstered gun's draws hidden for a holster's shown gun (2026-10-12)
 int g_nprop_diag = 0;
 
@@ -11087,7 +11366,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 // ShowGuns off): the game's own holstered gun on John's belt, the same model as a holster's shown gun, was
                 // matched onto the shown gun's pose only within the 0.3 m gate; turning, it was 0.34-0.38 m from it
                 // (r16_backwards6) and drawn on its own at the game's holster. Hidden while a holster shows that model
-                bool belt_twin = false;
+                bool belt_twin = false, pistol_shown = false;  // (pistol_shown: the right hip shows ours, GOAL-remaining item 1)
                 const HeldSample* hsm = hi >= 0 ? &g_frame.held[hi] : si >= 0 ? &g_frame.sec[si] : nullptr;
                 const int held = hi >= 0 ? (g_frame.held[hi].left ? 0 : 1) : si >= 0 ? g_frame.sec[si].john : -1;
                 if (!hsm && g_frame.sec_any) {  // "skel dual": near the second gun, matched to none of its samples
@@ -11160,7 +11439,21 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                 // a model known as a head prop, drawn facing away from it: another's (an NPC's hat of John's model):
                 // left alone, never matched to another of John's bones either
                 bool foreign_head = false;
-                belt_twin = best >= 0 && held_prop::shown_at_holster(drawable);  // before the draw lock (held_prop's own)
+                belt_twin = best >= 0 && held_prop::shown_at_holster(drawable, rc + 12);  // before the draw lock (held_prop's own)
+                // (2026-11-05, items 7 and 10; the user: "The second gun appears in the same circumstance as the turned revolver. If
+                // it is a revolver, it is turned. Pistols stay properly oriented"; "The second gun is decided by what gun you held
+                // last"; their pictures: the semi-automatic at the right hip, a Schofield turned through it) the game hangs the
+                // last sidearm held on its pistol bone, whatever the right hip shows: another model, never this gun's twin by
+                // drawable or shape. While the right hip shows a gun, anything drawn on the pistol bone is the game's: hidden
+                pistol_shown = g_rig.holster[0] >= 0 && pistol_bone_d2(rc + 12) <= 0.35f * 0.35f && held_prop::shown(held_prop::kHolsterSlot);
+                if (!belt_twin && best >= 0 && best == g_rig.holster[0] && pistol_shown) {
+                    belt_twin = true;
+                    g_pistol_bone_hides.fetch_add(1, std::memory_order_relaxed);
+                }
+                // (GOAL-remaining item 1, cycle HT1: the game's Cattleman held last, drawn with its six parts 19-29 cm from our
+                // holster gun and turned, nearest no attachment within 15 cm: never matched, so never hidden: the user's
+                // "Cattleman turns") a prop draw matched to no bone near the pistol bone: noted (counted, logged)
+                if (!belt_twin && best < 0 && pistol_shown) note_pistol_near(1, reinterpret_cast<uintptr_t>(rec[0x10]), rc + 12, static_cast<int>(t_draw_pass & 7));
                 {
                     std::lock_guard lock(g_draw_mutex);
                     for (const PropBone& pb : g_prop_bones)
@@ -11187,27 +11480,116 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                             g_head_refused.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
+                    // ([Body] WorldPropsStay) a remembered prop judged on this draw: true when it is the world's (it stayed
+                    // put, under 1 mm, for 10 frames with John's pelvis 2 cm from where it was; again his if it moves 1 cm)
+                    // (the review) against the pelvis, not the bone it was matched to: a holstered gun matched to the knee
+                    // stays put while the knee moves; and the nearest bone changing never restarts the judgement. Never a
+                    // head prop (its hide goes with it)
+                    auto worldly = [&](PropBone& pb) {
+                        if (!g_world_props_cfg.load(std::memory_order_relaxed) || pb.head || !g_frame.pelvis_ok) return false;
+                        const float* bp = g_frame.pelvis_w;
+                        auto d2 = [](const float* a, const float* b) {
+                            const float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+                            return x * x + y * y + z * z;
+                        };
+                        auto take = [&] {
+                            std::memcpy(pb.p0, rc + 12, sizeof(pb.p0));
+                            std::memcpy(pb.b0, bp, sizeof(pb.b0));
+                            pb.ref = true;
+                            pb.still_n = 0;
+                        };
+                        if (!pb.ref) {
+                            take();
+                            return pb.world;
+                        }
+                        const float dp = d2(rc + 12, pb.p0), db = d2(bp, pb.b0);
+                        if (pb.world) {
+                            if (dp > 0.01f * 0.01f) {  // it moved after all: his (or carried off), judged anew
+                                pb.world = false;
+                                take();
+                            }
+                            return pb.world;
+                        }
+                        if (dp >= 0.001f * 0.001f) {  // it moves (with its bone): his
+                            take();
+                            return false;
+                        }
+                        if (db <= 0.02f * 0.02f) {
+                            pb.still_n = 0;
+                            return false;
+                        }
+                        if (pb.still_frame != g_body_frame) {  // (each frame once: the passes draw it several times)
+                            pb.still_frame = g_body_frame;
+                            ++pb.still_n;
+                        }
+                        if (pb.still_n >= 10) {
+                            pb.world = true;
+                            if (g_world_props.fetch_add(1, std::memory_order_relaxed) < 50)  // (bone_name reads memory: said 50 times at most)
+                                log::info("[props] a draw by John's %s (drawable %llx) stayed put while his pelvis moved %.0f mm: the world's (a chest "
+                                          "he opens), drawn as the game has it", bone_name(g_rig.data, pb.bone).c_str(),
+                                          static_cast<unsigned long long>(drawable & 0xffffffull), std::sqrt(db) * 1000.0f);
+                            return true;
+                        }
+                        return false;
+                    };
                     if (best >= 0) {
                         bool found = false;
+                        PropBone* hit = nullptr;
                         for (PropBone& pb : g_prop_bones)
                             if (same(pb)) {
+                                hit = &pb;
                                 // a prop once on the head stays a head prop: the hat bobs between head_Attachment and
                                 // the nearer neck_Attachment while sprinting (round 5c: it flickered)
                                 if ((head_5cm ? pb.head : g_rig.in_head[pb.bone] != 0) && !g_rig.in_head[best]) best = pb.bone;
                                 else if (g_rig.in_head[best] && best_d <= 0.05f * 0.05f) pb.head = true;
+                                // (2026-11-04, GOAL-next-items item 7: the holstered revolvers turned after going indoors and
+                                // out, never in the simulator) a prop off the head taken by another bone for 30 frames in a row
+                                // (the review: not one bobbing between two near bones): said, at most one a second and 200 a
+                                // session, with the draw's pass and whether the correction was a frame old (each bone's
+                                // correction is its own: another bone, another turn)
+                                if (!pb.head) {
+                                    if (best == pb.run_bone) {
+                                        if (pb.frame != g_body_frame) ++pb.run_n;  // (the review: frames, not each pass's draw)
+                                    } else {
+                                        pb.run_bone = best;
+                                        pb.run_n = 1;
+                                    }
+                                    if (pb.stable == -2) pb.stable = best;  // (its first bone: nothing to say)
+                                    if (pb.run_n == 30 && pb.run_bone != pb.stable) {
+                                        const double nms = log::now_ms();
+                                        if (g_prop_rematch_said < 200 && nms - g_prop_rematch_ms >= 1000.0) {
+                                            g_prop_rematch_ms = nms;
+                                            ++g_prop_rematch_said;
+                                            log::info("[props] a prop on John (drawable %llx) re-matched for 30 frames: bone %d (%s) -> %d (%s), %.3f m "
+                                                      "from it, pass %d, the correction %s%s",
+                                                      static_cast<unsigned long long>(drawable & 0xffffffull), pb.stable,
+                                                      pb.stable >= 0 ? bone_name(g_rig.data, pb.stable).c_str() : "-", best,
+                                                      bone_name(g_rig.data, best).c_str(), std::sqrt(best_d), static_cast<int>(t_draw_pass & 7),
+                                                      g_corr_frame != g_body_frame ? "a frame old" : "this frame's",
+                                                      belt_twin ? " (a holster's shown gun's twin)" : "");
+                                        }
+                                        pb.stable = pb.run_bone;
+                                    }
+                                }
                                 pb.bone = best;
                                 pb.frame = g_body_frame;
                                 std::memcpy(pb.ax, axn, sizeof(pb.ax));
                                 found = true;
                             }
-                        if (!found && drawable)
+                        if (!found && drawable) {
                             g_prop_bones.push_back({drawable, best, g_body_frame, g_rig.in_head[best] && (!head_5cm || best_d <= 0.05f * 0.05f), inst,
-                                                    {axn[0], axn[1], axn[2]}});
+                                                    {axn[0], axn[1], axn[2]}, best});
+                            hit = &g_prop_bones.back();
+                        }
+                        // (item 10: a holster's twin hidden whatever WorldPropsStay says: its frames drawn as the game has it
+                        // were the flicker to "wherever it would be on Johns normal model")
+                        if (hit && !belt_twin && worldly(*hit)) best = -1;
                     } else if (drawable && !foreign_head) {
                         for (PropBone& pb : g_prop_bones) {
                             if (!same(pb)) continue;
                             // (a head prop kept within 25 cm of its bone: a frame's lag at a gallop; 0.5 m took an NPC's hat)
                             const float keep = pb.head ? 0.25f : 0.5f;
+                            bool kept = false;
                             for (size_t i = 0; i * 3 + 2 < ap.size(); ++i) {
                                 if (g_rig.attach[i] != pb.bone) continue;
                                 float dx = rc[12] - ap[i * 3], dy = rc[13] - ap[i * 3 + 1], dz = rc[14] - ap[i * 3 + 2];
@@ -11215,8 +11597,10 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                                     best = pb.bone;
                                     pb.frame = g_body_frame;
                                     if (pb.head) std::memcpy(pb.ax, axn, sizeof(pb.ax));
+                                    kept = true;
                                 }
                             }
+                            if (kept && !belt_twin && worldly(pb)) best = -1;
                         }
                     }
                     if (best < 0 && !foreign_head)  // (the diagnostic: his hat's model, its facing his, not kept)
@@ -11274,6 +11658,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     rec_at = rc;
                     const bool part_hidden = g_frame.show && !(g_frame.show == 1 ? g_rig.in_elbow[best] : g_rig.in_wrist[best]);
                     if (belt_twin) g_belt_twins.fetch_add(1, std::memory_order_relaxed);
+                    else if (pistol_shown) note_pistol_near(0, reinterpret_cast<uintptr_t>(rec[0x10]), rc + 12, static_cast<int>(t_draw_pass & 7));
                     if ((g_frame.hide && g_rig.in_head[best]) || part_hidden || belt_twin || (hp && hp_hide)) {
                         if (hp && hp_hide) g_hprop_hidden.fetch_add(1, std::memory_order_relaxed);
                         for (size_t j = 0; j < static_cast<size_t>(count) * 2; ++j) shrink_axes(sm + j * 12);
@@ -11796,6 +12181,12 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
     const bool rigid_hp = rigid && rigid_hi < 0 && rigid_si < 0 &&
                           held_prop::match(reinterpret_cast<uintptr_t>(rec[0x10]), draw_instance(rec), reinterpret_cast<const float*>(rec) + 12, hp_pose2,
                                            &hp_slot2, &hp_hide2);
+    // (GOAL-remaining item 1) a rigid draw of no gun in hand, no second gun and no held prop, within 25 cm of the pistol
+    // bone while the right hip shows ours: noted (the distance first, the right hip's lock last: most rigid draws are the
+    // world's)
+    if (rigid && !rigid_hp && !rigid_held && !rigid_sec && g_rig.holster[0] >= 0 && in_box(g_frame.attach_box, reinterpret_cast<const float*>(rec)) &&
+        pistol_bone_d2(reinterpret_cast<const float*>(rec) + 12) <= 0.25f * 0.25f && held_prop::shown(held_prop::kHolsterSlot))
+        note_pistol_near(2, reinterpret_cast<uintptr_t>(rec[0x10]), reinterpret_cast<const float*>(rec) + 12, static_cast<int>(t_draw_pass & 7));
     if (rigid_hp && hp_hide2) {
         float* rc = reinterpret_cast<float*>(rec);
         std::memcpy(rec_save, rc, sizeof(rec_save));  // (restored after the draw)
@@ -12071,6 +12462,102 @@ void dump_bones(const std::string& file, std::string* out) {
     }
     std::fclose(f);
     *out = std::to_string(count) + " bones to " + file;
+}
+
+// ---- [Body] ClothPins: the hook on the character cloth's display write (FUN_140a5b800(controller, matrix): the verlet
+// cloth's points (+0xf0) into the coat's display mesh, in the matrix's frame; after the pin update and its tethers, the
+// user's choice of 2026-11-06, "Re-tie in the hook"). The cloth simulates in the game's pose, pins and tethers alike, and
+// only its display is moved: for John's cloth every point is shifted onto the drawn body (the pelvis's correction below the
+// waist, root +1.0 m, to the upper spine's 0.45 m above it, blended), the original writes the mesh from them, and the
+// points are put back at once: nothing accumulates, the tethers stay consistent, and the game's own code writes its buffer
+using ClothDisplay_t = void (*)(uintptr_t ctrl, float* m);
+ClothDisplay_t o_cloth_display = nullptr;
+constexpr int kMaxClothPoints = 4096;
+struct ClothBuf {
+    float keep[kMaxClothPoints][3];
+    float pt[kMaxClothPoints][3];
+};
+thread_local std::unique_ptr<ClothBuf> t_cloth_buf;  // (per thread, made on its first use: off a cloth worker's stack)
+// John's cloth's points shifted onto the drawn body (kept in t_cloth.keep to be put back); the count shifted, 0 none
+int cloth_display_shift(uintptr_t ctrl, uintptr_t* cur_out) {
+    g_cloth_pin_calls.fetch_add(1, std::memory_order_relaxed);
+    if (!t_cloth_buf) t_cloth_buf = std::make_unique<ClothBuf>();
+    ClothBuf& t_cloth = *t_cloth_buf;
+    ClothCorr cc;
+    {
+        std::lock_guard lk(g_cloth_corr_mutex);
+        cc = g_cloth_corr;
+    }
+    if (!cc.ok || log::now_ms() - cc.ms > 100.0) {
+        g_cloth_pin_stale.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    RdrvrActorState st{};
+    if (!api::actor_state(&st) || !st.valid) return 0;
+    // (the review) John's by its drawable ([ctrl +0xd0], the coat's) among those drawn on the player's set, not by distance
+    // alone (a hogtied body on his shoulder, a second rider: their cloths near his waist)
+    uintptr_t drw = 0;
+    bool his = false;
+    if (rd(ctrl + 0xd0, &drw) && drw)
+        for (int si = 0; si < 8 && !his; ++si) his = g_player_drawables[si].load(std::memory_order_relaxed) == drw;
+    if (!his) {
+        g_cloth_pin_others.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    uintptr_t cloth = 0, cur = 0;
+    uint16_t np = 0;
+    if (!rd(ctrl + 200, &cloth) || !cloth || !rd(cloth + 0xf0, &cur) || !cur || !rd(cloth + 0xf8, &np) || !np || np > kMaxClothPoints) {
+        g_cloth_pin_bad.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    float mean[3] = {0, 0, 0};
+    for (int i = 0; i < np; ++i) {
+        float* q = t_cloth.keep[i];
+        if (!raw(cur + static_cast<uintptr_t>(i) * 16, q, 12) || !std::isfinite(q[0] + q[1] + q[2])) {
+            g_cloth_pin_bad.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        for (int k = 0; k < 3; ++k) mean[k] += q[k] / static_cast<float>(np);
+    }
+    const float waist = st.pos[1] + 1.0f, dx = mean[0] - st.pos[0], dz = mean[2] - st.pos[2];
+    if (dx * dx + dz * dz > 1.2f * 1.2f || std::fabs(mean[1] - waist) > 1.5f) {
+        g_cloth_pin_others.fetch_add(1, std::memory_order_relaxed);  // another's cloth (a townsperson's coat)
+        return 0;
+    }
+    g_john_cloth_ctrl.store(ctrl, std::memory_order_relaxed);
+    float most = 0.0f;
+    for (int i = 0; i < np; ++i) {  // every point judged before any is written
+        const float* q = t_cloth.keep[i];
+        float w = (q[1] - waist) / 0.45f;
+        w = w < 0.0f ? 0.0f : w > 1.0f ? 1.0f : w;
+        float* o = t_cloth.pt[i];
+        for (int k = 0; k < 3; ++k) {
+            const float lo = cc.lo.A[k * 3] * q[0] + cc.lo.A[k * 3 + 1] * q[1] + cc.lo.A[k * 3 + 2] * q[2] + cc.lo.a[k];
+            const float hi = cc.hi.A[k * 3] * q[0] + cc.hi.A[k * 3 + 1] * q[1] + cc.hi.A[k * 3 + 2] * q[2] + cc.hi.a[k];
+            o[k] = lo + (hi - lo) * w;
+        }
+        const float m = std::sqrt((o[0] - q[0]) * (o[0] - q[0]) + (o[1] - q[1]) * (o[1] - q[1]) + (o[2] - q[2]) * (o[2] - q[2]));
+        if (!std::isfinite(m) || m > 1.0f) {  // (a correction over a metre: not the body's; nothing written)
+            g_cloth_pin_bad.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        most = m > most ? m : most;
+    }
+    for (int i = 0; i < np; ++i) wraw(cur + static_cast<uintptr_t>(i) * 16, t_cloth.pt[i], 12);
+    g_cloth_pin_move.store(most, std::memory_order_relaxed);
+    g_cloth_pin_fixed.fetch_add(1, std::memory_order_relaxed);
+    *cur_out = cur;
+    return np;
+}
+void hk_cloth_display(uintptr_t ctrl, float* m) {
+    if (!g_cloth_pins_cfg.load(std::memory_order_relaxed)) {
+        o_cloth_display(ctrl, m);
+        return;
+    }
+    uintptr_t cur = 0;
+    const int n = cloth_display_shift(ctrl, &cur);
+    o_cloth_display(ctrl, m);
+    for (int i = 0; i < n; ++i) wraw(cur + static_cast<uintptr_t>(i) * 16, t_cloth_buf->keep[i], 12);  // the simulation's own points back
 }
 
 }  // namespace
@@ -13169,6 +13656,9 @@ bool install() {
         g_wind_still_cfg = config::get_bool("Body", "HiddenNoFlutter", true);
         g_no_flutter_cfg = config::get_bool("Body", "NoFlutter", true);
         g_collapse_root_cfg = config::get_bool("Body", "CollapseRoot", true);
+        g_cloth_follows_cfg = config::get_bool("Body", "ClothFollows", true);
+        g_cloth_pins_cfg = config::get_bool("Body", "ClothPins", false);
+        g_world_props_cfg = config::get_bool("Body", "WorldPropsStay", true);
         {
             const std::string hg = config::get_string("Body", "HiddenGeometry", "filter");
             g_geom_mode = hg == "skip" ? 1 : hg == "filter" ? 2 : 0;
@@ -13189,7 +13679,10 @@ bool install() {
             log::info("[body] the front hand's pose per long gun (FrontHandPose):%s", poses.c_str());
         }
         g_lasso_cfg = config::get_bool("Body", "LassoAtHands", true);
-        g_gun_hand_cfg = config::get_bool("Hands", "GunInGunHand", true);
+        // (2026-11-05, the user: "Left handed mode without the 'gun in Johns left hand' ticked has the arms crossed. Can you
+        // remove the option and make it so left handed mode activates that by default") always on: no menu row, the ini
+        // key no longer read (the test channel's "skel gun gunhand off" still turns it off for a session)
+        g_gun_hand_cfg = true;
         g_pin_cfg = config::get_bool("Hands", "TransplantPin", true);
         g_mirror_cfg = config::get_bool("Hands", "TransplantMirror", true);
         g_own_follow = config::get_bool("Hands", "OwnModelFollow", true);
@@ -13288,6 +13781,11 @@ bool install() {
     }
     bool ok = hooks::install("RDR DrawVisEntity (body)", reinterpret_cast<void*>(anchors::addr(anchors::Id::DrawVisEntity)), hk_DrawVisEntity,
                              &o_DrawVisEntity);
+    // ([Body] ClothPins: acts only while on; the hook costs a load when off. An optional anchor: its failure leaves the
+    // rest of the body's hooks, and ClothFollows, as they were)
+    if (anchors::present(anchors::Id::ClothDisplayWrite))
+        g_cloth_pin_hooked = hooks::install("RDR character cloth display write (ClothPins)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ClothDisplayWrite)),
+                                            hk_cloth_display, &o_cloth_display);
     ok &= hooks::install("RDR one geometry's draw (hidden parts not drawn)", reinterpret_cast<void*>(anchors::addr(anchors::Id::DrawModelGeometry)),
                          hk_draw_geom, &o_draw_geom);
     ok &= hooks::install("RDR draw recorder (the hidden triangles' filter)", reinterpret_cast<void*>(anchors::addr(anchors::Id::RecorderDraw)),
@@ -13444,11 +13942,18 @@ void before_scene(const float* cam) {
                 RdrvrActorState ast{};
                 hold = s_ok && api::actor_state(&ast) && pose::holds_armed_height(ast);
             }
+            // (2026-11-04, GOAL-next-items item 1, the review) the height held before a kneel with an item in hand, and the
+            // ease back to it at the stand-up (the item's stance leaves the head 6 cm under it), as the view's
+            // (the review: only while the view eases back, so never a stale ease after an ended or missed one)
+            static float s_ref = 0.0f;
+            const bool s_back = pose::item_restoring() && s_h < s_ref - 0.002f;
             if (!s_ok || !std::isfinite(s_h) || dt > 1.0 || std::fabs(hy - s_h) > 1.0f) s_h = hy;  // a first frame, a stall, a jump
             else if (hold) {  // only a rise let through (a crouch left with the gun out), as the view's
-                if (hy > s_h && tau > 1e-3f) s_h += (hy - s_h) * static_cast<float>(1.0 - std::exp(-dt / tau));
+                const float up = s_back ? std::fmax(hy, s_ref) : hy;
+                if (up > s_h && tau > 1e-3f) s_h += (up - s_h) * static_cast<float>(1.0 - std::exp(-dt / tau));
             } else if (tau > 1e-3f) s_h += (hy - s_h) * static_cast<float>(1.0 - std::exp(-dt / tau));
             else s_h = jh;  // 0: the standing height always
+            if (hold && !s_back) s_ref = s_h;
             s_ok = true;
             f.still_t[0] = f.actor_world[0];
             f.still_t[1] = f.actor_world[1] + s_h - jh + (s_pd_ok ? s_pd : 0.0f);
@@ -13484,6 +13989,33 @@ void before_scene(const float* cam) {
                     const float a = static_cast<float>(1.0 - std::exp(-dt / 0.5));
                     const bool riding = (flags & RDRVR_ACTOR_MOUNTED) != 0;
                     const bool keep = riding && g_body_with_cam.load(std::memory_order_relaxed);  // [Horse] BodyWithCamera
+                    // (2026-11-04, GOAL-next-items item 8: John's body inside the horse, the camera right; not in the
+                    // simulator) riding, the held offset more than 0.25 m from the live one for a second: said, at most
+                    // one each 5 s and 100 a session, with what the held one was learned or kept by
+                    {
+                        static double gap_since = -1.0, said_ms = -1e9, seen_ms = -1e9;
+                        static int said = 0;
+                        if (now - seen_ms > 500.0) gap_since = -1.0;  // (the review: a pause of this block is no gap's time)
+                        seen_ms = now;
+                        const float g = std::sqrt((ov[0] - o_lp[0]) * (ov[0] - o_lp[0]) + (ov[1] - o_lp[1]) * (ov[1] - o_lp[1]) +
+                                                  (ov[2] - o_lp[2]) * (ov[2] - o_lp[2]));
+                        if (riding && o_ok && g > 0.25f) {
+                            if (gap_since < 0.0) gap_since = now;
+                            if (now - gap_since >= 1000.0 && now - said_ms >= 5000.0 && said < 100) {
+                                said_ms = now;
+                                ++said;
+                                log::info("[body] riding: the body's held offset from the camera (%.3f %.3f %.3f) is %.3f m from the live one "
+                                          "(%.3f %.3f %.3f) for %.1f s; the camera's speed %.2f m/s, kept %d (BodyWithCamera), re-learned %llu "
+                                          "(riding %llu), kept riding %llu",
+                                          o_lp[0], o_lp[1], o_lp[2], g, ov[0], ov[1], ov[2], (now - gap_since) / 1000.0, c_speed, keep ? 1 : 0,
+                                          static_cast<unsigned long long>(g_still_resets.load()),
+                                          static_cast<unsigned long long>(g_still_resets_riding.load()),
+                                          static_cast<unsigned long long>(g_still_kept_riding.load()));
+                            }
+                        } else {
+                            gap_since = -1.0;
+                        }
+                    }
                     if (o_ok && jump > 0.3f && jump <= 1.5f && dt <= 1.0 && keep) g_still_kept_riding.fetch_add(1, std::memory_order_relaxed);
                     if (!o_ok || jump > (keep ? 1.5f : 0.3f) || dt > 1.0) {
                         if (o_ok) {
@@ -13587,6 +14119,8 @@ void before_scene(const float* cam) {
     }
     f.collapse = g_collapse_cfg.load(std::memory_order_relaxed);
     f.collapse_root = g_collapse_root_cfg.load(std::memory_order_relaxed);
+    f.cloth_follows = g_cloth_follows_cfg.load(std::memory_order_relaxed) &&
+                      !(g_cloth_pins_cfg.load(std::memory_order_relaxed) && g_cloth_pin_hooked.load(std::memory_order_relaxed));
     f.still_cloth = g_wind_still_cfg.load(std::memory_order_relaxed);
     f.no_flutter = g_no_flutter_cfg.load(std::memory_order_relaxed);
     {
@@ -13845,6 +14379,10 @@ void before_scene(const float* cam) {
     if (g_rig.up >= 0) std::memcpy(f.up_world, reinterpret_cast<const float*>(mtx + static_cast<uintptr_t>(g_rig.up) * 0x40 + 0x30), 12);
     int amax = 0;
     for (int b : g_rig.attach) amax = b > amax ? b : amax;
+    if (g_rig.pelvis >= 0) {  // (readable up to `top`, which counts the pelvis)
+        std::memcpy(f.pelvis_w, reinterpret_cast<const float*>(mtx + static_cast<uintptr_t>(g_rig.pelvis) * 0x40 + 0x30), sizeof(f.pelvis_w));
+        f.pelvis_ok = true;
+    }
     if (readable(mtx, static_cast<size_t>(amax + 1) * 0x40)) {
         f.attach_pos.reserve(g_rig.attach.size() * 3);
         for (int b : g_rig.attach) {
@@ -13857,6 +14395,21 @@ void before_scene(const float* cam) {
         for (HeldSample& hs : f.copy) hs.valid = false;
     g_skel_game.store(skel, std::memory_order_relaxed);  // the game thread's placement of the second gun
     for (int hb = 0; hb < 2; ++hb) g_att_bone[hb].store(g_rig.att_wrist[hb], std::memory_order_relaxed);
+    {  // (round 97) the attachments' default local matrices with them
+        AttBind ab2[2] = {};
+        for (int hb = 0; hb < 2; ++hb) {
+            const int a = g_rig.att_wrist[hb];
+            ab2[hb].bone = a;
+            ab2[hb].parent = a >= 0 && a < static_cast<int>(g_rig.parent.size()) ? g_rig.parent[a] : -1;
+            ab2[hb].ok = ab2[hb].parent >= 0 && static_cast<size_t>(a + 1) * 16 <= g_rig.local16.size();
+            if (ab2[hb].ok) std::memcpy(ab2[hb].local, &g_rig.local16[static_cast<size_t>(a) * 16], sizeof(ab2[hb].local));
+        }
+        if (std::memcmp(ab2, g_att_bind, sizeof(ab2)) != 0) {
+            g_att_seq.fetch_add(1, std::memory_order_acq_rel);
+            std::memcpy(g_att_bind, ab2, sizeof(ab2));
+            g_att_seq.fetch_add(1, std::memory_order_release);
+        }
+    }
     {  // the draws' first test (most of the world's draws are far from both)
         auto grow = [](float* b, const float* p, float pad) {
             for (int k = 0; k < 3; ++k) {
@@ -13964,6 +14517,31 @@ void before_scene(const float* cam) {
                           static_cast<unsigned long long>(mv.none), static_cast<unsigned long long>(mv.cut), g_stale_fix.load() ? "on" : "off",
                           static_cast<unsigned long long>(g_stale_shifted.load()));
             std::memcpy(c0, cb, sizeof(c0));
+            for (int hb = 0; hb < 2; ++hb) {  // (round 97) the game's attachment turned off its rest offset (an interaction)
+                const float mx = g_att_bind_max[hb].exchange(0.0f, std::memory_order_relaxed);
+                if (mx > 20.0f)
+                    log::info("[wield] John's %s hand's attachment turned up to %.0f deg off its rest offset in the last 10 s: the second gun "
+                              "and the copy held by the rest offset", hb ? "right" : "left", mx);
+            }
+            {  // (round 95) a copy turned off the gun in hand since the last line
+                static uint64_t ct0 = 0;
+                const uint64_t ct = g_ct_n.load(std::memory_order_acquire);
+                if (ct != ct0) {
+                    log::warn("[wield] the copy turned %.0f deg off the gun in hand (%llu times so far, John's hand %d, its bone %d): since its last "
+                              "good placement the gun's grip locator turned %.1f deg, John's hand bone %.1f, the hand's correction %.1f",
+                              g_ct_t.load(), static_cast<unsigned long long>(ct), g_ct_j.load(), g_ct_ab.load(), g_ct_dg.load(), g_ct_db.load(),
+                              g_ct_da.load());
+                    const float* q = g_ct_bad_G;
+                    const float* c = g_ct_bad_A;
+                    const float* e = g_ct_bad_B;
+                    log::warn("[wield]   its parts: grip locator rows (%.2f %.2f %.2f) (%.2f %.2f %.2f) (%.2f %.2f %.2f) at (%.3f %.3f %.3f) | the "
+                              "correction (%.2f %.2f %.2f) (%.2f %.2f %.2f) (%.2f %.2f %.2f) | the game hand rows (%.2f %.2f %.2f) (%.2f %.2f %.2f) "
+                              "(%.2f %.2f %.2f)",
+                              q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+                              c[8], e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8]);
+                }
+                ct0 = ct;
+            }
             std::memcpy(cs0, csb, sizeof(cs0));
             cp0 = cp, cr0 = cr, cn0 = cn;
             std::memcpy(h0, hb, sizeof(h0));
@@ -14770,7 +15348,8 @@ std::string command(const std::string& line) {
         }
         char b[900];
         std::lock_guard lock(g_draw_mutex);
-        static const char* const kSrc[5] = {"none", "the hand's pinch", "the other hand's pinch mirrored", "the foregrip's", "the foregrip's mirrored"};
+        static const char* const kSrc[7] = {"none", "the hand's pinch", "the other hand's pinch mirrored", "the foregrip's", "the foregrip's mirrored",
+                                            "the gun's front hold's", "the gun's front hold's mirrored"};
         std::snprintf(b, sizeof(b),
                       "part snap: weight %.2f, the handle (%.3f %.3f %.3f) in the gun, turned %.1f deg, snapped draws %llu, the drawn wrist %.1f mm from it (worst %.1f)"
                       " | the spot (the hand's turn) on it %.1f mm (worst %.1f, draws %llu) | carried: weight %.2f turned %.1f deg, spot %.1f mm (worst %.1f, draws %llu)"
@@ -14779,7 +15358,7 @@ std::string command(const std::string& line) {
                       g_frame.part_blend, g_frame.part_p[0], g_frame.part_p[1], g_frame.part_p[2], g_frame.part_turn, static_cast<unsigned long long>(g_part_snaps),
                       g_part_miss * 1000.0f, g_part_miss_max * 1000.0f, g_part_spot_miss[0] * 1000.0f, g_part_spot_max[0] * 1000.0f,
                       static_cast<unsigned long long>(g_part_spot_n[0]), g_frame.cpart_blend, g_frame.cpart_turn, g_part_spot_miss[1] * 1000.0f,
-                      g_part_spot_max[1] * 1000.0f, static_cast<unsigned long long>(g_part_spot_n[1]), g_grasp_hand, kSrc[g_grasp_src >= 0 && g_grasp_src < 5 ? g_grasp_src : 0],
+                      g_part_spot_max[1] * 1000.0f, static_cast<unsigned long long>(g_part_spot_n[1]), g_grasp_hand, kSrc[g_grasp_src >= 0 && g_grasp_src < 7 ? g_grasp_src : 0],
                       static_cast<unsigned long long>(g_grasp_frames), g_grasp_cfg.load() ? 1 : 0, g_grasp_curl, g_grasp_err, g_grasp_src_curl,
                       g_grasp_force.load());
         if (arg == "reset") {
@@ -15182,6 +15761,34 @@ std::string command(const std::string& line) {
                       static_cast<unsigned long long>(d.by_src[0]), static_cast<unsigned long long>(d.by_src[1]),
                       static_cast<unsigned long long>(d.by_src[2]), static_cast<unsigned long long>(g_fg_tick_differs.load()), d.why,
                       d.wrist_pos[0], d.wrist_pos[1], d.wrist_pos[2], d.gun_pos[0], d.gun_pos[1], d.gun_pos[2], d.att_pos[0], d.att_pos[1], d.att_pos[2]);
+        return b;
+    }
+    if (sub == "copy" && line.find("parts") != std::string::npos) {  // skel copy parts (round 98): the last placement's parts
+        const float* q = g_ct_last_G;
+        const float* c = g_ct_last_A;
+        const float* e = g_ct_last_B;
+        char b[480];
+        std::snprintf(b, sizeof(b), "copy parts: grip locator rows (%.2f %.2f %.2f) (%.2f %.2f %.2f) (%.2f %.2f %.2f) at (%.3f %.3f %.3f) | the correction "
+                      "(%.2f %.2f %.2f) (%.2f %.2f %.2f) (%.2f %.2f %.2f) | the game hand rows (%.2f %.2f %.2f) (%.2f %.2f %.2f) (%.2f %.2f %.2f)",
+                      q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8],
+                      e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8]);
+        return b;
+    }
+    if (sub == "copy" && line.find("axes") != std::string::npos) {
+        // skel copy axes (round 93, the user: the Cattleman as the copy "will face the same wrong direction in your hands as
+        // it would in the holster"): the copy's axes in the gun in hand's frame (T = P^-1 C), the angle between the barrels
+        // (both hands held alike: near 0)
+        float T[16] = {};
+        const bool tok = dual::copy_T(T);
+        const float zc = T[10] < -1.0f ? -1.0f : T[10] > 1.0f ? 1.0f : T[10];
+        if (line.find(" bind on") != std::string::npos) g_att_bind_on = true;
+        if (line.find(" bind off") != std::string::npos) g_att_bind_on = false;
+        char b[300];
+        std::snprintf(b, sizeof(b), "copy axes %d (model %d): x (%.2f %.2f %.2f) y (%.2f %.2f %.2f) z (%.2f %.2f %.2f), barrels %.1f deg apart | "
+                      "attachment by its rest offset %d (placements bound %llu, live %llu): the live one %.1f deg off it (left), %.1f (right)",
+                      tok ? 1 : 0, dual::copy_model(), T[0], T[1], T[2], T[4], T[5], T[6], T[8], T[9], T[10], tok ? std::acos(zc) * 57.2957795f : -1.0f,
+                      g_att_bind_on.load() ? 1 : 0, static_cast<unsigned long long>(g_att_bound_n.load()), static_cast<unsigned long long>(g_att_live_n.load()),
+                      g_att_bind_deg[0].load(), g_att_bind_deg[1].load());
         return b;
     }
     if (sub == "copy" && line.find("where") != std::string::npos) {  // skel copy where: the last copy draw's place (run 7 item 1)
@@ -15807,7 +16414,10 @@ std::string command(const std::string& line) {
             g_nprop_diag = 0;
             g_skinned_bone = -1;
         }
-        std::string r = "props (the belt's twins hidden " + std::to_string(g_belt_twins.load()) + "):";
+        std::string r = "props (the belt's twins hidden " + std::to_string(g_belt_twins.load()) + ", by another copy's shape " +
+                        std::to_string(held_prop::twin_shapes()) + ", on the pistol bone " + std::to_string(g_pistol_bone_hides.load()) + "; left shown by it: matched " +
+                        std::to_string(g_pistol_left_shown[0].load()) + ", unmatched " + std::to_string(g_pistol_left_shown[1].load()) + ", rigid " +
+                        std::to_string(g_pistol_left_shown[2].load()) + "):";
         char b[420];
         for (int i = 0; i < g_nprop_diag; ++i) {
             const PropDiag& d = g_prop_diag[i];
@@ -15856,6 +16466,126 @@ std::string command(const std::string& line) {
         std::string v;
         in >> v;
         if (v == "on" || v == "off" || v == "auto") g_override = v == "on" ? 1 : v == "off" ? 2 : 0;
+        if (v == "worldprops") {  // skel body worldprops on|off: [Body] WorldPropsStay for the session (item 13)
+            std::string s;
+            in >> s;
+            if (s == "on" || s == "off") {
+                g_world_props_cfg = s == "on";
+                std::lock_guard lock(g_draw_mutex);
+                for (PropBone& pb : g_prop_bones) pb.world = pb.ref = false;  // judged anew
+                log::info("[body] a prop staying put while its bone moves is the world's: %s", s.c_str());
+            }
+            return "world props stay " + std::string(g_world_props_cfg.load() ? "on" : "off") + ": " + std::to_string(g_world_props.load()) + " found";
+        }
+        if (v == "clothverts") {  // (2026-11-06, GOAL-remaining item 2, read only) skel body clothverts: each drawn player drawable's
+            // non-skinned candidates (a model whose geometry 0 has 300-600 vertices, the duster's cloth 422): its vertex buffer, CPU
+            // data, stride, count and the first two vertices' first three floats (are they rewritten each frame?)
+            // skel body clothverts <model>: that model's geometry 0 only, whatever its count (the duster's cloth: 30)
+            std::string wm;
+            in >> wm;  // (a failed int read would set 0)
+            const int want_model = wm.empty() ? -1 : std::atoi(wm.c_str());
+            std::string r;
+            for (int si = 0; si < 8; ++si) {
+                const uintptr_t d = g_player_drawables[si].load();
+                if (!d || g_body_frame - g_player_drawn_at[si].load() > 2) continue;
+                uintptr_t list = 0, models = 0;
+                uint16_t nm = 0;
+                if (!rd(d + 0x20 + 0x30, &list) || !list || !rd(list, &models) || !rd(list + 8, &nm)) continue;
+                for (int mi = 0; mi < nm && mi < 40; ++mi) {
+                    uintptr_t m = 0, geoms = 0, g = 0, vb = 0, vdata = 0;
+                    uint16_t ng = 0, vcount = 0;
+                    uint32_t stride = 0;
+                    if (!rd(models + mi * 8, &m) || !m || !rd(m + 0x2e, &ng) || !ng || !rd(m + 8, &geoms) || !geoms || !rd(geoms, &g) || !g) continue;
+                    if (!data_readable(g, 0x90) || !rd(g + 0x18, &vb) || !data_readable(vb, 0x38)) continue;
+                    rd(vb + 8, &vcount);
+                    rd(vb + 0x18, &stride);
+                    rd(vb + 0x20, &vdata);
+                    if (want_model >= 0 ? mi != want_model : (vcount < 300 || vcount > 600)) continue;
+                    if (!stride || stride > 256 || !data_readable(vdata, static_cast<size_t>(stride) * 2)) {
+                        char e[200];
+                        std::snprintf(e, sizeof(e), "drawable %d model %d: vb %llx data %llx stride %u count %u: not readable; ", si, mi,
+                                      static_cast<unsigned long long>(vb), static_cast<unsigned long long>(vdata), stride, vcount);
+                        r += e;
+                        continue;
+                    }
+                    float f[6] = {};
+                    std::memcpy(f, reinterpret_cast<const void*>(vdata), 12);
+                    std::memcpy(f + 3, reinterpret_cast<const void*>(vdata + stride), 12);
+                    char e[260];
+                    std::snprintf(e, sizeof(e), "drawable %d model %d (of %u): geometry 0 vb %llx data %llx stride %u count %u: (%.4f %.4f %.4f) (%.4f %.4f %.4f); ", si,
+                                  mi, static_cast<unsigned>(nm), static_cast<unsigned long long>(vb), static_cast<unsigned long long>(vdata), stride, vcount, f[0],
+                                  f[1], f[2], f[3], f[4], f[5]);
+                    r += e;
+                }
+            }
+            return r.empty() ? "no cloth-sized geometry on the player's drawables" : r;
+        }
+        if (v == "clothsrc") {  // (read only) John's cloth's skinned source: the geometry FUN_140a07c70 returns and its vertex buffer
+            const uintptr_t c = g_john_cloth_ctrl.load();
+            if (!c) return "no cloth of John's seen (skel body clothpins on, the duster)";
+            uintptr_t lst = 0, drw = 0, a = 0, b2 = 0, cc2 = 0, d = 0, geom = 0, vb = 0, vdata = 0, vtbl = 0;
+            int lod = 0;
+            uint32_t mi = 0, gi = 0, stride = 0;
+            uint16_t vcount = 0;
+            uint8_t f99 = 0, f14 = 0;
+            if ((!rd(c + 0xd8, &lst) || !lst) && (!rd(c + 0xe0, &lst) || !lst)) return "ERROR no list";
+            if (!rd(c + 0xd0, &drw) || !drw || !rd(lst + 0x60, &lod) || lod < 0 || lod > 7 || !rd(lst + 0x64, &mi) || !rd(lst + 0x68, &gi) ||
+                !rd(drw + 0x50 + static_cast<uintptr_t>(lod) * 8, &a) || !a || !rd(a, &b2) || !b2 || !rd(b2 + static_cast<uintptr_t>(mi) * 8, &cc2) || !cc2 ||
+                !rd(cc2 + 8, &d) || !d || !rd(d + static_cast<uintptr_t>(gi) * 8, &geom) || !geom)
+                return "ERROR the chain broke";
+            rd(geom + 99, &f99);
+            rd(geom + 0x14, &f14);
+            rd(geom + 0x18, &vb);
+            if (vb) {
+                rd(vb, &vtbl);
+                rd(vb + 8, &vcount);
+                rd(vb + 0x18, &stride);
+                rd(vb + 0x20, &vdata);
+            }
+            float f[6] = {};
+            if (vdata) raw(vdata, f, 12), raw(vdata + stride, f + 3, 12);
+            char e[360];
+            std::snprintf(e, sizeof(e), "ctrl %llx lod %d model %u geometry %u: geom %llx (+99 %u +0x14 %u) vb %llx (vtable RDR+%llx) count %u stride %u data %llx: (%.4f %.4f %.4f) (%.4f %.4f %.4f)",
+                          static_cast<unsigned long long>(c), lod, mi, gi, static_cast<unsigned long long>(geom), f99, f14, static_cast<unsigned long long>(vb),
+                          static_cast<unsigned long long>(vtbl ? vtbl - anchors::base() : 0), vcount, stride, static_cast<unsigned long long>(vdata), f[0], f[1], f[2],
+                          f[3], f[4], f[5]);
+            return e;
+        }
+        if (v == "clothpins") {  // skel body clothpins [on|off]: [Body] ClothPins for the session (GOAL-remaining item 2), its counters
+            std::string s2;
+            in >> s2;
+            if (s2 == "on" || s2 == "off") {
+                g_cloth_pins_cfg = s2 == "on";
+                log::info("[body] the coat's pins on the drawn body (ClothPins): %s", s2.c_str());
+            }
+            char b[260];
+            std::snprintf(b, sizeof(b), "cloth pins %d%s: pin updates %llu, John's fixed %llu (the largest move %.1f mm), others' %llu, stale %llu, unreadable %llu "
+                          "(the display writes; John's coat shifted, its largest point move)",
+                          g_cloth_pins_cfg.load() ? 1 : 0, g_cloth_pin_hooked.load() ? "" : " (not hooked)",
+                          static_cast<unsigned long long>(g_cloth_pin_calls.load()),
+                          static_cast<unsigned long long>(g_cloth_pin_fixed.load()), g_cloth_pin_move.load() * 1000.0f,
+                          static_cast<unsigned long long>(g_cloth_pin_others.load()), static_cast<unsigned long long>(g_cloth_pin_stale.load()),
+                          static_cast<unsigned long long>(g_cloth_pin_bad.load()));
+            return b;
+        }
+        if (v == "cloth") {  // skel body cloth [on|off]: [Body] ClothFollows for the session (item 11); the root and pelvis moved
+            std::string s;
+            in >> s;
+            if (s == "on" || s == "off") {
+                g_cloth_follows_cfg = s == "on";
+                log::info("[body] the cloth (the root) with the body: %s", g_cloth_follows_cfg.load() ? "on" : "off");
+            }
+            float cd[2];
+            {
+                std::lock_guard lock(g_draw_mutex);
+                cd[0] = g_cloth_diag[0];
+                cd[1] = g_cloth_diag[1];
+            }
+            char b[160];
+            std::snprintf(b, sizeof(b), "cloth follows %d: the root drawn %.1f mm from the game's, the pelvis %.1f mm", g_cloth_follows_cfg.load() ? 1 : 0,
+                          static_cast<double>(cd[0]), static_cast<double>(cd[1]));
+            return b;
+        }
         if (v == "stillbelt") {  // skel body stillbelt on|off: [Body] StillBelt for the session (run 10 item 9b)
             std::string s;
             in >> s;
@@ -15972,18 +16702,32 @@ std::string command(const std::string& line) {
                       static_cast<unsigned long long>(g_head_foreign.load()), static_cast<unsigned long long>(g_head_lost.load()));
         std::string o = out;
         {  // the remembered props: each one's bone, head, and instance (whose they are)
-            std::lock_guard lock(g_draw_mutex);
+            // (2026-11-05) its bone's name, the frames since it was drawn, w: the world's; copied under the lock, the names
+            // (memory reads) after it (the review: the draws wait on the lock)
+            std::vector<PropBone> q;
+            uint64_t frame = 0;
+            uintptr_t data = 0;
+            int count = 0;
+            {
+                std::lock_guard lock(g_draw_mutex);
+                q.assign(g_prop_bones.begin(), g_prop_bones.begin() + (std::min)(g_prop_bones.size(), static_cast<size_t>(12)));
+                frame = g_body_frame;
+                data = g_rig.data;
+                count = g_rig.count;
+            }
             o += " | remembered props:";
-            char b[96];
-            for (size_t i = 0; i < g_prop_bones.size() && i < 12; ++i) {
-                std::snprintf(b, sizeof(b), " %llx/b%d%s/i%llx", static_cast<unsigned long long>(g_prop_bones[i].drawable & 0xffffff), g_prop_bones[i].bone,
-                              g_prop_bones[i].head ? "h" : "", static_cast<unsigned long long>(g_prop_bones[i].inst));
+            char b[160];
+            for (const PropBone& p : q) {
+                std::snprintf(b, sizeof(b), " %llx/b%d(%s)%s%s/i%llx/f%llu", static_cast<unsigned long long>(p.drawable & 0xffffff), p.bone,
+                              p.bone >= 0 && p.bone < count && data ? bone_name(data, p.bone).c_str() : "-", p.head ? "h" : "", p.world ? "w" : "",
+                              static_cast<unsigned long long>(p.inst), static_cast<unsigned long long>(frame - p.frame));
                 o += b;
             }
+            o += " | world flags (WorldPropsStay " + std::string(g_world_props_cfg.load() ? "on" : "off") + "): " + std::to_string(g_world_props.load());
         }
         return o;
     }
-    return "ERROR usage: skel q|f|s <addr> [n] | skel bones <file> | skel ik | skel stretch | skel body [on|off|auto|stance upright|lean|still|game|back <m>|follow on|off|hidehead on|off|stretch on|off|<max>]";
+    return "ERROR usage: skel q|f|s <addr> [n] | skel bones <file> | skel ik | skel stretch | skel body [on|off|auto|stance upright|lean|still|game|back <m>|follow on|off|hidehead on|off|stretch on|off|<max>|cloth [on|off]|worldprops [on|off]]";
 }
 
 }  // namespace rdrvr::body

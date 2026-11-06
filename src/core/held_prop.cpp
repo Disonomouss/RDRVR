@@ -544,6 +544,40 @@ void frame(uint32_t actor) {
                 break;
         }
     }
+    // (2026-11-04, GOAL-next-items item 10; the user: "Every time I load in to the game, there is another gun on top on the
+    // gun in the holster, it goes away after unholstering the gun"; not in the simulator) 8 s after the holster guns are
+    // made: 3 s of "props diag" (each holster slot's own draws and the other draws near its place, their drawable and
+    // distance), said in the log; again after all of them were gone and made anew (a load), 5 times a session at most
+    {
+        static double twin_at = 0.0, twin_end = 0.0;
+        static bool twin_done = false, twin_was = false;
+        static int twin_n = 0;
+        bool any = false;
+        {
+            std::lock_guard lock(g_mutex);  // (the review: want is g_mutex's)
+            for (int i = kHolsterSlot; i < kHolsterSlot + 4 && i < kSlots; ++i)
+                if (g_slot[i].obj && g_slot[i].want) any = true;
+        }
+        if (twin_done && !any && twin_n < 5) {  // all gone: armed for the next ones
+            twin_done = false;
+            twin_at = twin_end = 0.0;
+        }
+        if (!twin_done) {
+            if (twin_at == 0.0) {
+                if (any) twin_at = now + 8000.0;
+            } else if (twin_end == 0.0 && now >= twin_at) {
+                twin_was = g_diag.load(std::memory_order_relaxed);
+                diag_command("reset");
+                g_diag = true;
+                twin_end = now + 3000.0;
+            } else if (twin_end > 0.0 && now >= twin_end) {
+                log::info("[prop] the holsters' draws 8 s after their guns were made (%d): %s", twin_n + 1, diag_command("").c_str());
+                if (!twin_was) g_diag = false;
+                twin_done = true;
+                ++twin_n;
+            }
+        }
+    }
     publish_status();
 }
 
@@ -565,6 +599,7 @@ void set_inst_check(bool on) {
     if (g_inst_check.exchange(on) != on) log::info("[prop] the draws' instance check %s", on ? "on" : "off");
 }
 
+std::atomic<bool> g_census_matched{true};  // "props census world|own": the census slot's object left to the world draws' rules (item 13's test)
 std::atomic<uint64_t> g_pool_hidden{0};
 bool match(uintptr_t drawable, uintptr_t inst, const float* pos, float* pose, int* slot, bool* hide) {
     if (hide) *hide = false;
@@ -580,8 +615,10 @@ bool match(uintptr_t drawable, uintptr_t inst, const float* pos, float* pose, in
     const float gate = g_gate.load(std::memory_order_relaxed) + g_root_speed.load(std::memory_order_relaxed) * 0.125f;
     float bd = gate * gate;
     const bool by_inst = g_inst_check.load(std::memory_order_relaxed);
+    const bool census = g_census_matched.load(std::memory_order_relaxed);
     for (Slot& s : g_slot) {
         if (!s.put_ok || !s.want) continue;
+        if (!census && &s == &g_slot[kCensusSlot]) continue;  // ("props census world") drawn as any world object's draw is
         // (cycle r174, the pool's perf: mode 2 cost about 0.16 ms of scene render) a slot whose model is learned and is
         // not this draw's, or that learns no more, needs no distance: of the 32 slots only the draw's own model's and the
         // learning ones are measured (the shells' 14 for a shell's draw, none of them for a gun's)
@@ -647,19 +684,95 @@ bool match(uintptr_t drawable, uintptr_t inst, const float* pos, float* pose, in
 
 bool diag_on() { return g_diag.load(std::memory_order_relaxed); }
 
+void set_census_matched(bool on) { g_census_matched = on; }
 std::atomic<bool> g_twins_on{true};  // "props twins on|off": the belt's twin hidden (the session; the perf test's control)
 void set_twins(bool on) { g_twins_on = on; }
-bool shown_at_holster(uintptr_t drawable) {
+// (2026-11-05, GOAL-next-items item 10; the user: "another gun on top on the gun in the holster" after every load, "It would
+// flicker between the holster position and wherever it would be on Johns normal model"; their logs: another drawable
+// drawn 2.3 cm from the right hip's shown gun) after a load the game draws its holstered gun from another copy of the
+// model than the shared one our holster's object draws (after a draw and a put-away it takes the shared one: hidden): a
+// drawable's shape, its box (+0x30, +0x40) and each model's geometries' vertex counts (+0x50 the models' list: its
+// models, +8 their count; a model's +8 geometries, +0x2e their count; a geometry's +0x18 vertex buffer, its +8 the count),
+// SEH-guarded reads; 0 unreadable
+uint64_t shape_of(uintptr_t d) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    __try {
+        uint32_t box[6];
+        std::memcpy(box, reinterpret_cast<const void*>(d + 0x30), 12);
+        std::memcpy(box + 3, reinterpret_cast<const void*>(d + 0x40), 12);
+        for (uint32_t v : box) mix(v);
+        const uintptr_t list = *reinterpret_cast<const uintptr_t*>(d + 0x50);
+        if (!list) return 0;
+        const uintptr_t models = *reinterpret_cast<const uintptr_t*>(list);
+        const uint16_t nm = *reinterpret_cast<const uint16_t*>(list + 8);
+        if (!models || !nm || nm > 64) return 0;
+        mix(nm);
+        for (int mi = 0; mi < nm && mi < 16; ++mi) {
+            const uintptr_t m = *reinterpret_cast<const uintptr_t*>(models + mi * 8);
+            if (!m) continue;
+            const uintptr_t geoms = *reinterpret_cast<const uintptr_t*>(m + 8);
+            const uint16_t ng = *reinterpret_cast<const uint16_t*>(m + 0x2e);
+            mix(ng);
+            for (int gi = 0; geoms && gi < ng && gi < 16; ++gi) {
+                const uintptr_t g = *reinterpret_cast<const uintptr_t*>(geoms + gi * 8);
+                const uintptr_t vb = g ? *reinterpret_cast<const uintptr_t*>(g + 0x18) : 0;
+                mix(vb ? *reinterpret_cast<const uint16_t*>(vb + 8) : 0);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return h ? h : 1;
+}
+struct ShapeMemo {
+    uintptr_t d = 0;
+    uint64_t shape = 0;
+    double ms = -1e12;
+};
+ShapeMemo g_shape_memo[32];  // (under g_mutex) the shapes read lately, each again after 2 s (a freed drawable's address reused)
+int g_shape_next = 0;
+std::atomic<uint64_t> g_twin_shapes{0};  // the draws hidden as another copy of a shown gun's model
+uint64_t shape_memo(uintptr_t d, double now) {  // under g_mutex
+    for (ShapeMemo& m : g_shape_memo)
+        if (m.d == d && now - m.ms < 2000.0) return m.shape;
+    ShapeMemo& m = g_shape_memo[g_shape_next];
+    g_shape_next = (g_shape_next + 1) % 32;
+    m = {d, shape_of(d), now};
+    return m.shape;
+}
+
+bool shown_at_holster(uintptr_t drawable, const float* pos) {
     if (!drawable || !g_any.load(std::memory_order_relaxed) || !g_twins_on.load(std::memory_order_relaxed) ||
         g_clear.load(std::memory_order_relaxed))
         return false;
-    if (!known(drawable)) return false;  // the lock-free filter first (match's): most draws are of no prop's model
+    const bool k = known(drawable);  // the lock-free filter first (match's): most draws are of no prop's model
+    if (!k && !pos) return false;
     std::lock_guard lock(g_mutex);
-    for (int i = kHolsterSlot; i < kHolsterSlot + 4 && i < kSlots; ++i)
-        if (g_slot[i].want && g_slot[i].drawable == drawable) return true;
-    // ([Hands] OffHandItems) the off hand's item: its model's own at John's belt (the knife at its sheath) hidden too
-    return g_slot[kOffhandSlot].want && g_slot[kOffhandSlot].drawable == drawable;
+    if (k) {
+        for (int i = kHolsterSlot; i < kHolsterSlot + 4 && i < kSlots; ++i)
+            if (g_slot[i].want && g_slot[i].drawable == drawable) return true;
+        // ([Hands] OffHandItems) the off hand's item: its model's own at John's belt (the knife at its sheath) hidden too
+        if (g_slot[kOffhandSlot].want && g_slot[kOffhandSlot].drawable == drawable) return true;
+    }
+    // (item 10) another copy of a holster's shown gun's model, within 0.45 m of that gun (the game's own holster: 2-40 cm)
+    const double now = log::now_ms();
+    uint64_t mine = 0;
+    for (int i = kHolsterSlot; i < kHolsterSlot + 4 && i < kSlots; ++i) {
+        const Slot& s = g_slot[i];
+        if (!s.want || !s.drawable || s.drawable == drawable || !s.put_ok || put_d2(s, pos) > 0.45f * 0.45f) continue;
+        if (!mine) mine = shape_memo(drawable, now);
+        if (mine && shape_memo(s.drawable, now) == mine) {
+            if (g_twin_shapes.fetch_add(1, std::memory_order_relaxed) < 3)  // (the first three a session)
+                log::info("[prop] slot %d: another copy of its model drawn %.2f m from it (drawable %llx, the slot's %llx, the same shape): "
+                          "hidden as the game's holstered gun", i, std::sqrt(put_d2(s, pos)), static_cast<unsigned long long>(drawable & 0xffffff),
+                          static_cast<unsigned long long>(s.drawable & 0xffffff));
+            return true;
+        }
+    }
+    return false;
 }
+uint64_t twin_shapes() { return g_twin_shapes.load(std::memory_order_relaxed); }
 
 void diag_draw(uintptr_t drawable, const float* pos, uint64_t pass, const float* m) {
     if (!g_any.load(std::memory_order_relaxed)) return;

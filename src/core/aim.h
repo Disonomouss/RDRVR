@@ -44,7 +44,15 @@ bool barrel_aim();
 // moves the smoothing on (any other caller reads the last place)
 bool reticle_target(float pos[3], bool* on_actor, float* size_deg, int which = 0, bool advance = false);
 bool reticle_on();
+// (2026-11-06, GOAL-remaining 6c) third person: a probe along the game's own aim ray came back within 300 ms (the mod's
+// reticle placed there): the game's flat one may be hidden
+bool third_person_reticle_live();
 void set_reticle_on(bool on);  // also written to the user ini
+// [Hands] BulletTrails (2026-11-06): the game's bullet trails on (default) or never made; _available: its hook installed
+bool bullet_trails();
+bool bullet_trails_available();
+void set_bullet_trails(bool on, bool save);
+std::string trails_status();  // "aim trails [on|off]"
 // [Hands] ReticleStyle: ring (a ring and a centre dot, the default) or dot (a dot only)
 bool reticle_dot();
 void set_reticle_dot(bool dot);  // also written to the user ini

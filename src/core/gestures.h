@@ -61,5 +61,6 @@ std::string command(const std::string& line);  // "gestures [throw|melee|lasso o
 std::string gun_melee_command(const std::string& line);
 // [Hands] OffHandItems: the off hand's knife's stab detector's state and counters (offhand::command's line)
 std::string offhand_strike_status();
+std::string second_gun_strike_status();  // (2026-11-05) the second gun's own swing ("gunmelee second")
 
 }  // namespace rdrvr::gestures

@@ -36,7 +36,10 @@ bool vehicle_heading();
 // [Body] ArmedStance=stand (run 10 item 8b): a gun drawn standing, the view's (and the still body's) height held
 bool armed_stand();
 void set_armed_stand(bool on, bool save);
-bool holds_armed_height(const RdrvrActorState& st);  // [Horse] VehicleHeading (run 10 item 3): driving a wagon, the view's heading the vehicle's
+bool holds_armed_height(const RdrvrActorState& st);
+// (2026-11-04, GOAL-next-items item 1) the view eased back up after a kneel with an item in hand: the still body then
+// eases back to the height it held before the kneel too
+bool item_restoring();  // [Horse] VehicleHeading (run 10 item 3): driving a wagon, the view's heading the vehicle's
 void set_vehicle_heading(bool on, bool save);
 void set_stick_turn_riding(bool on, bool save = true);
 float ride_turn_deg();  // the offset now (0 on foot or steering by the head)
@@ -120,6 +123,13 @@ void set_eye_lift(float m);
 // Turning ([Comfort] TurnMode / TurnSpeed / SnapAngle), applied at once (the menu's Comfort tab, "pose turn ...").
 void set_turning(bool snap, float speed_deg_s, float snap_deg);
 bool snap_turning();
+// "pose tpsnap [on|off]": [Comfort] ThirdPersonSnap for the session (2026-11-06, GOAL-remaining 6c), its counters
+std::string tps_command(const std::string& v);
+// [Comfort] ThirdPersonSnap and ThirdPersonSnapAngle (round 98: the menu's; 10-90 deg); save: also written to the user ini
+bool third_person_snap();
+void set_third_person_snap(bool on, bool save);
+float third_person_snap_angle();
+void set_third_person_snap_angle(float deg, bool save);
 float turn_speed();
 float snap_angle();
 // Recentre (DESIGN 3.7): the body turns to where the head looks, so the recentred forward is the new body forward.

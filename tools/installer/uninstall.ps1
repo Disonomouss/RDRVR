@@ -13,7 +13,7 @@ $LogPath = Join-Path $env:TEMP 'RDRVR_install.log'
 try { Start-Transcript -LiteralPath $LogPath -Append | Out-Null } catch {}
 if (-not $GameDir) { $GameDir = $PSScriptRoot }
 $Runtime = @('RDRVR.log', 'RDRVR_status.json', 'RDRVR_status.json.tmp', 'RDRVR_cmd.txt', 'RDRVR_cmd.txt.tmp',
-             'RDRVR_text_dump.bin', 'RedHook.log', 'RDRVR_framegraph_0.txt', 'RDRVR_framegraph_1.txt',
+             'RDRVR_text_dump.bin', 'RDRVR_hud.rde', 'RedHook.log', 'RDRVR_framegraph_0.txt', 'RDRVR_framegraph_1.txt',
              'RDRVR_framegraph_2.txt', 'RDRVR_framegraph_3.txt', 'RDRVR_xr_runtime.txt', 'RDRVR_build_report.txt')
 
 function Say([string] $s) { Write-Host $s }

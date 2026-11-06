@@ -169,6 +169,8 @@ constexpr Optional kOptional[] = {
     {"DeadEyeUpdate", "the Dead Eye level choice ([DeadEye] Level) is off on this build: the game's level"},
     {"PppDirtyPtr", "the Dead Eye sepia toggle takes effect at the game's next preset copy on this build"},
     {"ReplayDispatch", "the batched hand-off to the playback thread ([Render] PlaybackBatch) is off on this build"},
+    {"ClothDisplayWrite", "the coat drawn on the drawn body ([Body] ClothPins) is off on this build"},
+    {"BulletTrailFx", "the bullet trails' switch ([Hands] BulletTrails) is off on this build: the game's trails stay"},
     {"WindowVtblIsActive", "the background focus ([Debug] BackgroundFocus, test only) is off on this build"},
     {"WindowIsActive", "the background focus ([Debug] BackgroundFocus, test only) is off on this build"},
     {"PadFocusGateCall", "the background focus ([Debug] BackgroundFocus, test only) is off on this build"},

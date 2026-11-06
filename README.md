@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.12.2 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.13 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -416,6 +416,27 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
     swinging it two-handed (for a few seconds or more) left the gun a few centimetres off the carrying hand, the hand
     holding air beside it, for as long as it was carried. The carried gun now stays where it was in your hand.
 
+- New in 0.8.13 (your settings are kept; no reset):
+  - Used in the developer's Quest 3: **Snap turns in third person** (the Comfort tab, off by default) with its own
+    angle: with First person off, a push turns the view one step at once while the game's camera catches up
+    underneath. **The reticle in third person** ("Reticle where the shot lands", the Guns tab): where the game's own
+    aim lands, the game's flat crosshair hidden meanwhile. **Bullet trails** can be turned off (the Guns tab).
+  - Used in the developer's Quest 3: lever guns worked four ways (the Reloading tab, "Lever guns"): the stick held and
+    the gun down and up (as in 0.8.12, the default), a roll of the gun hand, a flick of the right stick, or a flick of
+    the gun. Fanning's zone size and speed, and the zone shown as a ring ("Show the fanning zone", off); a bigger zone
+    no longer makes the next sweep harder to arm.
+  - Used in the developer's Quest 3: the gun-butt melee finds townspeople, its "Hit strength" (the Gestures tab) can knock
+    them down, and the second gun and the copy swing on their own. The copy's shots do the damage of the gun it shows
+    ("The copy hits as the gun it shows", on). Left-handed: John always holds the gun in his left hand and the holsters
+    stay where they are.
+  - Used in the developer's Quest 3: a duster's cloth is drawn with the body you see (`[Body] ClothFollows`, on), and a
+    world object you kneel at (a chest) no longer turns with you (`[Body] WorldPropsStay`, on). The game's own gun at
+    the right hip is usually hidden while the hip shows the mod's, after a load too (see [Known issues](#known-issues)).
+  - Ini only, off: `[Body] ClothPins=1` draws the duster's cloth on the body you see, still swaying with the game's idle
+    (seen to work in the developer's Quest 3; not yet a menu row).
+  - The radar cut-out's arrows (the Display tab, under "What goes to the wrist") and a button that saves a picture of
+    the HUD, for a piece of the radar's ring left on the floating screen.
+
 ## Requirements
 
 - **Red Dead Redemption** for PC (the 2024 port), from Steam or the Rockstar Games Launcher.
@@ -432,7 +453,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.12.2.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.13.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -509,6 +530,7 @@ The picture, single pass, the resolution the game renders at for your headset, p
 | **Headset refresh rate** (new in 0.8.4) | The runtime's, or one of your headset's refresh rates, where your VR runtime lets the mod choose (otherwise the row says to set it in your headset's or runtime's own settings). A frame that misses the rate drops the runtime to half the rate; 72 or 80 holds steadier on a slower PC. | The runtime's |
 | **HUD on the left wrist** | Puts the radar and the ammo counter on the back of your left hand (the right when left-handed) like a watch: turn the palm down and look at it to see them. Prompts, subtitles and the rest of that corner of the screen stay on the floating screen (since 0.8.12; with "The whole corner" below, all of that corner goes to the wrist). | On |
 | ↳ **What goes to the wrist: The radar and ammo count / The whole corner** (new in 0.8.12.1) | The radar and the ammo counter only, anything else in that corner (a subtitle) staying on the floating screen; or the screen's whole lower-left corner as a rectangle. | The radar and ammo count |
+| ↳ ↳ **Radar cut-out: left / right, up / down, size** (new in 0.8.13; with The radar and ammo count) | Moves or resizes the part of the screen that goes to the wrist as the radar, 0.2% (the size 2%) per press: if a piece of the radar's ring stays on the floating screen, move it toward that piece or make it larger. A button below saves a picture of the HUD to send with an issue. | 0, 0, 100% |
 | ↳ **A double tap of Y at the wrist opens the satchel** (new in 0.7.0) | With the wrist HUD in view, two quick presses of Y open John's satchel and B closes it. A single press still reaches the game as Y, about a third of a second late. | On |
 | **Cutscenes: On the cinema screen / In 3D** | Cutscenes on a floating 16:9 screen, or in 3D around you from the cutscene camera with your head's turning added (you can switch mid-cutscene). | In 3D |
 | ↳ **3D separation** | The cutscenes' 3D depth as a fraction of your eye distance (1.00 = your own; lower is flatter), 0.05 per press. | 1.00 |
@@ -545,6 +567,8 @@ How you see and move: the first-person view, walking and crouching in your room,
 | **Smooth turning / Snap turning** | How the right stick turns you. | Smooth turning |
 | ↳ **Turn speed** | Smooth turning speed with the stick pushed all the way, 10°/s per press (30 to 360). | 90°/s |
 | ↳ **Snap angle** | The size of each snap turn, 5° per press (10 to 90). | 30° |
+| **Snap turns in third person** (new in 0.8.13) | With First person off, a push of the right stick turns the view one step at once while the game's camera turns round underneath; a push while one is still settling adds the next step. Where the camera cannot swing as far (by a wall or in a doorway), the view is handed back to it in a short blink. Not while aiming or on a mounted gun; with it on, a push past a third of the way never turns the third person camera smoothly. | Off |
+| ↳ **Third person snap angle** (new in 0.8.13) | The size of each third person snap, 5° per press (10 to 90), apart from the first person snap angle. | 30° |
 | **Riding: Steer with the stick / Steer with the head** | With the stick, the view faces the horse and the left stick steers while you look around freely; with the head, the left stick rides where you look. | Steer with the stick |
 | ↳ **The right stick turns the view while riding** (new in 0.7.0) | The right stick turns your view on horseback while the left stick still steers; mounting or recentring faces the horse again. | On |
 | **Recentre on getting on** (new in 0.8.12) | Getting on a horse, onto a wagon or into a vehicle recentres your view (as holding both stick clicks): you face the way it faces. | On |
@@ -621,7 +645,8 @@ The gun in your hand: the reticle, the scope, how it fires, the free hand, Dead 
 
 | Setting | What it does | Default |
 |---|---|---|
-| **Reticle where the shot lands** | With a gun in hand (lowered, raised or in Dead Eye), shows a reticle where the bullet will hit; it turns red while you aim at a person or animal (that part not yet tried). | Off |
+| **Bullet trails** (new in 0.8.13) | The streaks bullets leave in the air, everyone's shots. Off: no trails. | On |
+| **Reticle where the shot lands** | With a gun in hand (lowered, raised or in Dead Eye), shows a reticle where the bullet will hit; it turns red while you aim at a person or animal (that part not yet tried). Since 0.8.13 also in third person (First person off), where the game's own aim lands, with the game's flat crosshair hidden meanwhile. | Off |
 | ↳ **Ring and dot / Dot only** | The reticle's look. | Dot only |
 | **Look through a rifle's scope** (new in 0.8.12) | Bring a scoped rifle's eyepiece (the Rolling Block, the Carcano; the Buffalo by its sights) to either eye as you aim: that eye sees through the scope, magnified, in a round picture at the eyepiece, fading in and out as it comes and goes. One hand is enough. | On |
 | ↳ **Magnification: Realistic (4x) / The game's zoom** | A period scope's about 4x, or the game's own sniper view, about 7.75x. | The game's zoom |
@@ -651,8 +676,9 @@ The gun in your hand: the reticle, the scope, how it fires, the free hand, Dead 
 | ↳ **The click held in for** | How long that stick's click must be held in before it crouches you (or brakes on a horse), 25 ms per press (0 to 600 ms). | 200 ms |
 | **The same sidearm in both hands** | With a sidearm in hand, grip a hip holster with the free hand to take a copy of it; let go at a hip to put it back. | On |
 | ↳ **The copy drawn as a prop** | Draws the copy as a model of the gun, so you see it in the free hand. | On |
-| ↳ **Your other sidearm's model** | If you own a different sidearm, the copy is that gun (the one that hip's holster shows), and its shots leave its muzzle. Since 0.8.12 it also fires at that gun's own rate (`[Hands] CopyOwnRate`, on); its damage is still the gun in hand's (see [Known issues](#known-issues)). | On |
+| ↳ **Your other sidearm's model** | If you own a different sidearm, the copy is that gun (the one that hip's holster shows), and its shots leave its muzzle. Since 0.8.12 it also fires at that gun's own rate (`[Hands] CopyOwnRate`, on). | On |
 | ↳ ↳ **A second of the gun at its own holster** | Gripping the holster the gun was drawn from gives a second of that same gun; the other hip still gives your other sidearm. | On |
+| ↳ ↳ **The copy hits as the gun it shows** (new in 0.8.13) | The copy's shots do the damage of the gun it shows (your other sidearm's), not the gun in hand's. Turned on while the game runs, it works from the next start. | On |
 | **Two-handed long guns** | Grip a long gun's foregrip with your other hand to aim it with both hands. | On |
 | ↳ **The front hand snaps onto the gun** | While you hold the foregrip, John's front hand sits in the game's own grip instead of following your controller. | On |
 | ↳ **The front hand turns the gun** (new in 0.8.12) | On: the gun points from your gun hand toward your front hand. Off: John's front hand is drawn holding the gun, but only your gun hand moves it. | On |
@@ -688,8 +714,13 @@ Reloading by hand, where the rounds come from, the round in your hand, every gun
 | ↳ **Revolvers drawn open** | An open revolver is drawn open (tipped, swung out or gate open). | On |
 | ↳ **Revolvers: Opened by a flick of the stick / Cocked by a flick, opened by holding it and clicking** (new in 0.8.12) | Opened by a flick: a flick of the right stick down opens a revolver. Cocked by a flick: after each shot a flick of the right stick down cocks the Cattleman's, the Schofield's and the LeMat's hammer (the Double-action needs none), and the stick held down and clicked opens a revolver. Either way a flick of the gun shuts it. A revolver in your other hand is worked by that hand's stick (on foot). | Cocked by a flick, opened by holding it and clicking |
 | ↳ ↳ **John's thumb cocks the hammer** | On the stick's flick, John's thumb reaches up to the hammer and draws it back, then returns to the grip. | On |
-| ↳ ↳ **Fan the hammer with your other hand** | Sweep your other hand's palm back across the hammer to cock it; keep the trigger pulled and each sweep fires. | On |
-| ↳ **Lever guns: the lever drawn as you work it** | The lever drawn opening and closing as you work it, with the game's lever sounds. Since 0.8.12 a lever gun is worked one way: hold the right stick down, move the gun down to open the lever and up to shut it; the gun stays put meanwhile. | On |
+| ↳ ↳ **Fan the hammer with your other hand** | Sweep your other hand's palm back across the hammer to cock it; keep the trigger pulled and each sweep fires. Since 0.8.13 the next sweep counts once your hand is 2.4 cm out of the zone, whatever its size (it was a third of the size again, so a big zone got harder). | On |
+| ↳ ↳ ↳ **Fanning zone size** (new in 0.8.13) | How near the hammer the sweep must pass, 1 cm per press (2 to 30 cm). | 8 cm |
+| ↳ ↳ ↳ **Fanning speed** (new in 0.8.13) | How fast the sweep must be to cock the hammer, 0.1 m/s per press (0.2 to 6.0 m/s); lower is more sensitive. | 1.0 m/s |
+| ↳ ↳ ↳ **Show the fanning zone** (new in 0.8.13) | A ring round the hammer as big as the zone: bright while a sweep would cock it, lit while your hand is in it, faint while your hand must leave it before the next sweep counts, plain while the hammer is back. | Off |
+| ↳ **Lever guns: the lever drawn as you work it** | The lever drawn opening and closing as you work it, with the game's lever sounds. | On |
+| ↳ **Lever guns: Stick held, gun down and up / Roll the gun / Flick the stick / Flick the gun** (new in 0.8.13; 0.8.12 had the first only) | Stick held: hold the right stick down, move the gun down to open the lever and up to shut it; the gun stays put meanwhile. Roll the gun: after a shot, roll your gun hand a little left or right to open the lever and back to shut it. Flick the stick: after a shot, a flick of the right stick down works the lever. Flick the gun: after a shot, flick the gun down and back up (with the lever drawn, the flick down opens it and the flick up shuts it). | Stick held, gun down and up |
+| ↳ ↳ **Roll to open** (new in 0.8.13; with Roll the gun) | How far the gun hand rolls, either way, to open the lever, 1° per press (8 to 60°). Rolling back about half way shuts it. | 20° |
 | ↳ **Volcanic: its lever by a flick of the right stick** (new in 0.8.12) | After each shot, a flick of the right stick down works the Volcanic's lever. | On |
 | ↳ **Pump-action: the fore-end in your front hand** | After a shot, pull the fore-end back with your front hand and push it forward. | On |
 | ↳ **Bolt actions: the bolt in your other hand** | On the Bolt Action and Carcano: lift, pull back, push forward and turn down the bolt by hand. | On |
@@ -726,8 +757,9 @@ Actions you do with your own hand movements.
 | ↳ **Thrown by: Trigger / Swing / Either / Lock on** (Lock on new in 0.8.12) | Trigger: the lasso hand's trigger. Swing: a fast swing toward the aim. Either. Lock on: hold the left trigger (the game's aim) to lock on to the one you look at and spin the lasso, then the right trigger or a throwing swing throws it, whichever hand holds the lasso (left-handed: mirrored). Let go of the left trigger without either and nothing is thrown; keep it held to keep them on the rope. | Lock on |
 | ↳ **Aimed by: Head / Lasso hand / Other hand** (new in 0.8.7) | Head (where you look), Lasso hand, or Other hand (where your other controller points). Lock on always aims by your head. | Head |
 | ↳ **Swing speed** | How fast a swing must be to punch or throw the lasso, 0.25 m/s per press (1.0 to 8.0 m/s). | 1.50 m/s |
-| **Gun-butt melee** | Swing the gun in your hand into someone to land the game's knock-out hit (with the usual crime and anger). | On |
+| **Gun-butt melee** | Swing the gun in your hand into someone to land the game's knock-out hit (with the usual crime and anger). Since 0.8.13 it also finds townspeople, and the second gun and the copy swing on their own. | On |
 | ↳ **Hit speed** | How fast the gun's swing must be to hit, 0.25 m/s per press (1.0 to 6.0 m/s). | 1.00 m/s |
+| ↳ **Hit strength** (new in 0.8.13) | How much of a person's knock-out a hit takes, 5 per press (5 to 200): 100 knocks them down in one hit, and a hard swing doubles it. The game's own is 10. | 50 |
 | **Whistle for the horse** | Put a hand at your mouth and pull its trigger to whistle (the gun hand whistles only when it holds no gun). | On |
 | **Fists on both triggers** (new in 0.8.11) | With nothing in your hands, hold both triggers for the fighting stance and swing a fist to punch while holding them; raise both fists before your face to block. A trigger alone does nothing. Off: each trigger as the game has it. | On |
 | **Guard with both fists** (new in 0.8.5) | With your fists out, raise both hands before your face and hold both triggers to block. Fists raised without the triggers stay lowered for the game. Not riding, not in the game's menus. | On |
@@ -741,8 +773,7 @@ Handedness, how the triggers aim and fire, and button mapping.
 
 | Setting | What it does | Default |
 |---|---|---|
-| **Left-handed** | Swaps the controllers' roles: the left trigger fires and the right stick moves. | Off |
-| ↳ **The gun in John's left hand** | John holds the gun in his left hand, each arm on its own controller; off, the arms cross. | Off |
+| **Left-handed** | Swaps the controllers' roles: the left trigger fires and the right stick moves. Since 0.8.13 John always holds the gun in his left hand then (the row "The gun in John's left hand" is gone: off crossed his arms), and the holsters stay where they are. | Off |
 | **The trigger alone fires** | The right trigger alone fires; the mod holds the aim trigger for you. | On |
 | **Aim while the gun is raised** | While the gun is raised in front of you, the aim is held, so every pull fires at once. | On |
 | **Sprinting lowers the raised gun** | Pressing sprint lowers a raised gun so John can sprint with it. | On |
@@ -872,8 +903,11 @@ Shown only while Ped Gunfight Overhaul (a separate RedHook mod by another author
   in the developer's simulator, back on the grip within 3 seconds). `RDRVR.log` has a `[two] a shot two-handed`
   line after each such shot (since 0.8.0 measured as your eyes see it): please attach it to an issue if your hand
   ends up in the gun or in the air.
-- A dual-wield copy (the same sidearm drawn a second time: "The same sidearm in both hands", the Guns tab) does the
-  damage of the gun in your hand, not of the gun it shows ("Your other sidearm's model").
+- A revolver at the right hip can sometimes show a second copy of itself that trails slightly behind (the game's own
+  holstered gun; the Cattleman's turned, the Schofield's near the chest). Being looked into.
+- A dual-wield copy of the Cattleman can sit turned in the hand (its barrel pointing sideways), seen after walking out
+  of a building and back in with it; putting it back and taking it again does not always help. Being looked into;
+  `RDRVR.log`'s `[wield] the copy turned` lines say when it happened.
 - Foregrip positions can shift slightly between sessions, and a grab can sometimes land in a different hand pose
   (being looked into).
 - Short bursts of stutter (single frames of about 90 ms for 10 to 20 seconds, the GPU not the limit) were seen in the

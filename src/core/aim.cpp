@@ -51,6 +51,11 @@ std::atomic<bool> g_ret_smooth{true};   // [Hands] ReticleSmooth (run 10 item 8)
 std::atomic<uint64_t> g_reticle_shown{0}, g_reticle_offline{0};
 std::atomic<bool> g_assist{false}; // [Hands] AimAssist (soft lock and the reticle magnet in first person)
 std::atomic<bool> g_tracer{true};  // [Hands] TracerFromMuzzle
+// [Hands] BulletTrails (2026-11-06, the user: "an option to disable bullet trails"): 0 = the projectiles' "BULLETTRAIL"
+// effect never made (every shot's, the player's and others'); 1 (the default) the game's
+std::atomic<bool> g_trails{true};
+std::atomic<uint64_t> g_trails_skipped{0};
+std::atomic<bool> g_trails_hooked{false};
 std::atomic<bool> g_perfect{true};   // [Aim] PerfectAccuracy (on by default since run 8)
 std::atomic<bool> g_pattern{true};   // [Aim] ShotgunPattern
 std::atomic<bool> g_spawn_hooked{false};
@@ -78,6 +83,16 @@ thread_local float t_first_start[3] = {}, t_first_dir[3] = {}, t_first_speed = 0
 thread_local bool t_first_fresh = false;
 std::atomic<uint64_t> g_assist_off{0}, g_shots{0}, g_tracers{0};
 std::atomic<double> g_last_override_ms{0.0};
+// (2026-11-06, GOAL-remaining 6c; another player: "crosshair in third person") with the anchor off (First person off: the
+// game's own camera), the game's own aim ray as it computed it (the origin, the direction), for the reticle's probe
+// in place of the drawn barrel; its time doubles as the "the game aims" mark for the reticle's red
+std::mutex g_tp_mutex;
+float g_tp_origin[3] = {}, g_tp_dir[3] = {};  // under g_tp_mutex
+std::atomic<double> g_tp_ms{0.0};
+std::atomic<uint64_t> g_tp_rays{0}, g_tp_probes{0};
+// (the review) when a probe along the game's ray last came back: the game's flat reticle is hidden only while the mod's
+// is really placed (a gun, the ray, the probe), never for a mounted gun, the lasso or a thrown weapon (no probe there)
+std::atomic<double> g_tp_done_ms{0.0};
 // the player's last shot as launched: start, velocity direction, and the angle to the barrel ray then (degrees)
 float g_shot_start[3] = {}, g_shot_dir[3] = {}, g_shot_err = -1;
 std::atomic<uint64_t> g_rays{0}, g_overrides{0}, g_no_gun{0}, g_no_hand{0}, g_fires{0}, g_swaps{0}, g_hand_rays{0};
@@ -214,6 +229,19 @@ bool dead_eye_firing_marks() {
 float* hk_aim_ray(uintptr_t self, float* out, const float* yp) {
     float* r = o_aim_ray(self, out, yp);
     g_rays.fetch_add(1, std::memory_order_relaxed);
+    if (out && !pose::anchor_active() && g_reticle.load(std::memory_order_relaxed)) {  // (6c) third person: the game's ray kept
+        const float d[3] = {-out[8], -out[9], -out[10]};
+        const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (l > 0.5f && l < 2.0f && std::isfinite(out[12] + out[13] + out[14])) {
+            std::lock_guard lock(g_tp_mutex);
+            for (int k = 0; k < 3; ++k) {
+                g_tp_origin[k] = out[12 + k];
+                g_tp_dir[k] = d[k] / l;
+            }
+            g_tp_ms.store(log::now_ms(), std::memory_order_relaxed);
+            g_tp_rays.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (!g_barrel.load(std::memory_order_relaxed) || !out || !pose::anchor_active()) return r;
     if (dead_eye_firing_marks()) {
         g_de_skips.fetch_add(1, std::memory_order_relaxed);
@@ -647,6 +675,7 @@ void reticle_tick() {
     static double pending_ms = 0.0;
     static float req_m[3], req_d[3], req_h[3];
     static bool req_h_ok = false;
+    static bool req_tp = false;  // (6c) the pending probe was along the game's own ray
     const double now = log::now_ms();
     if (g_bs_on.load(std::memory_order_relaxed)) barrel_step_tick();  // item 1b's measure (the session)
     second_probe_tick(now);  // round 38 check 2: the second gun's own
@@ -669,6 +698,7 @@ void reticle_tick() {
             g_rp.dist = held;
             g_rp.hit = held_hit;
             g_rp.ms = now;
+            if (req_tp) g_tp_done_ms.store(now, std::memory_order_relaxed);
             g_dist_trace[g_dist_trace_n++ % kDistTraceN] = {now, dist, held};
             if (hit) g_rp_hits.fetch_add(1, std::memory_order_relaxed);  // (the probes' own hits)
         } else if (now - pending_ms > 500.0) {  // the plugin never ran it (a stall): given up
@@ -684,7 +714,17 @@ void reticle_tick() {
         return;
     }
     float m[3], d[3];
-    if (!barrel_ray(m, d)) {
+    req_tp = !pose::anchor_active();
+    if (req_tp) {  // (6c) third person: along the game's own aim ray, while the game aims (fresh within 200 ms)
+        if (now - g_tp_ms.load(std::memory_order_relaxed) > 200.0) {
+            g_rp_nobarrel.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        std::lock_guard lock(g_tp_mutex);
+        std::memcpy(m, g_tp_origin, sizeof(m));
+        std::memcpy(d, g_tp_dir, sizeof(d));
+        g_tp_probes.fetch_add(1, std::memory_order_relaxed);
+    } else if (!barrel_ray(m, d)) {
         g_rp_nobarrel.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -718,7 +758,7 @@ void reticle_tick() {
             tpend = 0;
         }
     }
-    if (!tpend && now - g_last_override_ms.load(std::memory_order_relaxed) < 150.0) {
+    if (!tpend && (now - g_last_override_ms.load(std::memory_order_relaxed) < 150.0 || now - g_tp_ms.load(std::memory_order_relaxed) < 150.0)) {
         const uintptr_t actor = player_actor();
         uintptr_t T = 0;
         int32_t h = 0;
@@ -733,6 +773,17 @@ void reticle_tick() {
 // FUN_1403237a0: the projectile launch, the one way player gun projectiles start (research\gc-aim.md 8-9):
 // (projectile, matrix rows a b c d, weapon type, velocity, owner handle, launch position (the tracer's start), flags,
 // ...). For the player's shots: logged against the barrel ray, and the tracer started at the drawn muzzle.
+// FUN_1406b8c70(byte, projectile, start (P +0x220), end (P +0x210), the effect's id, P +0x2b4, byte, byte (made already)):
+// the projectile's bullet trail made or moved; its one caller (the projectile's update) ignores any result
+using TrailFx_t = void (*)(uint8_t a, uintptr_t proj, const float* start, const float* end, int fx, uint32_t f6, uint8_t b7, uint8_t b8);
+TrailFx_t o_trail_fx = nullptr;
+void hk_trail_fx(uint8_t a, uintptr_t proj, const float* start, const float* end, int fx, uint32_t f6, uint8_t b7, uint8_t b8) {
+    if (!g_trails.load(std::memory_order_relaxed)) {
+        g_trails_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    o_trail_fx(a, proj, start, end, fx, f6, b7, b8);
+}
 using Launch_t = void (*)(uintptr_t p, const float* mtx, int wtype, const float* vel, uint32_t owner, const float* launch, uint32_t flags,
                           char c8, float f9, const float* voff);
 Launch_t o_launch = nullptr;
@@ -1289,6 +1340,7 @@ void init() {
     g_fire = config::get_bool("Hands", "FireInFirstPerson", true);
     g_assist = config::get_bool("Hands", "AimAssist", false);
     g_tracer = config::get_bool("Hands", "TracerFromMuzzle", true);
+    g_trails = config::get_bool("Hands", "BulletTrails", true);
     g_perfect = config::get_bool("Aim", "PerfectAccuracy", true);
     g_pattern = config::get_bool("Aim", "ShotgunPattern", true);
     g_reticle = config::get_bool("Hands", "Reticle", false);
@@ -1883,6 +1935,9 @@ bool install() {
                          &o_soft_lock);
     ok &= hooks::install("RDR projectile launch (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ProjectileLaunch)), hk_launch,
                          &o_launch);
+    if (anchors::present(anchors::Id::BulletTrailFx))  // ([Hands] BulletTrails: an optional anchor; its failure leaves the rest)
+        g_trails_hooked = hooks::install("RDR bullet trail effect (BulletTrails)", reinterpret_cast<void*>(anchors::addr(anchors::Id::BulletTrailFx)),
+                                         hk_trail_fx, &o_trail_fx);
     // run 3 item 3: the spawn (one shot's projectiles), for PerfectAccuracy and ShotgunPattern; without it both are unavailable
     const bool sp = hooks::install("RDR projectile spawn (perfect accuracy)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ProjectileSpawn)),
                                    hk_spawn, &o_spawn);
@@ -1896,6 +1951,21 @@ bool install() {
 bool barrel_aim() { return g_barrel.load(); }
 
 bool reticle_on() { return g_reticle.load(std::memory_order_relaxed); }
+bool third_person_reticle_live() {
+    return g_reticle.load(std::memory_order_relaxed) && log::now_ms() - g_tp_done_ms.load(std::memory_order_relaxed) < 300.0;
+}
+bool bullet_trails() { return g_trails.load(std::memory_order_relaxed); }
+bool bullet_trails_available() { return g_trails_hooked.load(std::memory_order_relaxed); }
+void set_bullet_trails(bool on, bool save) {
+    if (g_trails.exchange(on) != on) log::info("[aim] bullet trails: %s", on ? "on (the game's)" : "off");
+    if (save) config::set("Hands", "BulletTrails", on ? "1" : "0");
+}
+std::string trails_status() {
+    char b[160];
+    std::snprintf(b, sizeof(b), "bullet trails %d (hooked %d): trails skipped %llu", g_trails.load() ? 1 : 0, g_trails_hooked.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_trails_skipped.load()));
+    return b;
+}
 void set_reticle_on(bool on) {
     if (g_reticle.exchange(on) != on) log::info("[aim] the reticle where the shot lands: %s", on ? "on" : "off");
     config::set("Hands", "Reticle", on ? "1" : "0");
@@ -2270,13 +2340,15 @@ bool reticle_target(float pos[3], bool* on_actor, float* size_deg, int which, bo
     if (torch2 && now - rp2.ms > 250.0) return false;  // (the main probe is no gun's now: never its distance)
     float hit[3];
     for (int k = 0; k < 3; ++k) hit[k] = rp.muzzle[k] + rp.dir[k] * rp.dist;
+    const bool third = !pose::anchor_active();  // (6c) third person: the game's own ray's hit, no second reticle
+    if (third && which == 1) return false;
     if (which == 1) {  // the second gun's: smoothed only, never red
         if (!g_ret_smooth.load(std::memory_order_relaxed) || !reticle_smoothed(1, rp, advance, pos, &rp2, torch2)) return false;
         if (on_actor) *on_actor = false;
         if (size_deg) *size_deg = g_reticle_deg.load(std::memory_order_relaxed);
         return true;
     }
-    if (g_ret_smooth.load(std::memory_order_relaxed) && reticle_smoothed(0, rp, advance, pos)) {
+    if (!third && g_ret_smooth.load(std::memory_order_relaxed) && reticle_smoothed(0, rp, advance, pos)) {
         // (red below judged on the probe's own hit, as before)
     } else {
         std::memcpy(pos, hit, sizeof(hit));
@@ -2286,7 +2358,7 @@ bool reticle_target(float pos[3], bool* on_actor, float* size_deg, int which, bo
     // probe's hit on that actor: within 1.2 m of its position across, from 0.3 m below it to 2.3 m above (y up: a
     // person's or an animal's body). A stale handle, a lock elsewhere, a wall: white
     bool red = false;
-    if (on_actor && rp.hit && now - g_last_override_ms.load(std::memory_order_relaxed) < 150.0) {
+    if (on_actor && rp.hit && (now - g_last_override_ms.load(std::memory_order_relaxed) < 150.0 || now - g_tp_ms.load(std::memory_order_relaxed) < 150.0)) {
         const uintptr_t actor = player_actor();
         uintptr_t T = 0;
         int32_t handle = 0;
@@ -2547,6 +2619,11 @@ std::string command(const std::string& line) {
         }
         return o;
     }
+    if (line.find(" trails") != std::string::npos) {  // aim trails [on|off]: [Hands] BulletTrails for the session
+        if (line.find(" trails on") != std::string::npos) set_bullet_trails(true, false);
+        if (line.find(" trails off") != std::string::npos) set_bullet_trails(false, false);
+        return trails_status();
+    }
     if (line.find(" reticle") != std::string::npos) {  // aim reticle [on|off|dot|ring]: where it is drawn now, its counters (the session)
         if (line.find(" reticle on") != std::string::npos) g_reticle = true;
         if (line.find(" reticle off") != std::string::npos) g_reticle = false;
@@ -2575,7 +2652,10 @@ std::string command(const std::string& line) {
         char r2[200];
         std::snprintf(r2, sizeof(r2), " | probe ray (%.3f %.3f %.3f) along (%.4f %.4f %.4f) hit %d at %.2f m, %.0f ms old", rp.muzzle[0], rp.muzzle[1],
                       rp.muzzle[2], rp.dir[0], rp.dir[1], rp.dir[2], rp.hit ? 1 : 0, rp.dist, rp.ms > 0.0 ? log::now_ms() - rp.ms : -1.0);
-        return std::string(e) + r2;
+        char r3[160];  // (6c) third person: the game's own rays kept, the probes along them
+        std::snprintf(r3, sizeof(r3), " | third person: game rays %llu, probes %llu, the last %.0f ms ago", static_cast<unsigned long long>(g_tp_rays.load()),
+                      static_cast<unsigned long long>(g_tp_probes.load()), g_tp_ms.load() > 0.0 ? log::now_ms() - g_tp_ms.load() : -1.0);
+        return std::string(e) + r2 + r3;
     }
     if (line.find(" ledge") != std::string::npos) {  // aim ledge [trace on|off|reset]: the climb state (run 7 item 1f)
         if (line.find(" trace on") != std::string::npos) g_ledge_trace = true;

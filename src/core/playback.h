@@ -17,5 +17,8 @@ bool set_batch(int k);             // the test channel's "playbatch <K>"; false 
 bool installed();
 int batch();                       // the K in use (-1: not installed)
 void status(char* out, size_t len);
+// (2026-11-06, the hang dump) where the playback thread last entered the loop head: the chunk and the read offset's
+// address it replays, the claim's chunk and the packets claimed and not yet handed out. False before any entry.
+bool where(void** chunk, int** offset, void** claim_chunk, long* budget);
 
 }  // namespace rdrvr::playback

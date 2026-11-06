@@ -12,6 +12,7 @@
 #include "core/camera_lever.h"
 #include "core/config.h"
 #include "core/d3d_hooks.h"
+#include "core/cut_log.h"
 #include "core/diag.h"
 #include "core/dlss.h"
 #include "core/deadeye.h"
@@ -198,6 +199,7 @@ DWORD WINAPI bootstrap_thread(void*) {
         camera_lever::install();
         dual_pass::install();
         frame_probe::install();  // after dual_pass: its wait sites
+        cut_log::start();        // ([Debug] CutsceneLog) after frame_probe: the main thread's id
         playback::install();
         prepass::install();
         gpu_stages::install();  // [Stereo] PrepassGpuStages (run 19 item 3, test only; off: nothing)

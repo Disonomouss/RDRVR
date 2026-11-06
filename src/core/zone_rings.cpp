@@ -21,6 +21,7 @@
 #include "core/d3d_hooks.h"
 #include "core/holster.h"
 #include "core/log.h"
+#include "core/pose.h"
 #include "core/pso.h"
 #include "core/state.h"
 #include "core/xr.h"
@@ -424,10 +425,18 @@ bool reticle_frame(const XrView* views, XrSession session, XrSpace space, XrComp
     float p[3], deg = 1.2f;
     bool hot = false;
     if (!camera_lever::eyes_follow_head() || !aim::reticle_target(p, &hot, &deg, which, true)) return false;
-    body::BodyPoints bp;
-    if (!body::body_points(&bp) || !bp.cam_ok || !ensure(session)) return false;
+    // the frame camera: the drawn body's (first person); (round 94, the user: "No reticle visible in third person") in
+    // third person the game camera's, the body's points not published there
+    float cam[16];
+    if (!pose::anchor_active()) {
+        if (!camera_lever::game_camera(cam) || !ensure(session)) return false;
+    } else {
+        body::BodyPoints bp;
+        if (!body::body_points(&bp) || !bp.cam_ok || !ensure(session)) return false;
+        std::memcpy(cam, bp.cam, sizeof(cam));
+    }
     float l[3];
-    if (!camera_lever::world_to_local(bp.cam, p, l)) return false;
+    if (!camera_lever::world_to_local(cam, p, l)) return false;
     const float eye[3] = {0.5f * (views[0].pose.position.x + views[1].pose.position.x), 0.5f * (views[0].pose.position.y + views[1].pose.position.y),
                           0.5f * (views[0].pose.position.z + views[1].pose.position.z)};
     float d[3] = {eye[0] - l[0], eye[1] - l[1], eye[2] - l[2]};

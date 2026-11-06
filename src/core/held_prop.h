@@ -61,8 +61,14 @@ void set_inst_check(bool on);  // "props inst on|off" (on by default)
 // 2026-10-12: a holster's shown gun (slots kHolsterSlot..+3, wanted) has this model: the game's own holstered gun of the
 // same model on John's belt is hidden then (body.cpp), so one gun shows at the hip. ([Hands] OffHandItems) the off hand's
 // item too (kOffhandSlot): the game's own knife at its sheath hidden while our copy is in the hand
-bool shown_at_holster(uintptr_t drawable);
+// (2026-11-05, item 10) with pos (the draw's place): also a draw of another copy of that model (its drawable's shape the
+// same: the game's holstered gun after a load) within 0.45 m of the shown gun
+bool shown_at_holster(uintptr_t drawable, const float* pos = nullptr);
+uint64_t twin_shapes();  // the draws hidden so (another copy of the model)
 void set_twins(bool on);  // "props twins on|off" (the session)
+// "props census world|own" (item 13's test, the session): world, the census slot's object is not matched as the mod's own
+// (its draws go by the rules for any object near John: a chest's); own (the default), as before
+void set_census_matched(bool on);
 void set_puts(int n);          // "props puts <n>": the recent puts a draw is matched against (8; 1-64; the session)
 void set_gate(float m);         // "props gate <m>": a draw matched within that distance of a recent put ([Holsters] PropGate)
 // "props diag [on|off|reset]" (a test command): the draws near each placed slot (within 0.5 m of its recent puts) by

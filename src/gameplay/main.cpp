@@ -252,22 +252,66 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
     // the actors' objects: the iterator made, filtered, walked and destroyed here, with nothing else in between
     uint32_t objs[16];
     int n = 0;
-    {
-        const uint64_t layout = invoke(0xB52A3D48, {}) & 0xffffffffu;    // GET_AMBIENT_LAYOUT
-        const uint64_t it = invoke(0xD8A12B74, {layout}) & 0xffffffffu;  // CREATE_OBJECT_ITERATOR
-        if (!it) return done(0, RDRVR_GUN_MELEE_NO_ITERATOR, 0xff);
-        made = 1;
-        ++g_gm_made;
-        invoke(0xBE553F84, {it, 15});                                        // ITERATE_ON_OBJECT_TYPE: actors
-        invoke(0x2243FA6E, {it, vec2(c[0], c[1]), f32(c[2]), f32(radius)});  // ITERATE_IN_SPHERE(it, xy, z, r)
-        const int cap = scan ? 16 : 10;
-        for (uint32_t o = static_cast<uint32_t>(invoke(0xE96A0318, {it})); o && n < cap;) {  // START_OBJECT_ITERATOR
-            objs[n++] = o;
-            if (n < cap) o = static_cast<uint32_t>(invoke(0xD88DC865, {it}));  // OBJECT_ITERATOR_NEXT
+    // (2026-11-04, GOAL-next-items item 5; round 73, the user: "Does not work, only tried on non holstile civillians"; cycle
+    // N27 in the user's Mexican town: only animals found) an iterator sees one layout's objects (CREATE_OBJECT_ITERATOR
+    // needs a valid one: FUN_140226600), and the ambient layout holds the wildlife, not the towns' people: the ambient, the
+    // scripted ambient characters' (GET_ART_GRINGO_LAYOUT) and GET_GC_LAYOUT's, each its own iterator (the getters read
+    // the world's handles, +0x2b8, +0x4d8, +0x148; a stale one gives no iterator), an object counted once
+    const int cap = scan ? 16 : 10;
+    int per_layout[3] = {0, 0, 0};
+    // (2026-11-05, round 86 check 10: every swing at townspeople "actors within 2 m: 0" with the three layouts walked)
+    // every live actor from the core (API v8: the game's objects pool), those within the sphere (GET_POSITION, their
+    // roots, as the iterator's sphere) taken; the layouts' iterators only when the core cannot give them
+    int pool_all = -1, pool_in = 0;
+    float pool_near = 1e9f;
+    if (g_api->actor_handles) {
+        static uint32_t all[1024];
+        pool_all = g_api->actor_handles(all, 1024);
+        for (int i = 0; i < pool_all; ++i) {  // (all walked: the nearest for the log)
+            if (all[i] == a.actor) continue;
+            alignas(16) float pos[4] = {};
+            invoke(0x99BD9D6F, {all[i], reinterpret_cast<uint64_t>(pos)});  // GET_POSITION
+            const float d = gm_dist(pos, c);
+            if (d < pool_near) pool_near = d;
+            if (d > radius || n >= cap) continue;
+            objs[n++] = all[i];
+            ++pool_in;
         }
-        invoke(0xE284A10C, {it});  // DESTROY_ITERATOR
-        destroyed = 1;
-        ++g_gm_destroyed;
+    }
+    // (the review) none at all (the player is always one): the pool not as this build has it; the iterators then
+    if (pool_all <= 0) {
+        pool_all = -1;
+        uint64_t layouts[3] = {invoke(0xB52A3D48, {}) & 0xffffffffu,   // GET_AMBIENT_LAYOUT
+                               invoke(0x76FBF412, {}) & 0xffffffffu,   // GET_ART_GRINGO_LAYOUT
+                               invoke(0xADE13224, {}) & 0xffffffffu};  // GET_GC_LAYOUT
+        // (the review: the ambient one last, its animals never filling the cap before the people's layouts are walked)
+        static constexpr int kOrder[3] = {1, 2, 0};
+        for (int q = 0; q < 3 && n < cap; ++q) {
+            const int L = kOrder[q];
+            const uint64_t layout = layouts[L];
+            bool seen_l = false;
+            for (int r = 0; r < q; ++r) seen_l = seen_l || layouts[kOrder[r]] == layout;
+            if (!layout || seen_l) continue;
+            const uint64_t it = invoke(0xD8A12B74, {layout}) & 0xffffffffu;  // CREATE_OBJECT_ITERATOR
+            if (!it) continue;
+            ++made;
+            ++g_gm_made;
+            invoke(0xBE553F84, {it, 15});                                        // ITERATE_ON_OBJECT_TYPE: actors
+            invoke(0x2243FA6E, {it, vec2(c[0], c[1]), f32(c[2]), f32(radius)});  // ITERATE_IN_SPHERE(it, xy, z, r)
+            for (uint32_t o = static_cast<uint32_t>(invoke(0xE96A0318, {it})); o && n < cap;) {  // START_OBJECT_ITERATOR
+                bool dup = false;
+                for (int k = 0; k < n; ++k) dup = dup || objs[k] == o;
+                if (!dup) {
+                    objs[n++] = o;
+                    ++per_layout[L];
+                }
+                if (n < cap) o = static_cast<uint32_t>(invoke(0xD88DC865, {it}));  // OBJECT_ITERATOR_NEXT
+            }
+            invoke(0xE284A10C, {it});  // DESTROY_ITERATOR
+            ++destroyed;
+            ++g_gm_destroyed;
+        }
+        if (!made) return done(0, RDRVR_GUN_MELEE_NO_ITERATOR, 0xff);
     }
     struct Best {
         float t = 2.0f;
@@ -364,14 +408,19 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
             }
         }
     }
+    char from[120];  // where the actors came from, for the lines below
+    if (pool_all >= 0)
+        std::snprintf(from, sizeof(from), "the game's actors: %d, in the sphere %d, the nearest %.1f m", pool_all, pool_in, pool_near < 1e8f ? pool_near : -1.0f);
+    else
+        std::snprintf(from, sizeof(from), "objects by layout: ambient %d, art gringo %d, gc %d", per_layout[0], per_layout[1], per_layout[2]);
     if (scan) {
         if (near_h) {
             for (int j = 0; j < 3; ++j) res->vec[j] = near_p[j];
             res->vec[3] = near_d;
         }
-        char line[220];
-        std::snprintf(line, sizeof(line), "gunmelee scan: %u actor(s) within %.1f m of (%.2f %.2f %.2f); iterators made %llu, destroyed %llu (%llu ops)", seen,
-                      radius, c[0], c[1], c[2], static_cast<unsigned long long>(g_gm_made), static_cast<unsigned long long>(g_gm_destroyed),
+        char line[400];
+        std::snprintf(line, sizeof(line), "gunmelee scan: %u actor(s) within %.1f m of (%.2f %.2f %.2f) (%s); iterators made %llu, destroyed %llu (%llu ops)",
+                      seen, radius, c[0], c[1], c[2], from, static_cast<unsigned long long>(g_gm_made), static_cast<unsigned long long>(g_gm_destroyed),
                       static_cast<unsigned long long>(g_gm_ops));
         g_api->log(0, line);
         return done(near_h, RDRVR_GUN_MELEE_SCANNED, 0xff);
@@ -379,13 +428,13 @@ void gun_melee_op(const RdrvrNativeRequest& req, RdrvrNativeResult* res) {
     if (!best.h) {
         res->vec[2] = static_cast<float>(n_fit);
         static ULONGLONG passed_log_ms = 0;  // (once a second at most) the actors found and passed over
-        if (seen && (n_fit == 0 || n_nobones) && GetTickCount64() - passed_log_ms > 1000) {
+        if ((seen == 0 || n_fit == 0 || n_nobones) && GetTickCount64() - passed_log_ms > 1000) {
             passed_log_ms = GetTickCount64();
-            char line[220];
+            char line[400];
             std::snprintf(line, sizeof(line),
                           "gunmelee: %u actor(s) within %.1f m of the strike, none hit: %d to hit (%d without bones), passed over: dead %d, animals %d, "
-                          "ragdolls %d, held by a cutscene %d",
-                          seen, radius, n_fit, n_nobones, n_dead, n_animal, n_rag, n_cut);
+                          "ragdolls %d, held by a cutscene %d (%s)",
+                          seen, radius, n_fit, n_nobones, n_dead, n_animal, n_rag, n_cut, from);
             g_api->log(0, line);
         }
         if (miss_b >= 0) {  // how near it came (run 8 item 1)
@@ -533,10 +582,10 @@ void camera_tick(uint64_t tick) {
     {
         static bool hidden = false;
         static uint64_t last = 0;
-        bool want = job.enabled && job.hide_reticle;
+        bool want = (job.enabled && (job.hide_reticle & 1u)) || (job.hide_reticle & 2u);  // (2: third person, the mod's own drawn)
         if (want != hidden || (want && tick - last > 300)) {
             invoke(0xCE7CE46D, {0, want ? 1u : 0u});  // SET_RETICLE_DRAW_DISABLED_BY_SCRIPT
-            if (want != hidden) g_api->log(0, want ? "reticle hidden (first person)" : "reticle shown");
+            if (want != hidden) g_api->log(0, want ? (job.enabled ? "reticle hidden (first person)" : "reticle hidden (third person: the mod's drawn)") : "reticle shown");
             hidden = want;
             last = tick;
         }

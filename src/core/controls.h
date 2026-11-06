@@ -67,7 +67,7 @@ uint64_t wheel_steps();             // [Holsters] WheelStickDpad: the D-pad step
 int layout_gun_hand();            // 1 right (default), 0 left when left-handed
 // [Hands] DrawToGrabbingHand: a holster draw puts the gun in the hand that grabbed it (the trigger roles follow: that
 // controller's trigger fires). Active with each arm on its own controller (right-handed, or left-handed with
-// GunInGunHand). ctrl: the controller; -1 back to the layout's hand.
+// GunInGunHand, always on since 2026-11-05). ctrl: the controller; -1 back to the layout's hand.
 void set_draw_hand(int ctrl, int weapon = -1, bool now = true);  // not now: committed once `weapon` is in hand (commit_draw_hand)
 void commit_draw_hand(int weapon_in_hand, bool in_hand);  // the holsters' frame: a pending hand, once its weapon is in hand
 bool draw_any_active();

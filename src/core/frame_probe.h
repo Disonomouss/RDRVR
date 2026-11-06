@@ -61,5 +61,8 @@ void format(const Snap& a, const Snap& b, char* out, size_t len);
 // The game's own frame limiter (graphicsOptions' FrameRateLimit, 90 fps here), for an uncapped measurement: "off" sets
 // its period to 0 in memory, "on" puts back the value first seen; anything else only reads it. Never on its own.
 void game_frame_limit(const char* arg, char* out, size_t len);
+// That limiter's period now, read only (s; 0 = none; -1: the swap chain object not found). Not for a hot path: it
+// checks the pointers with VirtualQuery (the cutscene log reads it once a second).
+float game_frame_limit_value();
 
 }  // namespace rdrvr::frame_probe

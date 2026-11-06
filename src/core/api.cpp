@@ -150,9 +150,11 @@ int api_gun_melee_hit(const RdrvrMeleeHit* hit) { return gun_melee::hit(hit); }
 
 void api_end_script_tick(uint64_t /*tick*/) { g_in_tick.store(false, std::memory_order_release); }
 
+int api_actor_handles(uint32_t* out, int cap) { return gun_melee::actor_handles(out, cap); }
+
 const RdrvrApi g_api = {
     RDRVR_API_VERSION, api_log, api_on_script_tick, api_pop_native_request, api_post_native_result,
-    api_get_camera_job, api_post_actor_state, api_gun_melee_hit, api_end_script_tick,
+    api_get_camera_job, api_post_actor_state, api_gun_melee_hit, api_end_script_tick, api_actor_handles,
 };
 
 }  // namespace

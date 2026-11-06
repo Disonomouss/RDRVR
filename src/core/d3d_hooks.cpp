@@ -604,6 +604,54 @@ std::atomic<RtvSubstFn> g_rtv_subst2{nullptr};  // ([Stereo] PrepassEye2Velocity
 std::atomic<FrameSizeFn> g_frame_size{nullptr};
 std::atomic<bool> g_present_unsynced{false};
 std::atomic<uint64_t> g_unsynced_presents{0};
+// 2026-11-05 (the user: "cutscenes have been low fps"; the other PC's 3D cutscenes held at 60.1 Hz with Present itself
+// blocking 9.4 ms a frame, gameplay at 90 Hz with 0.14 ms): what the game asks of Present, for the cutscene log; and
+// [XR] PacingTearing (off; the simulator: the game asks for vsync on every frame, in play too, and in October's logs the
+// other PC held 90 Hz in play with the interval taken off and no flag, so this may not be its cause; the log decides):
+// with the game's sync interval taken off, the tearing flag added, so a windowed swap chain is not
+// held to the desktop monitor's refresh. Only the game's swap chain (state::swapchain: an overlay's own Presents are
+// left alone), made with ALLOW_TEARING and not in full screen (checked once per swap chain and after each
+// ResizeBuffers); a Present that refuses it is made again without, and the flag not added again until ResizeBuffers.
+std::atomic<uint32_t> g_game_present{0xffffffffu};  // the game's last Present: sync interval << 16 | its flags' low 16 bits
+std::atomic<uint64_t> g_tearing_added{0};
+std::atomic<int> g_tearing_ok{-1};  // -1 not checked, 0 no, 1 yes
+std::atomic<bool> g_tearing_cfg{false};
+IDXGISwapChain* g_tearing_sc = nullptr;  // (the presenting thread's)
+
+bool tearing_allowed(IDXGISwapChain* sc) {
+    if (!g_tearing_cfg.load(std::memory_order_relaxed)) return false;
+    int ok = g_tearing_ok.load(std::memory_order_relaxed);
+    if (ok >= 0 && sc == g_tearing_sc) return ok == 1;
+    g_tearing_sc = sc;
+    DXGI_SWAP_CHAIN_DESC d{};
+    BOOL full = FALSE;
+    const bool flag = SUCCEEDED(sc->GetDesc(&d)) && (d.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+    const bool windowed = SUCCEEDED(sc->GetFullscreenState(&full, nullptr)) && !full;
+    ok = flag && windowed ? 1 : 0;
+    g_tearing_ok.store(ok, std::memory_order_relaxed);
+    log::info("[d3d] the tearing flag with the game's vsync taken off: %s (the swap chain %s ALLOW_TEARING, %s)", ok ? "yes" : "no",
+              flag ? "made with" : "without", windowed ? "windowed" : "full screen");
+    return ok == 1;
+}
+
+// The game's sync interval taken off ([XR] Pacing) and the tearing flag added; true when the flag was added
+bool unsync(IDXGISwapChain* sc, UINT& sync, UINT& flags) {
+    const bool game = sc == state::swapchain.load(std::memory_order_relaxed);
+    if (game) g_game_present.store(sync << 16 | (flags & 0xffffu), std::memory_order_relaxed);
+    if (!sync || !g_present_unsynced.load(std::memory_order_relaxed)) return false;
+    sync = 0;
+    g_unsynced_presents.fetch_add(1, std::memory_order_relaxed);
+    if (!game || (flags & DXGI_PRESENT_ALLOW_TEARING) || !tearing_allowed(sc)) return false;
+    flags |= DXGI_PRESENT_ALLOW_TEARING;
+    g_tearing_added.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void tearing_refused(HRESULT hr) {
+    g_tearing_ok.store(0, std::memory_order_relaxed);  // (until ResizeBuffers checks again: a switch to full screen)
+    log::limited("d3d.tearing.refused", 8, "[d3d] Present refused the tearing flag (%#lx): made again without it, not added again until "
+                 "the next ResizeBuffers", static_cast<unsigned long>(hr));
+}
 
 void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts,
                                              BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
@@ -1629,12 +1677,13 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT flags) 
     t_presenting = sc;
     on_frame_end();
     t_presenting = nullptr;
-    if (sync && g_present_unsynced.load(std::memory_order_relaxed)) {
-        sync = 0;
-        g_unsynced_presents.fetch_add(1, std::memory_order_relaxed);
-    }
+    const bool tear = unsync(sc, sync, flags);
     const double t1 = probe ? log::now_ms() : 0;
     HRESULT hr = o_Present(sc, sync, flags);
+    if (tear && hr == DXGI_ERROR_INVALID_CALL) {
+        tearing_refused(hr);
+        hr = o_Present(sc, sync, flags & ~DXGI_PRESENT_ALLOW_TEARING);
+    }
     if (probe) probe_present(t0, t1);
     after_present(hr);
     --t_in_present;
@@ -1649,12 +1698,13 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags
     t_presenting = sc;
     on_frame_end();
     t_presenting = nullptr;
-    if (sync && g_present_unsynced.load(std::memory_order_relaxed)) {
-        sync = 0;
-        g_unsynced_presents.fetch_add(1, std::memory_order_relaxed);
-    }
+    const bool tear = unsync(sc, sync, flags);
     const double t1 = probe ? log::now_ms() : 0;
     HRESULT hr = o_Present1(sc, sync, flags, p);
+    if (tear && hr == DXGI_ERROR_INVALID_CALL) {
+        tearing_refused(hr);
+        hr = o_Present1(sc, sync, flags & ~DXGI_PRESENT_ALLOW_TEARING, p);
+    }
     if (probe) probe_present(t0, t1);
     after_present(hr);
     --t_in_present;
@@ -1674,6 +1724,7 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* sc, UINT count, UINT 
     if (FrameSizeFn fs = g_frame_size.load(std::memory_order_acquire)) fs("ResizeBuffers", w, h);
     HRESULT hr = o_ResizeBuffers(sc, count, w, h, f, flags);
     if (SUCCEEDED(hr)) {
+        g_tearing_ok.store(-1, std::memory_order_relaxed);  // ([XR] PacingTearing) checked again: full screen or windowed, the flags
         DXGI_SWAP_CHAIN_DESC d{};
         if (SUCCEEDED(sc->GetDesc(&d))) {
             state::swap_width = d.BufferDesc.Width;
@@ -2233,8 +2284,15 @@ void set_rtv_substitute(RtvSubstFn fn) { g_rtv_subst = fn; }
 void set_rtv_substitute2(RtvSubstFn fn) { g_rtv_subst2 = fn; }
 
 void set_present_unsynced(bool on) {
+    if (on) g_tearing_cfg = config::get_bool("XR", "PacingTearing", false);
     if (g_present_unsynced.exchange(on) != on)
         log::info("[d3d] Present sync interval: %s", on ? "0 (paced by the XR frame loop)" : "the game's");
+}
+
+void game_present_state(uint32_t* last, uint64_t* unsynced, uint64_t* tearing_added) {
+    *last = g_game_present.load(std::memory_order_relaxed);
+    *unsynced = g_unsynced_presents.load(std::memory_order_relaxed);
+    *tearing_added = g_tearing_added.load(std::memory_order_relaxed);
 }
 
 void set_bind_tap(int slot, BindTapFn fn) {

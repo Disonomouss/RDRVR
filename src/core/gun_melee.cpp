@@ -105,9 +105,11 @@ void init() {
     g_speed = speed;
     g_arm = clampf(config::get_float("Gestures", "GunMeleeArm", 1.2f), 0.9f, speed, 1.2f);
     g_by_peak = config::get_bool("Gestures", "GunMeleeByPeak", true);
-    g_damage = clampf(config::get_float("Gestures", "GunMeleeDamage", 10.0f), 0.1f, 1000.0f, 10.0f);
+    g_damage = clampf(config::get_float("Gestures", "GunMeleeDamage", 50.0f), 0.1f, 1000.0f, 50.0f);  // (2026-11-05, the user: 50)
     g_heavy = clampf(config::get_float("Gestures", "GunMeleeHeavy", 6.0f), speed + 0.1f, 30.0f, 6.0f);
-    g_force = clampf(config::get_float("Gestures", "GunMeleeForce", 1.0f), 0.0f, 50.0f, 1.0f);
+    // (2026-11-05, the user: "can we add a force scale for the melee. It would be good if we could knock npcs over") up to
+    // eight punches' push (the game's punch: 75, its [[M+0x10]+0xd4], the "calibration" line)
+    g_force = clampf(config::get_float("Gestures", "GunMeleeForce", 1.0f), 0.0f, 8.0f * kPunchForce, 1.0f);
     g_stock = clampf(config::get_float("Gestures", "GunMeleeStockLen", 0.40f), 0.10f, 1.0f, 0.40f);
     log::info("[gunmelee] the gun-butt melee %d (dry run %d): a hit from %.1f m/s %s (scans from %.1f), damage %.1f doubling by %.1f m/s, %s, "
               "force %.2f, the stock %.2f m",
@@ -124,6 +126,25 @@ Config config() {
 }
 void set_by_peak(bool on) {
     if (g_by_peak.exchange(on) != on) log::info("[gunmelee] a hit judged %s (the session)", on ? "at the swing's peak" : "at contact");
+}
+void set_damage(float d, bool save) {
+    d = std::isfinite(d) ? (d < 0.1f ? 0.1f : d > 1000.0f ? 1000.0f : d) : 10.0f;
+    if (g_damage.exchange(d) != d) log::info("[gunmelee] the hit's damage %.1f at the hit speed (%s)", d, save ? "saved" : "the session");
+    if (save) {
+        char v[16];
+        std::snprintf(v, sizeof(v), "%.1f", d);
+        config::set("Gestures", "GunMeleeDamage", v);
+    }
+}
+void set_force(float f, bool save) {
+    f = std::isfinite(f) ? (f < 0.0f ? 0.0f : f > 8.0f * kPunchForce ? 8.0f * kPunchForce : f) : 1.0f;
+    if (g_force.exchange(f) != f)
+        log::info("[gunmelee] the hit's push %.1f (%.2f of a punch; %s)", f, f / kPunchForce, save ? "saved" : "the session");
+    if (save) {
+        char v[16];
+        std::snprintf(v, sizeof(v), "%.1f", f);
+        config::set("Gestures", "GunMeleeForce", v);
+    }
 }
 void set_speed(float mps, bool save) {
     mps = mps < 1.0f ? 1.0f : mps > 6.0f ? 6.0f : mps;
@@ -162,6 +183,32 @@ int zone_of(const char* b) {
     if (pre("arm") || pre("elbow") || pre("wrist")) return left ? 5 : 6;
     if (pre("pelvis") || pre("hip") || pre("knee") || pre("ankle")) return left ? 7 : 8;
     return 1;
+}
+
+// (2026-11-05, round 86 check 10: every swing at townspeople "actors within 2 m: 0": the layout iterators never see the
+// towns' people) every live actor's handle, from the objects pool itself: its allocator (FUN_14058b830; made by
+// FUN_1402df1a0 with 0x1790 slots) +0 the slot count, +8 the slots (ObjectsPool's, checked); a slot in use has +0xa 0.
+// A handle is passed only as the natives check one (the slot's generation, an object) and more: the object's own
+// handle (+0x18, FUN_1402def90's) the one made, an actor (type 15 at +0x2c) whose actor-pool slot resolves.
+int actor_handles(uint32_t* out, int cap) {
+    uintptr_t alloc = 0, slots = 0, pool = 0;
+    uint16_t count = 0;
+    if (!out || cap <= 0 || anchors::stand_down() || !api::in_script_tick() || !rd(anchors::addr(anchors::Id::ObjectsAlloc), &alloc) || !alloc ||
+        !rd(alloc, &count) || !rd(alloc + 8, &slots) || !slots || !rd(anchors::addr(anchors::Id::ObjectsPool), &pool) || slots != pool)
+        return -1;
+    int n = 0;
+    for (uint32_t i = 0; i < count && n < cap; ++i) {
+        const uintptr_t slot = slots + static_cast<uintptr_t>(i) * 0x10;
+        uintptr_t obj = 0;
+        uint16_t gen = 0, free = 1;
+        uint32_t own = 0;
+        uint8_t type = 0;
+        if (!rd(slot + 0xa, &free) || free || !rd(slot, &obj) || !obj || !rd(slot + 8, &gen)) continue;
+        const uint32_t h = i | static_cast<uint32_t>(gen) << 16;
+        if (!rd(obj + 0x18, &own) || own != h || !rd(obj + 0x2c, &type) || type != 0x0f || !actor_of(h)) continue;
+        out[n++] = h;
+    }
+    return n;
 }
 
 int hit(const RdrvrMeleeHit* h) {

@@ -62,6 +62,7 @@ add_library(rdrvr_core SHARED
     src/core/pass2_skip.cpp
     src/core/fcensus.cpp
     src/core/frame_probe.cpp
+    src/core/cut_log.cpp
     src/core/playback.cpp
     src/core/playback_head.asm
     src/core/render_settings.cpp
