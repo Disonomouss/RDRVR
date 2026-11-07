@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.13 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.13.1 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -436,6 +436,15 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
     (seen to work in the developer's Quest 3; not yet a menu row).
   - The radar cut-out's arrows (the Display tab, under "What goes to the wrist") and a button that saves a picture of
     the HUD, for a piece of the radar's ring left on the floating screen.
+- 0.8.13.1, a hotfix (your settings are kept; no reset):
+  - Fixed (a player's report on SteamVR with a Pimax Dream Air; tried in the developer's simulator with the refusals
+    made up, not yet on a headset that refuses them): the headset froze on its last picture while the wrist HUD was in
+    view with a gun in hand, or with the menu open. SteamVR refused every frame that had that many flat pictures over
+    the scene (the floating screen, the wrist HUD, the reticle, the menu), though it says it takes more. After three
+    refused frames in a row the mod now sends one picture fewer, the least needed left out first (the reticle and the
+    rings, then the floating screen, then the wrist HUD, the menu last); the scope's pictures, the weapon wheel and Dead
+    Eye's are always kept. Every 30 seconds it tries one more again, which can show as a brief stutter on such a
+    headset. The log (RDRVR.log) says which pictures were refused.
 
 ## Requirements
 
@@ -453,7 +462,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.13.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.13.1.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to

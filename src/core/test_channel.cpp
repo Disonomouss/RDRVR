@@ -710,7 +710,9 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "hud") {  // hud wrist|quad (writes the user ini) | hud shape rect|radar|half (the session) | hud nudge <right%> <down%> <size%> (the session)
         if (t.size() >= 3 && t[1] == "shape") xr::hud_shape_test(t[2] == "rect" ? 0 : t[2] == "half" ? 2 : 1);
-        else if (t.size() >= 2 && (t[1] == "nudge" || t[1] == "shape")) {  // (too few values: the status only, never the wrist switch)
+        else if (t.size() >= 3 && t[1] == "refuse") xr::refuse_test(std::atoi(t[2].c_str()));  // (2026-11-08, the test's)
+        else if (t.size() >= 2 && t[1] == "refuse") {
+        } else if (t.size() >= 2 && (t[1] == "nudge" || t[1] == "shape")) {  // (too few values: the status only, never the wrist switch)
             if (t.size() >= 5 && t[1] == "nudge") xr::set_hud_radar_nudge(std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr), false);
         } else if (t.size() >= 2) xr::set_hud_on_wrist(t[1] == "wrist");
         char st[512];
