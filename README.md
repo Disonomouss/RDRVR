@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.13.1 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.13.2 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -445,6 +445,19 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
     rings, then the floating screen, then the wrist HUD, the menu last); the scope's pictures, the weapon wheel and Dead
     Eye's are always kept. Every 30 seconds it tries one more again, which can show as a brief stutter on such a
     headset. The log (RDRVR.log) says which pictures were refused.
+- 0.8.13.2, a hotfix (your settings are kept; no reset):
+  - Fixed, again (the same player's new log: 0.8.13.1's fix did not help; SteamVR refused the frames even with only
+    the wrist HUD over the scene): after three refused frames in a row the mod now finds which picture SteamVR refuses
+    and leaves that one out. It tries one kind at a time, the one that just appeared first (the reticle and the
+    rings, the floating screen, the wrist HUD; the menu is never left out), keeping the one whose frames are refused
+    without it. While the wrist HUD is left out, the HUD shows in the floating screen's corner as it does without the
+    wrist HUD, and holding Y at the wrist does not open the menu (hold the menu button). After 30 seconds the mod
+    tries it once more; refused again, it stays out until the game is restarted. The search can show as a short
+    stutter. RDRVR.log says which picture was found ("the runtime refuses the ..."): please attach it to an issue if
+    the freeze is still there.
+  - Tried in the developer's simulator with the refusals made up, and on SteamVR itself (no headset): SteamVR took
+    the wrist HUD's frames there, with a gun in hand and with the menu open, and nothing was left out. Not yet tried
+    on a headset that refuses them.
 
 ## Requirements
 
@@ -462,7 +475,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.13.1.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.13.2.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to

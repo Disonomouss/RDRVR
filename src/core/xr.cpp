@@ -851,19 +851,32 @@ uint32_t g_ui_tw = 0, g_ui_th = 0;  // the UI target (the frame's size), drawn i
 std::atomic<uint32_t> g_max_layers{16};  // XrSystemGraphicsProperties::maxLayerCount
 // (2026-11-08, a player on 0.8.13: SteamVR 2.19.2 on a Pimax Dream Air "will freeze until I stop looking at the hud" with
 // a gun in hand, and in the menu while looking at the wrist HUD; their log: every xrEndFrame of those frames
-// XR_ERROR_RUNTIME_FAILURE, the headset left on its last picture, though the runtime says it takes 16 layers) the quads
-// over the scene the runtime has refused: after three refused frames in a row, the fewest of them n, no more than n - 1
-// a frame, the least needed left out first (rank_layer); every 30 s one more tried again (a passing refusal does not
-// keep it); a frame refused with one quad: not their number, the cap off for the session. Each session starts with none
-// (the review: also the scope's pictures, the hand's wheel and Dead Eye's X never left out: their eye faded or their
-// place cut from the floating UI already). Presenting thread
-constexpr uint32_t kNoQuadCap = 99;
-std::atomic<uint32_t> g_quad_cap{kNoQuadCap};
-uint32_t g_refused_run = 0, g_refused_min = 0;  // the refused frames in a row, and the fewest quads of them
-std::atomic<bool> g_quad_cap_off{false};        // (refused with one quad: the cap not the cure)
-double g_quad_cap_ms = 0;                       // the cap's last change
-std::atomic<uint64_t> g_quads_left_out{0};      // the quads left out by the cap so far
-std::atomic<int> g_refuse_test{0};              // "hud refuse <n>" (the test's): a frame with n quads or more taken as refused
+// XR_ERROR_RUNTIME_FAILURE, the headset left on its last picture, though the runtime says it takes 16 layers. 0.8.13.1
+// capped the number of quads: their next log refused the wrist HUD alone, the quad that had just appeared, so not their
+// number) the kind of quad the runtime refuses (rank_layer: 1 the menu, 2 the wrist HUD, 3 the floating UI, 4 the
+// reticles, rings and highlights; 0 never left out), found by leaving out one kind at a time: after three refused frames
+// in a row, a kind new since the last frame it took first, then the least needed; never the menu (the review: left out,
+// it is worked unseen). The kind whose absence lets the same frame through is put back once to make sure (the review: a
+// passing refusal right after a menu opened blamed it): refused again, it stays out (the wrist HUD's: the HUD back on the
+// floating UI meanwhile), put back once more after 30 s and out for the session if refused again; taken with it for 90
+// frames, it is cleared. Each session starts with none. Presenting thread
+constexpr const char* kKindName[5] = {"scope picture/hand's wheel/Dead Eye", "menu", "wrist HUD", "floating UI", "reticle/ring/highlight"};
+std::atomic<uint32_t> g_out_kinds{0};       // the kinds left out now (1 << kind)
+uint32_t g_ok_kinds = 0;                    // the kinds in the last frame the runtime took
+uint32_t g_refused_run = 0;                 // the refused frames in a row
+int g_trial = 0;                            // the kind left out to try (0 none)
+uint32_t g_trial_rest = 0;                  // the other kinds of the refused frame it was tried on
+uint32_t g_tried = 0;                       // the kinds tried in this search
+bool g_no_cause = false;                    // every kind tried in vain: no more tries until a frame is taken
+int g_suspect = 0;                          // the kind put back to make sure (0 none)
+uint32_t g_suspect_ok = 0;                  // the frames taken with it since
+uint32_t g_found = 0, g_put_back = 0;       // the kinds found refused; those put back once
+double g_found_ms = 0;
+std::atomic<bool> g_refusals_reset{false};  // a new session or "hud refuse 0": all of it anew
+std::atomic<uint64_t> g_quads_left_out{0};  // the quads left out so far
+// "hud refuse <n>|menu|wrist|ui|marks" (the test's): a frame with n quads or more (n > 0), or with a quad of the kind -n,
+// taken as refused
+std::atomic<int> g_refuse_test{0};
 std::atomic<bool> g_hud_wrist{false};
 float g_hud_rect[4] = {0.02f, 0.60f, 0.34f, 0.96f};  // (2026-10-26: top 0.63 cut the ammo counter's top, at 0.625)
 // [XR] WristHudShape (2026-10-26): radar (the default): the wrist takes only the radar's ellipse ([XR] WristHudRadar:
@@ -886,6 +899,7 @@ uint32_t g_wr_w = 0, g_wr_h = 0;     // its swapchain: the crop at the UI quad's
 bool g_wr_failed = false, g_wr_shown = false;
 std::atomic<bool> g_wr_visible{false};  // g_wr_shown for other threads (false while the HUD cannot show)
 std::atomic<float> g_wr_up[3] = {0.0f, 0.0f, 0.0f};  // the last shown frame's image top (test status)
+std::atomic<float> g_wr_eye[6] = {};                   // (2026-11-08) the eyes' middle and the gaze, as the wrist HUD last saw them (test status)
 std::atomic<uint64_t> g_wr_frames{0}, g_wr_hidden{0};
 bool g_ui_failed = false;
 float g_ui_yaw = 0;
@@ -1184,7 +1198,7 @@ bool fill_ui(XrCompositionLayerQuad& quad) {
     wsi.timeout = 100000000;
     if (XR_FAILED(xrAcquireSwapchainImage(g_ui_sc, &ai, &index))) return false;
     // with the HUD on the wrist, its corner is left out here (the prompts stay; in the UI target's pixels)
-    const bool wrist = g_hud_wrist.load(std::memory_order_relaxed) && g_wr_sc != XR_NULL_HANDLE;
+    const bool wrist = g_hud_wrist.load(std::memory_order_relaxed) && g_wr_sc != XR_NULL_HANDLE && !(g_out_kinds.load(std::memory_order_relaxed) & 4u);
     const int hole[4] = {g_wr_x0, g_wr_y0, g_wr_x0 + static_cast<int>(g_wr_cw), g_wr_y0 + static_cast<int>(g_wr_ch)};
     const int hole2[4] = {g_wh_x0, g_wh_y0, g_wh_x0 + static_cast<int>(g_wh_cw), g_wh_y0 + static_cast<int>(g_wh_ch)};  // the hand's wheel
     int band[4];
@@ -1365,7 +1379,8 @@ XrQuaternionf quat_from_axes(const float x[3], const float y[3], const float z[3
 // down), read upright from the eyes, only while the head looks at it and it faces them (on within 30 degrees of the
 // gaze, off past 40).
 bool fill_wrist(XrCompositionLayerQuad& quad) {
-    if (!g_hud_wrist.load(std::memory_order_relaxed) || !ui_layer::has_ui() || !make_wrist_swapchain()) {
+    if (!g_hud_wrist.load(std::memory_order_relaxed) || !ui_layer::has_ui() || (g_out_kinds.load(std::memory_order_relaxed) & 4u) ||
+        !make_wrist_swapchain()) {  // (2026-11-08: left out, the runtime refusing it: the HUD on the floating UI)
         g_wr_visible.store(false, std::memory_order_relaxed);
         return false;
     }
@@ -1393,6 +1408,7 @@ bool fill_wrist(XrCompositionLayerQuad& quad) {
     const float mz[3] = {0, 0, -1};
     float gaze[3], to[3];
     qrot(v0.orientation, mz, gaze);
+    for (int k = 0; k < 3; ++k) g_wr_eye[k].store(eye[k], std::memory_order_relaxed), g_wr_eye[3 + k].store(gaze[k], std::memory_order_relaxed);
     for (int k = 0; k < 3; ++k) to[k] = pos[k] - eye[k];
     const float tl = std::sqrt(to[0] * to[0] + to[1] * to[1] + to[2] * to[2]);
     if (tl < 1e-3f) return false;
@@ -1699,30 +1715,57 @@ void end_open_frame(bool presenting = false) {
         if (v == &ui_quad) return 3;
         return 4;
     };
-    if (!cinema && g_quad_cap < kNoQuadCap && log::now_ms() - g_quad_cap_ms > 30000.0) {  // one more tried again
-        g_quad_cap = g_quad_cap + 1;
-        g_quad_cap_ms = log::now_ms();
-    }
-    if (!cinema && nlayers > 1 + g_quad_cap) {
-        uint32_t keep = 1;
-        int cut_rank = 1;  // the ranks kept whole below it, and of it as many as fit (room)
-        uint32_t n0 = 0;
-        for (uint32_t i = 1; i < nlayers; ++i) n0 += rank_layer(layers[i]) == 0 ? 1u : 0u;
-        uint32_t room = g_quad_cap > n0 ? g_quad_cap - n0 : 0u;
-        for (; cut_rank <= 4; ++cut_rank) {
-            uint32_t n = 0;
-            for (uint32_t i = 1; i < nlayers; ++i) n += rank_layer(layers[i]) == cut_rank ? 1u : 0u;
-            if (n > room) break;
-            room -= n;
+    // the frame's quads for the log: their kind, size, place and turn (|q|: its length), flags
+    auto describe = [&](const XrCompositionLayerBaseHeader* const* ls, uint32_t n) {
+        std::string what;
+        for (uint32_t i = 1; i < n; ++i) {
+            const auto* h = ls[i];
+            char b[256];
+            if (h->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                const auto* qd = reinterpret_cast<const XrCompositionLayerQuad*>(h);
+                const XrQuaternionf& o = qd->pose.orientation;
+                std::snprintf(b, sizeof(b), "%s%s (%dx%d at %d,%d, %.3fx%.3f m at (%.2f %.2f %.2f), |q| %.6f, flags 0x%llx, eyes %d%s)", i > 1 ? "; " : "",
+                              kKindName[rank_layer(h)], qd->subImage.imageRect.extent.width, qd->subImage.imageRect.extent.height,
+                              qd->subImage.imageRect.offset.x, qd->subImage.imageRect.offset.y, qd->size.width, qd->size.height, qd->pose.position.x,
+                              qd->pose.position.y, qd->pose.position.z, std::sqrt(o.x * o.x + o.y * o.y + o.z * o.z + o.w * o.w),
+                              static_cast<unsigned long long>(qd->layerFlags), static_cast<int>(qd->eyeVisibility), qd->space == g_space ? "" : ", another space");
+            } else {
+                std::snprintf(b, sizeof(b), "%s%s (layer type %d)", i > 1 ? "; " : "", kKindName[rank_layer(h)], static_cast<int>(h->type));
+            }
+            what += b;
         }
+        return what;
+    };
+    if (g_refusals_reset.exchange(false)) {
+        g_out_kinds = 0;
+        g_ok_kinds = g_refused_run = g_tried = g_found = g_put_back = g_trial_rest = 0;
+        g_trial = g_suspect = 0;
+        g_suspect_ok = 0;
+        g_no_cause = false;
+    }
+    uint32_t kinds = 0;  // the kinds sent (1 << kind, 1 to 4)
+    if (!cinema) {
+        const uint32_t back = g_found & ~g_put_back & g_out_kinds.load(std::memory_order_relaxed);
+        if (back && !g_trial && log::now_ms() - g_found_ms > 30000.0) {  // a kind found refused put back once
+            g_out_kinds.fetch_and(~back);
+            g_put_back |= back;
+            for (int k = 1; k <= 4; ++k)
+                if (back >> k & 1u) {
+                    g_suspect = k;  // (refused again: out at once)
+                    g_suspect_ok = 0;
+                    log::info("[xr] the %s put back (the runtime refused it 30 s ago; out for the session if refused again)", kKindName[k]);
+                }
+        }
+        const uint32_t out = g_out_kinds.load(std::memory_order_relaxed);
+        uint32_t keep = 1;
         for (uint32_t i = 1; i < nlayers; ++i) {
             const int rk = rank_layer(layers[i]);
-            if (rk == 0 || rk < cut_rank || (rk == cut_rank && room > 0)) {
-                if (rk == cut_rank) --room;
-                layers[keep++] = layers[i];
-            } else {
+            if (rk > 0 && (out >> rk & 1u)) {
                 ++g_quads_left_out;
+                continue;
             }
+            if (rk > 0) kinds |= 1u << rk;
+            layers[keep++] = layers[i];
         }
         nlayers = keep;
     }
@@ -1734,45 +1777,72 @@ void end_open_frame(bool presenting = false) {
     if (cinema) g_cinema_frames.fetch_add(1, std::memory_order_relaxed);
     if (!cinema && full) controllers::submit_probe(g_space, ei.displayTime);  // [handlag]: how late the drawn hands are
     XrResult r = pso::as_own([&] { return xrEndFrame(g_session, &ei); });
+    if (ei.layerCount <= 1) kinds = 0;  // (no quads went in)
     if (const int rt = g_refuse_test.load(std::memory_order_relaxed);
-        rt > 0 && XR_SUCCEEDED(r) && !cinema && ei.layerCount > 1 && ei.layerCount - 1 >= static_cast<uint32_t>(rt))
+        XR_SUCCEEDED(r) && !cinema && ei.layerCount > 1 &&
+        ((rt > 0 && ei.layerCount - 1 >= static_cast<uint32_t>(rt)) || (rt < 0 && rt >= -4 && (kinds >> -rt & 1u))))
         r = XR_ERROR_RUNTIME_FAILURE;  // (the test's refusal: the frame itself went in)
     if (XR_FAILED(r)) log::limited("xr.endframe", 8, "[xr] xrEndFrame -> %s", result_name(g_inst, r));
-    {  // (2026-11-08) a frame refused with quads over the scene: three in a row, a quad fewer than their fewest
+    {  // (2026-11-08) a frame refused with quads over the scene: three in a row, one kind left out to try
         const uint32_t quads = !cinema && ei.layerCount > 1 ? ei.layerCount - 1 : 0;
-        if (r == XR_ERROR_RUNTIME_FAILURE && quads == 1 && g_quad_cap < kNoQuadCap && !g_quad_cap_off) {
-            g_quad_cap_off = true;  // (one quad refused too: some other cause; never lowered again this session)
-            g_quad_cap = kNoQuadCap;
-            log::warn("[xr] the runtime refused a frame with one quad over the scene too: their number is not the cause (no cap from now on)");
-        }
-        if (r == XR_ERROR_RUNTIME_FAILURE && quads >= 2 && !g_quad_cap_off) {
-            g_refused_min = g_refused_run ? std::min(g_refused_min, quads) : quads;
-            ++g_refused_run;
-            if (g_refused_run == 1) {
-                static const char* const kName[5] = {"scope picture/hand's wheel/Dead Eye", "menu", "wrist HUD", "floating UI", "reticle/ring/highlight"};
-                std::string what;
-                for (uint32_t i = 1; i < ei.layerCount; ++i) {
-                    const auto* h = ei.layers[i];
-                    what += std::string(i > 1 ? ", " : "") + kName[rank_layer(h)];
-                    if (h->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
-                        const auto* qd = reinterpret_cast<const XrCompositionLayerQuad*>(h);
-                        char b[64];
-                        std::snprintf(b, sizeof(b), " (%dx%d)", qd->subImage.imageRect.extent.width, qd->subImage.imageRect.extent.height);
-                        what += b;
-                    }
-                }
-                log::limited("xr.refused", 8, "[xr] the runtime refused a frame with %u quads over the scene: %s", quads, what.c_str());
-            }
-            if (g_refused_run >= 3) {
-                if (g_refused_min - 1 < g_quad_cap)
-                    log::limited("xr.quadcap", 8, "[xr] the runtime refuses frames with %u quads over the scene: at most %u now (the least needed left out first)",
-                                 g_refused_min, g_refused_min - 1);
-                g_quad_cap = std::min(g_quad_cap.load(), g_refused_min - 1);
-                g_quad_cap_ms = log::now_ms();
+        if (r == XR_ERROR_RUNTIME_FAILURE && quads >= 1) {
+            if (++g_refused_run == 1)
+                log::limited("xr.refused", 12, "[xr] the runtime refused a frame with %u quads over the scene: %s", quads, describe(ei.layers, ei.layerCount).c_str());
+            if (g_refused_run >= 3 && g_suspect && (kinds >> g_suspect & 1u)) {  // put back to make sure, refused again: its cause
                 g_refused_run = 0;
+                const uint32_t bk = 1u << g_suspect;
+                const bool again = (g_put_back & bk) != 0;
+                g_found |= bk;
+                g_out_kinds.fetch_or(bk);
+                g_found_ms = log::now_ms();
+                log::limited("xr.found", 8, "[xr] the runtime refuses the %s: left out %s%s", kKindName[g_suspect],
+                             again ? "for the session (refused again once put back)" : "(put back once in 30 s)",
+                             g_suspect == 2 ? "; the HUD on the floating UI meanwhile" : "");
+                g_suspect = 0;
+                g_tried = 0;
+            } else if (g_refused_run >= 3 && !g_no_cause) {
+                g_refused_run = 0;
+                if (g_trial) {  // its absence did not help: back in
+                    g_out_kinds.fetch_and(~(1u << g_trial));
+                    log::limited("xr.trial", 24, "[xr] refused without the %s too: it is back", kKindName[g_trial]);
+                    g_trial = 0;
+                }
+                const uint32_t cand = kinds & ~g_tried & ~2u, fresh = cand & ~g_ok_kinds, from = fresh ? fresh : cand;  // (never the menu)
+                if (from) {  // the least needed of them (the highest kind)
+                    int k = 4;
+                    while (!(from >> k & 1u)) --k;
+                    g_trial = k;
+                    g_trial_rest = kinds & ~(1u << k);
+                    g_tried |= 1u << k;
+                    g_out_kinds.fetch_or(1u << k);
+                    log::limited("xr.trial", 24, "[xr] the runtime refuses frames with %u quads over the scene: the %s left out to try%s", quads,
+                                 kKindName[k], fresh ? " (new since the last frame it took)" : "");
+                } else if (g_tried) {
+                    log::limited("xr.nocause", 4, "[xr] the runtime refuses frames whichever kind of quad is left out: not one of them the cause");
+                    g_tried = 0;
+                    g_no_cause = true;
+                }
             }
         } else if (XR_SUCCEEDED(r)) {
             g_refused_run = 0;
+            g_no_cause = false;
+            const bool sent = !cinema && ei.layerCount > 1;  // (the review: only a frame with quads judges a trial)
+            if (g_trial && sent) {
+                const uint32_t bt = 1u << g_trial;
+                g_out_kinds.fetch_and(~bt);  // back in either way: to make sure, or not shown to be it
+                if ((kinds & g_trial_rest) == g_trial_rest) {  // the same frame but the kind: put back to make sure
+                    g_suspect = g_trial;
+                    g_suspect_ok = 0;
+                    log::limited("xr.suspect", 12, "[xr] the runtime takes the frames without the %s: put back to make sure", kKindName[g_trial]);
+                }
+                g_trial = 0;
+            }
+            if (!g_trial) g_tried = 0;
+            if (g_suspect && sent && (kinds >> g_suspect & 1u) && ++g_suspect_ok >= 90) {
+                log::limited("xr.suspect", 12, "[xr] the runtime takes the frames with the %s back in: a passing refusal", kKindName[g_suspect]);
+                g_suspect = 0;
+            }
+            if (!cinema && ei.layerCount > 0) g_ok_kinds = kinds;
         }
     }
     if (g_open_ms > 0) {  // the timing window: how long this XR frame was open, and its wait
@@ -2285,8 +2355,7 @@ DWORD WINAPI session_thread(void*) {
         blend = modes[0];
     g_inst = inst;
     g_session = session;
-    g_quad_cap = kNoQuadCap;  // (2026-11-08, the review) the refusals' cap learned anew each session
-    g_quad_cap_off = false;
+    g_refusals_reset = true;  // (2026-11-08, the review) the refused kinds learned anew each session
     g_blend = blend;
     if (g_rr_ext) {  // the headset's refresh rates (XR_FB_display_refresh_rate)
         xrGetInstanceProcAddr(inst, "xrEnumerateDisplayRefreshRatesFB", reinterpret_cast<PFN_xrVoidFunction*>(&g_rr_enum));
@@ -2528,14 +2597,15 @@ void hud_status(char* out, size_t len) {
                   g_hud_nudge[2].load(), g_wr_w, g_wr_h, g_wr_x0, g_wr_y0, static_cast<unsigned long long>(g_wr_frames.load()),
                   static_cast<unsigned long long>(g_wr_hidden.load()), g_wr_shown ? "shown" : "hidden", g_wr_up[0].load(), g_wr_up[1].load(),
                   g_wr_up[2].load(), g_wh_w, g_wh_h, g_wh_x0, g_wh_y0, static_cast<unsigned long long>(g_wh_frames.load()));
-    const size_t n = std::strlen(out);  // (2026-11-08) the refusals' cap
+    const size_t n = std::strlen(out);  // (2026-11-08) the refused kinds
     if (n < len)
-        std::snprintf(out + n, len - n, " | quads over the scene at most %u (left out %llu; the test refuses %d and over)", g_quad_cap.load(),
-                      static_cast<unsigned long long>(g_quads_left_out.load()), g_refuse_test.load());
+        std::snprintf(out + n, len - n, " | the kinds left out 0x%x (quads left out %llu; the test refuses %d) | eyes (%.3f %.3f %.3f) gaze (%.3f %.3f %.3f)",
+                      g_out_kinds.load(), static_cast<unsigned long long>(g_quads_left_out.load()), g_refuse_test.load(), g_wr_eye[0].load(),
+                      g_wr_eye[1].load(), g_wr_eye[2].load(), g_wr_eye[3].load(), g_wr_eye[4].load(), g_wr_eye[5].load());
 }
-void refuse_test(int quads) {  // "hud refuse <n>" (the session; 0 off; also the cap back to none)
-    g_refuse_test = quads;
-    if (quads <= 0) g_quad_cap = kNoQuadCap, g_quad_cap_off = false;
+void refuse_test(int v) {  // "hud refuse <n>|<kind>" (the session; 0 off, and the kinds left out anew)
+    g_refuse_test = v;
+    if (v == 0) g_refusals_reset = true;
 }
 void set_hud_on_wrist(bool on) {
     if (g_hud_wrist.exchange(on) != on) log::info("[xr] HUD %s", on ? "on the wrist (when you look at it)" : "on the floating quad");

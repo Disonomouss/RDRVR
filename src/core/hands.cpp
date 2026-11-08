@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <vector>
@@ -65,6 +66,10 @@ std::string command(const std::string& line) {
     d.stick[1] = v.size() > 11 ? v[11] : 0;
     d.valid = true;
     d.connected = true;
+    // (2026-11-08: the wrist HUD on SteamVR's null driver, no controllers) the grip the hand's own pose
+    std::memcpy(d.grip_pos, d.pos, sizeof(d.grip_pos));
+    std::memcpy(d.grip_rot, d.rot, sizeof(d.grip_rot));
+    d.grip_valid = true;
     ++d.updates;
     char out[200];
     std::snprintf(out, sizeof(out), "hand %s: pos (%.3f %.3f %.3f) trigger %.2f grip %.2f buttons %u stick (%.2f %.2f), update %llu",

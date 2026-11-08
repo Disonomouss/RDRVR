@@ -29,7 +29,7 @@ bool eye_views(EyeView out[2], uint64_t* xr_frame = nullptr);
 // The wrist HUD shown this frame (looked at, the palm flat; [XR] Hud=wrist). Any thread.
 bool wrist_hud_shown();
 void hud_shape_test(int mode);  // "hud shape rect|radar|half" ([XR] WristHudShape for the session; half: a test)
-void refuse_test(int quads);    // "hud refuse <n>": frames with n quads or more taken as refused by the runtime (a test; 0 off)
+void refuse_test(int v);  // "hud refuse <n>|menu|wrist|ui|marks": frames with n quads or more (v = n), or with that kind (v = -1..-4), taken as refused (a test; 0 off)
 // The same views without counting them as drawn with (the pose check): for the visibility cover.
 bool eye_views_peek(EyeView out[2]);
 // 2026-10-27 ([XR] PhysicalCrouch): the centre eye's height above the floor now (metres, the STAGE space's y), when the
