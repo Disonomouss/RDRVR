@@ -177,6 +177,7 @@ DrawTimeReset            global 0x2b24a58   # float: the countdown's reset value
 # --- G-C shots from the barrel (research\gc-aim.md, ENGINE-NOTES item 1)
 AimRay                   func   0x396b50   # (targeting, out 4x4 rows a b c d, yaw/pitch) -> out: the reticle ray from the gameplay camera
 FireTrigger              func   0x3480a0   # (player info, weapon manager): fires only while channel 0's camera is the gameplay camera
+PlayerAimUpdate          func   0x3461c0   # (player info): its aim update; tells the aim's target it is aimed at (FUN_140b1ddc0) only while the reticle's alpha (+0x410 -> +0x10) > 0
 SoftLockSelect           func   0x34ba30   # (player info, ped): stores the soft-lock tuning at T +0x57c0 (T = actor +0xb8)
 ProjectileLaunch         func   0x3237a0   # (p, mtx, type, vel, owner handle, launch pos, flags, c, f, visual offset): every gun projectile
 ProjectileSpawn          func   0x302a50   # (W, first projectile, count r8d, pellet matrices, speed [rsp+0x20], unused, no-bloom byte, seed, turret byte): one shot's projectiles; the bloom and the pellet directions (research\run3\accuracy.md)
@@ -356,4 +357,9 @@ DeadeyePosRet2           site   0x394355   8  # the return from DeadeyeMarksUi's
 DeadeyeUiRet             site   0x3947fd   8  # the return from DeadeyeMarksUi's ScreenToUi call (movss xmm0,[rbx+9Ch]: nothing volatile live)
 DeadeyeUiRet2            site   0xd076db   8  # the return from FUN_140d07680's ScreenToUi call, the duel's marks (mov rbx,[rip+..]: nothing volatile live)
 ClothDisplayWrite        func   0xa5b800   # the character cloth's display write (FUN_140a5b800, 2026-11-06): the verlet cloth's points (+0xf0) into the coat's display mesh in the bone matrix's frame; [Body] ClothPins shifts John's around it
+ActorSetDraw             func   0x673580   # FUN_140673580(actor, draw): an actor drawn or not (SET_DRAW_ACTOR and SET_DRAW_OBJECT of an actor end here; 2026-11-11): blackjack's dealer kept drawn
+NativeSetDrawObject      func   0x27c520   # SET_DRAW_OBJECT's native handler (the script's arguments at [context +0x10]: the handle, the flag at +8; 2026-11-11): blackjack's deck kept drawn
+ScriptNamedRunning       func   0x1ffa10   # (name): is a script of this name running (_IS_ANY_NAMED_SCRIPT_RUNNING's): walks the script list, its head's address in the mov at +0x23 (a node: the next +8, running +0x30, the first child +0x50, the name +0x70; 2026-11-11): which minigame's script runs
 BulletTrailFx            func   0x6b8c70   # a projectile's "BULLETTRAIL" effect made or moved (FUN_1406b8c70, its one caller the projectile's update FUN_140327140): [Hands] BulletTrails=0 skips it
+InstDrawUnskinned        func   0x87d950   # (instances, count, grmModel (+8 geometries, +0x2e their count), ?, bucket, mode): "rmcInstDrawModelUnskinned(inst: %d)": each geometry drawn from the instances' data (begin FUN_1401672d0, the geometry's draw, end FUN_1400bfa10), never DrawModelGeometry (GOAL-after-0.8.13.2 item 7, static). Non-leaf
+InstDrawSkinned          func   0x87df60   # the same for skinned models: "rmcInstDrawModelSkinned(inst: %d)" (item 7, static). Non-leaf

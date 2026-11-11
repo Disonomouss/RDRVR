@@ -13,11 +13,13 @@
 #include "core/anchors.h"
 #include "core/api.h"
 #include "core/config.h"
+#include "core/controls.h"
 #include "core/d3d_hooks.h"
 #include "core/hooks.h"
 #include "core/log.h"
 #include "core/pose.h"
 #include "core/ui_layer.h"
+#include "core/xinput.h"
 
 namespace rdrvr::deadeye {
 namespace {
@@ -120,8 +122,130 @@ void sepia_apply() {
 
 using Update_t = uintptr_t (*)(uintptr_t P, uintptr_t a2);
 Update_t o_update = nullptr;
+// (GOAL-after-0.8.13.2 item 6; the user: "Duels need to be changed too, so that up on the joystick places the Xs and
+// right trigger fires", the right stick) [DeadEye] DuelTriggerFires: in a duel's Dead Eye (player info +0x3be bit 2, set
+// by the duel's FUN_1403526d0) while it paints (R +0x20 == 2), the right trigger fires the marks placed instead of
+// placing one: on its press with a mark placed, the duel's time ends now, and the trigger's paint (on its press: +0x3b8,
+// last frame's trigger, at or under the game's threshold) is held off for the call (+0x3b8 0xff, put back after).
+// (round 116, the user: the X's and the trigger worked, "but both I and the opponent died") The first version sent the
+// game's own fire (request 3) at the press: the marks went while the duel still ran, and at its time-out the score
+// (counted from the marks, now gone) lost: the game had the opponent shoot John. The duel (FUN_140d078a0, the player's
+// duel state D = [[actor +0x38] +0xaa8] +0x20): D +0x30 the state (3 painting, 4 judged), D +0x10c the time left,
+// counted down in state 3; at its end the score D +0x108 (the marks') against D +0xd4 decides, state 4, and in duel
+// mode FUN_1403480a0 sends request 3 at state 4 itself: the marks fire as the game's own. So the press sets the time
+// left just under 0: the game judges the marks as placed, then fires them (a duel won as the game counts it). Only with
+// the marks' score at the bar (D +0x108 >= D +0xd4) and the outcome open (D +0x54 0): an early press would only lose (the
+// review); then the time runs on for more marks. The judged outcome logged after (or the time-out not held). The marks come from the paint button,
+// RB, which [Controls] FlickUpRB presses with the right stick flicked up: without it, nothing changes. In VR only.
+// Research: research/after-08132/notes.md, item 6 (static; no duel in the simulator). Off by default
+constexpr uintptr_t kTrigLast = 0x3b8;  // byte: the fire trigger as FUN_1403480a0 last read it
+constexpr uint8_t kDuelRtOn = 0x80;     // the trigger's press (half way)
+std::atomic<bool> g_duel_rt{false};
+std::atomic<uint64_t> g_duel_calls{0}, g_duel_fires{0}, g_duel_nomark{0}, g_duel_short{0}, g_duel_other{0};
+// (round 116's review) a press that ended the time: the duel's outcome logged once judged, or the end not held
+uintptr_t g_duel_ended_D = 0;
+double g_duel_ended_ms = 0.0;
+uint8_t g_duel_rt_prev = 0xff;  // (the game thread; 0xff: a held trigger at the start is no press)
+// (GOAL-doorway-and-poker item 4.5, the review: the edge was used up by whichever call saw it first, a request-2 call's
+// too: a press in the frame LT let go did nothing) the press kept 150 ms for a request-0 call in the duel to take
+double g_duel_press_ms = 0.0;
+// the player's duel state D (the comment above), 0 unread
+uintptr_t duel_state(uintptr_t P) {
+    uint16_t idx = 0;
+    uintptr_t pool = 0, actor = 0, a = 0, b = 0, D = 0;
+    if (!raw(P + 0x5ec, &idx, 2) || !raw(anchors::addr(anchors::Id::ActorPool), &pool, 8) || !pool || !raw(pool + idx * 0x10u, &actor, 8) ||
+        !actor || !raw(actor + 0x38, &a, 8) || !a || !raw(a + 0xaa8, &b, 8) || !b || !raw(b + 0x20, &D, 8))
+        return 0;
+    return D;
+}
+int marks_placed(uintptr_t P) {  // T +0x6060 (T: the player actor +0xb8), -1 unread
+    uint16_t idx = 0;
+    uintptr_t pool = 0, actor = 0, T = 0;
+    int32_t n = 0;
+    if (!raw(P + 0x5ec, &idx, 2) || !raw(anchors::addr(anchors::Id::ActorPool), &pool, 8) || !pool || !raw(pool + idx * 0x10u, &actor, 8) ||
+        !actor || !raw(actor + 0xb8, &T, 8) || !T || !raw(T + 0x6060, &n, 4))
+        return -1;
+    return n;
+}
+// the request for the call (a2 as it came, or 3: fire); *held: +0x3b8 held at 0xff for it, *keep its value to put back
+// (the review: the request compared as the 32 bits the callers set; held only while the trigger is pressed at all)
+uintptr_t duel_pre(uintptr_t P, uintptr_t a2, bool* held, uint8_t* keep) {
+    *held = false;
+    if (!g_duel_rt.load(std::memory_order_relaxed) || !P) return a2;
+    const uint8_t rt = xinput::pad_rt();
+    const double now = log::now_ms();
+    if (rt >= kDuelRtOn && g_duel_rt_prev < kDuelRtOn) g_duel_press_ms = now;
+    g_duel_rt_prev = rt;
+    if (g_duel_ended_D) {  // the press's result: judged (state 4 on, the outcome D +0x54), or the time-out undone
+        // (item 4.5, the review: before the gate; a loss ends Dead Eye's phase in the same update, so behind it a loss was
+        // never logged and the mark lasted into the next duel)
+        int32_t st = 0, out = 0;
+        float t = 0.0f;
+        const double age = now - g_duel_ended_ms;
+        if (!raw(g_duel_ended_D + 0x30, &st, 4) || st != 3) {
+            raw(g_duel_ended_D + 0x54, &out, 4);
+            log::info("[deadeye] the duel judged %.0f ms after the press: state %d, outcome %d (1 won, 2 won by a disarm, 3 lost)", age, st, out);
+            g_duel_ended_D = 0;
+        } else if (age > 500.0) {
+            raw(g_duel_ended_D + 0x10c, &t, 4);
+            log::warn("[deadeye] the duel still painting 500 ms after the press (%.2f s left): the time-out did not hold", t);
+            g_duel_ended_D = 0;
+        }
+    }
+    uint8_t fl = 0;
+    uintptr_t R = 0;
+    int32_t phase = 0;
+    if (!pose::anchor_active() || !controls::flick_up_rb_on() || !raw(P + kPaint, &fl, 1) || !(fl & 4) || !raw(P + 0x410, &R, 8) || !R ||
+        !raw(R + 0x20, &phase, 4) || phase != 2)
+        return a2;
+    g_duel_calls.fetch_add(1, std::memory_order_relaxed);
+    const uint8_t hold = 0xff;
+    if (rt > 0 && raw(P + kTrigLast, keep, 1) && wraw(P + kTrigLast, &hold, 1)) *held = true;
+    if (g_duel_press_ms > 0.0 && static_cast<uint32_t>(a2) == 0 && now - g_duel_press_ms < 150.0) {  // (item 4.5) the kept press
+        g_duel_press_ms = 0.0;
+        const int n = marks_placed(P);
+        const uintptr_t D = n > 0 ? duel_state(P) : 0;
+        int32_t state = 0, need = 0, out = -1;
+        float left = 0.0f, score = 0.0f;
+        const bool read = D && raw(D + 0x30, &state, 4) && raw(D + 0x10c, &left, 4) && raw(D + 0x108, &score, 4) && raw(D + 0xd4, &need, 4) &&
+                          raw(D + 0x54, &out, 4);
+        if (n <= 0) {
+            g_duel_nomark.fetch_add(1, std::memory_order_relaxed);
+        } else if (!read || state != 3 || left <= 0.0f || out != 0) {  // not painting, judged already, or a press after ours
+            g_duel_other.fetch_add(1, std::memory_order_relaxed);
+            log::info("[deadeye] the duel: the right trigger with %d marks, nothing done (%s: state %d, %.2f s left, outcome %d)", n,
+                      !read ? "the duel not read" : state != 3 ? "not painting" : left <= 0.0f ? "the time out" : "judged", state, left, out);
+        } else if (score < static_cast<float>(need)) {
+            // (the review) the marks' score under the duel's bar: ended now it loses (the opponent shoots John); the time runs
+            // on for more marks (a disarm's win is not in the score: the time-out still judges it)
+            g_duel_short.fetch_add(1, std::memory_order_relaxed);
+            log::info("[deadeye] the duel: the right trigger with %d marks, score %.0f of %.0f needed: not enough yet, the time runs on (%.2f s left)",
+                      n, score, static_cast<float>(need), left);
+        } else {
+            const float end = -0.001f;  // (the game's test: under 0, not 0)
+            if (wraw(D + 0x10c, &end, 4)) {
+                g_duel_fires.fetch_add(1, std::memory_order_relaxed);
+                g_duel_ended_D = D;
+                g_duel_ended_ms = now;
+                log::info("[deadeye] the duel: the right trigger ends the duel's time (%.2f s left): %d marks, score %.0f of %d, judged now", left, n,
+                          score, need);
+            }
+        }
+    }
+    return a2;
+}
+uintptr_t update_level(uintptr_t P, uintptr_t a2);
 // FUN_140348980(player info, flag): rcx and edx only (r8, r9 and xmm1-3 written before any read)
 uintptr_t hk_update(uintptr_t P, uintptr_t a2) {
+    uint8_t keep = 0;
+    bool held = false;
+    const uintptr_t req = duel_pre(P, a2, &held, &keep);
+    const uintptr_t r = update_level(P, req);
+    uint8_t now = 0;
+    if (held && raw(P + kTrigLast, &now, 1) && now == 0xff) wraw(P + kTrigLast, &keep, 1);  // (the review: only our 0xff put back)
+    return r;
+}
+uintptr_t update_level(uintptr_t P, uintptr_t a2) {
     g_calls.fetch_add(1, std::memory_order_relaxed);
     {
         static uint32_t n = 0;
@@ -541,7 +665,9 @@ void init() {
     g_level = l < 0 || l > 3 ? 0 : l;
     g_latched = g_level.load();
     g_sepia = config::get_bool("DeadEye", "Sepia", true);
-    log::info("[deadeye] level %d (0: the game's), sepia %d", g_level.load(), g_sepia.load() ? 1 : 0);
+    g_duel_rt = config::get_bool("DeadEye", "DuelTriggerFires", false);
+    log::info("[deadeye] level %d (0: the game's), sepia %d, the duel's right trigger fires %d", g_level.load(), g_sepia.load() ? 1 : 0,
+              g_duel_rt.load() ? 1 : 0);
     // his key names, so his users' inis carry over
     g_marks_on = config::get_bool("Hands", "DeadEyeMarks", false);
     g_barrel = config::get_bool("Hands", "DeadEyeBarrelPaint", true);
@@ -585,6 +711,11 @@ void set_level(int l) {
 }
 int unlocked() { return g_unlocked.load(std::memory_order_relaxed); }
 bool sepia() { return g_sepia.load(std::memory_order_relaxed); }
+bool duel_trigger_fires() { return g_duel_rt.load(std::memory_order_relaxed); }
+void set_duel_trigger_fires(bool on, bool save) {
+    if (g_duel_rt.exchange(on) != on) log::info("[deadeye] the duel's right trigger fires the marks: %s", on ? "on" : "off");
+    if (save) config::set("DeadEye", "DuelTriggerFires", on ? "1" : "0");
+}
 void set_sepia(bool on) {
     if (g_sepia.exchange(on) != on) log::info("[deadeye] the sepia filter %s", on ? "on" : "off");
     config::set("DeadEye", "Sepia", on ? "1" : "0");
@@ -675,6 +806,8 @@ std::string command(const std::string& line) {
             if (l >= 0 && l <= 3) g_level = l;
         } else if (w == "sepia" && (in >> v)) {
             g_sepia = v == "on";
+        } else if (w == "duelrt" && (in >> v)) {  // (item 6) [DeadEye] DuelTriggerFires
+            set_duel_trigger_fires(v == "on", false);
         } else if (w == "marks" && (in >> v)) {
             set_marks_on(v == "on", false);
         } else if (w == "barrel" && (in >> v)) {
@@ -781,6 +914,11 @@ std::string command(const std::string& line) {
                       d.u[0], d.v[0], d.px[1], d.py[1], d.u[1], d.v[1]);
         o += b;
     }
+    std::snprintf(b, sizeof(b), " | the duel's right trigger fires %s: calls %llu, the time ended %llu, presses under the bar %llu, without a "
+                  "mark %llu, otherwise refused %llu", g_duel_rt.load() ? "on" : "off", static_cast<unsigned long long>(g_duel_calls.load()),
+                  static_cast<unsigned long long>(g_duel_fires.load()), static_cast<unsigned long long>(g_duel_short.load()),
+                  static_cast<unsigned long long>(g_duel_nomark.load()), static_cast<unsigned long long>(g_duel_other.load()));
+    o += b;
     return o;
 }
 

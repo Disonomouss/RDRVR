@@ -37,6 +37,7 @@ double last_lt_ms();    // log::now_ms() of the last frame the game's LT was pre
 float player_lt(double* ms);
 
 void init();
+bool flick_up_rb_on();  // [Controls] FlickUpRB: the right stick flicked up presses RB (Dead Eye's paint)
 // Presenting thread, once per frame end: true and the pad when a controller is in use and the RDRVR menu is closed.
 bool pad(xinput::PadState* out);
 bool take_menu_toggle();  // the menu button was held MenuHoldMs (once per hold)

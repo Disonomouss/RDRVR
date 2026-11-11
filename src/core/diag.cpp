@@ -231,9 +231,14 @@ bool fatal_class(DWORD code) {
     }
 }
 
+// RDR.exe's image (install_crash_handler): a fault in the game's own code, for api::note_native_fault
+uintptr_t g_exe_lo = 0, g_exe_hi = 0;
+
 LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (!fatal_class(code)) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t at = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+    if (at >= g_exe_lo && at < g_exe_hi) api::note_native_fault();  // (round 115) a native the plugin runs, faulting in the game
     int line = g_crash_lines.fetch_add(1);
     if (line >= 24) return EXCEPTION_CONTINUE_SEARCH;
     char where[160];
@@ -754,9 +759,48 @@ const char* op_name(D3D12_AUTO_BREADCRUMB_OP op) {
     return op < sizeof(kNames) / sizeof(kNames[0]) ? kNames[op] : "op";
 }
 
+// "crashguard on|off" (2026-11-07, test only: the game's crash reporter uploads every crash to Rockstar): while on, the
+// process's top-level filter is ours in place of the reporter's, so an exception nothing handles ends the game at once
+// (logged) and never reaches the reporter. For a test's first call into an untried game path, in the simulator only
+LPTOP_LEVEL_EXCEPTION_FILTER g_guard_prev = nullptr;
+std::atomic<bool> g_guard_on{false};
+std::atomic<bool> g_guard_in{false};
+LONG WINAPI guard_filter(EXCEPTION_POINTERS* ep) {
+    if (g_guard_in.exchange(true)) TerminateProcess(GetCurrentProcess(), 0xC0DE0002);  // (an exception in here: out at once)
+    char where[160];
+    module_rva(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress), where, sizeof(where));
+    log::error("[crash] guard: exception %#lx at %s not handled: the game ended without its crash report",
+               ep->ExceptionRecord->ExceptionCode, where);
+    Sleep(300);  // (the log's writer)
+    TerminateProcess(GetCurrentProcess(), 0xC0DE0001);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 }  // namespace
 
+std::string crash_guard(bool on) {
+    if (on && !g_guard_on.exchange(true)) {
+        g_guard_prev = SetUnhandledExceptionFilter(guard_filter);
+        // (the review) a reporter may keep its own filter in place: the swap read back
+        const bool held = SetUnhandledExceptionFilter(guard_filter) == guard_filter;
+        log::info("[crash] guard on (the crash reporter's filter %p set aside)%s", reinterpret_cast<void*>(g_guard_prev),
+                  held ? "" : ": NOT HELD (another filter in place)");
+        if (!held) return "crash guard NOT HELD";
+    } else if (!on && g_guard_on.exchange(false)) {
+        SetUnhandledExceptionFilter(g_guard_prev);
+        log::info("[crash] guard off (the crash reporter's filter back)");
+    }
+    return std::string("crash guard ") + (g_guard_on.load() ? "on" : "off");
+}
+
 void install_crash_handler() {
+    if (const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(GetModuleHandleW(nullptr)); dos && dos->e_magic == IMAGE_DOS_SIGNATURE) {
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(dos) + dos->e_lfanew);
+        if (nt->Signature == IMAGE_NT_SIGNATURE) {
+            g_exe_lo = reinterpret_cast<uintptr_t>(dos);
+            g_exe_hi = g_exe_lo + nt->OptionalHeader.SizeOfImage;
+        }
+    }
     if (AddVectoredExceptionHandler(1, veh)) log::info("[crash] vectored handler installed (fatal classes, first 24 logged)");
 }
 

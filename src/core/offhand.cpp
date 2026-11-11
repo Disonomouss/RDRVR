@@ -514,6 +514,11 @@ void throw_tick() {
         }
         if (!fire_chain_ok(info, &proj)) std::snprintf(why, sizeof(why), "weapon %d has no projectile (its fire list)", p.w);
     }();
+    if (!why[0] && p.type >= 0) {  // (round 123: thrown with none left, "the count not lowered", endlessly) none left: not thrown
+        float spare0 = -1.0f, cap0 = 0.0f;
+        if (dual::inv_entry(p.type, &spare0, &cap0) && spare0 < 1.0f && spare0 < 9999.0f && !(p.clip >= 1.0f))
+            std::snprintf(why, sizeof(why), "none left (the clip %.0f, the spare %.0f)", p.clip, spare0);
+    }
     if (why[0]) {
         std::lock_guard lock(g_mu);
         ++g_throw_refused;
@@ -575,6 +580,46 @@ void throw_tick() {
 }  // namespace
 
 int kind_of(int w) { return w == kKnifeW ? kKnife : w == kTorchW ? kTorch : thrown_w(w) ? kThrown : kNone; }
+const char* item_fragment(int w) {
+    std::lock_guard lock(g_mu);
+    return fragment_of(w);
+}
+int thrown_left(int w, uint32_t actor) {
+    if (kind_of(w) != kThrown || !actor) return -1;
+    prime_type(w);  // (its type asked once; answered in frame)
+    std::lock_guard lock(g_mu);
+    static Req clip_req;
+    static int clip_w = -1, req_w = -1;  // the item the clip is of, the item the outstanding ask is of
+    static float clip = -1.0f;
+    static double asked_ms = 0.0, last_call_ms = 0.0;
+    static uint64_t req_throws = 0;  // (the review) the throws made before the ask: an answer from before the latest one dropped
+    const double now = log::now_ms();
+    const uint64_t throws = g_launched + g_unlaunched;
+    if (w != clip_w || now - last_call_ms > 500.0) {  // another item, or back after a gap (the item in a hand): asked afresh
+        clip_w = w;
+        clip = -1.0f;
+        asked_ms = 0.0;
+    }
+    last_call_ms = now;
+    RdrvrNativeResult r{};
+    if (answered(clip_req, &r) && req_w == w && req_throws == throws) {
+        const float c = as_f32(r.value);
+        clip = std::isfinite(c) && c >= 0.0f && c < 10000.0f ? c : 0.0f;
+    }
+    if (g_pend.on && g_pend.w == w) return -1;  // (the review) a throw of it waits for the plugin's tick: not known yet
+    if (!clip_req.id && now - asked_ms >= 1000.0) {
+        asked_ms = now;
+        clip_req.tries = 0;
+        req_w = w;
+        req_throws = throws;
+        const uint64_t a2[2] = {static_cast<uint64_t>(actor), static_cast<uint64_t>(static_cast<uint32_t>(w))};
+        ask(clip_req, kGetWeaponAmmo, a2, 2);
+    }
+    const int type = type_of(w);
+    float sp = -1.0f, cap = 0.0f;
+    if (type < 0 || clip < 0.0f || !dual::inv_entry(type, &sp, &cap) || sp < 0.0f) return type == -1 ? 0 : -1;
+    return clip + sp >= 1.0f ? 1 : 0;
+}
 
 void init() {
     g_on = config::get_bool("Hands", "OffHandItems", false);
@@ -674,6 +719,10 @@ void prime_type(int w) {
         g_type_req[w].tries = 0;
         ask(g_type_req[w], kAmmoEnumFor, a1, 1);
     }
+}
+bool throw_available() {
+    return anchors::addr(anchors::Id::FireProjectileCore) && anchors::addr(anchors::Id::WeaponInfoTree) &&
+           anchors::addr(anchors::Id::WeaponNameMapOwner) && aim::launch_hooked();
 }
 bool throw_in_hand(int h, int w, float clip, uint32_t actor, float* speed_out, double window_ms) {
     if (h < 0 || h > 1 || kind_of(w) != kThrown) return false;

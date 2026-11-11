@@ -72,6 +72,7 @@
 #include "core/bgfocus.h"
 #include "core/xr.h"
 #include "core/xr_blit.h"
+#include "core/xr_image.h"
 #include "core/ui_layer.h"
 #include "core/vr_mode.h"
 #include "core/menu.h"
@@ -316,6 +317,12 @@ std::string execute(const std::vector<std::string>& t) {
         game_hooks::census_log_now();
         return "logged";
     }
+    if (c == "apifaults") {  // (round 115) the requests that faulted inside the game (api::note_native_fault)
+        char b[96];
+        std::snprintf(b, sizeof(b), "native faults %llu (the latest 0x%08x)", static_cast<unsigned long long>(api::native_faults()),
+                      api::last_fault_hash());
+        return b;
+    }
     if (c == "native" && t.size() >= 2) {
         std::vector<uint64_t> args;
         uint32_t vec = 0;
@@ -363,6 +370,10 @@ std::string execute(const std::vector<std::string>& t) {
         camera_lever::set_view_yaw_offset(std::strtof(t[2].c_str(), nullptr));
         return "view yaw " + t[2];
     }
+    if (c == "cam" && t.size() >= 2 && t[1] == "near")  // cam near [on|off]: (round 130) the eyes' near plane never a script shot's
+        return camera_lever::near_fix_status(t.size() >= 3 ? (t[2] == "on" ? 1 : t[2] == "off" ? 0 : -1) : -1);
+    if (c == "cam" && t.size() >= 2 && t[1] == "train")  // cam train [on|off]: (round 129) the frame's camera steadied on a train
+        return camera_lever::train_cam_status(t.size() >= 3 ? (t[2] == "on" ? 1 : t[2] == "off" ? 0 : -1) : -1);
     if (c == "cam" && t.size() >= 2 && t[1] == "fp") {  // cam fp [on|off|mark|check]: [Body] FirstPersonMoments (the session)
         if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) camera_lever::set_first_person_moments(t[2] == "on");
         if (t.size() >= 3 && (t[2] == "mark" || t[2] == "check")) return camera_lever::fp_check(t[2] == "mark");
@@ -630,6 +641,11 @@ std::string execute(const std::vector<std::string>& t) {
         return "third person snap angle " + std::to_string(static_cast<int>(pose::third_person_snap_angle()));
     }
     if (c == "pose" && t.size() >= 2 && t[1] == "tpsnap") return pose::tps_command(t.size() >= 3 ? t[2] : "");
+    if (c == "pose" && t.size() >= 2 && t[1] == "tablehead") {  // pose tablehead [on|off]: [Body] TableGameHeadView for the session (item 3)
+        if (t.size() >= 3 && (t[2] == "on" || t[2] == "off")) pose::set_table_game_head_view(t[2] == "on");
+        return std::string("table game head view ") + (pose::table_game_head_view() ? "on" : "off") + ", frames at the head " +
+               std::to_string(pose::table_game_head_frames());
+    }
     if (c == "pose" && (t.size() == 1 || t[1] != "xr" && t[1] != "off")) {
         // pose | pose anchor on|off  ("pose xr" / "pose off" are the eye-camera switch above)
         if (t.size() >= 3 && t[1] == "anchor") pose::set_anchor(t[2] == "on");
@@ -711,8 +727,13 @@ std::string execute(const std::vector<std::string>& t) {
     if (c == "hud") {  // hud wrist|quad (writes the user ini) | hud shape rect|radar|half (the session) | hud nudge <right%> <down%> <size%> (the session)
         if (t.size() >= 3 && t[1] == "shape") xr::hud_shape_test(t[2] == "rect" ? 0 : t[2] == "half" ? 2 : 1);
         else if (t.size() >= 3 && t[1] == "refuse")  // (2026-11-08, the test's)
-            xr::refuse_test(t[2] == "menu" ? -1 : t[2] == "wrist" ? -2 : t[2] == "ui" ? -3 : t[2] == "marks" ? -4 : std::atoi(t[2].c_str()));
+            xr::refuse_test(t[2] == "menu" ? -1 : t[2] == "wrist" ? -2 : t[2] == "ui" ? -3 : t[2] == "marks" ? -4 : std::atoi(t[2].c_str()),
+                            t.size() >= 4 ? std::atoi(t[3].c_str()) : 0);
         else if (t.size() >= 2 && t[1] == "refuse") {
+        } else if (t.size() >= 2 && t[1] == "waittimeout") {  // (2026-11-09, the test's) hud waittimeout [<n> [eyes|ui|wrist|wheel|deadeye|cinema|menu|all]]
+            if (t.size() >= 3 && !xr_image::fake_timeouts(std::atoi(t[2].c_str()), t.size() >= 4 ? t[3] : "all"))
+                return "ERROR no swapchain \"" + t[3] + "\" (eyes ui wrist wheel deadeye cinema menu all)";
+            return xr_image::status();
         } else if (t.size() >= 2 && (t[1] == "nudge" || t[1] == "shape")) {  // (too few values: the status only, never the wrist switch)
             if (t.size() >= 5 && t[1] == "nudge") xr::set_hud_radar_nudge(std::strtof(t[2].c_str(), nullptr), std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr), false);
         } else if (t.size() >= 2) xr::set_hud_on_wrist(t[1] == "wrist");
@@ -738,10 +759,36 @@ std::string execute(const std::vector<std::string>& t) {
     if (c == "props") {  // the props the mod made and holds (held_prop); props diag [on|off|reset]: the draws near each
         if (t.size() >= 2 && t[1] == "diag") return held_prop::diag_command(t.size() >= 3 ? t[2] : "");
         if (t.size() >= 3 && t[1] == "inst") held_prop::set_inst_check(t[2] == "on");  // run 10 item 2's control
+        if (t.size() >= 3 && t[1] == "alt") held_prop::set_alt(t[2] == "on");  // (round 103) the perf check's control (the session)
+        if (t.size() >= 3 && t[1] == "altknown") held_prop::set_alt_known(t[2] == "on");  // (round 108) the test's control (the session)
+        if (t.size() >= 3 && t[1] == "strict") held_prop::set_strict(t[2] == "on");  // (round 109) the test's control (the session)
+        if (t.size() >= 3 && t[1] == "early") held_prop::set_early(t[2] == "on");  // (round 104) the test's control (the session)
         if (t.size() >= 3 && t[1] == "gate") held_prop::set_gate(std::strtof(t[2].c_str(), nullptr));  // run 10 item 2 (the session)
         if (t.size() >= 3 && t[1] == "puts") held_prop::set_puts(std::atoi(t[2].c_str()));  // 2026-10-12 (the session)
         if (t.size() >= 3 && t[1] == "twins") held_prop::set_twins(t[2] == "on");  // 2026-10-12 (the session)
+        if (t.size() >= 3 && t[1] == "turn") held_prop::set_auto_turn(t[2] == "on");  // props turn on|off (the session)
         if (t.size() >= 3 && t[1] == "census" && (t[2] == "world" || t[2] == "own")) held_prop::set_census_matched(t[2] == "own");  // item 13's test
+        if (t.size() >= 6 && t[1] == "angles") {
+            // props angles <fragment> <x> <y> <z> (GOAL-cattleman-belts item 1: SET_OBJECT_ORIENTATION's convention): the
+            // fragment made in the census slot 1.2 m before John, 1.1 m up, its own angles exactly these (degrees); with
+            // "props census world" its draws are left as the game draws them ("props diag near<slot>" reads their axes)
+            static char an[8][64];
+            static int an_next = 0;
+            RdrvrActorState st{};
+            if (!api::actor_state(&st)) return "props angles: no actor";
+            char* frag = an[an_next];
+            an_next = (an_next + 1) % 8;
+            std::snprintf(frag, sizeof(an[0]), "%s", t[2].c_str());
+            const float ang[3] = {std::strtof(t[3].c_str(), nullptr), std::strtof(t[4].c_str(), nullptr), std::strtof(t[5].c_str(), nullptr)};
+            const float h = st.heading_deg * 0.0174532925f;
+            float pz[12] = {1, 0, 0, 0, 1, 0, 0, 0, 1, st.pos[0] - std::sin(h) * 1.2f, st.pos[1] + 1.1f, st.pos[2] - std::cos(h) * 1.2f};
+            held_prop::want(held_prop::kCensusSlot, frag, pz);
+            held_prop::want_angles(held_prop::kCensusSlot, ang);
+            char b[160];
+            std::snprintf(b, sizeof(b), "angles %s (%.1f %.1f %.1f) at (%.2f %.2f %.2f), slot %d", frag, ang[0], ang[1], ang[2], pz[9], pz[10], pz[11],
+                          held_prop::kCensusSlot);
+            return b;
+        }
         if (t.size() >= 3 && t[1] == "show") {
             // run 11 item 1 (the props census): props show <fragment|off> [distance m] [height m] [spin deg] [tilt deg]: the
             // fragment made in the census slot before John (his heading, level), its axes X right, Y forward, Z up turned
@@ -1340,6 +1387,7 @@ std::string execute(const std::vector<std::string>& t) {
         return "pressed";
     }
     if (c == "forceremove") return diag::force_device_removal() ? "removing a WARP test device" : "ERROR could not start the removal test";
+    if (c == "crashguard" && t.size() >= 2) return diag::crash_guard(t[1] == "on");  // (test only: before an untried game path)
     if (c == "playbatch" && t.size() >= 2)  // playbatch <K>: [Render] PlaybackBatch at run time (0 = one packet a claim)
         return playback::set_batch(std::atoi(t[1].c_str())) ? "playback batch " + t[1] : "ERROR not installed ([Render] PlaybackBatch=-1)";
     if (c == "playback") {

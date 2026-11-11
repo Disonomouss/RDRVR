@@ -678,8 +678,9 @@ void camera_tick(uint64_t tick) {
         cam[1] = saddle_y;
     } else if (job.up_axis == 1) {
         saddle_qpc.QuadPart = 0;
-        cam[0] += -sinf(h) * job.forward;
-        cam[2] += -cosf(h) * job.forward;
+        // (v9: `right` along (cos h, -sin h), the heading's right)
+        cam[0] += -sinf(h) * job.forward + cosf(h) * job.right;
+        cam[2] += -cosf(h) * job.forward - sinf(h) * job.right;
         cam[1] += job.height;
     } else {
         cam[0] += -sinf(h) * job.forward;

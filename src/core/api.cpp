@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <unordered_map>
@@ -35,7 +36,7 @@ constexpr uint64_t kWatchBit = 1ull << 63;
 // (2026-10-29) a request queued at the front (queue_native_front): its id carries this bit and stays out of the posted
 // mark (result_posted's "every id up to it has run" holds only for the requests run in the order queued)
 constexpr uint64_t kFrontBit = 1ull << 62;
-constexpr int kWatches = 8;
+constexpr int kWatches = 12;
 std::atomic<uint32_t> g_watch_hash[kWatches];
 std::atomic<uint64_t> g_watch_arg[kWatches];
 std::atomic<uint32_t> g_watch_argc[kWatches];
@@ -56,6 +57,19 @@ double qpc_us(LONGLONG d) {
     return static_cast<double>(d) * 1e6 / static_cast<double>(f);
 }
 
+// (2026-11-09, round 115: CREATE_PROP_IN_LAYOUT making player_default faulted inside the game every time, RedHook caught it,
+// the object manager's lock at +0x1a20 stayed taken and the game froze at the poker table's exit, a worker waiting on it)
+// the request the plugin is running: popped, its result not yet posted (the plugin runs one at a time, on one thread)
+std::atomic<uint64_t> g_running_id{0};
+std::atomic<uint64_t> g_running_key{0};  // op << 32 | hash
+std::atomic<DWORD> g_running_thread{0};
+std::atomic<bool> g_running_faulted{false};
+std::atomic<uint64_t> g_faults{0}, g_last_fault_key{0};
+// the latest faulted requests' ids (faulted(id); the review: a session-wide refusal of the native would make one bad
+// call a silent 0 for every caller, its watches too, and the lock is already held by then: each caller decides)
+constexpr int kFaultedIds = 16;
+std::atomic<uint64_t> g_faulted_ids[kFaultedIds];
+
 void api_log(int level, const char* text) {
     log::write(level >= 2 ? log::Level::Error : level == 1 ? log::Level::Warn : log::Level::Info, "[red] %s", text);
 }
@@ -63,6 +77,7 @@ void api_log(int level, const char* text) {
 std::atomic<void (*)()> g_tick_hook{nullptr};
 std::atomic<void (*)()> g_tick_hook2{nullptr};  // (2026-10-29) a second: [Hands] OffHandItems' throw (offhand.cpp)
 std::atomic<void (*)()> g_tick_hook3{nullptr};  // (2026-10-31) a third: the test-only probe commands (probe.cpp; set by a command only)
+std::atomic<void (*)()> g_tick_once{nullptr};   // (round 130) run on the next script tick, once (run_on_tick)
 void api_on_script_tick(uint64_t tick, double /*script_ms*/) {
     if (!g_attached.exchange(true)) log::info("[api] gameplay plugin attached; first script tick %llu", tick);
     g_tick_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
@@ -72,6 +87,7 @@ void api_on_script_tick(uint64_t tick, double /*script_ms*/) {
     if (void (*h)() = g_tick_hook.load(std::memory_order_acquire)) h();  // before the lock: it may queue natives
     if (void (*h2)() = g_tick_hook2.load(std::memory_order_acquire)) h2();
     if (void (*h3)() = g_tick_hook3.load(std::memory_order_acquire)) h3();
+    if (void (*h4)() = g_tick_once.exchange(nullptr, std::memory_order_acq_rel)) h4();
     int n = g_watch_count.load(std::memory_order_acquire);
     if (!n) return;
     AcquireSRWLockExclusive(&g_lock);
@@ -97,10 +113,35 @@ int api_pop_native_request(RdrvrNativeRequest* out) {
             if (g_timed_id[s] && out->id == g_timed_id[s]) QueryPerformanceCounter(&g_timed_t0[s]);
     }
     ReleaseSRWLockExclusive(&g_lock);
+    if (have) {
+        g_running_faulted.store(false, std::memory_order_relaxed);
+        g_running_key.store(static_cast<uint64_t>(out->op) << 32 | (out->op == RDRVR_NATIVE_RAW ? out->hash : 0u), std::memory_order_relaxed);
+        g_running_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        g_running_id.store(out->id, std::memory_order_release);
+    }
     return have ? 1 : 0;
 }
 
-void api_post_native_result(const RdrvrNativeResult* r) {
+void api_post_native_result(const RdrvrNativeResult* in) {
+    RdrvrNativeResult kept = *in;
+    const RdrvrNativeResult* r = &kept;
+    if (in->id && g_running_id.load(std::memory_order_acquire) == in->id) {
+        if (g_running_faulted.exchange(false, std::memory_order_acq_rel)) {
+            const uint64_t key = g_running_key.load(std::memory_order_relaxed);
+            kept.value = 0;
+            std::memset(kept.vec, 0, sizeof(kept.vec));
+            const uint64_t n = g_faults.fetch_add(1, std::memory_order_relaxed);
+            g_faulted_ids[n % kFaultedIds].store(in->id, std::memory_order_release);
+            g_last_fault_key.store(key, std::memory_order_relaxed);
+            char what[40];
+            if (key >> 32) std::snprintf(what, sizeof(what), "the plugin's op %u", static_cast<unsigned>(key >> 32));
+            else std::snprintf(what, sizeof(what), "native 0x%08x", static_cast<unsigned>(key & 0xffffffffu));
+            if (n < 16)  // (each one counted: "apifaults")
+                log::error("[api] %s faulted inside the game (RedHook caught it; a lock the game held may stay held): its result "
+                           "answered 0 (faults %llu)", what, static_cast<unsigned long long>(n + 1));
+        }
+        g_running_id.store(0, std::memory_order_release);
+    }
     if (!(r->id & (kWatchBit | kFrontBit))) {  // (the mark: the tick first, so a reader of the id sees at least its tick)
         g_posted_tick.store(r->tick, std::memory_order_relaxed);
         if (r->id > g_posted_id.load(std::memory_order_relaxed)) g_posted_id.store(r->id, std::memory_order_release);
@@ -245,9 +286,22 @@ bool plugin_attached() { return g_attached.load(); }
 bool in_script_tick() {
     return g_in_tick.load(std::memory_order_acquire) && g_tick_thread.load(std::memory_order_relaxed) == GetCurrentThreadId();
 }
+void note_native_fault() {
+    if (g_running_id.load(std::memory_order_acquire) && g_running_thread.load(std::memory_order_relaxed) == GetCurrentThreadId())
+        g_running_faulted.store(true, std::memory_order_release);
+}
+uint64_t native_faults() { return g_faults.load(std::memory_order_relaxed); }
+uint32_t last_fault_hash() { return static_cast<uint32_t>(g_last_fault_key.load(std::memory_order_relaxed)); }
+bool faulted(uint64_t id) {
+    if (!id) return false;
+    for (int i = 0; i < kFaultedIds; ++i)
+        if (g_faulted_ids[i].load(std::memory_order_acquire) == id) return true;
+    return false;
+}
 void set_tick_hook(void (*hook)(), int slot) {
     (slot == 2 ? g_tick_hook3 : slot == 1 ? g_tick_hook2 : g_tick_hook).store(hook, std::memory_order_release);
 }
+void run_on_tick(void (*f)()) { g_tick_once.store(f, std::memory_order_release); }
 void time_native(uint64_t id, int slot) {
     if (!id || slot < 0 || slot >= kTimed) return;
     AcquireSRWLockExclusive(&g_lock);

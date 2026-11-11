@@ -21,6 +21,7 @@
 #include "core/taa.h"
 #include "core/hooks.h"
 #include "core/body.h"
+#include "core/holster.h"
 #include "core/config.h"
 #include "core/log.h"
 #include "core/pose.h"
@@ -153,13 +154,88 @@ void fp_build(const float* ref, float ref_heading, const RdrvrActorState& st, fl
     yaw_rows(out, heading - ref_heading);
     for (int k = 0; k < 3; ++k) out[12 + k] = st.camera_pos[k];
 }
-// the frame's camera for the scene and the culling: the game's, or (a first-person moment) the anchor's
+// (round 129, the user on a moving train: "camera flicker") the plugin's camera stands where a script tick put it, from
+// John's place then; the car and John are drawn from where the frame's visibility build found them. At 15 m/s a tick is
+// 17 cm, and every change of the time between the two shakes the car's inside against the view. On a train the frame's
+// camera takes that change out: the build's root (bone 0) less John's place of the tick, less its own slow average
+// (kTrainCamTau; the review: the root's standing offset from his place, a seat's clip and the steady part of the lag stay
+// with the plugin's camera, as before), added to the camera as the same tick placed it (st.camera_pos). Not over 0.5 m;
+// never a script's camera; only while he sits on it. "cam train [on|off]"; [Debug] TrainCamera. Under g_fp_mutex
+constexpr float kTrainCamTau = 0.5f;
+std::atomic<bool> g_train_cam{true};
+float g_tc_lp[3] = {}, g_tc_res[3] = {}, g_tc_max = 0.0f;
+bool g_tc_lp_ok = false;
+uint64_t g_tc_build = 0, g_tc_frames = 0, g_tc_far = 0;
+double g_tc_ms = 0.0, g_tc_sum = 0.0, g_tc_log_ms = 0.0;
+const float* train_cam(const float* cam, const RdrvrActorState& st) {
+    const int gate = holster::game_gate();
+    if (!g_train_cam.load(std::memory_order_relaxed) || !(gate & 8)) {
+        g_tc_lp_ok = false;
+        return cam;
+    }
+    if ((st.flags & RDRVR_ACTOR_CAM_AWAY) && cam != t_fp_cam) return cam;  // (the review) a script's camera: left as it is
+    float root[3];
+    uint64_t build = 0;
+    if (!body::build_root(root, &build)) return cam;
+    const double now = log::now_ms();
+    if (build != g_tc_build || !g_tc_lp_ok) {  // once a build: the average, then this frame's remainder
+        float d[3];
+        for (int k = 0; k < 3; ++k) d[k] = root[k] - st.pos[k];
+        const double dt = now - g_tc_ms;
+        if (!g_tc_lp_ok || !(dt >= 0.0 && dt < 500.0)) {
+            std::memcpy(g_tc_lp, d, sizeof(d));
+        } else {
+            const float a = 1.0f - std::exp(-static_cast<float>(dt) * 0.001f / kTrainCamTau);
+            for (int k = 0; k < 3; ++k) g_tc_lp[k] += (d[k] - g_tc_lp[k]) * a;
+        }
+        g_tc_lp_ok = true;
+        g_tc_build = build;
+        g_tc_ms = now;
+        for (int k = 0; k < 3; ++k) g_tc_res[k] = d[k] - g_tc_lp[k];
+        const float mm = 1000.0f * std::sqrt(g_tc_res[0] * g_tc_res[0] + g_tc_res[1] * g_tc_res[1] + g_tc_res[2] * g_tc_res[2]);
+        if (std::isfinite(mm)) {
+            ++g_tc_frames;
+            g_tc_sum += mm;
+            g_tc_max = mm > g_tc_max ? mm : g_tc_max;
+        }
+    }
+    // (cycle RA2: walking, the root runs up to 16 cm ahead of his place, and its start and stop would push the view: measured
+    // on any train, taken out only while he sits, the gate's bit 32, where the root keeps its place in the car)
+    if (!(gate & 32)) return cam;
+    if (!(g_tc_res[0] * g_tc_res[0] + g_tc_res[1] * g_tc_res[1] + g_tc_res[2] * g_tc_res[2] < 0.5f * 0.5f)) {  // (also not a number)
+        ++g_tc_far;
+        return cam;
+    }
+    if (cam != t_fp_cam) std::memcpy(t_fp_cam, cam, 64);
+    for (int k = 0; k < 3; ++k) t_fp_cam[12 + k] = st.camera_pos[k] + g_tc_res[k];
+    if (now - g_tc_log_ms > 10000.0 && g_tc_frames) {
+        g_tc_log_ms = now;
+        log::info("[cam] seated on a train: the frame's camera steadied on John as drawn; on trains %llu frames so far: the root against his "
+                  "place off its own average by %.0f mm on average, at most %.0f (over 0.5 m, left: %llu); the root from his place now (%.2f %.2f %.2f) m",
+                  static_cast<unsigned long long>(g_tc_frames), g_tc_sum / static_cast<double>(g_tc_frames), static_cast<double>(g_tc_max),
+                  static_cast<unsigned long long>(g_tc_far), static_cast<double>(g_tc_lp[0]), static_cast<double>(g_tc_lp[1]), static_cast<double>(g_tc_lp[2]));
+    }
+    return t_fp_cam;
+}
+const float* fp_cam_inner(const float* cam, const RdrvrActorState& st);
+// the frame's camera for the scene and the culling: the game's, or (a first-person moment) the anchor's; on a train, on
+// John as the frame draws him
+// (round 130, the review) the eyes at John's head this frame: the anchor's own camera current, or put in a script's place
+// here (NearPlaneFix: only then is a script's near plane not the eyes')
+std::atomic<bool> g_eyes_at_head{false};
 const float* fp_cam(const float* cam) {
-    if (!cam || !g_fpm.load(std::memory_order_relaxed) || !pose::anchor_active()) return cam;
     RdrvrActorState st{};
-    if (!api::actor_state(&st) || !st.camera) return cam;
-    const float hd = pose::body_heading_deg();
+    if (!cam || !pose::anchor_active() || !api::actor_state(&st) || !st.camera) {  // (the second review: stored once on each way out)
+        g_eyes_at_head.store(false, std::memory_order_relaxed);
+        return cam;
+    }
     std::lock_guard lock(g_fp_mutex);
+    const float* out = train_cam(g_fpm.load(std::memory_order_relaxed) ? fp_cam_inner(cam, st) : cam, st);
+    g_eyes_at_head.store(out != cam || !(st.flags & RDRVR_ACTOR_CAM_AWAY), std::memory_order_relaxed);
+    return out;
+}
+const float* fp_cam_inner(const float* cam, const RdrvrActorState& st) {
+    const float hd = pose::body_heading_deg();
     if (!(st.flags & RDRVR_ACTOR_CAM_AWAY)) {  // ours current: the reference
         // taken only from the anchor's own camera (at the place the plugin put it, level: a script's camera a frame
         // early is neither) with the heading still (the matrix lags the heading by a tick: after a turn, three frames)
@@ -658,7 +734,27 @@ float& f32(void* vp, size_t off) { return *reinterpret_cast<float*>(static_cast<
 
 // Writes the projection fields for tangents (l < 0 < r, d < 0 < u) and rebuilds the matrix with the engine's own
 // Perspective (which also rebuilds the cull planes and regenerates).
+// (round 130, the user at five finger fillet: "the table being partially invisible"; their video: the table cut off along
+// a line about a forearm from the view, the ground and the crates under it seen through) the scene's near plane is the
+// current camera's: 0.1 m in play, but a script's shot sets its own (fivefingerfillet: SET_CAMERASHOT_NEAR_CLIP_PLANE(shot,
+// 0.5)), and with the eyes at John's head whatever is within it is cut away. Every projection made here for the eyes (each
+// eye's, the union's, the culling's) is built with the near plane no farther than play's. [Debug] NearPlaneFix;
+// "cam near [on|off]"
+constexpr float kEyeNear = 0.1f;
+std::atomic<bool> g_near_fix{true};
+std::atomic<uint64_t> g_near_fixed{0};
+std::atomic<float> g_near_game{0.0f};  // the game's near plane last put back (m)
+std::atomic<float> g_scene_near{0}, g_scene_far{0};
 void apply_tangents(void* vp, float l, float r, float u, float d) {
+    // (the review) only with the eyes at John's head (a script's own shot seen from its camera keeps its near plane); and
+    // the scene's near plane as the rounds' depth constants read it (round_draw: scene_clip) is the one drawn with
+    if (const float n = f32(vp, 0x340); n > kEyeNear * 1.02f && n < 100.0f && g_near_fix.load(std::memory_order_relaxed) &&
+                                        g_eyes_at_head.load(std::memory_order_relaxed)) {
+        f32(vp, 0x340) = kEyeNear;
+        g_near_game.store(n, std::memory_order_relaxed);
+        g_scene_near.store(kEyeNear, std::memory_order_relaxed);
+        g_near_fixed.fetch_add(1, std::memory_order_relaxed);
+    }
     f32(vp, 0x338) = 2.0f * std::atan((u - d) * 0.5f) * 57.29577951f;
     f32(vp, 0x33c) = (r - l) / (u - d);
     f32(vp, 0x350) = 1.0f;
@@ -738,7 +834,6 @@ bool build_union_vp(void* vp, const float* cam_in);
 // and restored before the second, so every pointer the frame holds stays vanilla. dual_pass keeps the per-frame state
 // the second pass would see consumed, and runs the post chain for the first eye between the passes (with the first
 // pass's viewport still current).
-std::atomic<float> g_scene_near{0}, g_scene_far{0};
 void scope_frame(const float* cam_in);  // (r55 item 11; below)
 thread_local float t_frame_yaw = 0.0f;  // the test yaw latched once a frame: both passes and the union see the same
 
@@ -837,6 +932,24 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
     if (vp) {
         g_scene_near = f32(vp, 0x340);
         g_scene_far = f32(vp, 0x344);
+    }
+    {  // (round 130) said when a script's near plane begins to be put back, and a second after the last
+        static uint64_t nf_was = 0;
+        static double nf_ms = 0.0;
+        static bool nf_on = false;
+        if (const uint64_t nf = g_near_fixed.load(std::memory_order_relaxed); nf != nf_was) {
+            nf_was = nf;
+            nf_ms = timed.t0;
+            if (!nf_on) {
+                nf_on = true;
+                log::info("[cam] the scene's near plane %.2f m (a script's camera): the eyes' projections built with %.2f m (NearPlaneFix)",
+                          g_near_game.load(std::memory_order_relaxed), kEyeNear);
+            }
+        } else if (nf_on && timed.t0 - nf_ms > 1000.0) {
+            nf_on = false;
+            log::info("[cam] the scene's near plane the game's again (%.2f m; put back in %llu projections so far)", g_scene_near.load(),
+                      static_cast<unsigned long long>(nf));
+        }
     }
     if (g_xr_pose.load(std::memory_order_relaxed)) xr::latch_hands();  // the hands' poses for the IK, as late as the head's
     body::before_scene(cam);
@@ -1628,6 +1741,22 @@ void set_first_person_moments(bool on) {
     if (g_fpm.exchange(on) != on) log::info("[cam] first-person moments (a script's camera: the eyes kept at John's head) %s", on ? "on" : "off");
 }
 bool first_person_moments() { return g_fpm.load(); }
+std::string near_fix_status(int set) {  // "cam near [on|off]" (set: 1 on, 0 off, -1 read): (round 130) the eyes' near plane
+    if (set >= 0) g_near_fix = set == 1;
+    char b[200];
+    std::snprintf(b, sizeof(b), "near fix %d: %llu projections put at %.2f m, the game's near plane then %.3f m | the scene's near now %.3f",
+                  g_near_fix.load() ? 1 : 0, static_cast<unsigned long long>(g_near_fixed.load()), kEyeNear, g_near_game.load(), g_scene_near.load());
+    return b;
+}
+std::string train_cam_status(int set) {  // "cam train [on|off]" (set: 1 on, 0 off, -1 read)
+    if (set >= 0) g_train_cam = set == 1;
+    char b[240];
+    std::lock_guard lock(g_fp_mutex);
+    std::snprintf(b, sizeof(b), "train camera %d: steadied %llu frames, taken out %.0f mm on average, at most %.0f, left as over 0.5 m %llu",
+                  g_train_cam.load() ? 1 : 0, static_cast<unsigned long long>(g_tc_frames), g_tc_frames ? g_tc_sum / static_cast<double>(g_tc_frames) : 0.0,
+                  static_cast<double>(g_tc_max), static_cast<unsigned long long>(g_tc_far));
+    return b;
+}
 std::string fp_status() {
     std::lock_guard lock(g_fp_mutex);
     char b[200];

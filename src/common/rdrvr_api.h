@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 
-#define RDRVR_API_VERSION 8u
+#define RDRVR_API_VERSION 9u
 #define RDRVR_WEAPONS 40  // eWeapon 0..37 (WeaponModel), padded
 
 #ifdef __cplusplus
@@ -162,6 +162,7 @@ typedef struct RdrvrCameraJob {
                                   // heading (the view turned by the right stick); a plugin without it faces the mount;
                                   // bit 4 (2026-10-11): channel 0 is on the game's gameplay camera (no script's camera
                                   // current): with bit 2, the anchor takes the channel back only then or in a shop
+    float right;                  // v9 (2026-11-11, the seated view): metres to the right of the heading (y up only; not riding)
 } RdrvrCameraJob;
 
 typedef struct RdrvrActorState {

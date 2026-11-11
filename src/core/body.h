@@ -174,6 +174,7 @@ struct BodyPoints {
     float fore[3] = {};
     int gun = 1;               // John's gun hand (0 left-handed)
     uint64_t frame = 0;        // the body frame these were published in (2026-10-29: aim.cpp's barrelstep2 pairs by it)
+    uint64_t build = 0;        // (round 114) the visibility build that frame drew (its newest held sample's; 0 unknown)
     // run 5 (RoundInHand): each hand's thumb and index fingertip joints as drawn (thumb_03, finger_13; world)
     bool tips_ok[2] = {false, false};
     float thumb_tip[2][3] = {};
@@ -275,6 +276,20 @@ void set_rigid_pieces(bool on, bool save);
 void set_own_pieces(bool on, bool save);
 // The piece's joint as drawn (world) in the last frames; false when not drawn moved (OwnBelt off) or stale
 bool piece_where(int i, float joint[3]);
+// (GOAL-cattleman-belts item 2) whether this outfit has piece i (its geometry found; the lasso: its bone in the rig)
+bool piece_present(int i);
+// (round 103) piece i's bone as drawn (world, the eyes' latest player set: its axes as columns, then its joint), and the
+// pelvis joint that same set drew (pelvis: 3 floats, optional: a prop's anchor of the same frame); false: none drawn lately
+// (an outfit without the bone: the pelvis's matrix with the default rig's rest joint)
+bool piece_bone_drawn(int i, float W[12], float* pelvis = nullptr);
+// (round 103, the user: "Get the exact default satchel") [Holsters] OwnBeltProps: the default outfit's own model made as a
+// prop (held_prop::kBeltModelSlot) draws only these of its pieces (bits 1 the knife's sheath, 2 the satchel), each on this
+// outfit's bone as drawn; 0: none
+void set_belt_model_pieces(uint32_t mask);
+// (round 121) the outfit's own satchel hidden (its piece's bones collapsed in John's sets) while the belt's throwable is
+// shown at its place
+void set_hide_satchel(bool on);
+uint64_t satchel_hidden_draws();
 bool piece_delta(int i, float d[3]);  // its joint's move this frame (world: where the move put it less where it was), 0 unmoved
 // its move as a rigid one (world): its joint before (piv), after (want), its turn Rw (a point p on it at want + Rw (p - piv))
 bool piece_rigid(int i, float piv[3], float want[3], float Rw[9]);
@@ -288,6 +303,14 @@ bool gun_steady();  // [Hands] GunSteady (2026-11-02): the gun in hand held stil
 void set_gun_steady(bool on, bool save);
 bool no_flutter();  // [Body] NoFlutter (2026-11-02): no cloth flutter on any player draw
 void set_no_flutter(bool on, bool save);
+// [Body] ClothPins (2026-11-06, off by default; round 122's menu row): the duster's coat drawn on the drawn body (each part by
+// the body's change at its height, hips to chest), not the game's walk and idle; ClothFollows stands down while it is on
+bool cloth_pins();
+void set_cloth_pins(bool on, bool save);
+// [Body] ClothStill (round 124, seconds, 0 off): with ClothPins, the coat's points eased in the drawn hips' frame, so the game's
+// walk and idle sway are smoothed out
+float cloth_still();
+void set_cloth_still(float seconds, bool save);
 bool arm_motion_vectors();  // [Body] ArmMotionVectors
 void set_arm_motion_vectors(bool on, bool save);
 void set_left_holster(bool on, bool save);
@@ -309,12 +332,21 @@ bool left_holster_place(const float right[3], float out[3]);
 void left_holster_refresh();
 // [Holsters] OwnBeltRigid (2026-10-13): each moved piece drawn rigid (its geometries found again when the drawables change)
 void pieces_geom_refresh();
-void pieces_geom_scan();          // the holster geometry found again when the player's drawables change (rd: not the draw thread)
+bool pieces_geom_scan();          // the holster geometry found again when the player's drawables change (rd: not the draw thread)
 std::string left_holster_status();  // "skel lefthol"
 // Item 3's grab: the piece's move after a hand's move since its grip (the hand turned by Rd about it, from h0 to h1; world)
 // applied to the piece as it was at the grip (p0): the new offset and turn in the pelvis's frame (each offset within 0.6 m)
 bool piece_grab(int i, const float Rd[9], const float h0[3], const float h1[3], const Piece& p0, Piece* out);
 void set_auto_shows(bool on);
+// (round 117) [Body] HiddenBodyShadow: the hidden body's shadow in a show mode (on: John's whole shadow; off, the default:
+// none of him in the light's views)
+bool hidden_body_shadow();
+void set_hidden_body_shadow(bool on);
+// (round 128) [Body] TableGameArms (off): at the table games without the minigame's flag, John's arms as the game animates them
+bool table_game_arms();
+void set_table_game_arms(bool on);
+// (round 129) John's root (bone 0, world) as the newest visibility build read it; false: not read
+bool build_root(float out[3], uint64_t* build = nullptr);
 // [Horse] BodyWithCamera (run 12 item 8): riding with Stance=still, the body kept at its standing offset from the camera
 // (only a jump over 1.5 m re-learns it, not 0.3 m; the animation pinned while within 1.5 m, not 0.5 m). On by default;
 // "pose bodycam on|off" for the session

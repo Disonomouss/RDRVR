@@ -41,7 +41,22 @@ float g_height_tau = 0.35f, g_height_s = 0.0f;
 bool g_height_s_valid = false;
 bool g_no_idles = true;  // [Body] NoIdleAnims
 bool g_hide_reticle = true;  // [Hands] HideReticle
+std::atomic<bool> g_mod_hides_reticle{false};  // the frame's camera job hides the flat reticle (mod_hides_reticle)
 float g_heading = 0, g_height = 1.60f, g_lift = 0.05f, g_forward = 0.05f, g_turn_speed = 90, g_snap_angle = 30;
+// (GOAL-doorway-and-poker item 3) [Body] TableGameHeadView, off by default: while a minigame runs, the view at John's head
+std::atomic<bool> g_table_head{false};
+std::atomic<uint64_t> g_table_head_frames{0};
+// (round 130, the user on a turning train: "while sitting John does not turn with the train, so if the train turns, the
+// camera ends up away from Johns body"; their log: seated, John's heading went 162 -> 157 -> -173 -> -157 deg with the car
+// while the view's stayed at 162.4, and his head, 0.86 m behind his place there, was up to 0.53 m to the side of the line
+// the view is put on) seated on a train the view's heading turns with the car (by the course his place travels: below),
+// and the seated view has a sideways offset too (the job's `right`). [Debug] TrainTurn
+std::atomic<bool> g_train_turn{true};
+std::atomic<float> g_train_turned{0.0f};      // degrees the view was turned with the car so far
+std::atomic<uint32_t> g_train_turn_refused{0};  // the course's steps not taken (too large for a train)
+constexpr float kTrainTurnMax = 3.0f;         // degrees a script tick (the smoothed course's step)
+std::atomic<bool> g_table_view_active{false};  // the view at the head or easing back (the body seated while it is: body.cpp)
+bool g_table_head_was = false;
 int g_up_axis = 1;
 int g_orient_mode = 1;  // SET_CAMERA_ORIENTATION: 1 = heading on the vector's y (round 1: 0, the heading on z, rolled the view)
 bool g_auto_height = true, g_have_scale = false;
@@ -1869,6 +1884,7 @@ void on_frame_end(uint64_t) {
     // flat one hidden too (drawn on the HUD's quad it sits at the quad's depth, not the target's: doubled)
     job.hide_reticle = (g_hide_reticle ? 1u : 0u) |
                        (!want && aim::third_person_reticle_live() && camera_lever::eyes_follow_head() && xr::submitting() && vr_mode::gameplay_stereo() ? 2u : 0u);
+    g_mod_hides_reticle.store((job.enabled && (job.hide_reticle & 1u)) || (job.hide_reticle & 2u), std::memory_order_relaxed);  // (the plugin's own test)
     job.weapons = (holster::weapon_choice() ? 1u : 0u) | (g_keep_cam.load(std::memory_order_relaxed) ? 2u : 0u);
     if (aim::gameplay_camera_current()) job.weapons |= 8u;  // no script's camera holds channel 0: the anchor may take it back
     if (want) {
@@ -2017,6 +2033,61 @@ void on_frame_end(uint64_t) {
             g_heading -= sx * g_turn_speed * dt;
             ++g_turns;
         }
+        {  // (round 130) seated on a train: the view's heading turns with the car, by the course his place travels
+           // (cycle RE1: by John's own heading it ran away where he is not seated and turns to face the view himself (a
+           // forced seat, a gun out: the view drifted 8 degrees in 4 s with no one turning): his heading is the game's to
+           // change for other reasons, the way his place moves is the car's alone). The course over the last 0.4-0.8 s of
+           // his place at the script ticks, at 2.5 m/s or more, smoothed; its change added to the view's heading (the
+           // changes sum to the course's own change: nothing gathers on a straight)
+            struct TrainSmp {
+                double ms;
+                float x, z;
+            };
+            static TrainSmp ring[64];
+            static int rn = 0;
+            static bool c_ok = false;
+            static float c_s = 0.0f;  // the smoothed course, degrees (a heading: facing (-sin h, -cos h))
+            static uint64_t tick_was = 0;
+            const bool seat = g_train_turn.load(std::memory_order_relaxed) && (holster::game_gate() & 32) != 0 && have_st && !stick_steer && g_up_axis == 1;
+            if (!seat) {
+                rn = 0;
+                c_ok = false;
+            } else if (st.tick != tick_was && (rn == 0 || now - ring[rn - 1].ms >= 12.5)) {  // (the third review: 64 samples reach 0.8 s at any tick rate)
+                tick_was = st.tick;
+                int old = 0;
+                while (old < rn && now - ring[old].ms > 800.0) ++old;
+                if (old == 0 && rn == 64) old = 1;
+                if (old) {
+                    std::memmove(ring, ring + old, static_cast<size_t>(rn - old) * sizeof(TrainSmp));
+                    rn -= old;
+                }
+                const TrainSmp* base = rn > 0 && now - ring[0].ms >= 400.0 ? &ring[0] : nullptr;  // the oldest kept, 0.4-0.8 s back
+                ring[rn++] = {now, st.pos[0], st.pos[2]};
+                bool moving = false;
+                if (base) {
+                    const float dx = st.pos[0] - base->x, dz = st.pos[2] - base->z, dist = std::hypot(dx, dz);
+                    const float span_s = static_cast<float>(now - base->ms) * 0.001f;
+                    if (dist >= 2.5f * span_s && dist < 60.0f * span_s) {  // (2.5 m/s or more; not a jump)
+                        moving = true;
+                        const float c = std::atan2(-dx, -dz) * 57.2957795f;
+                        if (!c_ok) {
+                            c_s = c;
+                            c_ok = true;
+                        } else {
+                            const float d = (std::fmod(c - c_s + 540.0f, 360.0f) - 180.0f) * 0.3f;
+                            c_s = std::fmod(c_s + d + 540.0f, 360.0f) - 180.0f;
+                            if (std::fabs(d) < kTrainTurnMax) {
+                                g_heading += d;
+                                g_train_turned.store(g_train_turned.load(std::memory_order_relaxed) + std::fabs(d), std::memory_order_relaxed);
+                            } else {
+                                g_train_turn_refused.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                }
+                if (base && !moving) c_ok = false;  // (stopped, or a jump: the course taken afresh after)
+            }
+        }
         bt_frame(st, have_st, riding, dt, now);  // [XR] BodyFollowsTurn (2026-10-27): off, one relaxed load
         g_heading = std::fmod(g_heading + 540.0f, 360.0f) - 180.0f;
         job.heading_deg = (job.weapons & 4u) ? g_ride_off : g_heading;
@@ -2078,6 +2149,98 @@ void on_frame_end(uint64_t) {
             }
         }
         if (g_height_s_valid && !pc_hold && !(have_st && (st.flags & RDRVR_ACTOR_CROUCHING))) g_pc_stand_h = g_height_s;  // the standing view's
+        {  // (GOAL-doorway-and-poker item 3; [Body] TableGameHeadView, off by default; the user at poker: "Johns body is too
+           // far forward. It is clipping into the table") at the table the view stood at the standing eye height over the
+           // root, 0.05 m ahead (round 115: 1.69 m, the first-person moment's camera at the anchor's place), while John sat
+           // with his head lower and over the table: his body drawn in front of the view, through the table. While a
+           // minigame runs, the view at his head bone: its height (and SeatedLift) and its place ahead of the root along
+           // the view's heading (and EyeForward); the plugin puts the anchor's camera there. Not to the side: the job has
+           // no sideways offset
+            // (the review) eased by HeightSmoothing as the height follow is, in and back out: the head's every move at the
+            // table (chips, the cards) and the gate's switch never moved the view in one frame
+            static float tg_h = 0.0f, tg_f = 0.0f, tg_r = 0.0f;
+            static bool tg_on = false;
+            const float tg_a = 1.0f - std::exp(-dt / (g_height_tau > 0.01f ? g_height_tau : 0.01f));
+            // (round 128) at every table game (only poker raises the minigame's flag), and on a train's seat
+            const bool on = g_table_head.load(std::memory_order_relaxed) && holster::seated_view() && have_st && st.head_valid;
+            bool used = false;
+            if (on) {
+                const float hr_ = g_heading * 0.0174532925f, fx = -std::sin(hr_), fz = -std::cos(hr_);
+                const float up = g_up_axis == 1 ? st.head_pos[1] - st.pos[1] : st.head_pos[2] - st.pos[2];
+                const float ahead = (st.head_pos[0] - st.pos[0]) * fx + (st.head_pos[2] - st.pos[2]) * fz;
+                // (round 130) and to the side: the heading's right is (-fz, fx) (y up; the plugin's `right`). On the train's
+                // seat his head is 0.86-0.95 m from his place (the user's log), 0.32-0.37 m at the tables
+                const float right = g_up_axis == 1 ? (st.head_pos[0] - st.pos[0]) * -fz + (st.head_pos[2] - st.pos[2]) * fx : 0.0f;
+                if (up > 0.2f && up < 2.5f && std::hypot(ahead, right) < 1.5f) {
+                    if (!tg_on) {  // from the view as it was
+                        tg_h = job.height;
+                        tg_f = job.forward;
+                        tg_r = 0.0f;
+                        tg_on = true;
+                    }
+                    tg_h += (up + g_lift - tg_h) * tg_a;
+                    tg_f += (ahead + g_forward - tg_f) * tg_a;
+                    tg_r += (right - tg_r) * tg_a;
+                    job.height = tg_h;
+                    job.forward = tg_f;
+                    job.right = tg_r;
+                    g_table_head_frames.fetch_add(1, std::memory_order_relaxed);
+                    used = true;
+                }
+            }
+            if (!used && tg_on) {  // eased back to the anchor's view
+                tg_h += (job.height - tg_h) * tg_a;
+                tg_f += (job.forward - tg_f) * tg_a;
+                tg_r += (0.0f - tg_r) * tg_a;
+                if (std::fabs(tg_h - job.height) < 0.005f && std::fabs(tg_f - job.forward) < 0.005f && std::fabs(tg_r) < 0.005f) {
+                    tg_on = false;
+                } else {
+                    job.height = tg_h;
+                    job.forward = tg_f;
+                    job.right = tg_r;
+                }
+            }
+            g_table_view_active.store(used || tg_on, std::memory_order_relaxed);
+            if (used != g_table_head_was) {
+                g_table_head_was = used;
+                log::info("[pose] a table game or a seat (gate %d): the view %s (TableGameHeadView)", holster::game_gate(),
+                          used ? "at John's head" : "back at the anchor's eye height");
+            }
+        }
+        {  // (round 117, the user at poker: "Johns body is too far forward. It is clipping into the table") while a minigame
+           // runs, every 5 s: John's head against his root (height, ahead along his heading, right) and the view's place
+           // (the job's height, its forward), to see where the seated head is against the view (no change: the log only)
+            static double mg_log_ms = 0.0;
+            {  // (round 125: John left his seat at poker and the game's skip never faded back in) said the moment his head
+               // rises from seated (under 1.38 m over his root) to standing (over 1.48 m) while the minigame runs, with the pad's
+               // fists line: what the mod sent
+                static bool mg_seated = false;
+                if (!(holster::game_gate() & 1)) {  // (the review: the minigame's flag only: at horseshoes John stands and bends)
+                    mg_seated = false;
+                } else if (have_st && st.head_valid) {
+                    const float hh = g_up_axis == 1 ? st.head_pos[1] - st.pos[1] : st.head_pos[2] - st.pos[2];
+                    if (hh < 1.38f) {
+                        mg_seated = true;
+                    } else if (mg_seated && hh > 1.48f) {
+                        mg_seated = false;
+                        log::warn("[pose] minigame: John left his seat (his head %.2f m above his root, his heading %.1f deg, weapon %d) | %s", hh,
+                                  st.heading_deg, st.weapon, controls::fists_status().c_str());
+                    }
+                }
+            }
+            if (holster::seated_view() && have_st && st.head_valid && now - mg_log_ms >= 5000.0) {
+                mg_log_ms = now;
+                const float hr_ = g_heading * 0.0174532925f, fx = -std::sin(hr_), fz = -std::cos(hr_);
+                const float dx = st.head_pos[0] - st.pos[0], dz = st.head_pos[2] - st.pos[2];
+                log::info("[pose] seated (gate %d): John's head %.2f m above his root, %.2f m ahead and %.2f m right of it; the view %.2f m above "
+                          "it, %.2f m ahead, %.2f m right (eye height%s%s, lift %.2f) | the view's heading %.1f deg, John's %.1f; turned with a "
+                          "train's course %.1f deg so far (steps not taken %u)", holster::game_gate(),
+                          g_up_axis == 1 ? st.head_pos[1] - st.pos[1] : st.head_pos[2] - st.pos[2],
+                          dx * fx + dz * fz, dx * -fz + dz * fx, job.height, job.forward, job.right, hold ? " held" : "", pc_hold ? " crouch-held" : "",
+                          g_lift, g_heading, st.heading_deg, g_train_turned.load(std::memory_order_relaxed),
+                          g_train_turn_refused.load(std::memory_order_relaxed));
+            }
+        }
         int bits = (g_pc_want ? 1 : 0) | ((have_st && (st.flags & RDRVR_ACTOR_CROUCHING)) ? 2 : 0) | (g_pc_owned ? 4 : 0) | (g_pc_pend >= 0 ? 8 : 0) |
                    (g_pc_ref ? 16 : 0) | (g_pc_H_stage ? 32 : 0) | (pc_hold ? 64 : 0) | (g_pc_running ? 128 : 0) | (g_pc_defer ? 256 : 0) |
                    (g_pc_ref_wait ? 512 : 0);
@@ -2142,11 +2305,15 @@ void init() {
     g_anchor = config::get_bool("Body", "CameraAnchor", false);
     g_keep_cam = config::get_bool("Body", "KeepAnchorCamera", true);
     g_mounted_fp = config::get_bool("Hands", "MountedGunFirstPerson", false);  // 2026-10-13: experimental, off
+    camera_lever::train_cam_status(config::get_bool("Debug", "TrainCamera", true) ? 1 : 0);  // (round 129)
+    camera_lever::near_fix_status(config::get_bool("Debug", "NearPlaneFix", true) ? 1 : 0);  // (round 130)
+    g_train_turn = config::get_bool("Debug", "TrainTurn", true);                             // (round 130)
     camera_lever::set_first_person_moments(config::get_bool("Body", "FirstPersonMoments", true));  // 2026-10-12: on (the user's)
     g_height = config::get_float("Body", "EyeHeight", 0.0f);  // 0 = measured from the head bone
     g_auto_height = g_height <= 0;
     if (g_auto_height) g_height = 1.60f;  // until measured
     g_lift = config::get_float("Body", "SeatedLift", 0.09f);
+    g_table_head = config::get_bool("Body", "TableGameHeadView", false);  // (GOAL-doorway-and-poker item 3: off by default)
     g_no_idles = config::get_bool("Body", "NoIdleAnims", true);
     g_hide_reticle = config::get_bool("Hands", "HideReticle", true);
     g_forward = config::get_float("Body", "EyeForward", 0.05f);
@@ -2590,6 +2757,7 @@ void set_saddle(bool on, float tau, bool save) {
 }
 
 bool anchor_active() { return g_active_shared.load(std::memory_order_relaxed); }
+bool mod_hides_reticle() { return g_mod_hides_reticle.load(std::memory_order_relaxed); }
 bool on_mounted_gun() { return g_on_mounted_gun_shared.load(std::memory_order_relaxed); }
 bool mounted_gun_held() { return g_mounted_held_shared.load(std::memory_order_relaxed); }
 bool mounted_first_person() { return g_mounted_fp.load(std::memory_order_relaxed); }
@@ -2600,6 +2768,12 @@ void set_mounted_first_person(bool on, bool save) {
 bool anchor_enabled() { return g_anchor.load(std::memory_order_relaxed); }
 float body_heading_deg() { return g_heading_shared.load(std::memory_order_relaxed); }
 float eye_lift() { return g_lift; }
+bool table_game_head_view() { return g_table_head.load(std::memory_order_relaxed); }
+void set_table_game_head_view(bool on) {
+    if (g_table_head.exchange(on) != on) log::info("[pose] TableGameHeadView %s", on ? "on" : "off");
+}
+uint64_t table_game_head_frames() { return g_table_head_frames.load(std::memory_order_relaxed); }
+bool table_game_view_active() { return g_table_view_active.load(std::memory_order_relaxed); }
 void set_eye_lift(float m) {
     g_lift = m < -0.3f ? -0.3f : m > 0.4f ? 0.4f : m;
 }

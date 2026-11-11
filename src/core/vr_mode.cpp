@@ -28,11 +28,17 @@ std::atomic<bool> g_auto{true}, g_cut3d{false};
 std::atomic<int> g_force_cutscene{-1};  // test override of the cutscene state: -1 the native's, 0 off, 1 on
 std::atomic<float> g_separation{1.0f};
 int g_w_cutscene = -1, g_w_paused = -1, g_w_faded = -1;
+// (round 129, the user: "Movies are buggy, the view is constantly flickering"; their video: the theatre's screen drawn a
+// second time, a third of the view to the side, on about every other frame: the film's quad drawn with the game's own
+// camera, the theatre's, beside the eyes') while a film plays (the theatre's prompts are up: UI_ISACTIVE of its two
+// layers) the game's own picture on the cinema screen, as a cutscene: its camera looks at the screen, and zooms
+int g_w_movie[2] = {-1, -1};
+const char kMoviePrompts[] = "MoviesPrompts", kMoviePromptsZoomed[] = "MoviesPromptsZoomed";
 // presenting thread
 View g_view = View::None;
 uint64_t g_last_scenes = 0, g_last_ticks = 0;
 int g_no_scene = 0, g_tick_stall = 0, g_clear = 0;
-char g_reason[64] = "";
+char g_reason[112] = "";
 std::atomic<uint64_t> g_switches{0};
 std::atomic<int> g_flags{0};  // bits: 1 no scene, 2 paused, 4 stalled, 8 faded, 16 cutscene (for the status)
 
@@ -78,13 +84,14 @@ void on_frame_end(uint64_t) {
     g_tick_stall = ticks != g_last_ticks ? 0 : g_tick_stall + 1;
     g_last_ticks = ticks;
     bool paused = watch_true(g_w_paused), faded = watch_true(g_w_faded), cutscene = watch_true(g_w_cutscene);
+    const bool movie = watch_true(g_w_movie[0]) || watch_true(g_w_movie[1]);
     int force = g_force_cutscene.load(std::memory_order_relaxed);
     if (force >= 0) cutscene = force == 1;
     bool stalled = g_tick_stall > 20;
     // the game's frame made again at another size (xr's live-resize guard): the flat game on the cinema screen for good
     const bool resized = xr::frame_resized();
-    bool flat = g_no_scene >= 2 || paused || stalled || faded || resized;
-    g_flags = (g_no_scene >= 2 ? 1 : 0) | (paused ? 2 : 0) | (stalled ? 4 : 0) | (faded ? 8 : 0) | (cutscene ? 16 : 0) | (resized ? 32 : 0);
+    bool flat = g_no_scene >= 2 || paused || stalled || faded || resized || movie;
+    g_flags = (g_no_scene >= 2 ? 1 : 0) | (paused ? 2 : 0) | (stalled ? 4 : 0) | (faded ? 8 : 0) | (cutscene ? 16 : 0) | (resized ? 32 : 0) | (movie ? 64 : 0);
     bool cut3d = g_cut3d.load(std::memory_order_relaxed);
     View want = flat ? View::Cinema : cutscene ? (cut3d ? View::Cutscene3D : View::Cinema) : View::Stereo;
     if (want == g_view) {
@@ -94,8 +101,9 @@ void on_frame_end(uint64_t) {
     // into the cinema at once; out of it (or between the stereo views) after ten frames of the new state
     if (want != View::Cinema && g_view == View::Cinema && ++g_clear < 10) return;
     g_clear = 0;
-    std::snprintf(g_reason, sizeof(g_reason), "%s%s%s%s%s%s", resized ? "frame resized " : "", g_no_scene >= 2 ? "no scene " : "",
-                  paused ? "paused " : "", stalled ? "script stalled " : "", faded ? "faded " : "", cutscene ? "cutscene" : "");
+    std::snprintf(g_reason, sizeof(g_reason), "%s%s%s%s%s%s%s", resized ? "frame resized " : "", g_no_scene >= 2 ? "no scene " : "",
+                  paused ? "paused " : "", stalled ? "script stalled " : "", faded ? "faded " : "", movie ? "a film in the theatre " : "",
+                  cutscene ? "cutscene" : "");
     log::info("[mode] %s -> %s (%s)", view_name(g_view), view_name(want), g_reason[0] ? g_reason : "gameplay");
     g_view = want;
     g_switches.fetch_add(1, std::memory_order_relaxed);
@@ -111,6 +119,8 @@ void init() {
     g_w_cutscene = api::watch_native(0xA61FA36Bu);  // CUTSCENE_MANAGER_IS_CUTSCENE_PLAYING
     g_w_paused = api::watch_native(0x57246C02u);    // IS_GAME_PAUSED
     g_w_faded = api::watch_native(0x4EFFFC06u);     // HUD_IS_FADED
+    g_w_movie[0] = api::watch_native(0xB1FDB70Du, reinterpret_cast<uint64_t>(kMoviePrompts), 1);        // UI_ISACTIVE("MoviesPrompts")
+    g_w_movie[1] = api::watch_native(0xB1FDB70Du, reinterpret_cast<uint64_t>(kMoviePromptsZoomed), 1);  // UI_ISACTIVE("MoviesPromptsZoomed")
     d3d::add_frame_end_listener(on_frame_end);
 }
 

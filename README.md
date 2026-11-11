@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.13.2 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.14 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -458,6 +458,45 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
   - Tried in the developer's simulator with the refusals made up, and on SteamVR itself (no headset): SteamVR took
     the wrist HUD's frames there, with a gun in hand and with the menu open, and nothing was left out. Not yet tried
     on a headset that refuses them.
+- New in 0.8.14 (no reset: the settings you changed are kept. The new options below are on unless you turn them off:
+  the view at John's head, John's own arms at the other table games, the belt's props and throwable, hold-ups, the duel's
+  trigger and the coat's two):
+  - Used in the developer's Quest 3:
+    - **The table games and the train's seat.** "The view at John's head where the game seats him" (the Body tab):
+      at poker, liar's dice, blackjack, five finger fillet, arm wrestling and on a train's seat your view sits at
+      John's head as the game seats him, not at standing height in front of his body. Seated on a train, the view turns
+      with the car through a bend (with this option on or off). At poker the cards follow your hand and the deck and
+      chips stay on the table. Blackjack's dealer stays in his seat (the game hid him for its own camera). Five finger
+      fillet's table is whole (the game's camera cut away everything within half a metre of your eyes). A film in the
+      theatre is shown on the flat cinema screen in front of you, not around you.
+      The holsters are closed and the fists do not swing while a table game runs.
+    - **John's own arms at the other table games** (the Body tab): at horseshoes, five finger fillet and arm
+      wrestling John's arms move as the game animates them and you press the game's buttons; liar's dice, blackjack
+      and poker keep your own hands.
+    - **The knife, satchel and lasso on every outfit**, and **the equipped throwable instead of the satchel** (the
+      Holsters tab, under "Customize John's belt"): outfits that have no sheath, satchel or lasso of their own (the
+      duster and others) show the game's, where your belt has them; and the throwable you have equipped hangs at the
+      satchel's place (the fire bottle, dynamite, throwing knives, the tomahawk, and the Undead Nightmare's holy
+      water, undead bait and boom bait). Place each one by hand ("Placing by hand: Belt pieces and guns"). None
+      left: none shown, none drawn.
+    - **Hold-ups** (the Guns tab): people your gun points at put their hands up as when you aim at them in the
+      game, with the game's rob option from more than 4 m.
+    - **In a duel, the right trigger fires** (the Guns tab, with Dead Eye's rows): flick the right stick up to place
+      each X, pull the right trigger to fire.
+    - **The duster's coat** hangs on the body you see ("Coat on the drawn body" and "Coat held still", the Advanced
+      tab), not on the game's own walk.
+    - Fixed: a second gun held in the other hand left the glove for a moment at a step or a doorway; the holsters'
+      guns lagged, doubled or flickered at the hip; a door by John's side jumped as he passed; a gun drawn at night or
+      in shade could look see-through (each eye was shown a slightly different gun); a throwing knife or tomahawk
+      could be thrown by the trigger; with none of a throwable left it could still be drawn; leaving poker could
+      freeze the game; changing outfit could leave John in a T pose.
+  - Fixed, from the developer's logs: after a death or a loaded save the game could put up its "exited unexpectedly"
+    box behind the other windows and go on running (the mod read through an address the reload had freed). If you
+    still see such a box, please attach `RDRVR.log` to an issue.
+  - **The hidden body casts a shadow** (the Body tab, off): with "Shown" at forearms or hands only, John's whole
+    shadow on the ground; off, none.
+  - 0.8.13.1's and 0.8.13.2's fix for headsets whose runtime refuses frames (the freeze at the wrist HUD) is judged
+    over more frames now: a runtime that refuses only some of them no longer loses the prompts and the menu.
 
 ## Requirements
 
@@ -475,7 +514,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.13.2.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.14.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -608,6 +647,9 @@ How much of John is drawn, his torso, and how his arms and hands fit your contro
 | **Shown: Whole body / Forearms and hands / Hands only** | How much of John is drawn in first person (only what you see changes, not gameplay). | Whole body |
 | **Forearms and hands when crouching, in cover or riding** | Draws only the forearms and hands at those times, when the body gets in the way of the view. | Off |
 | **Hide head and hat** | Hides John's head and hat in first person; cutscenes still show them. | On |
+| **The hidden body casts a shadow** (new in 0.8.14) | With part of John hidden by "Shown" (forearms and hands, or hands only): his whole body's shadow on the ground. Off: no shadow of him at all. | Off |
+| **The view at John's head where the game seats him** (new in 0.8.14) | At a table game (poker, liar's dice, blackjack, five finger fillet, arm wrestling, horseshoes) and on a train's seat: the view at John's head as the game places him, instead of the standing eye height. | On |
+| **John's own arms at the other table games** (new in 0.8.14) | At horseshoes, five finger fillet and arm wrestling: John's arms as the game animates them (the knife and the horseshoe are in his animated hands), not on your controllers; you only press the game's buttons. Liar's dice, blackjack and poker keep your hands. | On |
 | **Torso: Upper body upright / Still / Remove lean only / Game animation** | Holds the torso upright over the hips, holds it still under your view (new in 0.8.5: only the arms and legs move), removes only its lean, or draws it as animated. | Still |
 | ↳ **Torso pitch** | Tilts the upright torso, 1 degree per press; positive leans it forward. | 0° |
 | **Body back** | How far behind your view the body is drawn, so looking down shows your chest from outside. | 0.04 m |
@@ -655,6 +697,8 @@ The body holsters: how you draw and hold, what they follow, placing them by hand
 | **Choose the weapon in each holster** | Each holster draws the weapon you pick in its own rows below, and the game's weapon wheel follows; Automatic draws the game's weapon. | On |
 | ↳ **Any weapon in the gun holsters** (new in 0.8.5; the gun holsters only since 0.8.9) | The hips' and the backs' holsters take any weapon you own; one put away at a gun holster is drawn from there again. The knife's, the satchel's and the lasso's keep their own items, the chest the rounds. | Off |
 | **Customize John's belt** (new in 0.8.9) | Move and turn John's own holster, knife sheath, satchel, lasso and rifle sling (each holster's Place / Angle rows, or Placing by hand), and add **A mirrored holster at the left hip** for the secondary sidearm. Off: John's belt exactly as the game has it (with Rings stay on their holsters, the rings move back with the pieces); your places are kept. **Reset the belt to the game's positions** returns every piece to the game's place, and **Reset the rings to their defaults** every ring to its default place on its piece (each on a second click). | On (the developer's layout, the mirrored holster on) |
+| ↳ **The knife, satchel and lasso on every outfit** (new in 0.8.14) | On an outfit that has no knife sheath, satchel or lasso of its own (the duster and others), the game's knife, satchel and lasso coil are shown where your belt has them, moved and turned with those pieces. | On |
+| ↳ ↳ **The equipped throwable instead of the satchel** (new in 0.8.14) | At the satchel's place, the throwable you have equipped (the fire bottle, the dynamite, the throwing knives, the tomahawk; in Undead Nightmare holy water, undead bait and boom bait) instead of the satchel; nothing there when none is left. Each one can be placed by hand ("Placing by hand: Belt pieces and guns", a grip near it). | On |
 | **Each holster** (since 0.8.9 in this order): **Right hip (primary sidearm), Left hip (secondary sidearm), Right back (primary long gun), Left back (secondary long gun), Knife, Satchel (throwables), Lasso, Ammo** | Turns each holster on or off (the ammo holster is always on). The Lasso holster (new in 0.8.9) sits on John's lasso and replaced the lower back's knife-and-lasso holster; the knife holster holds the knife only. | On |
 | ↳ **Weapon** | The weapon this holster draws. On Automatic, the secondary sidearm and long gun holsters take a different owned gun when you have one. A weapon you no longer own shows "(not owned: automatic)". The lists fill in once you are in gameplay. | Automatic |
 | ↳ **Ring / Size arrows** | Move each holster's ring right / up / forward, 5 mm per press, and change its size; saved at once. Set Interaction points to Rings or Both and turn on Show the holsters to see them while you move them. | Placed for the release |
@@ -676,6 +720,7 @@ The gun in your hand: the reticle, the scope, how it fires, the free hand, Dead 
 | **Keep the gun drawn** | A drawn gun stays in your hand until you put it away, instead of being holstered 3 seconds after your last shot. | On |
 | **Executions up close** (was "No executions up close" before 0.8.9) | Pulling the trigger close to someone can start the game's third-person execution, pistol whip or butt strike. Off: it just fires. | Off |
 | **Shoot past the arm block** | Lets you fire when the game thinks John's shoulder-to-gun line hits a wall; a friendly in the way still blocks the shot. | On |
+| **Hold-ups** (new in 0.8.14) | People your gun points at react as when you aim at them in the game: hands up, and the game's rob option once you stand more than 4 m away. | On |
 | **Perfect accuracy** | Every shot goes exactly along the barrel, with no random spread. Other characters keep the game's spread. | On |
 | **Shotgun pellets spread** | Pellets spread in the game's cone; off puts them all on one line. | On |
 | **Gun kick** (new in 0.8.12) | Each shot kicks the gun in your hand muzzle up and back for a moment, most on revolvers, rifles and shotguns; a long gun held with both hands slides back instead. The second gun and the copy kick on their own shots. Looks only: your shots still go where the barrel points. 25% per press (0 to 200%); 0% is off. | 0% |
@@ -686,6 +731,7 @@ The gun in your hand: the reticle, the scope, how it fires, the free hand, Dead 
 | **Mounted guns in first person (experimental)** (new in 0.8.10, not yet tried on a real mounted gun) | The Gatling, the Browning and the cannon: first person kept, John's hands on the gun, and the gun turned toward where your gun hand points (it learns the gun's barrel from your first shot). While on, the right stick no longer turns the gun: if the gun does not follow your hand, turn it off. Off: the game's own camera and aim while you use one. | Off |
 | **Dead Eye level: The game's / 1: slow motion / 2: marks as you sweep / 3: marks by the button** (new in 0.8.12) | Which Dead Eye you use, up to the level the story has unlocked (the row says which): slow motion only, the marks painted as you sweep over targets, or the marks painted with the button. A change applies at the next Dead Eye. | The game's |
 | **Dead Eye's sepia colour** (new in 0.8.12) | Dead Eye's sepia screen colour. Off: the colours stay as they are; the slow motion and the rest stay. | On |
+| **In a duel, the right trigger fires** (new in 0.8.14) | In a duel, flick the right stick up to place each X, then pull the right trigger to fire at them: once your X's score enough to win, the duel ends there and they fire (with too few the time runs on). Off: the game's way (the right trigger places the X's, the duel fires them). Needs the right stick's flick up on. | On |
 | **Dead Eye's X on each mark** (new in 0.8.12) | The game's X on each target you mark in Dead Eye, drawn on the target in the headset (it showed nowhere before). While marks show, a small part of the floating HUD is left out. Turned on while the game runs, it applies after a restart. | On |
 | ↳ **Its size** | How big each X looks, 0.5° per press (0.5 to 15°). | 3.0° |
 | **Dead Eye marks where the barrel points** (new in 0.8.12) | A mark painted with the button lands on whoever your barrel points at. Off: the game picks the target from its flat camera's view, which in the headset often is not the one you aim at. Turned on after the game started with it off, it applies after a restart. | On |
@@ -818,6 +864,8 @@ Live performance and view-mode readouts (frame rate, missed frames, CPU and GPU 
 | **Shadows drawn once for both eyes** | The shadows drawn once a frame for both eyes instead of once per eye: about 0.9 ms faster; a shadow's edge can shift by a pixel. | On |
 | **Steady gun far out** (new in 0.8.12) | The gun in your hand doesn't tremble far from the map's middle (the game's positions there step by half a millimetre): it is held where it was while your hand and head stay still. | On |
 | **Still clothes** (new in 0.8.12) | John's clothes don't flutter in the wind (seen from inside the body it reads as a buzz). | On |
+| **Coat on the drawn body (test)** (new in 0.8.14) | The duster's coat drawn on John's drawn body, each part with the body at its height (hips to chest), not swaying with the game's own walk and idle. Off: the whole coat moved with the hips. | On |
+| ↳ **Coat held still (test)** (new in 0.8.14) | With the option above: the duster's coat hangs still on your body, the game's walking and idle sway smoothed out (it follows a slow change, a crouch or the saddle, in about a second). Off: the coat swings as the game simulates it. | On |
 | **Arm motion vectors (experimental)** (new in 0.8.9) | Tells DLSS and TAA how John's arms moved, which may cut the ghosting beside fast-moving arms. | On |
 | **Show the launcher when the game starts (next start)** (new in 0.8.12) | `RDRVR_Launcher.exe` opens on the desktop each time the game starts, and the game waits for its Save & Play (its Close cancels the start): the settings saved there apply to that start. Off: the game starts at once. | On |
 | ↳ **Goes on by itself after** | If nobody presses Save & Play (you started the game from the headset), the game goes on after this many seconds with the saved settings, 5 s per press (0 to 300 s). A click in the launcher stops the countdown; 0: no countdown (the game still goes on after 5 minutes). Applies at the next start. | 30 s |
@@ -925,6 +973,14 @@ Shown only while Ped Gunfight Overhaul (a separate RedHook mod by another author
   in the developer's simulator, back on the grip within 3 seconds). `RDRVR.log` has a `[two] a shot two-handed`
   line after each such shot (since 0.8.0 measured as your eyes see it): please attach it to an issue if your hand
   ends up in the gun or in the air.
+- In the theatre the film's own picture pulses in brightness on the flat screen (the room around it is steady in the
+  developer's recording: the game's old-film look, as far as that shows).
+- Horseshoes is hard to play from first person: the game's meter and John's swing are made for its own camera. A throw
+  by your own arm is planned.
+- At five finger fillet near a lamp (indoors or at night) the lamp's light can show as a lit cone in the air (seen in
+  the developer's simulator; the fix that keeps the table whole causes it). Being looked into.
+- Looking down the duster's side in the sun, a second outline of the coat can show as a darker patch on the ground
+  beside it. Being looked into.
 - A revolver at the right hip can sometimes show a second copy of itself that trails slightly behind (the game's own
   holstered gun; the Cattleman's turned, the Schofield's near the chest). Being looked into.
 - A dual-wield copy of the Cattleman can sit turned in the hand (its barrel pointing sideways), seen after walking out

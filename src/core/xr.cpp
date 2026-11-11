@@ -1,6 +1,7 @@
 #include "core/xr.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
@@ -42,6 +43,7 @@
 #include "core/scope.h"
 #include "core/state.h"
 #include "core/xr_blit.h"
+#include "core/xr_image.h"
 #include "core/ui_layer.h"
 #include "core/menu.h"
 #include "core/xinput.h"
@@ -395,7 +397,7 @@ int g_target_nrtv[2] = {};
 DXGI_FORMAT g_target_fmt = DXGI_FORMAT_UNKNOWN;  // the post output's (both targets'), checked before each copy
 bool g_blit = false;                     // eye images through the colour blit (sRGB swapchains), else raw copies
 bool g_raw_refused = false;              // raw copies of a frame larger than the runtime's largest image: no submission
-bool g_eyes_acquired = false;            // presenting thread: this frame took the eye images (not after a live resize)
+xr_image::Held g_eye_held[2];            // (under g_frame_mutex) each eye's image from its acquire to its release (xr_image.h)
 std::atomic<ID3D12Resource*> g_dst[2];   // this frame's acquired images, for the recording thread
 std::atomic<int> g_filled{0};            // bit per eye filled this frame
 int g_fxaa_binds = 0;                    // recording thread
@@ -406,6 +408,7 @@ std::atomic<bool> g_cinema{false};
 bool g_cinema_placed = false;            // presenting thread
 XrPosef g_cinema_pose{};
 XrSwapchain g_quad = XR_NULL_HANDLE;
+xr_image::Held g_quad_held;
 std::vector<ID3D12Resource*> g_quad_images;
 uint32_t g_quad_w = 0, g_quad_h = 0;     // the quad swapchain: the back buffer's size, at most [XR] CinemaMaxWidth wide
 uint32_t g_quad_bw = 0, g_quad_bh = 0;   // the back buffer it was made for, and its format: a CopyResource needs both
@@ -521,13 +524,11 @@ bool fill_quad() {
                 return false;
             }
         }
-        uint32_t index = 0;
-        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-        wsi.timeout = 100000000;
-        if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_quad, &ai, &index)) && XR_SUCCEEDED(xrWaitSwapchainImage(g_quad, &wsi)) &&
-            index < g_quad_images.size() && (!copy || (SUCCEEDED(g_quad_alloc->Reset()) && SUCCEEDED(g_quad_list->Reset(g_quad_alloc, nullptr))))) {
-            ID3D12Resource* dst = g_quad_images[index];
+        // (2026-11-09, the code review: a failed wait or list reset left the image acquired, a timed-out wait drew into an
+        // unwaited one) xr_image: drawn only once waited; a waited one given back drawn or not
+        if (xr_image::acquire(g_quad, g_quad_held, "cinema") && g_quad_held.index < g_quad_images.size() &&
+            (!copy || (SUCCEEDED(g_quad_alloc->Reset()) && SUCCEEDED(g_quad_list->Reset(g_quad_alloc, nullptr))))) {
+            ID3D12Resource* dst = g_quad_images[g_quad_held.index];
             if (copy) {
                 D3D12_RESOURCE_BARRIER b[2]{};
                 for (auto& x : b) {
@@ -551,9 +552,8 @@ bool fill_quad() {
             } else {
                 ok = xr_blit::cinema_resample(state::device.load(), q, bb, dst, g_quad_fmt, rw, rh);
             }
-            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            xrReleaseSwapchainImage(g_quad, &ri);
         }
+        xr_image::release(g_quad_held, "cinema");  // (not waited: kept for the next frame's wait)
         if (ok) {
             g_quad_rw.store(rw, std::memory_order_relaxed);
             g_quad_rh.store(rh, std::memory_order_relaxed);
@@ -841,6 +841,7 @@ bool make_swapchains() {
 // (ui_layer.h) on a quad 2 m ahead, 1.8 m wide, slightly below eye height; it turns with the head only when the head
 // has turned more than 20 degrees away from it, and then eases back to the head's yaw.
 XrSwapchain g_ui_sc = XR_NULL_HANDLE;
+xr_image::Held g_ui_held;
 std::vector<ID3D12Resource*> g_ui_images;
 DXGI_FORMAT g_ui_fmt = DXGI_FORMAT_UNKNOWN;
 uint32_t g_ui_w = 0, g_ui_h = 0;    // the quad's swapchain: the UI target's size, at most [XR] UiQuadMaxWidth wide
@@ -860,23 +861,35 @@ std::atomic<uint32_t> g_max_layers{16};  // XrSystemGraphicsProperties::maxLayer
 // passing refusal right after a menu opened blamed it): refused again, it stays out (the wrist HUD's: the HUD back on the
 // floating UI meanwhile), put back once more after 30 s and out for the session if refused again; taken with it for 90
 // frames, it is cleared. Each session starts with none. Presenting thread
+// (2026-11-09, the same player on 0.8.13.2 with OFXR Bridge, a frame-generation layer: the prompts and the menu gone,
+// later the wrist HUD. Their runtime refused most frames with the wrist HUD, not all: a trial without the floating UI
+// had a wrist-only frame taken, so the floating UI was put back as the suspect, refused with the wrist HUD again, and left
+// out for the session) each step judged over a window, not one frame: a search starts after three refusals with no 30
+// frames taken between them; a trial ends at three refused frames with the rest of its frame (not the cause) or 60 taken
+// (its suspect, if none was refused; the review: at 30, a runtime refusing a tenth of the wrist HUD's frames would let
+// one in 25 such trials through), or after 30 frames without the rest (back, untried); a suspect is found at three
+// refused frames with it, passing at 90 taken, dropped after 30 frames without it (the review: one not on screen held
+// off every search); a search (its kinds tried) ends at 90 frames taken in a row
 constexpr const char* kKindName[5] = {"scope picture/hand's wheel/Dead Eye", "menu", "wrist HUD", "floating UI", "reticle/ring/highlight"};
 std::atomic<uint32_t> g_out_kinds{0};       // the kinds left out now (1 << kind)
 uint32_t g_ok_kinds = 0;                    // the kinds in the last frame the runtime took
-uint32_t g_refused_run = 0;                 // the refused frames in a row
+uint32_t g_refused_run = 0;                 // the refused frames since the last 30 taken in a row
+uint32_t g_ok_run = 0;                      // the frames with quads taken in a row
 int g_trial = 0;                            // the kind left out to try (0 none)
 uint32_t g_trial_rest = 0;                  // the other kinds of the refused frame it was tried on
+uint32_t g_trial_ok = 0, g_trial_bad = 0;   // the frames with the rest taken, refused, in the trial
+uint32_t g_trial_idle = 0;                  // its frames without the rest (30: the trial ends, the kind back, nothing judged)
 uint32_t g_tried = 0;                       // the kinds tried in this search
-bool g_no_cause = false;                    // every kind tried in vain: no more tries until a frame is taken
+bool g_no_cause = false;                    // every kind tried in vain: no more tries until 90 frames are taken
 int g_suspect = 0;                          // the kind put back to make sure (0 none)
-uint32_t g_suspect_ok = 0;                  // the frames taken with it since
+uint32_t g_suspect_ok = 0, g_suspect_bad = 0, g_suspect_idle = 0;  // the frames with it taken, refused, without it, since
 uint32_t g_found = 0, g_put_back = 0;       // the kinds found refused; those put back once
 double g_found_ms = 0;
 std::atomic<bool> g_refusals_reset{false};  // a new session or "hud refuse 0": all of it anew
 std::atomic<uint64_t> g_quads_left_out{0};  // the quads left out so far
-// "hud refuse <n>|menu|wrist|ui|marks" (the test's): a frame with n quads or more (n > 0), or with a quad of the kind -n,
-// taken as refused
-std::atomic<int> g_refuse_test{0};
+// "hud refuse <n>|menu|wrist|ui|marks [k]" (the test's): a frame with n quads or more (n > 0), or with a quad of the kind
+// -n, taken as refused; with k, every k-th such frame let through (a runtime that refuses most of them)
+std::atomic<int> g_refuse_test{0}, g_refuse_pass{0};
 std::atomic<bool> g_hud_wrist{false};
 float g_hud_rect[4] = {0.02f, 0.60f, 0.34f, 0.96f};  // (2026-10-26: top 0.63 cut the ammo counter's top, at 0.625)
 // [XR] WristHudShape (2026-10-26): radar (the default): the wrist takes only the radar's ellipse ([XR] WristHudRadar:
@@ -892,6 +905,7 @@ float g_hud_radar[4] = {0.1795f, 0.8250f, 0.1500f, 0.1300f}, g_hud_ammo[4] = {0.
 // ellipse moved right and down (percent of the screen) and its size (percent), from the menu's arrows, on WristHudRadar
 std::atomic<float> g_hud_nudge[3] = {0.0f, 0.0f, 100.0f};
 XrSwapchain g_wr_sc = XR_NULL_HANDLE;
+xr_image::Held g_wr_held;
 std::vector<ID3D12Resource*> g_wr_images;
 int g_wr_x0 = 0, g_wr_y0 = 0;        // the crop in the UI target's pixels
 uint32_t g_wr_cw = 0, g_wr_ch = 0;
@@ -1050,6 +1064,7 @@ XrPosef ui_pose() {
 // ---- the hand-placed wheel (run 8 item 5): while the mod holds the game's weapon wheel open, its rect of the UI
 // target on its own quad where the hand was at the press, facing the head as it was then; the floating quad leaves it out
 XrSwapchain g_wh_sc = XR_NULL_HANDLE;
+xr_image::Held g_wh_held;
 std::vector<ID3D12Resource*> g_wh_images;
 int g_wh_x0 = 0, g_wh_y0 = 0;
 uint32_t g_wh_cw = 0, g_wh_ch = 0, g_wh_w = 0, g_wh_h = 0;
@@ -1166,15 +1181,10 @@ bool fill_wheel(XrCompositionLayerQuad& quad) {
     g_wh_on = false;
     float pos[3], q[4], rect[4];
     if (!wheel::hand_quad(pos, q, rect) || !ui_layer::has_ui() || !make_wheel_swapchain(rect)) return false;
-    uint32_t index = 0;
-    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wsi.timeout = 100000000;
-    if (XR_FAILED(xrAcquireSwapchainImage(g_wh_sc, &ai, &index))) return false;
-    bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_wh_sc, &wsi)) && index < g_wh_images.size() &&
-              ui_layer::draw_crop(g_wh_images[index], g_ui_fmt, g_wh_x0, g_wh_y0, g_wh_cw, g_wh_ch, 1);
-    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(g_wh_sc, &ri);
+    if (!xr_image::acquire(g_wh_sc, g_wh_held, "wheel")) return false;  // (none waited this frame: no layer)
+    const uint32_t index = g_wh_held.index;
+    bool ok = index < g_wh_images.size() && ui_layer::draw_crop(g_wh_images[index], g_ui_fmt, g_wh_x0, g_wh_y0, g_wh_cw, g_wh_ch, 1);
+    xr_image::release(g_wh_held, "wheel");
     if (!ok) return false;
     quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     quad.space = g_space;
@@ -1192,21 +1202,17 @@ bool fill_wheel(XrCompositionLayerQuad& quad) {
 // Presenting thread, frame end: this frame's UI into an acquired quad image. False when there is none.
 bool fill_ui(XrCompositionLayerQuad& quad) {
     if (!ui_layer::has_ui() || !make_ui_swapchain()) return false;
-    uint32_t index = 0;
-    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wsi.timeout = 100000000;
-    if (XR_FAILED(xrAcquireSwapchainImage(g_ui_sc, &ai, &index))) return false;
+    if (!xr_image::acquire(g_ui_sc, g_ui_held, "ui")) return false;  // (none waited this frame: no layer)
+    const uint32_t index = g_ui_held.index;
     // with the HUD on the wrist, its corner is left out here (the prompts stay; in the UI target's pixels)
     const bool wrist = g_hud_wrist.load(std::memory_order_relaxed) && g_wr_sc != XR_NULL_HANDLE && !(g_out_kinds.load(std::memory_order_relaxed) & 4u);
     const int hole[4] = {g_wr_x0, g_wr_y0, g_wr_x0 + static_cast<int>(g_wr_cw), g_wr_y0 + static_cast<int>(g_wr_ch)};
     const int hole2[4] = {g_wh_x0, g_wh_y0, g_wh_x0 + static_cast<int>(g_wh_cw), g_wh_y0 + static_cast<int>(g_wh_ch)};  // the hand's wheel
     int band[4];
     const bool de_band = deadeye::band(band);  // the Dead Eye X's slots in use: drawn where the marks are instead
-    bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_ui_sc, &wsi)) && index < g_ui_images.size() &&
+    bool ok = index < g_ui_images.size() &&
               ui_layer::draw_quad(g_ui_images[index], g_ui_fmt, wrist ? hole : nullptr, g_wh_on ? hole2 : nullptr, de_band ? band : nullptr);
-    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(g_ui_sc, &ri);
+    xr_image::release(g_ui_held, "ui");
     if (!ok) return false;
     quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     quad.space = g_space;
@@ -1232,6 +1238,7 @@ void qrot(const XrQuaternionf& q, const float v[3], float out[3]) {
 // projection layer over the scene (each eye half the eye image's size, side by side in one image). Made at the first
 // marks; submitted only while marks show.
 XrSwapchain g_de_sc = XR_NULL_HANDLE;
+xr_image::Held g_de_held;
 std::vector<ID3D12Resource*> g_de_images;
 uint32_t g_de_w = 0, g_de_h = 0;  // one eye's half
 bool g_de_failed = false;
@@ -1328,15 +1335,10 @@ bool fill_deadeye(uint32_t iw, uint32_t ih, XrCompositionLayerProjection& layer,
         }
     }
     if (!ns) return false;
-    uint32_t index = 0;
-    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wsi.timeout = 100000000;
-    if (XR_FAILED(xrAcquireSwapchainImage(g_de_sc, &ai, &index))) return false;
-    const bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_de_sc, &wsi)) && index < g_de_images.size() &&
-                    ui_layer::draw_sprites(g_de_images[index], g_ui_fmt, sp, ns);
-    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(g_de_sc, &ri);
+    if (!xr_image::acquire(g_de_sc, g_de_held, "deadeye")) return false;  // (none waited this frame: no layer)
+    const uint32_t index = g_de_held.index;
+    const bool ok = index < g_de_images.size() && ui_layer::draw_sprites(g_de_images[index], g_ui_fmt, sp, ns);
+    xr_image::release(g_de_held, "deadeye");
     if (!ok) return false;
     for (int e = 0; e < 2; ++e) {
         pv[e] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
@@ -1446,15 +1448,10 @@ bool fill_wrist(XrCompositionLayerQuad& quad) {
         g_wr_hidden.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    uint32_t index = 0;
-    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wsi.timeout = 100000000;
-    if (XR_FAILED(xrAcquireSwapchainImage(g_wr_sc, &ai, &index))) return false;
-    bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_wr_sc, &wsi)) && index < g_wr_images.size() &&
-              ui_layer::draw_crop(g_wr_images[index], g_ui_fmt, g_wr_x0, g_wr_y0, g_wr_cw, g_wr_ch);
-    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(g_wr_sc, &ri);
+    if (!xr_image::acquire(g_wr_sc, g_wr_held, "wrist")) return false;  // (none waited this frame: no layer)
+    const uint32_t index = g_wr_held.index;
+    bool ok = index < g_wr_images.size() && ui_layer::draw_crop(g_wr_images[index], g_ui_fmt, g_wr_x0, g_wr_y0, g_wr_cw, g_wr_ch);
+    xr_image::release(g_wr_held, "wrist");
     if (!ok) return false;
     quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     quad.space = g_space;
@@ -1568,10 +1565,7 @@ void end_open_frame(bool presenting = false) {
     }
     g_rect_w.store(iw, std::memory_order_relaxed);
     g_rect_h.store(ih, std::memory_order_relaxed);
-    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    if (g_eyes_acquired)
-        for (auto& c : g_chain) xrReleaseSwapchainImage(c.sc, &ri);
-    g_eyes_acquired = false;
+    for (auto& h : g_eye_held) xr_image::release(h, "eyes");  // (the waited ones; one kept after a timeout is waited on next)
     XrCompositionLayerProjectionView pv[2];
     for (int i = 0; i < 2; ++i) {
         pv[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
@@ -1738,21 +1732,21 @@ void end_open_frame(bool presenting = false) {
     };
     if (g_refusals_reset.exchange(false)) {
         g_out_kinds = 0;
-        g_ok_kinds = g_refused_run = g_tried = g_found = g_put_back = g_trial_rest = 0;
+        g_ok_kinds = g_refused_run = g_ok_run = g_tried = g_found = g_put_back = g_trial_rest = 0;
         g_trial = g_suspect = 0;
-        g_suspect_ok = 0;
+        g_trial_ok = g_trial_bad = g_trial_idle = g_suspect_ok = g_suspect_bad = 0;
         g_no_cause = false;
     }
     uint32_t kinds = 0;  // the kinds sent (1 << kind, 1 to 4)
     if (!cinema) {
         const uint32_t back = g_found & ~g_put_back & g_out_kinds.load(std::memory_order_relaxed);
-        if (back && !g_trial && log::now_ms() - g_found_ms > 30000.0) {  // a kind found refused put back once
+        if (back && !g_trial && !g_suspect && log::now_ms() - g_found_ms > 30000.0) {  // a kind found refused put back once
             g_out_kinds.fetch_and(~back);
             g_put_back |= back;
             for (int k = 1; k <= 4; ++k)
                 if (back >> k & 1u) {
-                    g_suspect = k;  // (refused again: out at once)
-                    g_suspect_ok = 0;
+                    g_suspect = k;  // (refused again three times: out)
+                    g_suspect_ok = g_suspect_bad = g_suspect_idle = 0;
                     log::info("[xr] the %s put back (the runtime refused it 30 s ago; out for the session if refused again)", kKindName[k]);
                 }
         }
@@ -1780,15 +1774,31 @@ void end_open_frame(bool presenting = false) {
     if (ei.layerCount <= 1) kinds = 0;  // (no quads went in)
     if (const int rt = g_refuse_test.load(std::memory_order_relaxed);
         XR_SUCCEEDED(r) && !cinema && ei.layerCount > 1 &&
-        ((rt > 0 && ei.layerCount - 1 >= static_cast<uint32_t>(rt)) || (rt < 0 && rt >= -4 && (kinds >> -rt & 1u))))
-        r = XR_ERROR_RUNTIME_FAILURE;  // (the test's refusal: the frame itself went in)
+        ((rt > 0 && ei.layerCount - 1 >= static_cast<uint32_t>(rt)) || (rt < 0 && rt >= -4 && (kinds >> -rt & 1u)))) {
+        static uint32_t nth = 0;
+        const int pass = g_refuse_pass.load(std::memory_order_relaxed);
+        if (pass <= 0 || ++nth % static_cast<uint32_t>(pass) != 0) r = XR_ERROR_RUNTIME_FAILURE;  // (the test's refusal: the frame itself went in)
+    }
     if (XR_FAILED(r)) log::limited("xr.endframe", 8, "[xr] xrEndFrame -> %s", result_name(g_inst, r));
-    {  // (2026-11-08) a frame refused with quads over the scene: three in a row, one kind left out to try
+    {  // (2026-11-08) frames refused with quads over the scene: one kind left out to try (each step over a window, 11-09)
         const uint32_t quads = !cinema && ei.layerCount > 1 ? ei.layerCount - 1 : 0;
+        if (g_trial && !cinema && (kinds & g_trial_rest) != g_trial_rest && ++g_trial_idle >= 30) {  // (the wrist HUD looked away from)
+            g_out_kinds.fetch_and(~(1u << g_trial));
+            log::limited("xr.trial", 24, "[xr] the %s back, untried: the rest of its frame not shown for a while", kKindName[g_trial]);
+            g_tried &= ~(1u << g_trial);
+            g_trial = 0;
+        }
+        if (g_suspect && !cinema && !(kinds >> g_suspect & 1u) && ++g_suspect_idle >= 30) {  // (put back while not on screen)
+            log::limited("xr.suspect", 12, "[xr] the %s not shown for a while: no longer a suspect", kKindName[g_suspect]);
+            g_suspect = 0;
+        }
         if (r == XR_ERROR_RUNTIME_FAILURE && quads >= 1) {
+            g_ok_run = 0;
             if (++g_refused_run == 1)
                 log::limited("xr.refused", 12, "[xr] the runtime refused a frame with %u quads over the scene: %s", quads, describe(ei.layers, ei.layerCount).c_str());
-            if (g_refused_run >= 3 && g_suspect && (kinds >> g_suspect & 1u)) {  // put back to make sure, refused again: its cause
+            if (g_trial && (kinds & g_trial_rest) == g_trial_rest) ++g_trial_bad;
+            if (g_suspect && (kinds >> g_suspect & 1u)) ++g_suspect_bad;
+            if (g_suspect && g_suspect_bad >= 3) {  // put back to make sure, refused again: its cause
                 g_refused_run = 0;
                 const uint32_t bk = 1u << g_suspect;
                 const bool again = (g_put_back & bk) != 0;
@@ -1800,7 +1810,7 @@ void end_open_frame(bool presenting = false) {
                              g_suspect == 2 ? "; the HUD on the floating UI meanwhile" : "");
                 g_suspect = 0;
                 g_tried = 0;
-            } else if (g_refused_run >= 3 && !g_no_cause) {
+            } else if (g_refused_run >= 3 && !g_no_cause && !g_suspect && (!g_trial || g_trial_bad >= 3)) {
                 g_refused_run = 0;
                 if (g_trial) {  // its absence did not help: back in
                     g_out_kinds.fetch_and(~(1u << g_trial));
@@ -1813,6 +1823,7 @@ void end_open_frame(bool presenting = false) {
                     while (!(from >> k & 1u)) --k;
                     g_trial = k;
                     g_trial_rest = kinds & ~(1u << k);
+                    g_trial_ok = g_trial_bad = g_trial_idle = 0;
                     g_tried |= 1u << k;
                     g_out_kinds.fetch_or(1u << k);
                     log::limited("xr.trial", 24, "[xr] the runtime refuses frames with %u quads over the scene: the %s left out to try%s", quads,
@@ -1824,20 +1835,24 @@ void end_open_frame(bool presenting = false) {
                 }
             }
         } else if (XR_SUCCEEDED(r)) {
-            g_refused_run = 0;
-            g_no_cause = false;
             const bool sent = !cinema && ei.layerCount > 1;  // (the review: only a frame with quads judges a trial)
-            if (g_trial && sent) {
-                const uint32_t bt = 1u << g_trial;
-                g_out_kinds.fetch_and(~bt);  // back in either way: to make sure, or not shown to be it
-                if ((kinds & g_trial_rest) == g_trial_rest) {  // the same frame but the kind: put back to make sure
+            if (sent && ++g_ok_run >= 30) g_refused_run = 0;
+            // the same frame but the kind taken (the review: with nothing else in it, a frame of the scene alone), 60 times
+            if (g_trial && !cinema && (sent ? (kinds & g_trial_rest) == g_trial_rest : g_trial_rest == 0 && ei.layerCount > 0) && ++g_trial_ok >= 60) {
+                g_out_kinds.fetch_and(~(1u << g_trial));  // back in either way: to make sure, or not shown to be it
+                if (!g_trial_bad) {  // none of them refused: put back to make sure
                     g_suspect = g_trial;
-                    g_suspect_ok = 0;
+                    g_suspect_ok = g_suspect_bad = g_suspect_idle = 0;
                     log::limited("xr.suspect", 12, "[xr] the runtime takes the frames without the %s: put back to make sure", kKindName[g_trial]);
+                } else {
+                    log::limited("xr.trial", 24, "[xr] refused without the %s now and then too: it is back", kKindName[g_trial]);
                 }
                 g_trial = 0;
             }
-            if (!g_trial) g_tried = 0;
+            if (g_ok_run >= 90 && !g_trial && !g_suspect) {  // the search over
+                g_tried = 0;
+                g_no_cause = false;
+            }
             if (g_suspect && sent && (kinds >> g_suspect & 1u) && ++g_suspect_ok >= 90) {
                 log::limited("xr.suspect", 12, "[xr] the runtime takes the frames with the %s back in: a passing refusal", kKindName[g_suspect]);
                 g_suspect = 0;
@@ -1942,6 +1957,14 @@ void timing_window(const XrFrameState& fs) {
         log::info("[xr] timing %s | %s", line, vq.c_str());
     } else if (!vq_quiet) {
         log::info("[xr] timing %s", vq.c_str());
+    }
+    {  // (2026-11-09, the code review) the swapchain images' timed-out or failed waits and refused releases, in a window with new ones
+        static uint64_t s_img = 0;
+        const uint64_t img = xr_image::timeouts() + xr_image::wait_errors() + xr_image::release_failures();
+        if (img != s_img) {
+            s_img = img;
+            log::info("[xr] timing: swapchain %s", xr_image::status().c_str());
+        }
     }
     {  // the last windows for the menu's preset suggestion: stereo gameplay only, missed periods over 3%
         const double mp = 100.0 * static_cast<double>(g_tw.missed) / static_cast<double>(g_tw.frames + g_tw.missed ? g_tw.frames + g_tw.missed : 1);
@@ -2120,22 +2143,14 @@ void submit_frame_end() {
     }
     controllers::sync(g_space, fs.predictedDisplayTime);
     g_filled = 0;
-    g_eyes_acquired = !g_resized.load(std::memory_order_acquire);  // the live-resize guard: no eye images from then on
+    const bool eyes = !g_resized.load(std::memory_order_acquire);  // the live-resize guard: no eye images from then on
     for (int e = 0; e < 2; ++e) {
-        if (!g_eyes_acquired) {
-            g_dst[e] = nullptr;
-            continue;
-        }
-        uint32_t index = 0;
-        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-        wsi.timeout = 100000000;  // 100 ms
-        if (XR_FAILED(xrAcquireSwapchainImage(g_chain[e].sc, &ai, &index)) || XR_FAILED(xrWaitSwapchainImage(g_chain[e].sc, &wsi)) ||
-            index >= g_chain[e].images.size()) {
-            g_dst[e] = nullptr;
-            continue;
-        }
-        g_dst[e] = g_chain[e].images[index];
+        g_dst[e] = nullptr;
+        // (2026-11-09, the code review) xr_image: an image whose wait timed out is not drawn (the frame goes without the
+        // eyes' layer) and is waited again next frame, the spec's same image, never a new one drawn unwaited
+        if (!eyes || !xr_image::acquire(g_chain[e].sc, g_eye_held[e], "eyes")) continue;
+        if (g_eye_held[e].index < g_chain[e].images.size()) g_dst[e] = g_chain[e].images[g_eye_held[e].index];
+        else xr_image::release(g_eye_held[e], "eyes");  // (an index past the images: given back undrawn)
     }
     g_frame_open = true;
 }
@@ -2259,6 +2274,23 @@ DWORD WINAPI session_thread(void*) {
         std::snprintf(g_runtime, sizeof(g_runtime), "%s %u.%u.%u", ip.runtimeName, XR_VERSION_MAJOR(ip.runtimeVersion),
                       XR_VERSION_MINOR(ip.runtimeVersion), XR_VERSION_PATCH(ip.runtimeVersion));
         log::info("[xr] runtime: %s", g_runtime);
+    }
+    {  // (2026-11-09, a player's OFXR Bridge) the OpenXR API layers loaded into the game (their modules), for the log
+        std::string names;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32W me{};
+            me.dwSize = sizeof(me);
+            for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
+                if (_wcsnicmp(me.szModule, L"XR_APILAYER", 11) != 0) continue;
+                char b[MAX_MODULE_NAME32 + 1];
+                if (!WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, b, sizeof(b), nullptr, nullptr)) continue;
+                if (!names.empty()) names += ", ";
+                names += b;
+            }
+            CloseHandle(snap);
+        }
+        log::info("[xr] OpenXR API layers loaded: %s", names.empty() ? "none seen" : names.c_str());
     }
     XrSystemGetInfo sgi{XR_TYPE_SYSTEM_GET_INFO};
     sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -2603,8 +2635,9 @@ void hud_status(char* out, size_t len) {
                       g_out_kinds.load(), static_cast<unsigned long long>(g_quads_left_out.load()), g_refuse_test.load(), g_wr_eye[0].load(),
                       g_wr_eye[1].load(), g_wr_eye[2].load(), g_wr_eye[3].load(), g_wr_eye[4].load(), g_wr_eye[5].load());
 }
-void refuse_test(int v) {  // "hud refuse <n>|<kind>" (the session; 0 off, and the kinds left out anew)
+void refuse_test(int v, int pass) {  // "hud refuse <n>|<kind> [k]" (the session; 0 off, and the kinds left out anew)
     g_refuse_test = v;
+    g_refuse_pass = pass;
     if (v == 0) g_refusals_reset = true;
 }
 void set_hud_on_wrist(bool on) {
@@ -2918,3 +2951,121 @@ void set_mount_recentre(bool on, bool save) {
     if (save) config::set("Horse", "MountRecentre", on ? "1" : "0");
 }
 }  // namespace rdrvr::xr
+
+namespace rdrvr::xr_image {
+namespace {
+constexpr int kKinds = 8;
+const char* const kWhat[kKinds] = {"eyes", "ui", "wrist", "wheel", "deadeye", "cinema", "menu", "other"};
+int kind_of(const char* what) {
+    for (int i = 0; i < kKinds - 1; ++i)
+        if (what && std::strcmp(what, kWhat[i]) == 0) return i;
+    return kKinds - 1;
+}
+std::atomic<uint64_t> g_timeouts{0}, g_wait_errors{0}, g_release_failures{0}, g_faked{0};
+std::atomic<uint64_t> g_retried{0};  // a kept image waited again after its timeout, with no new acquire
+std::atomic<uint64_t> g_acquires{0}, g_releases{0};  // (the test's check: their difference, the images held, never grows)
+std::atomic<uint64_t> g_by_kind[kKinds] = {};
+std::atomic<int> g_fake_n{0};      // ("hud waittimeout", the test's) waits still to be taken as timed out
+std::atomic<int> g_fake_kind{-1};  // on which swapchain (-1 any)
+bool take_fake(const char* what) {
+    const int fk = g_fake_kind.load(std::memory_order_relaxed);
+    if (fk >= 0 && fk != kind_of(what)) return false;
+    int n = g_fake_n.load(std::memory_order_relaxed);
+    while (n > 0 && !g_fake_n.compare_exchange_weak(n, n - 1)) {
+    }
+    return n > 0;
+}
+}  // namespace
+
+bool acquire(XrSwapchain sc, Held& h, const char* what, XrDuration timeout) {
+    if (sc == XR_NULL_HANDLE) return false;
+    if (h.sc != sc) {  // (a swapchain not held from before: nothing of the old one's state applies)
+        h = Held{};
+        h.sc = sc;
+    }
+    if (!h.acquired) {
+        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if (XR_FAILED(xrAcquireSwapchainImage(sc, &ai, &h.index))) return false;
+        g_acquires.fetch_add(1, std::memory_order_relaxed);
+        h.acquired = true;
+        h.waited = false;
+        h.timed_out = false;
+    }
+    if (h.waited) return true;
+    XrResult r = XR_TIMEOUT_EXPIRED;
+    if (take_fake(what)) {
+        g_faked.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = timeout;
+        r = xrWaitSwapchainImage(sc, &wi);
+    }
+    if (r == XR_TIMEOUT_EXPIRED) {
+        h.timed_out = true;
+        const uint64_t n = g_timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_by_kind[kind_of(what)].fetch_add(1, std::memory_order_relaxed);
+        log::limited("xr.image.timeout", 20, "[xr] the %s swapchain's image %u not ready in %.0f ms (timeout %llu): kept, waited again next frame, not drawn",
+                     what, h.index, static_cast<double>(timeout) / 1e6, static_cast<unsigned long long>(n));
+        return false;
+    }
+    if (XR_FAILED(r)) {
+        g_wait_errors.fetch_add(1, std::memory_order_relaxed);
+        log::limited("xr.image.waiterr", 12, "[xr] the %s swapchain's image %u: xrWaitSwapchainImage -> %s", what, h.index, xr::result_name(xr::g_inst, r));
+        if (r == XR_ERROR_CALL_ORDER_INVALID) h.acquired = false;  // (the runtime holds no image of ours to wait on)
+        return false;
+    }
+    h.waited = true;  // (XR_SUCCESS, or XR_SESSION_LOSS_PENDING: waited, the session going)
+    if (h.timed_out) {
+        h.timed_out = false;
+        g_retried.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool release(Held& h, const char* what) {
+    if (!h.acquired || !h.waited || h.sc == XR_NULL_HANDLE) return false;
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    const XrResult r = xrReleaseSwapchainImage(h.sc, &ri);
+    g_releases.fetch_add(1, std::memory_order_relaxed);
+    h.acquired = h.waited = false;
+    if (XR_FAILED(r)) {
+        g_release_failures.fetch_add(1, std::memory_order_relaxed);
+        log::limited("xr.image.release", 12, "[xr] the %s swapchain's image %u: xrReleaseSwapchainImage -> %s", what, h.index, xr::result_name(xr::g_inst, r));
+        return false;
+    }
+    return true;
+}
+
+uint64_t timeouts() { return g_timeouts.load(std::memory_order_relaxed); }
+uint64_t wait_errors() { return g_wait_errors.load(std::memory_order_relaxed); }
+uint64_t release_failures() { return g_release_failures.load(std::memory_order_relaxed); }
+
+std::string status() {
+    char b[512];
+    int n = std::snprintf(b, sizeof(b), "image waits timed out %llu (", static_cast<unsigned long long>(g_timeouts.load()));
+    bool any = false;
+    for (int i = 0; i < kKinds && n > 0 && n < static_cast<int>(sizeof(b)); ++i) {
+        const uint64_t k = g_by_kind[i].load(std::memory_order_relaxed);
+        if (!k) continue;
+        n += std::snprintf(b + n, sizeof(b) - n, "%s%s %llu", any ? ", " : "", kWhat[i], static_cast<unsigned long long>(k));
+        any = true;
+    }
+    if (n > 0 && n < static_cast<int>(sizeof(b)))
+        std::snprintf(b + n, sizeof(b) - n, "%s), retried %llu, wait errors %llu, release failures %llu, acquires %llu, releases %llu, faked %llu (%d to come)",
+                      any ? "" : "none", static_cast<unsigned long long>(g_retried.load()), static_cast<unsigned long long>(g_wait_errors.load()),
+                      static_cast<unsigned long long>(g_release_failures.load()), static_cast<unsigned long long>(g_acquires.load()),
+                      static_cast<unsigned long long>(g_releases.load()), static_cast<unsigned long long>(g_faked.load()), g_fake_n.load());
+    return b;
+}
+
+bool fake_timeouts(int n, const std::string& what) {
+    const int k = what == "all" || what.empty() ? -1 : kind_of(what.c_str());
+    if (k == kKinds - 1) return false;  // (the review: an unknown name's count never taken)
+    g_fake_n = 0;  // (the review: an earlier count not spent on the new kind meanwhile)
+    g_fake_kind = k;
+    g_fake_n = n < 0 ? 0 : n;
+    log::info("[xr] the test: the next %d image waits%s%s taken as timed out", g_fake_n.load(), k < 0 ? "" : " on the ", k < 0 ? "" : what.c_str());
+    return true;
+}
+
+}  // namespace rdrvr::xr_image

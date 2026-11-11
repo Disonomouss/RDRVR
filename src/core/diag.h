@@ -16,6 +16,9 @@ namespace rdrvr::diag {
 void find_pattern(const void* pattern, size_t n, const char* what, int max_hits);
 
 void install_crash_handler();   // as early as possible
+// "crashguard on|off" (test only): an exception nothing handles ends the game at once, logged, without the game's crash
+// reporter (which uploads every crash to Rockstar). Returns the state.
+std::string crash_guard(bool on);
 void start_watchdog();          // after the D3D12 hooks are installed
 // Test-only (DESIGN R0 exit criterion: the watcher is proven live): creates a separate WARP device, removes it and
 // lets the watcher detect that removal. The game's device is never touched.

@@ -23,6 +23,8 @@ constexpr int kHolsterSlot = 2;
 constexpr int kModelSlot = 6;
 constexpr int kCensusSlot = 8;
 constexpr int kOffhandSlot = 9;
+constexpr int kBeltPropSlot = 10;  // 10-12: [Holsters] OwnBeltProps (GOAL-cattleman-belts item 2): the knife, the satchel, the lasso
+constexpr int kBeltModelSlot = kBeltPropSlot + 1;  // (round 103) the satchel's: the default outfit's own model (body.cpp draws its pieces)
 // 2026-10-27 ([Reload] RoundInHand = 2; the user: "Use the games shotgun shells"; research/run27/rounds.md section 5):
 // the game's own shell wherever a shell is drawn, the hand's handful (RoundsPerGrab, up to 8) and the row at the chest
 // (up to 6) at once: a pool of up to 14 objects of one model, made while a shotgun is in hand (not per grab), its
@@ -42,6 +44,7 @@ void want(int s, const char* fragment, const float* pose, const float* anchor = 
 // Any thread: slot s's object turned by SET_OBJECT_ORIENTATION (Euler degrees, the native's three values) with each
 // move; nullptr: not turned (the default; the draw hook moves a learned prop's draws instead)
 void want_angles(int s, const float* deg);
+float put_distance(int s, const float* pos);  // (item 4.3) m from the nearest of slot s's recent puts; -1: none
 // The render thread, once a frame as the body's points are published: the body's anchor point of that frame (world;
 // the pelvis as drawn, body::kPelvisPoint).
 void note_root(const float* root);
@@ -49,6 +52,8 @@ void note_root(const float* root);
 // many draws of its model were gated out (beyond 1.5 m of its recent puts); false before any draw. Any thread.
 bool last_drawn(int s, float pos[3], double* ms, float rel[3] = nullptr, uint64_t* gated = nullptr);
 bool last_put(int s, float pos[3]);  // run 11: slot s's last queued position (world); false: none
+// (round 102) slot s's object let go (no longer wanted) but not yet destroyed: the game draws it on until its destroy
+bool released(int s);
 // The draw hook (render thread): if `drawable` is a held prop's (or, before it is known, the record's position `pos`
 // is within 3 cm of where the object was put), its wanted pose (12 floats as above), its slot (if `slot`) and true. Of
 // the slots with that drawable the one put nearest `pos`, within 1.5 m of one of its last four puts (two props of one
@@ -56,8 +61,16 @@ bool last_put(int s, float pos[3]);  // run 11: slot s's last queued position (w
 // inst: the draw's instance (its record's owner: run 10 item 2), 0 when unknown
 // hide (2026-10-27): set when the draw is a pool object's with no pose to draw (the caller hides it: its axes shrunk);
 // the pose is then not filled. nullptr: such draws are not matched.
-bool match(uintptr_t drawable, uintptr_t inst, const float* pos, float* pose, int* slot = nullptr, bool* hide = nullptr);
+// early (round 104): the draw comes before the frame's body was drawn (note_root not yet called this frame: indoors the
+// pre-pass draws so), its anchored pose moved by the body's last frame's step as well
+bool match(uintptr_t drawable, uintptr_t inst, const float* pos, float* pose, int* slot = nullptr, bool* hide = nullptr, bool early = false);
 void set_inst_check(bool on);  // "props inst on|off" (on by default)
+void set_early(bool on);       // "props early on|off": an early draw moved by the body's step (round 104; on by default)
+void set_alt(bool on);         // "props alt on|off": another copy of a model taken at a put (round 103; on by default)
+// A drawable's shape: its box and its models' geometries' vertex counts (SEH-guarded reads; 0 unreadable)
+uint64_t shape_of(uintptr_t d);
+void set_alt_known(bool on);   // "props altknown on|off": also a drawable another slot learned (round 108; on by default)
+void set_strict(bool on);      // "props strict on|off": a holster gun takes only draws at its puts, hides the rest it refuses (round 109; on)
 // 2026-10-12: a holster's shown gun (slots kHolsterSlot..+3, wanted) has this model: the game's own holstered gun of the
 // same model on John's belt is hidden then (body.cpp), so one gun shows at the hip. ([Hands] OffHandItems) the off hand's
 // item too (kOffhandSlot): the game's own knife at its sheath hidden while our copy is in the hand
@@ -66,6 +79,7 @@ void set_inst_check(bool on);  // "props inst on|off" (on by default)
 bool shown_at_holster(uintptr_t drawable, const float* pos = nullptr);
 uint64_t twin_shapes();  // the draws hidden so (another copy of the model)
 void set_twins(bool on);  // "props twins on|off" (the session)
+void set_auto_turn(bool on);  // (GOAL-cattleman-belts item 1) the slots without their own angles turned by their pose (the test's)
 // "props census world|own" (item 13's test, the session): world, the census slot's object is not matched as the mod's own
 // (its draws go by the rules for any object near John: a chest's); own (the default), as before
 void set_census_matched(bool on);
@@ -85,6 +99,11 @@ void set_clear(bool on);
 bool holster_wanted();  // a clearable slot's prop (a holster's gun or model, the pool, the round, the copy, the off hand's item) is wanted now (hogtie.cpp polls the lasso only then)
 // Slot s's prop drawn (a draw of it moved) within the last 100 ms. Any thread.
 bool shown(int s);
+// (round 103) slot s's learned model while it is placed (0: none): a model only that slot's object draws (the default
+// outfit's own, player_default) is known by it alone, wherever the game draws it
+uintptr_t slot_drawable(int s);
+// Any thread: slot s still holds an object of `frag` (made and not yet destroyed, wanted or not)
+bool slot_holds(int s, const char* frag);
 // The pool (2026-10-27), the game thread (the holsters' update, before frame): `objects` of `fragment` kept (0 or
 // nullptr: none, each destroyed; at most kPoolMax), the first n of `poses` (12 floats each, as want's) drawn by them,
 // the first n_free as given, the others moved with the body's walk since `anchor` (the row at the chest; nullptr: none

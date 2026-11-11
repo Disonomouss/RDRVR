@@ -19,6 +19,9 @@ void init();  // frame-end listener
 void set_keep_camera(bool on);  // [Body] KeepAnchorCamera for the session ("pose keepcam on|off")
 void set_anchor(bool on);    // the switch ([Body] CameraAnchor, the menu, "pose anchor on|off")
 bool anchor_active();   // the camera anchor is placing the view this frame (first person)
+// the plugin hides the game's flat reticle now ([Hands] HideReticle in first person, or third person under the mod's own
+// reticle: the camera job's hide_reticle as the plugin reads it). Any thread
+bool mod_hides_reticle();
 bool on_mounted_gun();  // a mounted gun (the Gatling, the Browning, the cannon) in use now, or fired within 1.5 s
 bool mounted_gun_held();  // one in hand now
 bool mounted_first_person();
@@ -119,6 +122,12 @@ void set_saddle(bool on, float tau, bool save);
 void reset_ride_jitter();  // the test channel's "pose jitter reset"
 float body_heading_deg();    // the anchored camera's body heading (degrees; positive turns left)
 float eye_lift();            // [Body] SeatedLift: metres added to the eye height
+// (GOAL-doorway-and-poker item 3) [Body] TableGameHeadView, off by default: while a minigame runs (poker), the view at
+// John's head bone (its height and its place ahead of the root), not the standing eye height over the root
+bool table_game_head_view();
+void set_table_game_head_view(bool on);
+uint64_t table_game_head_frames();  // the frames the view was put at the head
+bool table_game_view_active();      // the view at the head, or easing back from it (the body drawn seated meanwhile)
 void set_eye_lift(float m);
 // Turning ([Comfort] TurnMode / TurnSpeed / SnapAngle), applied at once (the menu's Comfort tab, "pose turn ...").
 void set_turning(bool snap, float speed_deg_s, float snap_deg);

@@ -628,6 +628,116 @@ float g_model_off[3] = {0, 0, 0}, g_model_rot[3] = {90, 90, 0};  // under g_zone
 float g_model_raw[3] = {0, 0, 0};  // "holster model raw a b c": the native's angles as given (the axes' test)
 bool g_model_raw_on = false;       // under g_zone_mutex
 void turn_about(float* v, const float* ax, float rad);  // (below)
+// [Holsters] OwnBeltProps (GOAL-cattleman-belts item 2; the user: "All outfits except the default one were missing the
+// belt", then "Add them, off by default"): on an outfit without its own knife sheath, satchel or lasso (the duster, outfit
+// 11 and others: research in the goal sheet), the game's own props drawn where the custom belt has that piece: the bowie
+// knife for the sheath (no sheath prop exists), the satchel, the lasso's coil. Each at its home (where the default outfit
+// hangs it: right, up, forward from the pelvis in the holsters' frame), moved and turned as the piece's OwnBelt keys say,
+// the prop's own base turn first ([Holsters] OwnBeltProp<Piece>Home and OwnBeltProp<Piece>Turn)
+std::atomic<bool> g_belt_props{false};
+std::atomic<bool> g_belt_props_force{false};  // ("holster beltprops force on|off": also on outfits with the piece, the test's)
+constexpr int kBeltProps = 3;                 // pieces 1 (the sheath), 2 (the satchel), 3 (the lasso)
+// (round 103; the user: "none of the belt items except for holsters are where they are on the default outfit. They don't
+// line up with their interaction points", and "Get the exact default satchel") each as the default outfit has it, on this
+// outfit's own bone as drawn (where its zone is): the knife the game's own model (melee_knife02x) and the lasso's coil, in
+// their bones' frames as the game hangs them on the default outfit (cycle DM1, "skel binds"); the satchel prop at half size
+// on the thrower bone, its box's middle at the default satchel's (r157's boxes). The default outfit's own satchel and
+// sheath from its own model (player_default; body.cpp draws only those pieces of it): [Holsters] OwnBeltPropsDefault
+// (GOAL-after-0.8.13.2 item 7, off by default; "holster beltprops model on|off" the session's). (2026-11-08, cycle IP3:
+// the "bind-posed John" seen in third-person test views stayed with the model off: the headset's second John, not it;
+// cycle SF8: on the duster the default outfit's own satchel at the left hip, nothing else of the model in view)
+const char* const kBeltPropFrag[kBeltProps] = {"melee_knife02x", "p_gen_satchel01x", "melee_lasso01x"};  // (the knife: cycle EB2)
+std::atomic<bool> g_bp_model{false};  // "holster beltprops model on|off": the satchel slot the default outfit's own model
+// (round 117; the user: "We should try using the throwables models to represent the currently equipped throwable on the
+// belt. For example, molotov model visible on belt when molotov equipped.") [Holsters] OwnBeltThrowable: the satchel's
+// slot the thrown slot's item's model (offhand::item_fragment), at its own size, on the satchel's bone; hidden while that
+// item is in a hand; none equipped, none shown. Each model's frame on the bone: kThrownOnBone (the cycles' pictures)
+std::atomic<bool> g_bp_throwable{false};
+// Each model on the satchel prop's frame and place (kBpOnBone[1]), at its own size, rolled about John's forward axis
+// (degrees, as the session's "holster beltprops turn 1 0 0 <roll>") and dropped along his up (m). Cycle BT2 (r196b,
+// six turns each, seen from his left side): with none each one stuck straight out sideways; the fire bottle neck up at
+// 90, the throwing knife (melee_knife03x) blade down at -90 as in a sheath, the dynamite stick down the thigh at -90,
+// the tomahawk's head up at 90 (its box: the handle 0.475 m along its y, the head at the far end), dropped 0.30 m so
+// the head sits at the belt and the handle hangs
+struct ThrownOnBone {
+    int w;
+    float roll, drop;
+};
+const ThrownOnBone kThrownOnBone[] = {
+    {23, 90.0f, 0.0f},     // the fire bottle (throw_molotov01x)
+    {24, -90.0f, 0.0f},    // dynamite (throw_dynamite01x)
+    {25, -90.0f, 0.0f},    // the throwing knife (melee_knife03x)
+    {29, 90.0f, -0.30f},   // the tomahawk (melee_tomahawk01x)
+    // (round 132, the user: "Need models on belt for undead nightmare throwables") the Undead Nightmare's three (cycle UN1's
+    // pictures; each one's own place by hand as the others')
+    {35, 90.0f, 0.0f},     // holy water
+    {36, 90.0f, 0.0f},     // undead bait
+    {37, 90.0f, 0.0f},     // boom bait
+};
+const ThrownOnBone& thrown_on_bone(int w) {
+    for (const ThrownOnBone& t : kThrownOnBone)
+        if (t.w == w) return t;
+    return kThrownOnBone[0];  // (the Undead Nightmare's: as the fire bottle)
+}
+// the prop in its piece bone's frame (axes as columns, then the place; the bones' rest poses alike in every rig, r161)
+const float kBpOnBone[kBeltProps][12] = {
+    {-0.8798f, 0.3397f, 0.3325f, 0.0840f, -0.5774f, 0.8122f, 0.4678f, 0.7425f, 0.4794f, -0.0270f, 0.0463f, -0.0590f},
+    {1, 0, 0, 0, 0, 1, 0, -1, 0, -0.123f, -0.034f, 0.077f},
+    {0.9851f, 0.0372f, 0.1678f, -0.0271f, 0.9977f, -0.0621f, -0.1697f, 0.0566f, 0.9839f, 0.0000f, 0.0002f, 0.0003f}};
+// the user's moves on top (OwnBeltProp<Piece>Home: right, up, forward m; Turn deg), none by default
+float g_bp_home[kBeltProps][3] = {};
+float g_bp_turn[kBeltProps][3] = {};
+// (round 101, the user: "this big satchel clips through") each prop's size against the default outfit's own piece: its
+// draws' axes scaled (held_prop moves each draw by the pose's axes, so a scaled pose draws it scaled). Measured (cycle
+// BZ1, r157): the satchel prop's box 0.40 x 0.29 x 0.24 m against the outfit's satchel 0.13 x 0.19 x 0.18 (about half);
+// the knife prop 0.45 m long against the sheath's 0.09 m of handle (the sheath holds the rest: 0.6, a 27 cm knife); the
+// lasso's coil 0.33 m tall (the outfits' coil not measured: as made). [Holsters] OwnBeltProp<Piece>Scale sets each
+// (round 103: the knife and the lasso the default outfit's own, at their own size; the satchel prop at half, r157)
+float g_bp_scale[kBeltProps] = {1.0f, 0.5f, 1.0f};
+std::mutex g_bp_mutex;  // g_bp_home, g_bp_turn, g_bp_scale, g_thr_adj
+// (round 120; the user: OwnBeltThrowable "works, need to adjust model positions depending on what is equipped... I'd like
+// to place the throwables myself. Using the move by hand option") each measured throwable's own place on the belt: a
+// turn (3x3) and a move, both in the throwable's own axes as placed without it (so they ride with the belt: the review),
+// put on its pose last; set by hand while placing John's belt's pieces (a grip within 12 cm of it), saved as
+// [Holsters] OwnBeltThrowable<Name>Pose (the 9 numbers of the turn by rows, then the 3 of the move)
+constexpr int kThrowables = 7;  // (round 132: with the Undead Nightmare's three)
+const int kThrowableW[kThrowables] = {23, 24, 25, 29, 35, 36, 37};
+const char* const kThrowableKey[kThrowables] = {"FireBottle", "Dynamite", "ThrowingKnives", "Tomahawk", "HolyWater", "ZombieBait", "BoomBait"};
+// (round 132, cycle UN2's pictures: the baits are flat flasks, 4 cm thick and 9 cm wide (the boom bait 16 with its
+// stick), hung as the fire bottle they stood edge-on to the hip) the two baits a quarter turn about their own long axis
+// (y): the flat side to the leg. Each one's place before the user's own (and what "reset" goes back to)
+#define RDRVR_THR_ID {1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0}
+#define RDRVR_THR_FLAT {0, 0, 1, 0, 1, 0, -1, 0, 0, 0, 0, 0}
+const float kThrAdjDefault[kThrowables][12] = {RDRVR_THR_ID, RDRVR_THR_ID, RDRVR_THR_ID, RDRVR_THR_ID, RDRVR_THR_ID, RDRVR_THR_FLAT, RDRVR_THR_FLAT};
+float g_thr_adj[kThrowables][12] = {RDRVR_THR_ID, RDRVR_THR_ID, RDRVR_THR_ID, RDRVR_THR_ID, RDRVR_THR_ID, RDRVR_THR_FLAT, RDRVR_THR_FLAT};
+int throwable_index(int w) {
+    for (int i = 0; i < kThrowables; ++i)
+        if (kThrowableW[i] == w) return i;
+    return -1;
+}
+// (the review) an adjustment a turn (its rows unit and square to each other, not a mirror) and a move within 1 m
+bool thr_adj_ok(const float* a) {
+    for (int i = 0; i < 12; ++i)
+        if (!std::isfinite(a[i])) return false;
+    for (int r = 0; r < 3; ++r) {
+        for (int q = r; q < 3; ++q) {
+            const float d = a[r * 3] * a[q * 3] + a[r * 3 + 1] * a[q * 3 + 1] + a[r * 3 + 2] * a[q * 3 + 2];
+            if (std::fabs(d - (r == q ? 1.0f : 0.0f)) > 0.02f) return false;
+        }
+    }
+    const float det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) + a[2] * (a[3] * a[7] - a[4] * a[6]);
+    return det > 0.0f && std::fabs(a[9]) <= 1.0f && std::fabs(a[10]) <= 1.0f && std::fabs(a[11]) <= 1.0f;
+}
+int g_thr_shown_w = -1;      // the throwable shown at the satchel's place by the last update (holster_frame's thread)
+double g_thr_shown_ms = -1e12;
+float g_thr_shown_pos[3] = {};  // its place then (world; "holster beltprops", g_bp_mutex)
+std::atomic<uint64_t> g_thr_placed{0};  // throwables placed by hand and saved
+std::atomic<uint64_t> g_thr_hand_hides{0};
+std::atomic<uint64_t> g_none_left_refused{0};  // (round 123) the satchel holster's draws refused with none of the throwable left  // (round 122) updates the outfit's satchel hidden with the belt's throwable in a hand
+float g_bp_frame[12] = {};  // the last frame's right, up, forward and the pelvis ("holster beltprops" measures by it)
+bool g_bp_frame_ok = false;
+bool belt_prop_pose(int k, const float* hr, const float* up, const float* hf, const float* origin, float* pz, float* anchor, bool model,
+                    int thrown = -1, bool thrown_adj = true);
 // The model's pose at a hip (12 floats: X, Y, Z columns, then the position): the holster's frame (X right, Y forward,
 // Z up) turned by the model's turn, at the zone moved by its offset
 void model_pose(int i, const float* at, const float* rgt, const float* up, const float* fwd, const float* off, const float* rot, float* pz) {
@@ -827,6 +937,140 @@ std::mutex g_hdiag_mutex;
 
 const uint32_t kWeaponEquipped = 0x42C0FAAA;   // GET_WEAPON_EQUIPPED(actor, slot): the slot's eWeapon, -1 none
 const uint32_t kPutWeaponInHand = 0x8F4B473D;  // ACTOR_PUT_WEAPON_IN_HAND(actor, eWeapon, animated)
+const uint32_t kIsMinigameRunning = 0x117D7E71;     // IS_MINIGAME_RUNNING()
+const uint32_t kIsPlayerControllable = 0x9613C2D0;  // IS_PLAYER_CONTROLLABLE(player)
+const uint32_t kGetCurrentGringo = 0x5D9DB7A5;      // GET_CURRENT_GRINGO(actor): the gringo (a scripted use spot) he is in
+const uint32_t kIsGringoValid = 0x7C858A47;         // IS_GRINGO_VALID(gringo)
+const uint32_t kIsActorOnTrain = 0xD36E2D54;        // IS_ACTOR_ON_TRAIN(actor, 0)
+// (round 114) the holsters closed while the game runs a minigame (bit 0), closed to draws into empty hands while it holds
+// the player's control (bit 1) (holster_frame's poll; "holster gate")
+// (round 128, the user: "look into other mini games. Liars dice and horseshoes for example. Also ... when I sat on the
+// train, the camera was in front of johns body"; research/after-08132/minigames_research.md) only poker raises the
+// minigame's flag (START_MINIGAME: poker01, and carcrank_gringo, tamewildhorse). Liar's dice, horseshoes, blackjack, five
+// finger fillet and arm wrestling take the player's control and snap John to a gringo; the train's seat is a gringo too,
+// John left controllable while he rides. So two more answers: bit 2 (4) he is in a gringo, bit 3 (8) he is on a train; and
+// two made from them once they have held a while (a chest opened, a door: a second or less): bit 4 (16) a table game by
+// the control held in a gringo for kTableHoldMs, bit 5 (32) seated on a train (in a gringo on one, or his head at a seat's
+// height on one, for kSeatHoldMs)
+constexpr double kTableHoldMs = 1500.0, kSeatHoldMs = 1000.0, kHoldOffMs = 600.0;
+bool gate_table(int g) { return (g & 1) != 0 || (g & 16) != 0; }
+bool gate_seated(int g) { return gate_table(g) || (g & 32) != 0; }
+std::atomic<int> g_game_gate{0};
+std::atomic<double> g_game_gate_ms{-1e9};  // (the re-review) the gate's last poll: older than 2 s, taken as open
+std::atomic<uint64_t> g_gate_closes{0};
+// (round 130, the user: blackjack's dealer "Same as before"; "Liars dice does not work [with John's own arms] ... Make it
+// unaffected by it"; their log: the named-script test of round 129 never answered) the table games all read the same gate,
+// so which one runs is read from the game's own list of scripts, as _IS_ANY_NAMED_SCRIPT_RUNNING walks it (RDR.exe
+// 0x1ffa10: the list's head pointer by the mov at +0x23; a node: the next at +8, running at +0x30, its first child at
+// +0x50, its name at +0x70, compared without case): a running script whose name ends in a minigame's launch path
+// (LAUNCH_NEW_SCRIPT_WITH_ARGS("content/Mini_Games/BlackJack01/BlackJack01", ...); the launchers' own scripts, in other
+// folders or of other names, do not). Walked on a script tick (the thread that changes the list), asked for by the
+// gate's poll four times a second. "holster scripts [force <bits>|off]"
+constexpr const char* kMiniTails[6] = {"/blackjack01/blackjack01", "/liarsdice/liarsdice",       "/fivefingerfillet/fivefingerfillet",
+                                       "/horseshoes/horseshoes",   "/armwrestling/armwrestling", "/poker01/poker01"};
+constexpr const char* kMiniNames[6] = {"blackjack", "liar's dice", "five finger fillet", "horseshoes", "arm wrestling", "poker"};
+constexpr int kScriptBudget = 800;
+std::atomic<int> g_minigame{0}, g_minigame_force{-1};
+std::atomic<int> g_script_list_state{0};  // 0 not looked for, 1 found, -1 not on this build
+std::atomic<uintptr_t> g_script_list{0};  // the address of the list's head pointer
+std::atomic<uint64_t> g_script_walks{0}, g_script_bad{0};
+std::atomic<int> g_script_nodes{0};
+std::atomic<double> g_script_walk_ms{-1e12};  // the last walk (the review: with no script tick, a load, its answer is not kept)
+std::mutex g_script_mx;
+std::string g_script_names;  // the running scripts' names as last walked (g_script_mx)
+std::string mini_text(int bits) {
+    std::string r;
+    for (int k = 0; k < 6; ++k)
+        if (bits & (1 << k)) r += (r.empty() ? "" : ", ") + std::string(kMiniNames[k]);
+    return r.empty() ? "none" : r;
+}
+// false: something that is not a script's node (the walk ends there)
+bool script_walk(uintptr_t node, int depth, int& budget, int& bits, std::string& names) {
+    while (node && budget > 0) {
+        --budget;
+        char nm[73];  // (the review: 72 bytes, the longest minigame's path 54: less to read past a node's end)
+        int32_t state = 0;
+        uintptr_t next = 0, child = 0;
+        if ((node & 7) || node < 0x10000 || !raw(node + 0x70, nm, sizeof(nm) - 1) || !raw(node + 0x30, &state, sizeof(state)) ||
+            !raw(node + 8, &next, sizeof(next)) || !raw(node + 0x50, &child, sizeof(child)))
+            return false;
+        nm[sizeof(nm) - 1] = 0;
+        char rawnm[sizeof(nm)];  // (cycle RC1: the name as the game has it, for the list; matched on the lowered copy)
+        std::memcpy(rawnm, nm, sizeof(nm));
+        size_t n = 0;
+        for (; nm[n]; ++n) {
+            const unsigned char c = static_cast<unsigned char>(nm[n]);
+            if (c < 0x20 || c > 0x7e) return false;
+            nm[n] = c == '\\' ? '/' : c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : static_cast<char>(c);
+        }
+        if (n && state) {
+            size_t e = n;  // (without an extension)
+            for (size_t i = n; i-- > 0 && nm[i] != '/';)
+                if (nm[i] == '.') {
+                    e = i;
+                    break;
+                }
+            for (int k = 0; k < 6; ++k) {
+                const size_t tl = std::strlen(kMiniTails[k]);
+                if (e >= tl && !std::memcmp(nm + e - tl, kMiniTails[k], tl)) bits |= 1 << k;
+            }
+            if (names.size() < 6000) {
+                if (!names.empty()) names += ' ';
+                names.append(rawnm, n);
+                if (depth) names += "@" + std::to_string(depth);  // (a child: its depth)
+            }
+        }
+        if (child && depth < 8 && !script_walk(child, depth + 1, budget, bits, names)) return false;
+        node = next;
+    }
+    return true;
+}
+void scripts_tick() {  // (a script tick's thread: api::run_on_tick)
+    const uintptr_t list = g_script_list.load(std::memory_order_relaxed);
+    if (!list) return;
+    uintptr_t root = 0;
+    int bits = 0, budget = kScriptBudget;
+    std::string names;
+    if (raw(list, &root, sizeof(root)) && root && !script_walk(root, 0, budget, bits, names)) g_script_bad.fetch_add(1, std::memory_order_relaxed);
+    g_script_nodes.store(kScriptBudget - budget, std::memory_order_relaxed);
+    g_script_walks.fetch_add(1, std::memory_order_relaxed);
+    g_script_walk_ms.store(log::now_ms(), std::memory_order_relaxed);
+    if (const int was = g_minigame.exchange(bits, std::memory_order_relaxed); was != bits)
+        log::info("[holster] the minigames' scripts running: %s (was %s; %d scripts in the game's list)", mini_text(bits).c_str(), mini_text(was).c_str(),
+                  kScriptBudget - budget);
+    std::lock_guard lock(g_script_mx);
+    g_script_names.swap(names);
+}
+void script_list_find() {
+    unsigned char b[7] = {};
+    const uintptr_t fn = anchors::present(anchors::Id::ScriptNamedRunning) ? anchors::addr(anchors::Id::ScriptNamedRunning) : 0;
+    if (fn && raw(fn + 0x23, b, sizeof(b)) && b[0] == 0x48 && b[1] == 0x8b && b[2] == 0x35) {  // mov rsi, [rip + disp32]
+        int32_t disp = 0;
+        std::memcpy(&disp, b + 3, sizeof(disp));
+        g_script_list.store(fn + 0x2a + static_cast<intptr_t>(disp), std::memory_order_relaxed);
+        g_script_list_state = 1;
+        log::info("[holster] the game's script list at RDR.exe+0x%llx: the table games told apart by their scripts",
+                  static_cast<unsigned long long>(g_script_list.load() - reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))));
+    } else {
+        g_script_list_state = -1;
+        log::warn("[holster] the game's script list not found on this build: the table games are not told apart by it");
+    }
+}
+// the running scripts with `part` in their name (lower case), up to `cap` characters
+std::string scripts_with(const char* part, size_t cap, bool slashes = false) {  // slashes: for the test channel's answer (cycle RD1: it ends at a backslash's escape)
+    std::lock_guard lock(g_script_mx);
+    std::istringstream in(g_script_names);
+    std::string w, r;
+    while (in >> w) {  // (round 132: the braces were missing: only the last name was ever given)
+        if (r.size() + w.size() + 1 > cap) continue;
+        std::string lw = w;  // (the names as the game has them: `part` looked for without case)
+        for (char& ch : lw) ch = ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + 32) : ch;
+        if (slashes)
+            for (char& ch : w) ch = ch == '\\' ? '/' : ch;
+        if (!part || lw.find(part) != std::string::npos) r += (r.empty() ? "" : " ") + w;
+    }
+    return r;
+}
 const uint32_t kSetNextWeapon = 0xBFD6D55F;     // ACTOR_SET_NEXT_WEAPON(actor, eWeapon): its slot's object becomes it (not drawn)
 std::atomic<uint64_t> g_sec_switches{0}, g_sec_refused{0};
 const uint32_t kPutItemAway = 0x13A63AA7;      // ACTOR_PUT_ITEM_AWAY(actor)
@@ -838,6 +1082,21 @@ const uint32_t kHolsterWeapon = 0xFE9903CC;    // ACTOR_HOLSTER_WEAPON(actor, an
 // riding, the horse's walk kept). The carry's own put-away keeps the clip (its placement follows the item's states)
 std::atomic<bool> g_instant_put{false};  // (2026-11-03, round 77: off, its step; the game's put-away, its clip's draws hidden)
 std::atomic<uint64_t> g_put_holds{0};  // (round 76) instant put-aways whose step was taken back
+// (GOAL-doorway-and-poker item 4.6, the review: a let-go's put-away holstered whatever was in hand; the other hand's
+// draw queued before it, PUT_WEAPON_IN_HAND then the holster, was put away at once. The fix's review: the game's state
+// shows a draw a script tick or more after it, so a let-go an update or two later still saw the gun pressed for) the last
+// weapon put in a hand and when: a put-away of another weapon within 1 s of it is refused (holster_frame's thread)
+int g_put_in_hand_w = -1;
+double g_put_in_hand_ms = -1e12;
+void queue_put_in_hand(const uint64_t* args) {
+    api::queue_native(kPutWeaponInHand, args, 3, 0, nullptr);
+    g_put_in_hand_w = static_cast<int>(args[1]);
+    g_put_in_hand_ms = log::now_ms();
+}
+bool put_in_hand_other(int w) {  // another weapon than w put in a hand within the last second
+    return log::now_ms() - g_put_in_hand_ms < 1000.0 && g_put_in_hand_w != w;
+}
+std::atomic<uint64_t> g_putaway_skipped{0};  // let-gos not put away: another weapon put in hand since the press
 void put_item_away(int32_t actor, int weapon = -1) {
     const uint64_t a = static_cast<uint64_t>(static_cast<uint32_t>(actor));
     if (g_instant_put.load(std::memory_order_relaxed)) {
@@ -856,6 +1115,7 @@ const uint32_t kMeleeModeSelected = 0xAC1285A3;
 
 void holster_frame() {
     static bool grip_down[2] = {false, false}, pending[2] = {false, false};
+    static int pending_w[2] = {-1, -1};  // (item 4.6) the weapon in hand at the press that armed `pending`
     static int zone_in[2] = {-1, -1}, press_zone[2] = {-1, -1};
     static uint64_t draw_req[2] = {0, 0};  // a queued GET_WEAPON_EQUIPPED, answered on a script tick
     static double draw_ms[2] = {0, 0};
@@ -921,6 +1181,121 @@ void holster_frame() {
     const double now_ms = log::now_ms();
     const float dt = last_ms > 0 ? static_cast<float>((now_ms - last_ms) * 0.001) : 0.0f;
     last_ms = now_ms;
+    {  // the game's gate (a minigame runs, the game holds the player's control): polled every frame this runs, before any
+       // return below (round 125's review)
+        static uint64_t gate_req[4] = {0, 0, 0, 0};
+        static double gate_ms[4] = {-1e9, -1e9, -1e9, -1e9};
+        static bool gate_val[4] = {false, true, false, false};  // a minigame running; the player controllable; in a gringo; on a train
+        static int gringo_step = 0;  // 0: GET_CURRENT_GRINGO asked; 1: IS_GRINGO_VALID of its answer
+        static double ans_ms[4] = {-1e12, -1e12, -1e12, -1e12};  // each one's last answer
+        // the control held in a gringo, in a gringo on a train: since when (ms; -1 not), last true, and the bit made of it
+        static double table_since = -1.0, seat_since = -1.0, table_true = -1e12, seat_true = -1e12;
+        static bool table_on = false, seat_on = false;
+        RdrvrActorState gst{};
+        const uint64_t gactor = api::actor_state(&gst) && gst.valid ? static_cast<uint64_t>(static_cast<uint32_t>(gst.actor)) : 0;
+        for (int i = 0; i < 4; ++i) {
+            RdrvrNativeResult r{};
+            if (gate_req[i] && api::wait_native(gate_req[i], &r, 0)) {
+                gate_req[i] = 0;
+                const uint64_t v = r.value & 0xffffffffull;
+                if (i == 2 && gringo_step == 0) {
+                    if (v) {  // a gringo: is it valid (the scripts' own test, IS_GRINGO_VALID(GET_CURRENT_GRINGO(actor)))
+                        gate_req[2] = api::queue_native(kIsGringoValid, &v, 1, 0, nullptr);
+                        gringo_step = 1;
+                    } else {
+                        gate_val[2] = false;
+                        ans_ms[2] = now_ms;
+                    }
+                } else if (i == 2) {
+                    gate_val[2] = v != 0;
+                    gringo_step = 0;
+                    ans_ms[2] = now_ms;
+                } else {
+                    gate_val[i] = v != 0;
+                    ans_ms[i] = now_ms;
+                }
+            } else if (gate_req[i] && now_ms - gate_ms[i] > 1000.0) {  // (no script tick: a load, the pause menu)
+                api::cancel_op(gate_req[i]);
+                gate_req[i] = 0;
+                if (i == 2) gringo_step = 0;
+            }
+            if (!gate_req[i] && now_ms - gate_ms[i] >= 250.0) {
+                const uint64_t player = 0;
+                const uint64_t a2[2] = {gactor, 0};
+                if (i == 0) {
+                    gate_req[i] = api::queue_native(kIsMinigameRunning, nullptr, 0, 0, nullptr);
+                } else if (i == 1) {
+                    gate_req[i] = api::queue_native(kIsPlayerControllable, &player, 1, 0, nullptr);
+                } else if (!gactor) {
+                    gate_val[i] = false;  // (no actor: neither)
+                    ans_ms[i] = now_ms;
+                } else if (i == 2) {
+                    gate_req[i] = api::queue_native(kGetCurrentGringo, a2, 1, 0, nullptr);
+                    gringo_step = 0;
+                } else {
+                    gate_req[i] = api::queue_native(kIsActorOnTrain, a2, 2, 0, nullptr);
+                }
+                gate_ms[i] = now_ms;
+            }
+        }
+        {  // (round 130) which minigame's script runs: the list walked on the next script tick, four times a second
+            static double scripts_ms = -1e9;
+            if (now_ms - scripts_ms >= 250.0) {
+                scripts_ms = now_ms;
+                if (g_script_list_state.load(std::memory_order_relaxed) == 0) script_list_find();
+                if (g_script_list.load(std::memory_order_relaxed)) api::run_on_tick(scripts_tick);
+            }
+        }
+        int gate_now = (gate_val[0] ? 1 : 0) | (gate_val[1] ? 0 : 2) | (gate_val[2] ? 4 : 0) | (gate_val[3] ? 8 : 0);
+        // (the review) the holds run only over fresh answers (no script tick, the pause menu: the last answers stand, and the
+        // hold neither runs on nor ends), and end only once their condition has been false for kHoldOffMs (one poll's
+        // "no actor", a native answered 0: not the game over)
+        const bool fresh = now_ms - std::fmin(ans_ms[1], std::fmin(ans_ms[2], ans_ms[3])) < 700.0;
+        auto hold = [&](bool cond, double hold_ms, double& since, double& last_true, bool& on) {
+            if (!fresh) {
+                if (since >= 0.0) since += static_cast<double>(dt) * 1000.0;
+                return;
+            }
+            if (cond) {
+                last_true = now_ms;
+                if (since < 0.0) since = now_ms;
+                if (now_ms - since >= hold_ms) on = true;
+            } else if (now_ms - last_true > kHoldOffMs) {
+                since = -1.0;
+                on = false;
+            }
+        };
+        hold((gate_now & 6) == 6, kTableHoldMs, table_since, table_true, table_on);
+        // (round 129, the user on the train's seat: "Camera is still too far forward"; their log: on a train for 39 s, never in
+        // a gringo: the seat's gringo is not GET_CURRENT_GRINGO's) the seat by John himself: on a train with his head under
+        // 1.38 m over his place (1.21-1.25 seated at the tables, 1.56-1.60 standing) and not crouching; over 1.48 he stands
+        // (the review) not in cover; not lying (a fall, knocked down: his head under 0.6 m), nor with his head unread
+        static bool seat_low = false;
+        if (gactor && gst.head_valid) {
+            const float hh = gst.head_pos[1] - gst.pos[1];
+            if (hh > 0.6f && hh < 1.38f) seat_low = true;
+            else if (!(hh > 0.6f && hh < 1.48f)) seat_low = false;
+        } else {
+            seat_low = false;
+        }
+        const bool seat_cond = (gate_now & 8) != 0 &&
+                               ((gate_now & 4) != 0 || (seat_low && !(gst.flags & (RDRVR_ACTOR_CROUCHING | RDRVR_ACTOR_IN_COVER))));
+        hold(seat_cond, kSeatHoldMs, seat_since, seat_true, seat_on);
+        gate_now |= (table_on ? 16 : 0) | (seat_on ? 32 : 0);
+        g_game_gate_ms.store(now_ms, std::memory_order_relaxed);
+        if (const int was = g_game_gate.load(std::memory_order_relaxed); gate_now != was) {
+            if ((gate_now & 3) && !(was & 3)) g_gate_closes.fetch_add(1, std::memory_order_relaxed);
+            log::info("[holster] the game's gate %d -> %d (a minigame %d, the control held %d, in a gringo %d, on a train %d): the holsters %s%s", was,
+                      gate_now, gate_now & 1, (gate_now >> 1) & 1, (gate_now >> 2) & 1, (gate_now >> 3) & 1,
+                      gate_now & 1 ? "closed (a minigame)" : gate_now & 2 ? (gate_table(gate_now) ? "closed to draws (a table game)" : "closed to draws") : "open",
+                      gate_seated(gate_now) && !gate_table(gate_now) ? "; seated on a train" : "");
+            if (gate_table(gate_now) && !gate_table(was))  // (round 130) which one, and the names it was told by (the next log's proof)
+                log::info("[holster] a table game: by the scripts running %s (the list %d, %d scripts) | the minigames' scripts: %s",
+                          mini_text(g_minigame.load(std::memory_order_relaxed)).c_str(), g_script_list_state.load(std::memory_order_relaxed),
+                          g_script_nodes.load(std::memory_order_relaxed), scripts_with("mini", 700).c_str());
+            g_game_gate.store(gate_now, std::memory_order_relaxed);
+        }
+    }
     const double hold_letgo = g_hold_letgo.load(std::memory_order_relaxed);
     for (int h = 0; h < 2; ++h) {
         const float g = hands::get(h).grip;
@@ -1040,6 +1415,9 @@ void holster_frame() {
         held_prop::want(1, nullptr, nullptr);  // and the copy's own model
         for (int i = 0; i < 4; ++i) held_prop::want(held_prop::kHolsterSlot + i, nullptr, nullptr);  // and the holsters' guns
         for (int i = 0; i < 2; ++i) held_prop::want(held_prop::kModelSlot + i, nullptr, nullptr);    // and their models
+        for (int k = 0; k < 3; ++k) held_prop::want(held_prop::kBeltPropSlot + k, nullptr, nullptr);  // and the belt's props (item 2)
+        // (the review) the default model's rewrite: all collapsed while its object lives, then off
+        body::set_belt_model_pieces(held_prop::slot_holds(held_prop::kBeltPropSlot + 1, "player_default") ? 1u : 0u);
         offhand::frame(nullptr, nullptr, nullptr, -1, false);  // and the off hand's item (put back)
         held_prop::frame(0);
         // [Holsters] HoldToKeep: the kept guns wait (a missed read); over half a second without the body they are loose
@@ -2086,6 +2464,14 @@ void holster_frame() {
     auto hold_put_away = [&](int h, double len, bool other_go) {
         const dual::State dn = dual::state();
         const int w = st.weapon >= 0 && st.weapon < kWeapons ? st.weapon : -1, from = keep_from[h] >= 0 && keep_from[h] < kZones ? keep_from[h] : -1;
+        if (put_in_hand_other(w)) {  // (item 4.6) another weapon put in hand within the second: it is not put away
+            g_putaway_skipped.fetch_add(1, std::memory_order_relaxed);
+            keep[h] = 0;
+            log::info("[holster] %s hand let go of the %s (HoldToKeep, %.0f ms): not put away, the %s put in hand within the second",
+                      h ? "right" : "left", w >= 0 ? kWeaponLabel[w] : "?", len,
+                      g_put_in_hand_w >= 0 && g_put_in_hand_w < kWeapons ? kWeaponLabel[g_put_in_hand_w] : "?");
+            return;
+        }
         g_puts.fetch_add(1, std::memory_order_relaxed);
         g_hold_puts.fetch_add(1, std::memory_order_relaxed);
         g_hold_put_len.store(static_cast<float>(len), std::memory_order_relaxed);
@@ -2113,7 +2499,7 @@ void holster_frame() {
             const int sec_ctrl = dn.ctrl, sec_w = dn.weapon;
             dual::end("the gun in hand let go: it becomes the gun in hand (HoldToKeep)");
             const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(sec_w), 0ull};
-            api::queue_native(kPutWeaponInHand, args, 3, 0, nullptr);
+            queue_put_in_hand(args);
             controls::set_draw_hand(sec_ctrl, sec_w, false);  // that hand, once the gun is in it
             if (keep[sec_ctrl] == 2) {  // its grip keeps it as the gun in hand now
                 const int sf = sec_from[sec_ctrl];
@@ -2225,6 +2611,13 @@ void holster_frame() {
     static bool chest_armed[2] = {false, false};
     static double chest_out_ms[2] = {-1.0, -1.0};
     constexpr double kChestRearmMs = 200.0, kAutoRoundsMs = 10000.0;
+    // (round 114, the user: at the poker table the grip "pulls out a gun and causes John to stand up") the table games run
+    // as a minigame (poker: START_MINIGAME) or take the player's control (blackjack, liar's dice, five finger fillet,
+    // horseshoes, arm wrestling: SET_PLAYER_CONTROL off), and the mod's draws are natives neither stops. Asked every 250 ms:
+    // while a minigame runs no hand is at a holster's zone; while the control is held, none with empty hands (below)
+    // (round 125's review) polled at the top of the frame now, before its early returns (the Holsters off, the body's
+    // points missed: the gate went stale after 2 s and the fists' gate with it)
+    const int gate = g_game_gate.load(std::memory_order_relaxed);
     for (int h = 0; h < 2; ++h) {  // h: the controller; jh: John's hand on it (body.cpp's mapping)
         const int jh = bp.ctrl[0] == h ? 0 : 1;
         if (bp.hand_ok[jh]) {
@@ -2244,6 +2637,11 @@ void holster_frame() {
                 }
             }
         }
+        // (round 114) a minigame closes every zone; the control held only a draw into empty hands (the review: a mission's
+        // hold may still let John shoot: his put-aways and the reloads' takes stay)
+        // (round 128, the review: not by the table games found by the control held in a gringo: a bed, a camp fire or a
+        // mission's use spot holds the control as long, and the control held already refuses a draw into empty hands)
+        if ((gate & 1) || ((gate & 2) && !in_hand && !ds.on && !ds.carry && !offhand::held(h))) in_z[h] = -1;
         {  // ([Reload] RoundSource: the status line's)
             float ring = 0.0f;
             g_palm_y[h].store(palm_y_of(jh), std::memory_order_relaxed);
@@ -2359,12 +2757,20 @@ void holster_frame() {
            // holster too, within 12 cm of it: it follows the hand rigidly; let go: its GunTurn and GunOffset saved
             static int grab_p[2] = {-1, -1};
             static int grab_g[2] = {-1, -1};  // the shown gun held (its kShowZones index)
+            static int grab_t[2] = {-1, -1};  // (round 120) the throwable held (its kThrowables index)
+            static float T0[2][12];
             static float h0[2][3], R0[2][9], G0[2][12];
             static body::Piece p0[2];
             if (!g_piece_place.load(std::memory_order_relaxed)) {
                 grab_p[h] = -1;
                 grab_g[h] = -1;
+                grab_t[h] = -1;
             } else {
+                const float* anc_t = bp.bone_ok[body::kPelvisPoint] ? bp.bone[body::kPelvisPoint] : bp.root;
+                auto thr_pose = [&](int w, float* tp, bool adjusted) {  // (round 120) the shown throwable's pose this frame
+                    float an[3] = {anc_t[0], anc_t[1], anc_t[2]};
+                    return belt_prop_pose(1, hr, up, hf, anc_t, tp, an, false, w, adjusted);
+                };
                 auto gun_pose = [&](int i, float* gp, bool adjusted) {  // a shown gun's pose this frame (12 floats)
                     const int zi = kShowZones[i];
                     show_pose(zi, zp[zi], hr, up, hf, bp.root, gp);
@@ -2397,7 +2803,32 @@ void holster_frame() {
                             const float dx = gp[9] - gb[jh][0], dy = gp[10] - gb[jh][1], dz = gp[11] - gb[jh][2];
                             if (dx * dx + dy * dy + dz * dz < gd) gd = dx * dx + dy * dy + dz * dz, gi = i;
                         }
-                    if (gi >= 0 && (bi < 0 || gd < bd)) {
+                    int ti = -1;  // (round 120) the throwable shown at the satchel's place
+                    float td = 0.12f * 0.12f;
+                    const int tw = g_thr_shown_w;
+                    if (tw >= 0 && throwable_index(tw) >= 0 && log::now_ms() - g_thr_shown_ms < 250.0) {
+                        float tp[12];
+                        if (thr_pose(tw, tp, true)) {
+                            // (the review) its place and its belt point (the tomahawk hangs 0.30 m below it: its head at the belt)
+                            const float drop = thrown_on_bone(tw).drop;
+                            const float bx = tp[9] - up[0] * drop, by = tp[10] - up[1] * drop, bz = tp[11] - up[2] * drop;
+                            const float dx = tp[9] - gb[jh][0], dy = tp[10] - gb[jh][1], dz = tp[11] - gb[jh][2];
+                            const float ex = bx - gb[jh][0], ey = by - gb[jh][1], ez = bz - gb[jh][2];
+                            const float dd = std::fmin(dx * dx + dy * dy + dz * dz, ex * ex + ey * ey + ez * ez);
+                            if (dd < td) {
+                                td = dd;
+                                ti = throwable_index(tw);
+                                std::memcpy(T0[h], tp, sizeof(T0[h]));
+                            }
+                        }
+                    }
+                    if (ti >= 0 && (bi < 0 || td < bd) && (gi < 0 || td < gd)) {
+                        grab_t[h] = ti;
+                        std::memcpy(h0[h], gb[jh], sizeof(h0[h]));
+                        std::memcpy(R0[h], bp.target_rot[jh], sizeof(R0[h]));
+                        controllers::pulse(h, 0.5f, 30);
+                        log::info("[holster] placing the %s on the belt by hand (the %s hand)", kWeaponLabel[kThrowableW[ti]], h ? "right" : "left");
+                    } else if (gi >= 0 && (bi < 0 || gd < bd)) {
                         grab_g[h] = gi;
                         std::memcpy(h0[h], gb[jh], sizeof(h0[h]));
                         std::memcpy(R0[h], bp.target_rot[jh], sizeof(R0[h]));
@@ -2469,6 +2900,52 @@ void holster_frame() {
                               go[1], go[2]);
                     grab_g[h] = -1;
                 }
+                const int gt = grab_t[h];
+                if (gt >= 0 && down && bp.hand_ok[jh]) {  // (round 120) the throwable rigid with the hand; its own place solved
+                    float B[12];
+                    if (thr_pose(kThrowableW[gt], B, false)) {
+                        float D[9], P[3];  // the held axes (as pz: X, Y, Z) and place
+                        for (int a = 0; a < 3; ++a)
+                            for (int k = 0; k < 3; ++k) D[a * 3 + k] = Rd[k * 3] * T0[h][a * 3] + Rd[k * 3 + 1] * T0[h][a * 3 + 1] + Rd[k * 3 + 2] * T0[h][a * 3 + 2];
+                        {
+                            const float q[3] = {T0[h][9] - h0[h][0], T0[h][10] - h0[h][1], T0[h][11] - h0[h][2]};
+                            for (int k = 0; k < 3; ++k) P[k] = Rd[k * 3] * q[0] + Rd[k * 3 + 1] * q[1] + Rd[k * 3 + 2] * q[2] + gb[jh][k];
+                        }
+                        float Mw[9];  // world: the plain pose's axes onto the held ones (unit axes: a throwable is drawn at its size)
+                        for (int r = 0; r < 3; ++r)
+                            for (int c = 0; c < 3; ++c) Mw[r * 3 + c] = D[r] * B[c] + D[3 + r] * B[3 + c] + D[6 + r] * B[6 + c];
+                        const float* F[3] = {B, B + 3, B + 6};  // (the review) in its own axes as placed without the adjustment
+                        float a[12];
+                        for (int i = 0; i < 3; ++i)
+                            for (int j = 0; j < 3; ++j) {
+                                float v = 0.0f;
+                                for (int r = 0; r < 3; ++r)
+                                    for (int c = 0; c < 3; ++c) v += F[i][r] * Mw[r * 3 + c] * F[j][c];
+                                a[i * 3 + j] = v;
+                            }
+                        const float o[3] = {P[0] - B[9], P[1] - B[10], P[2] - B[11]};
+                        for (int i = 0; i < 3; ++i) a[9 + i] = o[0] * F[i][0] + o[1] * F[i][1] + o[2] * F[i][2];
+                        if (thr_adj_ok(a)) {
+                            std::lock_guard lock(g_bp_mutex);
+                            std::memcpy(g_thr_adj[gt], a, sizeof(a));
+                        }
+                    }
+                }
+                if (gt >= 0 && !down) {
+                    float a[12];
+                    {
+                        std::lock_guard lock(g_bp_mutex);
+                        std::memcpy(a, g_thr_adj[gt], sizeof(a));
+                    }
+                    char v[200];
+                    std::snprintf(v, sizeof(v), "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.3f %.3f %.3f", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                                  a[8], a[9], a[10], a[11]);
+                    config::set("Holsters", (std::string("OwnBeltThrowable") + kThrowableKey[gt] + "Pose").c_str(), v);
+                    g_thr_placed.fetch_add(1, std::memory_order_relaxed);
+                    controllers::pulse(h, 0.3f, 20);
+                    log::info("[holster] the %s placed on the belt by hand: moved (%.3f %.3f %.3f) m", kWeaponLabel[kThrowableW[gt]], a[9], a[10], a[11]);
+                    grab_t[h] = -1;
+                }
                 const int gp = grab_p[h];
                 if (gp >= 0 && down && bp.hand_ok[jh]) {
                     body::Piece np;
@@ -2498,7 +2975,7 @@ void holster_frame() {
                     grab_p[h] = -1;
                 }
                 g_piece_held[h].store(grab_p[h], std::memory_order_relaxed);
-                if (grab_p[h] >= 0 || grab_g[h] >= 0) {
+                if (grab_p[h] >= 0 || grab_g[h] >= 0 || grab_t[h] >= 0) {
                     g_consumed[h] = true;
                     press_zone[h] = -1;
                     pending[h] = false;
@@ -2600,7 +3077,7 @@ void holster_frame() {
             const int w = ds.carry_weapon;
             if (w >= 0 && w < kWeapons) {
                 const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(w), 0ull};
-                api::queue_native(kPutWeaponInHand, args, 3, 0, nullptr);
+                queue_put_in_hand(args);
                 controls::set_draw_hand(h, w, true);
                 drawn_from = carry_from;
                 dual::carry_return();
@@ -2689,7 +3166,7 @@ void holster_frame() {
             drawn_from = in_z[h];  // (the review: the item in hand's holster is the torch's now)
             // (C2, KnifeSwap: the knife the same way, its stab the game's own melee)
             const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(oh_w), 0ull};
-            api::queue_native(kPutWeaponInHand, args, 3, 0, nullptr);  // (instant: no holstering clip of the gun)
+            queue_put_in_hand(args);  // (instant: no holstering clip of the gun)
             controls::set_draw_hand(h, oh_w, false);
             hold_take(gun_h, 2, gw, gz);
             hold_take(h, 1, oh_w, in_z[h]);
@@ -2835,6 +3312,7 @@ void holster_frame() {
                           ds.slot);
             } else if (holds(in_z[h]) && mine) {
                 pending[h] = true;  // let go here: holstered
+                pending_w[h] = st.weapon;
                 log::info("[holster] %s hand at the %s with the %s in hand (slot %d): let go to put it away", h ? "right" : "left", z.key,
                           st.weapon >= 0 && st.weapon < kWeapons ? kWeaponLabel[st.weapon] : "?", cur);
             } else if (holds(in_z[h]) && dw < 0) {  // the other hand at the gun's own holster: the gun into that hand
@@ -2852,10 +3330,16 @@ void holster_frame() {
                 controllers::pulse(h, 0.15f, 10);
                 log::info("[holster] %s hand at the %s: the %s beside the %s %s: two long guns, refused", h ? "right" : "left", z.key, kWeaponLabel[dw],
                           ds.carry ? kWeaponLabel[ds.carry_weapon] : ds.on ? kWeaponLabel[ds.weapon] : "long gun", ds.carry ? "carried" : "as the second gun");
+            } else if (dw >= 0 && throwable_index(dw) >= 0 && offhand::thrown_left(dw, static_cast<uint32_t>(st.actor)) == 0) {
+                // (round 123, the user: "when you run out of ammo with a throwing weapon ... you can continue to grab the throwable
+                // from there endlessly") none of it left: no draw
+                g_none_left_refused.fetch_add(1, std::memory_order_relaxed);
+                controllers::pulse(h, 0.15f, 10);
+                log::info("[holster] %s hand at the %s: no %s left, no draw", h ? "right" : "left", z.key, kWeaponLabel[dw]);
             } else if (dw >= 0) {  // the holster's chosen weapon, or a twin's other gun (any owned weapon draws)
                 const bool instant = g_instant.load(std::memory_order_relaxed);
                 const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(dw), instant ? 0ull : 1ull};
-                api::queue_native(kPutWeaponInHand, args, 3, 0, nullptr);
+                queue_put_in_hand(args);
                 zone_last[in_z[h]] = dw;
                 drawn_from = in_z[h];
                 // ([Holsters] HoldToKeep: a gun held by the grip of the hand it lands in; the knife, the lasso, a throwable keep
@@ -2903,7 +3387,7 @@ void holster_frame() {
                     const bool instant = g_instant.load(std::memory_order_relaxed);
                     const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(w),
                                               instant ? 0ull : 1ull};
-                    api::queue_native(kPutWeaponInHand, args, 3, 0, nullptr);
+                    queue_put_in_hand(args);
                     if (press_zone[h] >= 0) zone_last[press_zone[h]] = w;
                     drawn_from = press_zone[h];
                     controls::set_draw_hand(h, w, !in_hand);
@@ -3201,7 +3685,7 @@ void holster_frame() {
                 const int sec_ctrl = ds.ctrl, sec_w = ds.weapon;
                 dual::end("the gun in hand put away: it becomes the gun in hand");
                 const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(sec_w), 0ull};
-                api::queue_native(kPutWeaponInHand, args, 3, 0, nullptr);
+                queue_put_in_hand(args);
                 controls::set_draw_hand(sec_ctrl, sec_w, false);  // that hand, once the gun is in it
                 g_puts.fetch_add(1, std::memory_order_relaxed);
                 keep[h] = 0;  // ([Holsters] HoldToKeep: put away here; the second gun's grip keeps it as the gun in hand)
@@ -3209,6 +3693,14 @@ void holster_frame() {
                 if (keep[sec_ctrl] == 2) hold_take(sec_ctrl, 1, sec_w, sec_from[sec_ctrl]);
                 log::info("[holster] %s hand let go at the %s: put away; the second gun (the %s) is the gun in hand now, in the %s hand",
                           h ? "right" : "left", zones[in_z[h]].key, kWeaponLabel[sec_w], sec_ctrl ? "right" : "left");
+            } else if (g_consumed[h] && pending[h] && in_z[h] >= 0 && in_z[h] == press_zone[h] && in_hand &&
+                       (st.weapon != pending_w[h] || put_in_hand_other(pending_w[h]))) {  // (item 4.6) another weapon in hand since the press
+                g_putaway_skipped.fetch_add(1, std::memory_order_relaxed);
+                keep[h] = 0;  // (the fix's review: no HoldToKeep put-away of the draw later either)
+                hold_put_ms = now_ms;
+                log::info("[holster] %s hand let go at the %s: not put away (the %s pressed for; %s): the other hand's draw kept",
+                          h ? "right" : "left", zones[in_z[h]].key, pending_w[h] >= 0 && pending_w[h] < kWeapons ? kWeaponLabel[pending_w[h]] : "?",
+                          st.weapon != pending_w[h] ? "another weapon in hand now" : "another weapon put in hand within the second");
             } else if (g_consumed[h] && pending[h] && in_z[h] >= 0 && in_z[h] == press_zone[h] && in_hand) {
                 put_item_away(st.actor, st.weapon);  // ([Holsters] InstantPutAway)
                 g_puts.fetch_add(1, std::memory_order_relaxed);
@@ -3429,7 +3921,10 @@ void holster_frame() {
                     // the game's own throw (armed by the trigger, a throw clip started) or its aim (LT: it lights dynamite and
                     // the fire bottle) has it (the review)
                     const aim::LassoProbe ap = aim::lasso_probe();
-                    if (aim::grip_throw_busy() || (ap.ok && (ap.aim_state == 1 || ap.aim_state == 2))) {
+                    // (round 122: RT no longer throws the knives nor the tomahawk, so the game's aim, LT, has no throw of
+                    // them to give: theirs is the hand's, the review)
+                    const bool aim_has = ap.ok && (ap.aim_state == 1 || ap.aim_state == 2) && kw != 25 && kw != 29;
+                    if (aim::grip_throw_busy() || aim_has) {
                         g_hold_item_game_throws.fetch_add(1, std::memory_order_relaxed);
                         log::info("[holster] %s hand let go of the %s (HoldToKeep, %.0f ms): the game's throw (armed by the trigger)", side, what(), len);
                         keep[h] = 0;
@@ -3471,7 +3966,8 @@ void holster_frame() {
             if (lm < game_throw_ms[h] || now_ms - lm < 150.0 || aim::grip_throw_busy()) continue;
             const aim::LassoProbe tp = aim::lasso_probe();  // (the review: never while the game aims it: LT lights dynamite)
             if (tp.ok && (tp.aim_state == 1 || tp.aim_state == 2)) continue;
-            if (in_hand && h == gun_h && st.weapon == game_throw_w[h] && offhand::kind_of(st.weapon) == offhand::kThrown) {
+            if (in_hand && h == gun_h && st.weapon == game_throw_w[h] && offhand::kind_of(st.weapon) == offhand::kThrown &&
+                !put_in_hand_other(st.weapon)) {  // (item 4.6, the fix's review: not a draw the other hand just made)
                 put_item_away(st.actor, st.weapon);
                 g_puts.fetch_add(1, std::memory_order_relaxed);
                 hold_put_ms = now_ms;
@@ -3506,7 +4002,7 @@ void holster_frame() {
             const int sec_ctrl = dn.ctrl, sec_w = dn.weapon;
             dual::end("nothing in hand beside it: it becomes the gun in hand");
             const uint64_t args[3] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), static_cast<uint64_t>(sec_w), 0ull};
-            api::queue_native(kPutWeaponInHand, args, 3, 0, nullptr);
+            queue_put_in_hand(args);
             controls::set_draw_hand(sec_ctrl, sec_w, false);
             if (keep[sec_ctrl] == 2) hold_take(sec_ctrl, 1, sec_w, sec_from[sec_ctrl]);
             log::info("[holster] the second gun (the %s) beside nothing: the gun in hand now, in the %s hand", kWeaponLabel[sec_w], sec_ctrl ? "right" : "left");
@@ -3788,7 +4284,113 @@ void holster_frame() {
         }
         if (body::left_holster()) body::left_holster_refresh();  // run 12 item 5: the holster's geometry for its left copy
         if (body::own_pieces()) body::pieces_geom_refresh();    // [Holsters] OwnBeltRigid: the pieces' geometries
+        {  // [Holsters] OwnBeltProps (item 2): the knife, the satchel and the lasso's coil on an outfit without its own (after
+           // the scan's refresh: the review)
+            const float* anc2 = bp.bone_ok[body::kPelvisPoint] ? bp.bone[body::kPelvisPoint] : bp.root;
+            // (the review) none at the belt while that item is in a hand: the knife (22) in hand or the off hand's, the lasso (21)
+            const bool knife_out = (in_hand && st.weapon == 22) || offhand::held_weapon(0) == 22 || offhand::held_weapon(1) == 22;
+            const bool lasso_out = in_hand && st.weapon == 21;
+            // (round 102) the knife and the lasso only once owned (the weapon manager's list; before its first read, taken as owned)
+            auto owned_item = [&](int w) { return !st.owned_tick || (st.owned >> w & 1); };
+            {
+                std::lock_guard lock(g_bp_mutex);
+                for (int i = 0; i < 3; ++i) g_bp_frame[i] = hr[i], g_bp_frame[3 + i] = up[i], g_bp_frame[6 + i] = hf[i], g_bp_frame[9 + i] = anc2[i];
+                g_bp_frame_ok = true;
+            }
+            const bool on = g_belt_props.load(std::memory_order_relaxed) && body::own_pieces();
+            const bool force = g_belt_props_force.load(std::memory_order_relaxed);
+            // (round 103) the pieces the outfit lacks (the sheath goes with the knife's piece, the knife itself only once owned
+            // and not in a hand); the default model draws the sheath and the satchel
+            const bool sheath = on && (force || !body::piece_present(1)), satchel = on && (force || !body::piece_present(2));
+            const bool model = g_bp_model.load(std::memory_order_relaxed);
+            uint32_t bm_mask = model ? (sheath ? 2u : 0u) | (satchel ? 4u : 0u) : 0u;
+            // (the review) while the default model's object still lives (its destroy queued, a remake on the way), all of it
+            // collapsed (1: no piece kept), never drawn whole as the game has it
+            if (!bm_mask && held_prop::slot_holds(held_prop::kBeltPropSlot + 1, "player_default")) bm_mask = 1u;
+            body::set_belt_model_pieces(bm_mask);
+            // (round 117) [Holsters] OwnBeltThrowable: the thrown slot's item at the satchel's place, unless it is in a hand
+            int tw = -1;
+            const char* tfrag = nullptr;
+            const bool thrown_on = g_bp_throwable.load(std::memory_order_relaxed);
+            // (round 122, the user: "The default outfit has the model on the hip, but when you are holding the throwable, the
+            // satchel reappears"; round 123: "when you run out of ammo with a throwing weapon, the satchel appears again") the
+            // outfit's satchel hidden whenever the belt's item is an owned one of the four, in a hand, at the hip or none left
+            bool thr_in_hand = false, thr_owned = false;
+            // (round 121, the user: "apply this to all outfits"; "the model does not change when you change it in the mod
+            // menu, it changes only when you unholster it afterwards") on every outfit (its own satchel hidden while the
+            // throwable is shown); the item the satchel's holster draws: its menu choice, else the thrown slot's
+            if (thrown_on && on) {
+                // (the review) exactly what the satchel's holster draws (its choice, WeaponChoice's test, the item last drawn from
+                // it, else the thrown slot's); not one of the four measured: none shown
+                int dw = -1;
+                for (int zi = 0; zi < kZones; ++zi)
+                    if (!std::strcmp(zones[zi].key, "Belt")) dw = draw_weapon(zi);
+                const int w = dw >= 0 ? dw : slot_gun(2);
+                const bool in_a_hand = (in_hand && st.weapon == w) || offhand::held_weapon(0) == w || offhand::held_weapon(1) == w;
+                // (the review) the measured ones only (kThrownOnBone; round 132: the Undead Nightmare's three with them, made in
+                // cycle UN1), and one left at least (the last one thrown leaves the item in the slot: not shown while the count
+                // is not known)
+                const bool measured = throwable_index(w) >= 0;
+                const char* wfrag = measured && owned_item(w) ? offhand::item_fragment(w) : nullptr;
+                thr_owned = wfrag != nullptr;
+                thr_in_hand = wfrag && in_a_hand;
+                if (wfrag && !in_a_hand && offhand::thrown_left(w, static_cast<uint32_t>(st.actor)) == 1) tfrag = wfrag, tw = w;
+            }
+            for (int k = 0; k < kBeltProps; ++k) {
+                const bool out = (k == 0 && (knife_out || !owned_item(22))) || (k == 2 && (lasso_out || !owned_item(21)));
+                bool want = k == 1 ? (model ? sheath || satchel : (satchel && (!thrown_on || tw >= 0)) || (thrown_on && tw >= 0))
+                                   : on && !out && (force || !body::piece_present(k + 1));
+                float pz[12], an[3] = {anc2[0], anc2[1], anc2[2]};  // (the review: a bone's prop anchored by the pelvis its set drew)
+                if (want) want = belt_prop_pose(k, hr, up, hf, k == 1 && model ? bp.root : anc2, pz, an, model, k == 1 ? tw : -1);
+                const char* frag = k == 1 && model ? "player_default" : k == 1 && tw >= 0 ? tfrag : kBeltPropFrag[k];
+                if (k == 1) {  // (round 120) the throwable shown, for placing it by hand
+                    g_thr_shown_w = want && tw >= 0 ? tw : -1;
+                    // (round 121) the outfit's own satchel, once the throwable's object is made (the review: not while it is made;
+                    // cycle TB1d: held_prop::shown, by its matched draws, stayed false on the default outfit after an outfit change)
+                    body::set_hide_satchel(body::piece_present(2) && thr_owned);
+                    if (thr_in_hand && body::piece_present(2)) g_thr_hand_hides.fetch_add(1, std::memory_order_relaxed);
+                    if (g_thr_shown_w >= 0) {
+                        g_thr_shown_ms = log::now_ms();
+                        std::lock_guard lock(g_bp_mutex);
+                        for (int i = 0; i < 3; ++i) g_thr_shown_pos[i] = pz[9 + i];
+                    }
+                }
+                held_prop::want(held_prop::kBeltPropSlot + k, want ? frag : nullptr, want ? pz : nullptr, an);
+            }
+        }
         ++sd.frames;
+        {  // (round 107; the user: both holstered guns "lag behind and catch up", round 106's motion vectors no help) every
+           // 10 s while a gun is shown: each one's drawn place on the body against the place wanted the tick after, the
+           // worst and the ticks over 2 cm, and the ticks with no draw of it in 100 ms (its draws not moved)
+            static double log_ms = 0.0;
+            static float lw[4] = {};
+            static uint64_t ln[4] = {}, lo0[4] = {}, ls0[4] = {};
+            static const char* const kHip[4] = {"right hip", "back", "left hip", "left shoulder"};
+            bool any_shown = false;
+            for (int i = 0; i < 4; ++i)
+                if (sd.weapon[i] >= 0) {
+                    any_shown = true;
+                    ++ln[i];
+                    lw[i] = std::fmax(lw[i], sd.err[i]);
+                }
+            if (now_ms - log_ms >= 10000.0) {
+                log_ms = now_ms;
+                std::string o;
+                char b[200];
+                for (int i = 0; i < 4; ++i) {
+                    if (ln[i])
+                        std::snprintf(b, sizeof(b), " | %s (weapon %d) worst %.1f mm, over 2 cm %llu of %llu ticks, no draw in 100 ms %llu", kHip[i], sd.weapon[i],
+                                      lw[i] * 1000.0f, static_cast<unsigned long long>(sd.over[i] - lo0[i]), static_cast<unsigned long long>(ln[i]),
+                                      static_cast<unsigned long long>(sd.stale[i] - ls0[i]));
+                    if (ln[i]) o += b;
+                    lw[i] = 0.0f;
+                    ln[i] = 0;
+                    lo0[i] = sd.over[i];
+                    ls0[i] = sd.stale[i];
+                }
+                if (any_shown && !o.empty()) log::info("[holster] 10 s: the shown guns drawn against their wanted place%s", o.c_str());
+            }
+        }
         {
             std::lock_guard lock(g_zone_mutex);
             g_show_diag = sd;
@@ -4625,6 +5227,37 @@ void init() {
         g_rings_follow = config::get_bool("Holsters", "RingsFollowHolsters", true);
         g_torso_len = std::fmin(0.9f, std::fmax(0.3f, config::get_float("Holsters", "TorsoLength", 0.55f)));
         g_show_models = config::get_bool("Holsters", "ShowModels", false);
+        g_belt_props = config::get_bool("Holsters", "OwnBeltProps", false);  // (GOAL-cattleman-belts item 2)
+        // (GOAL-after-0.8.13.2 item 7) never on (round 115): CREATE_PROP_IN_LAYOUT faults inside the game making player_default
+        // (RDR.exe+0x51bb72, every time, in the simulator's cycles since 11-07 too), RedHook catches it and answers with the
+        // layout: a T-posed John left in the world, the layout destroyed as the object (the belt's props gone), and the object
+        // manager's lock left taken (the game froze at the poker table's exit, a worker waiting on it)
+        g_bp_model = false;
+        g_bp_throwable = config::get_bool("Holsters", "OwnBeltThrowable", false);  // (round 117)
+        if (config::get_bool("Holsters", "OwnBeltPropsDefault", false))
+            log::warn("[holster] OwnBeltPropsDefault ignored: the game faults making the default outfit's model as a prop (the game's satchel shown instead)");
+        {
+            std::lock_guard lock(g_bp_mutex);
+            for (int k = 0; k < kBeltProps; ++k) {
+                const std::string key = body::piece_key(k + 1);
+                float v[3];
+                if (std::sscanf(config::get_string("Holsters", ("OwnBeltProp" + key + "Home").c_str(), "").c_str(), "%f %f %f", &v[0], &v[1], &v[2]) == 3)
+                    for (int i = 0; i < 3; ++i) g_bp_home[k][i] = std::isfinite(v[i]) ? std::fmax(-0.6f, std::fmin(0.6f, v[i])) : g_bp_home[k][i];
+                if (std::sscanf(config::get_string("Holsters", ("OwnBeltProp" + key + "Turn").c_str(), "").c_str(), "%f %f %f", &v[0], &v[1], &v[2]) == 3)
+                    for (int i = 0; i < 3; ++i) g_bp_turn[k][i] = std::isfinite(v[i]) ? v[i] : 0.0f;
+                if (std::sscanf(config::get_string("Holsters", ("OwnBeltProp" + key + "Scale").c_str(), "").c_str(), "%f", &v[0]) == 1 && std::isfinite(v[0]))
+                    g_bp_scale[k] = std::fmax(0.2f, std::fmin(2.0f, v[0]));
+            }
+            for (int i = 0; i < kThrowables; ++i) {  // (round 120) each throwable's own place
+                float a[12];
+                const std::string v = config::get_string("Holsters", (std::string("OwnBeltThrowable") + kThrowableKey[i] + "Pose").c_str(), "");
+                if (std::sscanf(v.c_str(), "%f %f %f %f %f %f %f %f %f %f %f %f", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6], &a[7], &a[8],
+                                &a[9], &a[10], &a[11]) != 12)
+                    continue;
+                if (thr_adj_ok(a)) std::memcpy(g_thr_adj[i], a, sizeof(a));
+                else log::warn("[holster] OwnBeltThrowable%sPose not a turn and a move: ignored", kThrowableKey[i]);
+            }
+        }
         {
             const std::string mn = config::get_string("Holsters", "Model", "p_gen_gunbelt01x");
             std::snprintf(g_model_name, sizeof(g_model_name), "%s", mn.c_str());
@@ -5276,6 +5909,107 @@ bool gun_raised() { return g_raised.load(std::memory_order_relaxed); }
 bool fire_ready() { return g_fire_ready.load(std::memory_order_relaxed); }
 float fire_clip_phase() { return g_fire_phase.load(std::memory_order_relaxed); }
 bool show_models() { return g_show_models.load(std::memory_order_relaxed); }
+bool belt_props() { return g_belt_props.load(std::memory_order_relaxed); }
+bool belt_props_default() { return g_bp_model.load(std::memory_order_relaxed); }
+bool belt_throwable() { return g_bp_throwable.load(std::memory_order_relaxed); }
+std::atomic<int> g_game_gate_force{-1};  // (GOAL-doorway-and-poker item 3) "holster gate force <n|off>": the tests' gate
+int game_gate() {  // (the re-review: holster_frame stopped, the Holsters off or the body off, a gate stale for 2 s is open)
+    const int f = g_game_gate_force.load(std::memory_order_relaxed);
+    if (f >= 0) return f;
+    return log::now_ms() - g_game_gate_ms.load(std::memory_order_relaxed) > 2000.0 ? 0 : g_game_gate.load(std::memory_order_relaxed);
+}
+bool table_game() { return gate_table(game_gate()); }
+int minigame() {
+    const int f = g_minigame_force.load(std::memory_order_relaxed);
+    return f >= 0 ? f : g_minigame.load(std::memory_order_relaxed);
+}
+// (the reviews) walked within 2 s: with no script tick (a load started at the table) the last answer is not one to refuse
+// the game's hides by; the pause menu keeps it for the arms (the gate stands there too)
+bool minigame_fresh() {
+    return g_minigame_force.load(std::memory_order_relaxed) >= 0 || log::now_ms() - g_script_walk_ms.load(std::memory_order_relaxed) < 2000.0;
+}
+bool minigame_known() { return g_minigame_force.load(std::memory_order_relaxed) >= 0 || g_script_list_state.load(std::memory_order_relaxed) == 1; }
+bool seated_view() { return gate_seated(game_gate()); }
+void set_belt_throwable(bool on, bool save) {  // (round 117) [Holsters] OwnBeltThrowable
+    if (g_bp_throwable.exchange(on) != on) log::info("[holster] the equipped throwable at the satchel's place: %s", on ? "on" : "off");
+    if (save) config::set("Holsters", "OwnBeltThrowable", on ? "1" : "0");
+}
+void set_belt_props_default(bool on, bool save) {  // (GOAL-after-0.8.13.2 item 7) [Holsters] OwnBeltPropsDefault: never on (round 115)
+    if (on) log::warn("[holster] the default outfit's own satchel refused: the game faults making its model as a prop");
+    g_bp_model = false;
+    if (save) config::set("Holsters", "OwnBeltPropsDefault", "0");
+}
+void set_belt_props(bool on, bool save) {
+    if (g_belt_props.exchange(on) != on) log::info("[holster] the belt's props on outfits without the pieces: %s", on ? "on" : "off");
+    if (save) config::set("Holsters", "OwnBeltProps", on ? "1" : "0");
+}
+// the prop's pose (round 103): the knife and the lasso on their piece bones as drawn (the piece's own move is in the drawn
+// bone), in its frame as the default outfit hangs them (kBpOnBone); the default model (k 1) at John's root in the body's
+// frame (its model's axes x right, y up, z back: its draws are rewritten onto the bones, its place only where the game
+// draws and culls it). Then the user's moves: turned by OwnBeltProp<Piece>Turn about the holsters' axes (body.cpp
+// piece_world's order: about forward first, then right, then up), moved by Home (right, up, forward). False: no bone
+namespace {  // (the declaration's, above)
+bool belt_prop_pose(int k, const float* hr, const float* up, const float* hf, const float* origin, float* pz, float* anchor, bool model,
+                    int thrown, bool thrown_adj) {
+    float home[3], base[3], sc, adj[12];
+    const int ti = thrown >= 0 && thrown_adj ? throwable_index(thrown) : -1;
+    {
+        std::lock_guard lock(g_bp_mutex);
+        if (ti >= 0) std::memcpy(adj, g_thr_adj[ti], sizeof(adj));
+        std::memcpy(home, g_bp_home[k], sizeof(home));
+        std::memcpy(base, g_bp_turn[k], sizeof(base));
+        sc = thrown >= 0 ? 1.0f : g_bp_scale[k];  // (round 117: a throwable at its own size)
+    }
+    float X[3], Y[3], Z[3], at[3];
+    if (k == 1 && model) {  // (the review: the flag read once a tick, by the caller)
+        for (int i = 0; i < 3; ++i) X[i] = hr[i], Y[i] = up[i], Z[i] = -hf[i], at[i] = origin[i];
+        sc = 1.0f;
+    } else {
+        float W[12];
+        if (!body::piece_bone_drawn(k + 1, W, anchor)) return false;  // (the melee, thrower and rope bones; their set's pelvis)
+        const float* q = kBpOnBone[k];
+        for (int i = 0; i < 3; ++i) {
+            X[i] = W[i * 3] * q[0] + W[i * 3 + 1] * q[3] + W[i * 3 + 2] * q[6];
+            Y[i] = W[i * 3] * q[1] + W[i * 3 + 1] * q[4] + W[i * 3 + 2] * q[7];
+            Z[i] = W[i * 3] * q[2] + W[i * 3 + 1] * q[5] + W[i * 3 + 2] * q[8];
+            at[i] = W[i * 3] * q[9] + W[i * 3 + 1] * q[10] + W[i * 3 + 2] * q[11] + W[9 + i];
+        }
+    }
+    const float r = 0.0174532925f;
+    if (thrown >= 0) {  // (round 117) the throwable's own roll and drop (kThrownOnBone)
+        const ThrownOnBone& t = thrown_on_bone(thrown);
+        for (float* v : {X, Y, Z}) turn_about(v, hf, -t.roll * r);
+        for (int i = 0; i < 3; ++i) at[i] += up[i] * t.drop;
+    }
+    for (float* v : {X, Y, Z}) turn_about(v, hf, -base[2] * r);
+    for (float* v : {X, Y, Z}) turn_about(v, hr, base[0] * r);
+    for (float* v : {X, Y, Z}) turn_about(v, up, base[1] * r);
+    for (int i = 0; i < 3; ++i) {
+        pz[i] = X[i] * sc;
+        pz[3 + i] = Y[i] * sc;
+        pz[6 + i] = Z[i] * sc;
+        pz[9 + i] = at[i] + hr[i] * home[0] + up[i] * home[1] + hf[i] * home[2];
+    }
+    if (ti >= 0) {  // (round 120) the throwable's own place, set by hand: its turn (F Rl F^T, F its own axes as placed) and move
+        const float F0[3] = {pz[0], pz[1], pz[2]}, F1[3] = {pz[3], pz[4], pz[5]}, F2[3] = {pz[6], pz[7], pz[8]};
+        const float* F[3] = {F0, F1, F2};
+        float Rw[9];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) {
+                float v = 0.0f;
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b) v += F[a][r] * adj[a * 3 + b] * F[b][c];
+                Rw[r * 3 + c] = v;
+            }
+        for (int ax = 0; ax < 3; ++ax) {
+            const float x[3] = {pz[ax * 3], pz[ax * 3 + 1], pz[ax * 3 + 2]};
+            for (int r = 0; r < 3; ++r) pz[ax * 3 + r] = Rw[r * 3] * x[0] + Rw[r * 3 + 1] * x[1] + Rw[r * 3 + 2] * x[2];
+        }
+        for (int i = 0; i < 3; ++i) pz[9 + i] += F0[i] * adj[9] + F1[i] * adj[10] + F2[i] * adj[11];
+    }
+    return true;
+}
+}  // namespace
 
 void set_show_models(bool on, bool save) {
     if (g_show_models.exchange(on) != on) log::info("[holster] the holster models (%s) at the hips: %s", g_model_name, on ? "on" : "off");
@@ -5330,6 +6064,11 @@ void set_unarmed_after_holster(bool on) {
     config::set("Holsters", "UnarmedAfterHolster", on ? "1" : "0");
 }
 bool hold_to_keep() { return g_hold.load(); }
+bool hold_items_on() { return g_hold_items.load(std::memory_order_relaxed); }
+bool grip_holds(int h, int w) {
+    return h >= 0 && h < 2 && w >= 0 && g_hold.load(std::memory_order_relaxed) && !wheel::wheel_mode() &&
+           g_keep_pub[h].load(std::memory_order_relaxed) == 1 && g_keep_w_pub[h].load(std::memory_order_relaxed) == w;
+}
 void set_hold_to_keep(bool on, bool save) {
     // (off: the held guns loose at the next frame end, nothing put away; on: a gun already in hand is loose until its grip
     // is pressed and let go)
@@ -5398,6 +6137,27 @@ std::string command(const std::string& line) {
         std::string path;
         in >> path;
         return dump(path);
+    }
+    if (v == "gate") {  // (round 114) the holsters closed by the game: a minigame, the player's control held
+        std::string f, n;  // (item 3) holster gate force <n|off>: game_gate() answers n (the tests; a minigame is bit 1)
+        if (in >> f && f == "force" && in >> n) g_game_gate_force = n == "off" ? -1 : std::atoi(n.c_str());
+        const int g = g_game_gate.load();
+        return "gate " + std::to_string(g) + " (minigame " + std::to_string(g & 1) + ", control held " + std::to_string((g >> 1) & 1) + ", in a gringo " +
+               std::to_string((g >> 2) & 1) + ", on a train " + std::to_string((g >> 3) & 1) + "; a table game " + std::to_string(gate_table(g) ? 1 : 0) +
+               ", the seated view " + std::to_string(gate_seated(g) ? 1 : 0) + "), closed " +
+               std::to_string(g_gate_closes.load()) + " times" +
+               (g_game_gate_force.load() >= 0 ? " | forced " + std::to_string(g_game_gate_force.load()) + " (the tests)" : std::string());
+    }
+    if (v == "scripts") {  // holster scripts [force <bits>|off] [all]: (round 130) which minigame's script runs; the running scripts' names
+        std::string f, n;
+        bool all = false;
+        if (in >> f && f == "force" && in >> n) g_minigame_force = n == "off" ? -1 : std::atoi(n.c_str());
+        else if (f == "all") all = true;
+        const int g = minigame();
+        return "minigame " + std::to_string(g) + " (" + mini_text(g) + ")" +
+               (g_minigame_force.load() >= 0 ? " forced (the tests)" : std::string()) + ", the list " + std::to_string(g_script_list_state.load()) +
+               ", walks " + std::to_string(g_script_walks.load()) + " (ended early " + std::to_string(g_script_bad.load()) + "), scripts " +
+               std::to_string(g_script_nodes.load()) + " | (backslashes shown as slashes) " + scripts_with(all ? nullptr : "mini", all ? 2400 : 900, true);
     }
     if (v == "highlights") {  // holster highlights [rings|highlights|both]: [Holsters] InteractionHighlights for the session; each
         // place: exists (e), usable now (u), over the sights (s), the judging hand's distance and reach, the wanted strength;
@@ -5570,6 +6330,103 @@ std::string command(const std::string& line) {
         g_any_weapon = x == "on";
         log::info("[holster] anything in any holster: %s (the session)", g_any_weapon.load() ? "on" : "off");
         v = "weapons";
+    }
+    if (v == "beltprops") {  // holster beltprops [on|off|force on|off|home <k> x y z|turn <k> a b c|scale <k> s] (item 2; the session)
+        std::string x;
+        in >> x;
+        if (x == "on" || x == "off") set_belt_props(x == "on", false);
+        if (x == "force") {
+            std::string y;
+            in >> y;
+            g_belt_props_force = y == "on";
+        }
+        if (x == "throwable") {  // holster beltprops throwable on|off (round 117, the session)
+            std::string y;
+            in >> y;
+            set_belt_throwable(y == "on", false);
+        }
+        if (x == "model") {  // holster beltprops model on|off (round 103, the session): the default outfit's own satchel and sheath
+            std::string y;
+            in >> y;
+            set_belt_props_default(y == "on", false);  // (round 115: refused)
+        }
+        if (x == "scale") {
+            int k = -1;
+            float s = 1.0f;
+            if (in >> k >> s && k >= 0 && k < kBeltProps && std::isfinite(s)) {
+                std::lock_guard lock(g_bp_mutex);
+                g_bp_scale[k] = std::fmax(0.2f, std::fmin(2.0f, s));
+            }
+        }
+        if (x == "throwreset") {  // holster beltprops throwreset [all|<name>]: (round 120) a throwable's own place back to none, saved
+            std::string y;
+            in >> y;
+            for (int i = 0; i < kThrowables; ++i)
+                if (y.empty() || y == "all" || y == kThrowableKey[i]) {
+                    {
+                        std::lock_guard lock(g_bp_mutex);
+                        std::memcpy(g_thr_adj[i], kThrAdjDefault[i], sizeof(g_thr_adj[i]));  // (round 132: its own default)
+                    }
+                    char dv[160];
+                    const float* dd = kThrAdjDefault[i];
+                    std::snprintf(dv, sizeof(dv), "%g %g %g %g %g %g %g %g %g %g %g %g", dd[0], dd[1], dd[2], dd[3], dd[4], dd[5], dd[6], dd[7], dd[8],
+                                  dd[9], dd[10], dd[11]);
+                    config::set("Holsters", (std::string("OwnBeltThrowable") + kThrowableKey[i] + "Pose").c_str(), dv);
+                }
+        }
+        if (x == "home" || x == "turn") {
+            int k = -1;
+            float a = 0, b2 = 0, c = 0;
+            if (in >> k >> a >> b2 >> c && k >= 0 && k < kBeltProps) {
+                std::lock_guard lock(g_bp_mutex);
+                float* d = x == "home" ? g_bp_home[k] : g_bp_turn[k];
+                d[0] = a, d[1] = b2, d[2] = c;
+            }
+        }
+        // each piece's joint as drawn now, in the holsters' frame from the pelvis (right, up, forward), less its OwnBelt move:
+        // where the outfit hangs it (the homes' measure, on the default outfit)
+        std::string r = std::string("beltprops ") + (g_belt_props.load() ? "on" : "off") + (g_belt_props_force.load() ? " (forced)" : "");
+        float fr[12];
+        bool fok;
+        {
+            std::lock_guard lock(g_bp_mutex);
+            std::memcpy(fr, g_bp_frame, sizeof(fr));
+            fok = g_bp_frame_ok;
+            for (int k = 0; k < kBeltProps; ++k) {
+                char b[120];
+                std::snprintf(b, sizeof(b), " | %s present %d home (%.3f %.3f %.3f) turn (%.0f %.0f %.0f) scale %.2f", body::piece_key(k + 1),
+                              body::piece_present(k + 1) ? 1 : 0, g_bp_home[k][0], g_bp_home[k][1], g_bp_home[k][2], g_bp_turn[k][0], g_bp_turn[k][1],
+                              g_bp_turn[k][2], g_bp_scale[k]);
+                r += b;
+            }
+            {  // (round 120) the throwable shown and each one's own place (its move, m)
+                char b[260];
+                std::snprintf(b, sizeof(b), " | the throwable shown %d at (%.3f %.3f %.3f) %.0f ms ago; placed by hand %llu; the outfit's satchel's "
+                              "draws hidden %llu, hidden with the throwable in a hand %llu; draws refused with none left %llu", g_thr_shown_w,
+                              g_thr_shown_pos[0], g_thr_shown_pos[1], g_thr_shown_pos[2], log::now_ms() - g_thr_shown_ms,
+                              static_cast<unsigned long long>(g_thr_placed.load()), static_cast<unsigned long long>(body::satchel_hidden_draws()),
+                              static_cast<unsigned long long>(g_thr_hand_hides.load()), static_cast<unsigned long long>(g_none_left_refused.load()));
+                r += b;
+                for (int i = 0; i < kThrowables; ++i) {
+                    std::snprintf(b, sizeof(b), " | %s own place: moved (%.3f %.3f %.3f), turned %s", kThrowableKey[i], g_thr_adj[i][9], g_thr_adj[i][10],
+                                  g_thr_adj[i][11], g_thr_adj[i][0] > 0.9999f && g_thr_adj[i][4] > 0.9999f && g_thr_adj[i][8] > 0.9999f ? "no" : "yes");
+                    r += b;
+                }
+            }
+        }
+        for (int i = 0; i < body::kPieces && fok; ++i) {
+            float j[3];
+            if (!body::piece_where(i, j)) continue;
+            const float d[3] = {j[0] - fr[9], j[1] - fr[10], j[2] - fr[11]};
+            const body::Piece p = body::piece(i);
+            char b[120];
+            std::snprintf(b, sizeof(b), " | %s's joint (%.3f %.3f %.3f), less its move (%.3f %.3f %.3f)", body::piece_key(i),
+                          d[0] * fr[0] + d[1] * fr[1] + d[2] * fr[2], d[0] * fr[3] + d[1] * fr[4] + d[2] * fr[5], d[0] * fr[6] + d[1] * fr[7] + d[2] * fr[8],
+                          d[0] * fr[0] + d[1] * fr[1] + d[2] * fr[2] - p.d[0], d[0] * fr[3] + d[1] * fr[4] + d[2] * fr[5] - p.d[1],
+                          d[0] * fr[6] + d[1] * fr[7] + d[2] * fr[8] - p.d[2]);
+            r += b;
+        }
+        return r;
     }
     if (v == "weapon") {  // holster weapon <Key> <token|auto|Rounds> [session] (writes the user ini, as the menu does; with
                           // "session" (2026-10-29, a test's) the session only)

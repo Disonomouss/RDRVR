@@ -25,6 +25,7 @@
 #include "core/physics.h"
 #include "core/log.h"
 #include "core/menu.h"
+#include "core/offhand.h"
 #include "core/pose.h"
 #include "core/reload.h"
 #include "core/wheel.h"
@@ -103,6 +104,9 @@ double g_fist_arm_ms = 0.0;     // when the stance began (its LT waits for the f
 double g_fist_select_ms = -1e9;  // the last SET_PLAYER_MELEE_MODE_SELECTED sent by the stance
 bool g_fist_hold_rt = false;     // a gun came into the hand during a stance: RT held back until it is let go
 std::atomic<uint64_t> g_fist_held_back{0}, g_fist_passed{0}, g_fist_arms{0};
+std::atomic<uint64_t> g_thrown_rt_held{0};  // (round 122) frames of RT held back from the knives and the tomahawk in hand
+std::atomic<uint64_t> g_fist_gated{0};  // (round 125) frames a trigger was held while a minigame ran or the game held control: no stance
+double g_fist_said_ms = -1e9;           // the stance's last log line (the pad's thread)
 std::atomic<int> g_fist_last_lt{0}, g_fist_last_rt{0};  // the last pad's triggers while unarmed (0-255, the tests)
 // [Reload] TwoHandedAims: while a long gun is held with both hands, LT is held for it the whole time (the game's aim
 // stance: its support-hand grip, which the front hand snaps onto, and shots at once), whatever TriggerAims is; when the
@@ -219,6 +223,9 @@ std::atomic<bool> g_flick_rb{true};
 double g_rb_until = 0.0, g_up_t0 = 0.0;
 bool g_up_armed = true;
 std::atomic<uint64_t> g_up_flicks{0}, g_up_skipped{0};
+}  // namespace
+bool flick_up_rb_on() { return g_flick_rb.load(std::memory_order_relaxed); }
+namespace {
 void flick_up_rb(float x, float y, double now, bool seated, bool deadeye, bool menu) {
     if (!g_flick_rb.load(std::memory_order_relaxed)) return;
     const bool cone = y > 0.0f && std::fabs(x) <= 0.6f * y;
@@ -375,7 +382,11 @@ bool pad(xinput::PadState* out) {
         const bool lasso_held = api::actor_state(&ls) && ls.weapon == 21;  // WEAPON_LASSO
         const bool want = gun_hand() != layout_gun_hand() && !lasso_held;
         if (want != g_trig_swapped && l.trigger < 0.15f && r.trigger < 0.15f) g_trig_swapped = want;
-        if (g_trig_swapped) std::swap(l.trigger, r.trigger);
+        // (round 125) never while a minigame runs; (round 128) nor at a table game without the flag, which is known only 1.5 s
+        // in: that change, as the swap's own, only with both triggers let go (the review: a held one would change sides)
+        static bool table_was = false;
+        if (const bool tg = holster::table_game(); tg != table_was && ((holster::game_gate() & 1) != 0 || (l.trigger < 0.15f && r.trigger < 0.15f))) table_was = tg;
+        if (g_trig_swapped && !(holster::game_gate() & 1) && !table_was) std::swap(l.trigger, r.trigger);
     }
     xinput::PadState p;
     // the chord for controllers without a menu button: both B buttons are the menu button (and not B / Y)
@@ -629,11 +640,41 @@ bool pad(xinput::PadState* out) {
     if (gestures::guard_up()) rt = 0.0f;
     // [Gestures] LassoThrow trigger or both (2026-10-12): the lasso's trigger throw sends the game's aim first, then RT
     if (gestures::lasso_trigger_owned()) rt = 0.0f;
+    // (round 122, the user: the throwing knife "holding right trigger flips it into throwing position but then a sound
+    // effects plays quickly and repeatedly. Then when you let go of right trigger it throws the knife (this part happens with
+    // the tomahawk too). Right trigger should not throw them") the knives and the tomahawk held by the grip (HoldToKeep,
+    // HoldItems) are thrown only by letting go in a throw: RT neither arms the game's throw (ThrowByGrip) nor throws them.
+    // (the review) only while the gun hand's grip holds it (not loose, not the wheel's mode), its let-go throw there, no menu
+    if (have_st && (st.weapon == 25 || st.weapon == 29) && holster::hold_items_on() && holster::grip_holds(gun_hand(), st.weapon) &&
+        offhand::throw_available() && pose::anchor_active() && !game_menu_now() && !menu::visible()) {
+        if (rt > 0.15f) g_thrown_rt_held.fetch_add(1, std::memory_order_relaxed);
+        rt = 0.0f;
+    }
     // [Gestures] FistsBothTriggers: nothing in hand, on foot, first person, no menu: a trigger alone held back (no fighting
     // stance, no punch); both past half together arm it, and it stays armed while either is held. The guard (both fists
     // before the face) still takes RT above; the mod's own presses (the swing's punch, the guard's block) are added after.
+    // (round 125, the user at a poker table: John "sat down then stood up and began to move around", and the game's skip to
+    // his turn then never faded back in; the holsters were closed by the gate, the fists' stance was not: both triggers held
+    // selected the fists by a native and sent the game's LT) never while a minigame runs or the game holds the player's
+    // control: the triggers pass as the game's own there
+    const bool gated = (holster::game_gate() & 3) != 0;
+    {  // (the review) a trigger held as the gate closes (the stance's, or one held back alone) is no new press for the game:
+       // held back until let go
+        static bool gate_was = false, hold_lt = false, hold_rt = false;  // (the pad's thread)
+        if (gated && !gate_was && have_st && st.weapon < 0) hold_lt = lt > 0.15f, hold_rt = rt > 0.15f;  // (empty hands only: a gun's trigger is the game's)
+        gate_was = gated;
+        if (hold_lt) {
+            if (!gated || lt < 0.15f) hold_lt = false;
+            else lt = 0.0f;
+        }
+        if (hold_rt) {
+            if (!gated || rt < 0.15f) hold_rt = false;
+            else rt = 0.0f;
+        }
+    }
+    if (gated && (lt > 0.5f || rt > 0.5f)) g_fist_gated.fetch_add(1, std::memory_order_relaxed);
     const bool unarmed = have_st && st.weapon < 0 && !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING)) && pose::anchor_active() &&
-                         !game_menu_now() && !menu::visible();
+                         !game_menu_now() && !menu::visible() && !gated;
     // (the guard's pose takes both triggers as before: its fighting stance from the player's LT at once)
     if (g_fists_both.load(std::memory_order_relaxed) && unarmed) {
         const bool was = g_fist_armed.load(std::memory_order_relaxed), guard = gestures::guard_up();
@@ -642,6 +683,10 @@ bool pad(xinput::PadState* out) {
         if (both && !was) {
             g_fist_arms.fetch_add(1, std::memory_order_relaxed);
             g_fist_arm_ms = now;
+            if (now - g_fist_said_ms > 2000.0) {  // (round 125: said, so a log shows it; at most every 2 s)
+                g_fist_said_ms = now;
+                log::info("[controls] fists: both triggers held with nothing in hand: the fighting stance%s", guard ? " (the guard up)" : "");
+            }
             // (the review of 0.8.11) a gun still selected on the wheel (put away by the game or a script) is drawn by
             // the stance's LT: the fists selected first, as the guard does (SET_PLAYER_MELEE_MODE_SELECTED), at most every
             // 2 s, and the LT held back 150 ms for it (the guard waits as long)
@@ -810,7 +855,7 @@ bool pad(xinput::PadState* out) {
     }
     p.lt = trig(lt);
     p.rt = trig(rt);
-    if (unarmed) {
+    if (unarmed || gated) {
         g_fist_last_lt.store(p.lt, std::memory_order_relaxed);
         g_fist_last_rt.store(p.rt, std::memory_order_relaxed);
     }
@@ -910,11 +955,13 @@ void set_fists_both_triggers(bool on, bool save) {
     log::info("[controls] fists: %s", on ? "both triggers together for the fighting stance and the punch" : "each trigger as the game's");
 }
 std::string fists_status() {
-    char b[240];
-    std::snprintf(b, sizeof(b), "fists both triggers %s: armed %d, arms %llu, frames held back %llu, passed %llu, the last unarmed pad lt %d rt %d",
+    char b[420];
+    std::snprintf(b, sizeof(b), "fists both triggers %s: armed %d, arms %llu, frames held back %llu, passed %llu, the last unarmed pad lt %d rt %d"
+                  " | the knives' and the tomahawk's RT held back %llu | triggers left to the game (a minigame, control held) %llu",
                   g_fists_both.load() ? "on" : "off", g_fist_armed.load() ? 1 : 0, static_cast<unsigned long long>(g_fist_arms.load()),
                   static_cast<unsigned long long>(g_fist_held_back.load()), static_cast<unsigned long long>(g_fist_passed.load()),
-                  g_fist_last_lt.load(), g_fist_last_rt.load());
+                  g_fist_last_lt.load(), g_fist_last_rt.load(), static_cast<unsigned long long>(g_thrown_rt_held.load()),
+                  static_cast<unsigned long long>(g_fist_gated.load()));
     return b;
 }
 

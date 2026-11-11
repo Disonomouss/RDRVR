@@ -174,8 +174,10 @@ void qrot(const float q[4], const float v[3], float out[3]) {  // q (x y z w) ap
 }
 void guard_frame(double now, const RdrvrActorState& st) {
     static double in_since = -1.0, out_since = -1.0;
+    // (round 125) never while a minigame runs or the game holds the player's control (its LT and RB would reach a table game:
+    // RB is poker's skip to your turn)
     const bool allowed = g_guard.load(std::memory_order_relaxed) && st.weapon < 0 && !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING)) &&
-                         !menu::visible() && !controls::game_menu_open() && now - g_last_swing_ms > 500.0;
+                         !menu::visible() && !controls::game_menu_open() && now - g_last_swing_ms > 500.0 && !(holster::game_gate() & 3);
     static double up_since = 0.0;
     bool pose = false;
     xr::EyeView v[2];
@@ -1235,7 +1237,7 @@ void frame() {
         const bool fists_ok = st.weapon < 0 && (controls::fists_both_triggers() ? stance : melee);
         // (step 5, O4) not the hand holding an off-hand item: its own stab (offhand's) strikes, not the game's attack
         if ((fists_ok || (melee && ((st.weapon == kKnife || st.weapon == kTorch) && h != torch_sec && !offhand::held(h)))) &&
-            s > g_swing_speed.load(std::memory_order_relaxed) &&
+            s > g_swing_speed.load(std::memory_order_relaxed) && !(holster::game_gate() & 3) &&  // (round 125: no attack at a table game)
             fwd_speed > 0.4f * s && now >= next_ok[h] && !whistle::at_mouth(h)) {  // run 8: a hand to the mouth is no punch
             next_ok[h] = now + 400.0;
             // run 10 item 6 (the user: "moving hand rapidly while on horseback draws last held gun"): riding or driving,

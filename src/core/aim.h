@@ -48,6 +48,11 @@ bool reticle_on();
 // reticle placed there): the game's flat one may be hidden
 bool third_person_reticle_live();
 void set_reticle_on(bool on);  // also written to the user ini
+// [Hands] HoldUps (2026-11-09, off by default): the people the gun points at are told the player aims at them as with the
+// game's own reticle (the mod hides it, and the game only tells them while it shows): hands up, the game's rob prompt
+bool hold_ups();
+bool hold_ups_available();  // its hook installed (an optional anchor: another build may lack it)
+void set_hold_ups(bool on, bool save);
 // [Hands] BulletTrails (2026-11-06): the game's bullet trails on (default) or never made; _available: its hook installed
 bool bullet_trails();
 bool bullet_trails_available();

@@ -197,6 +197,10 @@ std::atomic<uint64_t> g_copy_same_tick{0};  // pulls held a tick: the gun in han
 uintptr_t g_copy_flash_src = 0;  // the muzzle flash's own matrix (the prop's muzzle bone), followed through T
 uint64_t g_copy_flash_until = 0;
 alignas(16) float g_copy_bone[16] = {};  // the copy's muzzle flash follows this (MuzzleFxMatrix's pointer)
+// (round 127) the copy's last shot (the game thread's): its W and weapon tick, for the flashes asked outside that tick
+uintptr_t g_copy_shot_W = 0;
+uint64_t g_copy_shot_tick = 0, g_copy_shot_said = ~0ull;
+std::atomic<uint64_t> g_copy_flash_late{0}, g_copy_flash_unread{0}, g_copy_flash_far{0};  // (far: put over 3 m from the gun in hand's, or not a number)
 // the sidearms' ammo types (Enums.h AmmoType): the pistols 0-3 AMMO_TYPE_PISTOL 6, the revolvers 4-7 AMMO_TYPE_REVOLVER 7
 // (2026-11-01, the off-hand build step 4, P2) and the Sawed-off (it pairs as a sidearm): a copy of it, its shells (10)
 int sidearm_ammo(int w) { return w >= 0 && w <= 3 ? 6 : w >= 4 && w <= 7 ? 7 : w == 15 ? 10 : -1; }
@@ -216,11 +220,16 @@ void set_spare(int32_t actor, int type, float count) {
     reload::note_spare_native(api::queue_native(0x4372593E, args, 4, 0, nullptr));
 }
 // row-vector 4x4 affine product out = a b (the game's matrices: rows the axes, then the translation)
+// (round 127, the user: "Copy gun has no muzzle flash") a b for the game's bone matrices (rows: the axes, then the place),
+// as affine ones: the game leaves their fourth column unset (the copy's flash matrix read with -1.3e29 and 3.6e27 there:
+// the full product sent the flash 1e29 m away, every shot). The fourth column of the result is 0 0 0 1
 void mul44(const float* a, const float* bm, float* out) {
     float t[16];
-    for (int i = 0; i < 4; ++i)
-        for (int k = 0; k < 4; ++k)
-            t[i * 4 + k] = a[i * 4] * bm[k] + a[i * 4 + 1] * bm[4 + k] + a[i * 4 + 2] * bm[8 + k] + a[i * 4 + 3] * bm[12 + k];
+    for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < 3; ++k)
+            t[i * 4 + k] = a[i * 4] * bm[k] + a[i * 4 + 1] * bm[4 + k] + a[i * 4 + 2] * bm[8 + k] + (i == 3 ? bm[12 + k] : 0.0f);
+        t[i * 4 + 3] = i == 3 ? 1.0f : 0.0f;
+    }
     std::memcpy(out, t, sizeof(t));
 }
 
@@ -492,6 +501,8 @@ bool fire_copy(uintptr_t item, uintptr_t W, int weapon) {  // true: held for the
         return false;
     }
     g_copy_armed = W;
+    g_copy_shot_W = W;
+    g_copy_shot_tick = g_tick_n.load(std::memory_order_relaxed);
     g_copy_restore = c0;
     if (g_copy_dmg.load(std::memory_order_relaxed)) {  // [Hands] CopyOwnDamage: this shot's scale, for its hits this tick
         const int shown = copy_model();
@@ -1008,6 +1019,7 @@ void idle_fx(uintptr_t W, uintptr_t* mptr) {
     uintptr_t src = 0;
     alignas(16) float M[16], G[16];
     if (!raw(reinterpret_cast<uintptr_t>(mptr), &src, sizeof(src)) || !src || !raw(src, M, sizeof(M))) return;
+    M[3] = M[7] = M[11] = 0.0f, M[15] = 1.0f;  // (round 127: a bone matrix's fourth column is unset; mul44r below takes it)
     if (!b) {  // a free slot, else the least recently called
         b = &g_follow[0];
         for (FollowBuf& f : g_follow)
@@ -1118,6 +1130,7 @@ void idle_fx_tick() {  // the weapon tick, after the game's: held effects not as
         if (f.W && f.src && !f.ours && f.last + 1 < g_fx_tick && !body::leaving_W(f.W)) {  // (round 78: a leaving item's kept out of sight)
             alignas(16) float m[16];
             bool ok = raw(f.src, m, sizeof(m));
+            m[3] = m[7] = m[11] = 0.0f, m[15] = 1.0f;  // (round 127: a bone matrix's fourth column is unset: not judged, not kept)
             for (int i = 0; ok && i < 16; ++i) ok = std::isfinite(m[i]);
             if (ok) {
                 std::memcpy(f.m, m, sizeof(m));
@@ -1194,14 +1207,44 @@ void hk_muzzle_fx(uintptr_t W, uintptr_t* mptr, void* local) {
         idle_fx(W, mptr);
         return;
     }
-    if (!W || W != g_copy_armed || !mptr || !g_copy_T_ok) return;
+    if (!W || !mptr) return;
+    const uint64_t tick = g_tick_n.load(std::memory_order_relaxed);
+    if (W != g_copy_armed || !g_copy_T_ok) {
+        // (round 127, the user: "Copy gun has no muzzle flash") a flash asked for the copy's gun after its shot's tick
+        // stays at the gun in hand: counted and said, once a shot
+        if (W == g_copy_shot_W && tick - g_copy_shot_tick <= 30 && g_copy_shot_said != g_copy_shot_tick) {
+            g_copy_shot_said = g_copy_shot_tick;
+            g_copy_flash_late.fetch_add(1, std::memory_order_relaxed);
+            // (the review: the copy fires through the gun in hand's W, so this may be the gun in hand's own next shot's)
+            log::info("[wield] the copy's shot moved no flash; a flash for its W %llu ticks after it (armed %d, placed %d): at the gun in hand",
+                      static_cast<unsigned long long>(tick - g_copy_shot_tick), W == g_copy_armed ? 1 : 0, g_copy_T_ok ? 1 : 0);
+        }
+        return;
+    }
     uintptr_t src = 0;
     alignas(16) float m[16];
-    if (!raw(reinterpret_cast<uintptr_t>(mptr), &src, sizeof(src)) || !src || !raw(src, m, sizeof(m))) return;
-    mul44(m, g_copy_T, g_copy_bone);
+    if (!raw(reinterpret_cast<uintptr_t>(mptr), &src, sizeof(src)) || !src || !raw(src, m, sizeof(m))) {
+        g_copy_flash_unread.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    alignas(16) float nb[16];  // (the review: made aside, so a flash still alive never follows a refused one's matrix)
+    mul44(m, g_copy_T, nb);
+    g_copy_shot_said = g_copy_shot_tick;
+    {  // said with each shot: where the flash is put, how far from the gun in hand's (the hands' distance, about)
+        const float dx = nb[12] - m[12], dy = nb[13] - m[13], dz = nb[14] - m[14];
+        const float far_m = std::sqrt(dx * dx + dy * dy + dz * dz);
+        log::info("[wield] the copy's flash: follows (%.2f %.2f %.2f), %.2f m from the gun in hand's (%.2f %.2f %.2f)", static_cast<double>(nb[12]),
+                  static_cast<double>(nb[13]), static_cast<double>(nb[14]), static_cast<double>(far_m), static_cast<double>(m[12]),
+                  static_cast<double>(m[13]), static_cast<double>(m[14]));
+        if (!(far_m < 3.0f)) {  // (the review) over 3 m off, or not a number: not sent, the flash left at the gun in hand
+            g_copy_flash_far.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    std::memcpy(g_copy_bone, nb, sizeof(nb));
     g_copy_flash_src = src;
     g_copy_flashes.fetch_add(1, std::memory_order_relaxed);
-    g_copy_flash_until = g_tick_n.load(std::memory_order_relaxed) + 40;
+    g_copy_flash_until = tick + 40;
     wr<uintptr_t>(reinterpret_cast<uintptr_t>(mptr), reinterpret_cast<uintptr_t>(g_copy_bone));  // the caller's local
 }
 
@@ -2111,14 +2154,15 @@ std::string command(const std::string& line) {
     }
     if (copy_status) {  // dual copyst: the copy's own line (the full one runs past the channel's 512 characters)
         const State cs = state();
-        char cb[300];
+        char cb[360];
         std::snprintf(cb, sizeof(cb), "copy %d | second: %s, copy %d, ctrl %d, John's hand %d, weapon %d, clip %.0f/%.0f | shots %llu, loads %llu, refused %llu, "
-                      "unplaced %llu, clicks %llu, placed %d, why %d, flashes %llu",
+                      "unplaced %llu, clicks %llu, placed %d, why %d, flashes %llu (late %llu, unread %llu, far %llu)",
                       g_copy_en.load() ? 1 : 0, cs.on ? "out" : "none", cs.copy ? 1 : 0, cs.ctrl, cs.john, cs.weapon, cs.clip, cs.copy_max,
                       static_cast<unsigned long long>(g_copy_shots.load()), static_cast<unsigned long long>(g_copy_loads.load()),
                       static_cast<unsigned long long>(g_refused.load()), static_cast<unsigned long long>(g_unplaced.load()),
                       static_cast<unsigned long long>(g_clicks.load()), g_copy_T_ok ? 1 : 0, g_invalid.load(),
-                      static_cast<unsigned long long>(g_copy_flashes.load()));
+                      static_cast<unsigned long long>(g_copy_flashes.load()), static_cast<unsigned long long>(g_copy_flash_late.load()),
+                      static_cast<unsigned long long>(g_copy_flash_unread.load()), static_cast<unsigned long long>(g_copy_flash_far.load()));
         return cb;
     }
     const State s = state();

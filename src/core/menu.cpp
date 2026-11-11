@@ -28,6 +28,7 @@
 #include "core/audio.h"
 #include "core/body.h"
 #include "core/xr_blit.h"
+#include "core/xr_image.h"
 #include "core/holster.h"
 #include "core/reload.h"
 #include "core/gestures.h"
@@ -105,6 +106,7 @@ ID3D12RootSignature* g_root = nullptr;
 ID3D12PipelineState* g_pso = nullptr;
 DXGI_FORMAT g_quad_fmt = DXGI_FORMAT_UNKNOWN;
 XrSwapchain g_sc = XR_NULL_HANDLE;
+xr_image::Held g_held;  // (under xr.cpp's frame mutex) the quad's image from its acquire to its release
 std::vector<ID3D12Resource*> g_images;
 XrPosef g_pose{{0, 0, 0, 1}, {0, 0, -kDistance}};
 
@@ -1238,6 +1240,28 @@ void page_body() {
         body::set_auto_shows(as);
         config::set("Body", "AutoShow", as ? "1" : "0");
     }
+    bool hs = body::hidden_body_shadow();  // (round 117) [Body] HiddenBodyShadow
+    if (check("The hidden body casts a shadow", &hs,
+              "With part of John hidden by \"Shown\" (forearms and hands, or hands only): his whole body's shadow on the ground. "
+              "Off: no shadow of him at all.")) {
+        body::set_hidden_body_shadow(hs);
+        config::set("Body", "HiddenBodyShadow", hs ? "1" : "0");
+    }
+    bool tgh = pose::table_game_head_view();  // (GOAL-doorway-and-poker item 3) [Body] TableGameHeadView
+    if (check("The view at John's head where the game seats him", &tgh,
+              "At a table game (poker, liar's dice, blackjack, five finger fillet, arm wrestling, horseshoes) and on a train's seat: the view at "
+              "John's head as the game places him, instead of the standing eye height. Try it if his body shows in front of you.")) {
+        pose::set_table_game_head_view(tgh);
+        config::set("Body", "TableGameHeadView", tgh ? "1" : "0");
+    }
+    bool tga = body::table_game_arms();  // (round 128) [Body] TableGameArms
+    if (check("John's own arms at the other table games", &tga,
+              "At horseshoes, five finger fillet and arm wrestling: John's arms as the game animates them (the knife and the horseshoe "
+              "are in his animated hands), not on your controllers; you only press the game's buttons. Liar's dice, blackjack and poker "
+              "keep your hands.")) {
+        body::set_table_game_arms(tga);
+        config::set("Body", "TableGameArms", tga ? "1" : "0");
+    }
     bool hide = body::hide_enabled();
     if (check("Hide head and hat", &hide, "John's head and hat hidden in first person (cutscenes still show them).")) {
         body::set_hide_enabled(hide);
@@ -1449,8 +1473,8 @@ void page_holsters() {
     {
         const int pm = holster::placing() ? 1 : holster::placing_pieces() ? 2 : 0;
         const char* const kPlaceTip = "Rings: close the menu, grip a holster's ring and move it. Belt pieces and guns: grip a piece of "
-                                      "John's belt or a holstered gun, then move and turn it. Let go to leave it (saved). Nothing is "
-                                      "drawn meanwhile: set Off when done.";
+                                      "John's belt, a holstered gun or the throwable on the belt (each throwable keeps its own place), "
+                                      "then move and turn it. Let go to leave it (saved). Nothing is drawn meanwhile: set Off when done.";
         if (radio("Off##Placing off", pm == 0, kPlaceTip)) holster::set_placing(false), holster::set_placing_pieces(false);
         ImGui::SameLine();
         if (radio("Rings##Placing rings", pm == 1, kPlaceTip)) holster::set_placing_pieces(false), holster::set_placing(true);
@@ -1554,6 +1578,20 @@ void page_holsters() {
         bool lh = body::left_holster();
         if (check("A mirrored holster at the left hip", &lh, "John's holster drawn again at the left hip for the secondary sidearm."))
             body::set_left_holster(lh, true);
+        bool bpr = holster::belt_props();  // (GOAL-cattleman-belts item 2) [Holsters] OwnBeltProps
+        if (check("The knife, satchel and lasso on every outfit", &bpr,
+                  "On an outfit that has no knife sheath, satchel or lasso of its own (the duster and others), the game's knife, satchel "
+                  "and lasso coil are shown where your belt has them, moved and turned with those pieces."))
+            holster::set_belt_props(bpr, true);
+        // (round 115) "The default outfit's own satchel" ([Holsters] OwnBeltPropsDefault) taken out: the game faults making
+        // the default outfit's model as a prop (holster.cpp)
+        sub_begin(bpr);  // (round 117) [Holsters] OwnBeltThrowable, only with OwnBeltProps
+        bool bth = holster::belt_throwable();
+        if (check("The equipped throwable instead of the satchel", &bth,
+                  "With the knife, satchel and lasso on every outfit: at the satchel's place, the throwable you have equipped (the "
+                  "fire bottle, the dynamite, the tomahawk...) instead of the satchel; nothing there when none is equipped."))
+            holster::set_belt_throwable(bth, true);
+        sub_end();
         sub_end();
     }
     // 2026-10-13 (the user: "Can you add an option to reset the belt to game default positions?"): always clickable (also
@@ -1663,6 +1701,13 @@ void page_guns() {
         bool bt = aim::bullet_trails();
         if (check("Bullet trails", &bt, "The streaks bullets leave in the air (everyone's shots). Off: no trails."))
             aim::set_bullet_trails(bt, true);
+    }
+    if (aim::hold_ups_available()) {  // 2026-11-09 ([Hands] HoldUps; the user: pointing the gun at someone should offer the game's rob)
+        bool hu = aim::hold_ups();
+        if (check("Hold-ups", &hu,
+                  "People your gun points at react as when you aim at them in the game: hands up, and the game's rob option once you "
+                  "stand more than 4 m away."))
+            aim::set_hold_ups(hu, true);
     }
     {  // 2026-10-07: the reticle where the shot lands
         bool rt = aim::reticle_on();
@@ -1794,6 +1839,12 @@ void page_guns() {
         bool sp = deadeye::sepia();
         if (check("Dead Eye's sepia colour", &sp, "Dead Eye's sepia screen colour. Off: the colours stay as they are; the slow motion and the rest stay."))
             deadeye::set_sepia(sp);
+        bool dr = deadeye::duel_trigger_fires();  // (GOAL-after-0.8.13.2 item 6) [DeadEye] DuelTriggerFires
+        if (check("In a duel, the right trigger fires", &dr,
+                  "In a duel, flick the right stick up to place each X, then pull the right trigger to fire at them: once your X's "
+                  "score enough to win, the duel ends there and they fire (with too few the time runs on). Off: the game's way "
+                  "(the right trigger places the X's, the duel fires them). Needs the right stick's flick up on."))
+            deadeye::set_duel_trigger_fires(dr, true);
     }
     {  // [Hands] DeadEyeMarks, DeadEyeMarkDegrees, DeadEyeBarrelPaint (run 28 item 1c; after optimumbox's fork, v0.8.11.9,
        // commit ac942427, MIT; his key names)
@@ -2658,6 +2709,16 @@ void page_advanced() {
     bool nfl = body::no_flutter();  // (2026-11-02, GOAL-older-items item 23) [Body] NoFlutter
     if (check("Still clothes", &nfl, "John's clothes don't flutter in the wind (seen from inside the body it reads as a buzz)."))
         body::set_no_flutter(nfl, true);
+    bool cpn = body::cloth_pins();  // (round 122) [Body] ClothPins
+    if (check("Coat on the drawn body (test)##Coat on the drawn body", &cpn,
+              "The duster's coat drawn on John's drawn body, each part with the body at its height (hips to chest), not swaying with "
+              "the game's own walk and idle. Off: the whole coat moved with the hips."))
+        body::set_cloth_pins(cpn, true);
+    bool cst = body::cloth_still() > 0.0f;  // (round 124) [Body] ClothStill
+    if (check("Coat held still (test)##Coat held still", &cst,
+              "With the option above: the duster's coat hangs still on your body, the game's walking and idle sway smoothed out (it "
+              "follows a slow change, a crouch or the saddle, in about a second). Off: the coat swings as the game simulates it."))
+        body::set_cloth_still(cst ? 1.0f : 0.0f, true);
     bool amv = body::arm_motion_vectors();  // run 12 item 9: [Body] ArmMotionVectors
     if (check("Arm motion vectors (experimental)##Arm motion vectors", &amv,
               "Tells DLSS and TAA how John's arms moved, which may cut the ghosting beside fast-moving arms."))
@@ -3325,14 +3386,11 @@ bool frame(const XrView* views, XrSession session, XrSpace space, XrCompositionL
         fg->AddCircleFilled(at, pressed ? 13.0f : 6.0f, col, 24);
     }
     ImGui::Render();
-    uint32_t index = 0;
-    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wi.timeout = 100000000;
-    if (XR_FAILED(xrAcquireSwapchainImage(g_sc, &ai, &index))) return false;
-    bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_sc, &wi)) && index < g_images.size() && render(g_images[index]);
-    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(g_sc, &ri);
+    // (2026-11-09, the code review) xr_image: a timed-out wait keeps the image, waited again next frame, never drawn unwaited
+    if (!xr_image::acquire(g_sc, g_held, "menu")) return false;
+    const uint32_t index = g_held.index;
+    bool ok = index < g_images.size() && render(g_images[index]);
+    xr_image::release(g_held, "menu");
     if (!ok) return false;
     *quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;

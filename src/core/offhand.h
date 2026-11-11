@@ -39,6 +39,12 @@ enum Kind { kNone = 0, kKnife = 1, kThrown = 2, kTorch = 3 };
 // the item's kind by eWeapon: 22 the knife; 23, 24, 25, 29, 35, 36, 37 the throwables (not the zombies' spit, 32); 33
 // the torch
 int kind_of(int weapon);
+// (round 117, [Holsters] OwnBeltThrowable) weapon w's model name (the game's, else the research's): nullptr until known
+// (asked once); the pointer stays valid
+const char* item_fragment(int w);
+// (round 117's review) whether the thrown slot's item w has any left: its clip (ACTOR_GET_WEAPON_AMMO for actor, asked
+// every second) and its type's spare in the inventory, as the off hand's "none left": 1 some, 0 none, -1 not known yet
+int thrown_left(int w, uint32_t actor);
 
 void init();     // reads [Hands] OffHandItems, logs it; the throw's tick hook (api slot 1)
 bool enabled();  // relaxed
@@ -59,6 +65,7 @@ void release(int h, bool at_zone);
 // (true: the launch queued; *speed: the hand's, -1 unknown). prime_type: its ammo type asked ahead (the count needs it)
 // window_ms: the hand's motion looked at (from the let-go's start, which the hold's waits may have delayed)
 bool throw_in_hand(int h, int w, float clip, uint32_t actor, float* speed, double window_ms);
+bool throw_available();  // (round 122) throw_in_hand's launch is there on this build (its anchors and hook)
 void prime_type(int w);
 // Each frame end (holster.cpp): the drawn item's pose at its hand (grab: each John hand's grab point, world); bp null:
 // out of first person (every item put back at once). gun_h: the gun hand (a controller), gun: a gun is the item in hand

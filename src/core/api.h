@@ -35,11 +35,21 @@ bool plugin_attached();
 // v7: the calling thread is inside the plugin's script tick (on_script_tick seen on this thread and end_script_tick not
 // yet): the game thread, where the plugin runs natives and the core may call into the game (gun_melee_hit).
 bool in_script_tick();
+// (2026-11-09, round 115) The vectored handler's call for a fatal-class exception raised in RDR.exe's code: on the
+// thread running a request the plugin popped (its result not yet posted), that request faulted inside the game. RedHook
+// catches it and hands back the call's leftover buffer (its first argument), and a lock the game held stays held: the
+// result is answered 0 and the request's id noted (faulted). Atomics only (any thread).
+void note_native_fault();
+uint64_t native_faults();    // requests that faulted so far
+uint32_t last_fault_hash();  // the latest one's hash (0 for a plugin op)
+bool faulted(uint64_t id);   // request `id` faulted (one of the latest 16 that did): its 0 is no answer of the game's
 // A function the core runs at the start of each script tick, on the game thread, before the tick's requests (slot 0: the
 // reticle's barrel probe, aim.cpp; slot 1, 2026-10-29: [Hands] OffHandItems' throw, offhand.cpp; slot 2, 2026-10-31: the
 // test-only probe commands, probe.cpp, set only once a probe command is sent). It may queue natives;
 // their results come in the same tick.
 void set_tick_hook(void (*hook)(), int slot = 0);
+// (round 130) `f` run once on the next script tick, on its thread (one at a time: a later call before the tick replaces it)
+void run_on_tick(void (*f)());
 // (2026-10-28) The plugin's run of request `id` timed, from its pop to its posted result, in slot 0-3 (the latest id a
 // slot was given; aim.cpp's reticle probes: 0 the main's, 1 the second gun's): the runs' total (us) and count.
 void time_native(uint64_t id, int slot);

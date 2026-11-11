@@ -32,6 +32,7 @@ std::atomic<uint64_t> g_polls{0}, g_injected{0}, g_caps{0}, g_rumbles{0};
 std::atomic<uint64_t> g_rb_presses{0}, g_lb_presses{0}, g_x_presses{0};  // X: the game's jump (item 1f)
 std::atomic<uint64_t> g_x_press_ms{0};
 WORD g_last_buttons = 0;
+std::atomic<uint8_t> g_last_rt{0};  // (GOAL-after-0.8.13.2 item 6) pad 0's right trigger as the game last read it
 std::atomic<uint32_t> g_rumble{0};  // last motor speeds sent to pad 0: left << 16 | right
 std::atomic<DWORD> g_packet{0x52445652};
 std::atomic<bool> g_was_injecting{false};
@@ -186,6 +187,7 @@ DWORD WINAPI hk_GetState(DWORD user, XINPUT_STATE* st) {
             g_x_press_ms.store(GetTickCount64(), std::memory_order_relaxed);
         }
         g_last_buttons = b;
+        g_last_rt.store(st->Gamepad.bRightTrigger, std::memory_order_relaxed);
     }
     return r;
 }
@@ -210,6 +212,7 @@ void set_pad_turn(bool on, float deg) {
 }
 
 float pad_right_x() { return g_right_x.load(std::memory_order_relaxed); }
+uint8_t pad_rt() { return g_last_rt.load(std::memory_order_relaxed); }
 
 void set_override(uint16_t buttons, bool stick, float rx, float ry, uint32_t ms) {
     auto s16 = [](float v) { return static_cast<SHORT>((v < -1.0f ? -1.0f : v > 1.0f ? 1.0f : v) * 32767.0f); };

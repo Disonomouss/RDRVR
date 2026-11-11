@@ -669,6 +669,7 @@ void second_probe_tick(double now) {
     req.copy = sd.copy;
     g_rp2_probes.fetch_add(1, std::memory_order_relaxed);
 }
+void hold_up_tick(double now);  // ([Hands] HoldUps' evidence, below)
 // Each script tick (api's tick hook): the last probe's result taken, a new one queued along the barrel now.
 void reticle_tick() {
     static uint64_t pending = 0;
@@ -677,6 +678,7 @@ void reticle_tick() {
     static bool req_h_ok = false;
     static bool req_tp = false;  // (6c) the pending probe was along the game's own ray
     const double now = log::now_ms();
+    hold_up_tick(now);
     if (g_bs_on.load(std::memory_order_relaxed)) barrel_step_tick();  // item 1b's measure (the session)
     second_probe_tick(now);  // round 38 check 2: the second gun's own
     if (pending) {
@@ -1311,6 +1313,97 @@ void hk_fire(uintptr_t info, uintptr_t wmgr) {
     reload::after_fire_trigger(info, reload_before);
 }
 
+// FUN_1403461c0(player info): the player's aim update. At its end it tells the aim's target that the player is aiming at
+// it (FUN_140b1ddc0 on the target's AI memory: the reaction trees' HasBeenAimZoomingAtMe, human_reactions.tr's hands-up
+// rule; player.wsc's "stickup_rob" prompt needs IS_ACTOR_HANDSUP) only while the reticle's alpha (R = info +0x410, R
+// +0x10) is above 0 or the scope's overlay is up. The plugin hides the flat reticle (SET_RETICLE_DRAW_DISABLED_BY_SCRIPT),
+// so its alpha stayed 0 and no one was ever told (2026-11-09, the user: pointing the gun at someone never offered the
+// game's rob, "they just run away"). [Hands] HoldUps (off by default): while the mod hides it and the game aims (R +0x14),
+// the alpha 1 for this call alone, put back after (the reticle's draw reads it later: still hidden)
+// (the review) only while the plugin's disable (R +0xc bit 0x10000, research/gc-aim.md) is the reticle's one hide bit: the
+// game's own (0x2000 player control, 0x4000 the weapon's state, 0x40000 Dead Eye firing) keep the game's way
+using AimUpdate_t = void (*)(uintptr_t info);
+AimUpdate_t o_aim_update = nullptr;
+std::atomic<bool> g_hold_ups{false}, g_hold_ups_hooked{false};
+std::atomic<uint64_t> g_hold_up_calls{0};
+void hk_aim_update(uintptr_t info) {
+    uintptr_t R = 0;
+    int32_t zoom = 0;
+    uint32_t bits = 0;
+    float alpha = -1.0f;
+    const bool lift = g_hold_ups.load(std::memory_order_relaxed) && pose::mod_hides_reticle() && info && rd(info + 0x410, &R) && R &&
+                      rd(R + 0xc, &bits) && (bits & ~0x10000u) == 0 && rd(R + 0x14, &zoom) && zoom != 0 && rd(R + 0x10, &alpha) &&
+                      alpha <= 0.0f && wr<float>(R + 0x10, 1.0f);
+    o_aim_update(info);
+    if (!lift) return;
+    float now = 0.0f;
+    if (rd(R + 0x10, &now) && now == 1.0f) wr<float>(R + 0x10, alpha);  // (the call's own change kept)
+    g_hold_up_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+// (the round's evidence, HoldUps on only) once a second while the game aims: the actor under the reticle, its distance and
+// whether its hands are up (player.wsc offers the rob beyond 4 m with them up), logged as it changes. Script tick
+void hold_up_tick(double now) {
+    static int st8 = 0;  // 0 idle, 1 the reticle's actor asked, 2 its hands and place asked
+    static uint64_t q1 = 0, q2 = 0, q3 = 0;
+    static double next_ms = 0.0, asked_ms = 0.0;
+    static uint32_t who = 0, last_who = 0;
+    static int last_hands = -1;
+    static float me[3] = {};
+    static RdrvrNativeResult got2{}, got3{};  // (wait_native takes a result once: each kept until both are in)
+    static bool have2 = false, have3 = false;
+    RdrvrNativeResult r{};
+    if (st8 != 0 && now - asked_ms > 500.0) {  // (the review: a result never posted, as reticle_tick's) given up
+        for (uint64_t q : {q1, q2, q3})
+            if (q) api::cancel_op(q);
+        q1 = q2 = q3 = 0;
+        st8 = 0;
+    }
+    if (st8 == 0) {
+        if (!g_hold_ups.load(std::memory_order_relaxed) || now < next_ms) return;
+        next_ms = now + 1000.0;
+        uintptr_t info = 0, R = 0;
+        int32_t zoom = 0;
+        RdrvrActorState st{};
+        if (!rd(anchors::addr(anchors::Id::PlayerInfo), &info) || !info || !rd(info + 0x410, &R) || !R || !rd(R + 0x14, &zoom) || !zoom ||
+            !api::actor_state(&st) || !st.valid)
+            return;
+        std::memcpy(me, st.pos, sizeof(me));
+        const uint64_t args[2] = {static_cast<uint64_t>(static_cast<uint32_t>(st.actor)), 0};
+        q1 = api::queue_native(0x86BAAC6Cu, args, 2);  // GET_ACTOR_UNDER_RETICLE(player, 0)
+        asked_ms = now;
+        st8 = q1 ? 1 : 0;
+    } else if (st8 == 1) {
+        if (!api::wait_native(q1, &r, 0)) return;
+        q1 = 0;
+        who = static_cast<uint32_t>(r.value);
+        if (!who || who == 0xffffffffu) {
+            st8 = 0;
+            return;
+        }
+        const uint64_t a1[1] = {who}, a2[2] = {who, 0};
+        q2 = api::queue_native(0xA5A24484u, a1, 1);     // IS_ACTOR_HANDSUP
+        q3 = api::queue_native(0x99BD9D6Fu, a2, 2, 2);  // GET_POSITION(actor, Vector3*) (the review: an actor's, not an object's)
+        asked_ms = now;
+        have2 = have3 = false;
+        st8 = q2 && q3 ? 2 : 0;
+    } else {
+        if (!have2 && api::wait_native(q2, &got2, 0)) have2 = true, q2 = 0;
+        if (!have3 && api::wait_native(q3, &got3, 0)) have3 = true, q3 = 0;
+        if (!have2 || !have3) return;
+        r = got2;
+        const RdrvrNativeResult p = got3;
+        st8 = 0;
+        const int hands = (r.value & 0xff) ? 1 : 0;
+        const float dx = p.vec[0] - me[0], dy = p.vec[1] - me[1], dz = p.vec[2] - me[2];
+        if (who != last_who || hands != last_hands)
+            log::limited("aim.holdups", 60, "[aim] hold-ups: aiming at actor %#x %.1f m away, hands up %d%s", who, std::sqrt(dx * dx + dy * dy + dz * dz),
+                         hands, hands ? " (the game offers the rob beyond 4 m)" : "");
+        last_who = who;
+        last_hands = hands;
+    }
+}
+
 // FUN_14034ba30(player info, ped): picks the soft-lock tuning each frame and stores it at T +0x57c0 (T = the
 // player actor +0xb8); soft lock and the reticle magnet (which moves the target point onto a nearby actor and forces
 // the hit) both need it set. Cleared after it in first person unless [Hands] AimAssist.
@@ -1925,6 +2018,10 @@ bool install() {
                          &o_melee_start);
     ok &= hooks::install("RDR reticle ray (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::AimRay)), hk_aim_ray, &o_aim_ray);
     ok &= hooks::install("RDR fire trigger (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::FireTrigger)), hk_fire, &o_fire);
+    g_hold_ups = config::get_bool("Hands", "HoldUps", false);
+    if (anchors::present(anchors::Id::PlayerAimUpdate))  // ([Hands] HoldUps: an optional anchor; its failure leaves the rest)
+        g_hold_ups_hooked = hooks::install("RDR player aim update (hold-ups)", reinterpret_cast<void*>(anchors::addr(anchors::Id::PlayerAimUpdate)),
+                                           hk_aim_update, &o_aim_update);
     ok &= hooks::install("RDR execution gate (aim)", reinterpret_cast<void*>(anchors::addr(anchors::Id::ExecGate)),
                          reinterpret_cast<void*>(&rdrvr_exec_gate_stub), reinterpret_cast<void**>(&o_exec_gate));
     log::info("[aim] close-range executions on the trigger blocked: %d", g_block_exec.load() ? 1 : 0);
@@ -1959,6 +2056,26 @@ bool bullet_trails_available() { return g_trails_hooked.load(std::memory_order_r
 void set_bullet_trails(bool on, bool save) {
     if (g_trails.exchange(on) != on) log::info("[aim] bullet trails: %s", on ? "on (the game's)" : "off");
     if (save) config::set("Hands", "BulletTrails", on ? "1" : "0");
+}
+bool hold_ups() { return g_hold_ups.load(std::memory_order_relaxed); }
+bool hold_ups_available() { return g_hold_ups_hooked.load(std::memory_order_relaxed); }
+void set_hold_ups(bool on, bool save) {
+    if (g_hold_ups.exchange(on) != on)
+        log::info("[aim] hold-ups: %s", on ? "on (people the gun points at told they are aimed at, the reticle still hidden)" : "off");
+    if (save) config::set("Hands", "HoldUps", on ? "1" : "0");
+}
+std::string hold_ups_status() {
+    char b[200];
+    uintptr_t info = 0, R = 0;
+    float alpha = -1.0f;
+    int32_t zoom = -1;
+    uint32_t bits = 0;
+    if (rd(anchors::addr(anchors::Id::PlayerInfo), &info) && info && rd(info + 0x410, &R) && R)
+        rd(R + 0x10, &alpha), rd(R + 0x14, &zoom), rd(R + 0xc, &bits);
+    std::snprintf(b, sizeof(b), "hold-ups %d (hooked %d): calls lifted %llu | the mod hides the reticle %d, the game's aim %d, its alpha %.2f, hide bits %#x",
+                  g_hold_ups.load() ? 1 : 0, g_hold_ups_hooked.load() ? 1 : 0, static_cast<unsigned long long>(g_hold_up_calls.load()),
+                  pose::mod_hides_reticle() ? 1 : 0, zoom, alpha, bits);
+    return b;
 }
 std::string trails_status() {
     char b[160];
@@ -2618,6 +2735,11 @@ std::string command(const std::string& line) {
             o += e;
         }
         return o;
+    }
+    if (line.find(" holdups") != std::string::npos) {  // aim holdups [on|off]: [Hands] HoldUps for the session
+        if (line.find(" holdups on") != std::string::npos) set_hold_ups(true, false);
+        if (line.find(" holdups off") != std::string::npos) set_hold_ups(false, false);
+        return hold_ups_status();
     }
     if (line.find(" trails") != std::string::npos) {  // aim trails [on|off]: [Hands] BulletTrails for the session
         if (line.find(" trails on") != std::string::npos) set_bullet_trails(true, false);

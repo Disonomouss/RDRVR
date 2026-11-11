@@ -50,6 +50,32 @@ float fire_clip_phase();
 // gun diagonal), hidden while that gun is in a hand; destroyed when off or out of first person.
 // [Holsters] ShowModels: a holster model (the game's prop [Holsters] Model) drawn at each enabled hip holster
 bool show_models();
+// [Holsters] OwnBeltProps (GOAL-cattleman-belts item 2; off by default): on an outfit without its own knife sheath,
+// satchel or lasso, the game's props (the bowie knife, the satchel, the lasso's coil) drawn where the custom belt has them
+bool belt_props();
+void set_belt_props(bool on, bool save);  // save: also written to the user ini
+// [Holsters] OwnBeltPropsDefault (GOAL-after-0.8.13.2 item 7; off by default): with OwnBeltProps, the satchel and the sheath
+// from the default outfit's own model (player_default as a prop, only those pieces of it drawn)
+bool belt_props_default();
+void set_belt_props_default(bool on, bool save);  // save: also written to the user ini
+// [Holsters] OwnBeltThrowable (round 117, the user's idea; off by default): with OwnBeltProps, at the satchel's place the
+// equipped throwable's own model (the thrown slot's item) instead of the game's other satchel; none equipped, none shown
+bool belt_throwable();
+// (round 117) the table games' gate, as polled (holster_frame): bit 1 a minigame runs (poker), bit 2 the game holds the
+// player's control
+int game_gate();
+// (round 128) by game_gate(): a table game (the minigame's flag: poker; or the game holding the player's control with John in a
+// gringo for 1.5 s: liar's dice, horseshoes, blackjack, five finger fillet, arm wrestling), and the view at John's seated head
+// (a table game, or John in a gringo on a train for a second: its seat)
+bool table_game();
+bool seated_view();
+// (round 130) which minigame's script runs, by the game's own list of running scripts (walked on a script tick four times
+// a second): bit 1 blackjack, 2 liar's dice, 4 five finger fillet, 8 horseshoes, 16 arm wrestling, 32 poker; 0 none, or the
+// list not found on this build (minigame_known() false)
+int minigame();
+bool minigame_known();
+bool minigame_fresh();  // the list walked within 2 s (script ticks running)
+void set_belt_throwable(bool on, bool save);  // save: also written to the user ini
 void set_show_models(bool on, bool save = true);
 bool show_guns();
 void set_show_guns(bool on, bool save = true);
@@ -303,6 +329,9 @@ void set_unarmed_after_holster(bool on);  // also written to the user ini
 // only while the grip that drew it stays held; let go, it goes back to its holster, or with the other hand on a long
 // gun's foregrip it stays carried by that hand ([Hands] CarryByForegrip); DualWield's second gun and the copy too
 bool hold_to_keep();
+bool hold_items_on();  // [Holsters] HoldItems: the knife, the torch, the lasso and the throwables held by the grip too
+// (round 122) controller h's grip holds weapon w in hand by HoldToKeep (the holsters' mode, not the wheel's)
+bool grip_holds(int h, int w);
 void set_hold_to_keep(bool on, bool save);  // save: also written to the user ini (the menu; "holster hold on|off" is the session's)
 // that controller's grip is HoldToKeep's hold on its gun, holding no rounds (in a holster's zone too: 2026-11-05) (gestures.cpp: the
 // gun's swing is not held off as a holster's grip)

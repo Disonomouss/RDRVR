@@ -25,6 +25,10 @@ int level();  // [DeadEye] Level, 0-3
 void set_level(int l);  // also written to the user ini
 int unlocked();  // the story's level as last read (0: not read yet)
 bool sepia();
+// (GOAL-after-0.8.13.2 item 6) [DeadEye] DuelTriggerFires: in a duel the right trigger fires the marks placed (the marks
+// from the right stick flicked up, FlickUpRB); off by default
+bool duel_trigger_fires();
+void set_duel_trigger_fires(bool on, bool save = true);
 void set_sepia(bool on);  // also written to the user ini
 
 // Run 28 item 1c (after optimumbox's fork, v0.8.11.9, commit ac942427, MIT; research\run28\deadeye.md):

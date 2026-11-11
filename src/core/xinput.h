@@ -29,6 +29,7 @@ void set_source(bool on, const PadState& state, bool quiet = false);  // quiet: 
 // to turn).
 void set_pad_turn(bool on, float deg);
 float pad_right_x();
+uint8_t pad_rt();  // (GOAL-after-0.8.13.2 item 6) pad 0's right trigger as the game last read it (0-255)
 // Run 8 item 5 (the weapon wheel): the last word on pad 0 for `ms` (0 ends it), after the head turn and the merge:
 // `buttons` or'd, and with `stick` the right stick set to (rx, ry) (-1..1; the turn otherwise gives the game 0)
 void set_override(uint16_t buttons, bool stick, float rx, float ry, uint32_t ms);

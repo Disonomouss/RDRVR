@@ -44,6 +44,8 @@ void set_head_cover(bool on);
 // choice after their headset round: skinning stayed first person)
 void set_first_person_moments(bool on);
 bool first_person_moments();
+std::string near_fix_status(int set);   // (round 130) "cam near [on|off]": the eyes' near plane never a script shot's
+std::string train_cam_status(int set);  // (round 129) "cam train [on|off]": the frame's camera steadied on a train
 std::string fp_status();  // "cam fp": on, frames drawn so, the reference's check against the real camera
 std::string fp_check(bool mark);  // "cam fp mark|check" (a test)
 // [XR] AudioFollowsHead: the game's audio listeners (panning and distance) from the centre eye's camera (the head) rather
