@@ -11,6 +11,8 @@
 #include "core/aim.h"
 #include "core/api.h"
 #include "core/camera_lever.h"
+#include "core/deadeye.h"
+#include "core/prepass_arrays.h"
 #include "core/config.h"
 #include "core/controls.h"
 #include "core/d3d_hooks.h"
@@ -55,7 +57,10 @@ std::atomic<bool> g_train_turn{true};
 std::atomic<float> g_train_turned{0.0f};      // degrees the view was turned with the car so far
 std::atomic<uint32_t> g_train_turn_refused{0};  // the course's steps not taken (too large for a train)
 constexpr float kTrainTurnMax = 3.0f;         // degrees a script tick (the smoothed course's step)
-std::atomic<bool> g_table_view_active{false};  // the view at the head or easing back (the body seated while it is: body.cpp)
+std::atomic<bool> g_table_view_active{false};
+// (round 142, the review) John's own heading while the view sits at his head: the body is the game's then (no facing
+// lock), so the frames built on the torso's heading (the holsters, the belt's props, the elbows' hints) take his
+std::atomic<float> g_seat_heading_shared{0.0f};  // the view at the head or easing back (the body seated while it is: body.cpp)
 bool g_table_head_was = false;
 int g_up_axis = 1;
 int g_orient_mode = 1;  // SET_CAMERA_ORIENTATION: 1 = heading on the vector's y (round 1: 0, the heading on z, rolled the view)
@@ -357,6 +362,8 @@ bool armed_hold(const RdrvrActorState& st, float up, float held, double now) {
     return h;
 }  // [Horse] VehicleHeading (run 10 item 3): driving, the view's heading the vehicle's
 float g_ride_off = 0.0f;
+double g_pass_since = -1.0;      // (round 142) a passenger since (ms), -1 not
+uint64_t g_pass_turns0 = 0;      // the stick's turns then
 std::atomic<float> g_ride_off_shared{0.0f};
 bool g_ride_snapped = false;
 uint64_t g_ride_turns = 0;
@@ -374,6 +381,11 @@ std::atomic<bool> g_trace_on{false};
 uint64_t g_trace_tick = 0;
 std::atomic<float> g_saddle_tau{0.15f};
 float g_saddle_h = 0.0f, g_saddle_f = 0.0f;
+// (round 135) the saddle camera stands at the rider's head as averaged over the mount's root, plus the view's lift and its
+// forward offset along the mount's heading: those two, for the still body's place under it (body.cpp); valid only while
+// the frame's job carries the saddle
+std::atomic<bool> g_job_saddle{false};
+std::atomic<float> g_job_saddle_h{0.0f}, g_job_saddle_f{0.0f};
 bool g_saddle_valid = false, g_was_riding = false;
 uint64_t g_ride_frames = 0;
 // the view's steadiness while riding: the camera's height over the horse's root, its change per script tick (RMS)
@@ -1844,7 +1856,10 @@ void on_frame_end(uint64_t) {
         g_on_mounted_gun_shared.store(mounted, std::memory_order_relaxed);
         // (the Gatling probe: first person kept only while the turret drive can read the gun; else the game's own camera,
         // so the right stick still turns it: the review of 0.8.10)
-        if (mounted && !(g_mounted_fp.load(std::memory_order_relaxed) && held && holster::turret_ready())) want = false;
+        // (round 137, the review) and only while the eyes can be drawn at John's head with the game's camera current (the
+        // gun's camera on the channel: weapons bit 16 below); else the hands' ray would be taken from the gun's own camera
+        if (mounted && !(g_mounted_fp.load(std::memory_order_relaxed) && held && holster::turret_ready() && camera_lever::first_person_ready()))
+            want = false;
     }
     if (want != g_active) {
         g_active = want;
@@ -1887,6 +1902,9 @@ void on_frame_end(uint64_t) {
     g_mod_hides_reticle.store((job.enabled && (job.hide_reticle & 1u)) || (job.hide_reticle & 2u), std::memory_order_relaxed);  // (the plugin's own test)
     job.weapons = (holster::weapon_choice() ? 1u : 0u) | (g_keep_cam.load(std::memory_order_relaxed) ? 2u : 0u);
     if (aim::gameplay_camera_current()) job.weapons |= 8u;  // no script's camera holds channel 0: the anchor may take it back
+    // (round 137) a mounted gun in first person: the game's own camera wanted on the channel (it turns the gun; with the
+    // anchor's current the turret does not answer the stick: cycle RU6), the eyes from John's head as in a script's shot
+    if (want && g_mounted_held_shared.load(std::memory_order_relaxed) && g_mounted_fp.load(std::memory_order_relaxed)) job.weapons |= 16u;
     if (want) {
         RdrvrActorState st{};
         if (!g_have_scale && g_auto_height && api::actor_state(&st) && st.head_valid) {
@@ -1935,13 +1953,29 @@ void on_frame_end(uint64_t) {
         // over the vehicle's middle line: the camera stays over John's own root)
         const bool have_st = api::actor_state(&st);
         const bool vehicle = have_st && st.mount != 0 && (st.flags & RDRVR_ACTOR_VEHICLE);
+        const bool passenger = vehicle && (st.flags & RDRVR_ACTOR_PASSENGER);  // (round 141)
         const bool riding = have_st && st.mount != 0 && (!vehicle || g_vehicle_heading.load(std::memory_order_relaxed));
-        if (riding != g_was_riding) {
+        static int ride_kind_was = 0;
+        const double now_pass = log::now_ms();  // (the review: 0 not, 1 riding or driving, 2 a passenger: a change of seat is a change too)
+        const int ride_kind = !riding ? 0 : passenger ? 2 : 1;
+        if (ride_kind != ride_kind_was) {
+            ride_kind_was = ride_kind;
             g_was_riding = riding;
             g_saddle_valid = false;
             g_ride_off = 0.0f;  // [Horse] StickTurn: the view faces the horse at the mount (the dismount keeps the turned heading)
             g_ride_snapped = true;  // a stick still held from a turn on foot: no snap until it comes back
-            if (vehicle)
+            // (round 141) a passenger (the mission's wagon, a stagecoach): the view keeps the way it faces and turns with
+            // the vehicle from there (its heading plus the turn the view had against it as he got in; the right stick
+            // turns it further, as riding)
+            // (round 142) as his seat faces: John's own heading against the vehicle's (the Fort Mercer wagon's seat faces
+            // back, 172 degrees; the view's own heading then was whatever the cutscene left)
+            if (riding && passenger) g_ride_off = std::fmod(st.heading_deg - st.mount_heading + 540.0f, 360.0f) - 180.0f;
+            g_pass_since = riding && passenger ? now_pass : -1.0;
+            g_pass_turns0 = g_ride_turns;
+            if (vehicle && passenger)
+                log::info("[pose] a passenger (the view turns with the vehicle: its heading %.1f deg, John's %.1f, the view's %.1f before: "
+                          "his seat's %.1f from it kept)", st.mount_heading, st.heading_deg, g_heading, g_ride_off);
+            else if (vehicle)
                 log::info("[pose] driving (the view's heading the vehicle's %.1f deg, steering by the %s)", st.mount_heading,
                           g_steer_head.load() ? "head" : "stick");
             else
@@ -1971,7 +2005,7 @@ void on_frame_end(uint64_t) {
                 g_jit_tick = st.tick;
             }
         }
-        const bool stick_steer = riding && !g_steer_head.load(std::memory_order_relaxed);
+        const bool stick_steer = riding && (passenger || !g_steer_head.load(std::memory_order_relaxed));  // (a passenger steers nothing)
         if (riding && st.tick != g_trace_tick && g_trace_on.load(std::memory_order_relaxed)) {
             g_trace_tick = st.tick;
             TraceRow r{};
@@ -1992,14 +2026,32 @@ void on_frame_end(uint64_t) {
             job.saddle_height = g_saddle_h + g_lift;
             job.saddle_forward = g_saddle_f + g_forward;
             job.saddle_tau = g_saddle_tau.load(std::memory_order_relaxed);
+            g_job_saddle_h.store(g_lift, std::memory_order_relaxed);
+            g_job_saddle_f.store(g_forward, std::memory_order_relaxed);
+            g_job_saddle.store(true, std::memory_order_relaxed);
+        } else {
+            g_job_saddle.store(false, std::memory_order_relaxed);
         }
         float sx = xinput::pad_right_x();
         if (controllers && std::fabs(pad.rx / 32767.0f) > std::fabs(sx)) sx = pad.rx / 32767.0f;
+        // (round 138) [DeadEye] DuelNoTurn: in a duel the stick's sideways push turns nothing (the user flicking it up for
+        // an X turned the view). (The review) after it the stick must come back to the middle before it turns again: held
+        // sideways as the duel ends, it would snap at once
+        {
+            static bool duel_hold = false;
+            if (deadeye::duel_no_turn() && deadeye::in_duel()) {
+                duel_hold = true;
+                sx = 0.0f;
+            } else if (duel_hold) {
+                if (std::fabs(sx) < 0.3f) duel_hold = false;
+                else sx = 0.0f;
+            }
+        }
         if (stick_steer) {
             // the view faces the horse and the left stick steers it; the right stick turns the view by an offset over
             // the mount's heading ([Horse] StickTurn), or not at all
             job.heading_from_mount = 1;
-            if (g_ride_turn.load(std::memory_order_relaxed)) {
+            if (g_ride_turn.load(std::memory_order_relaxed) || passenger) {  // (the review: a passenger whatever StickTurn says)
                 if (g_snap) {
                     if (std::fabs(sx) > 0.7f && !g_ride_snapped) {
                         g_ride_off += sx > 0 ? -g_snap_angle : g_snap_angle;
@@ -2016,11 +2068,16 @@ void on_frame_end(uint64_t) {
             } else {
                 g_ride_off = 0.0f;
             }
+            // (round 142, the review) a passenger's seat followed for his first 2.5 s (the flag can rise as he climbs in),
+            // until the stick turns the view
+            if (passenger && g_pass_since >= 0.0 && now - g_pass_since < 2500.0 && g_ride_turns == g_pass_turns0)
+                g_ride_off = std::fmod(st.heading_deg - st.mount_heading + 540.0f, 360.0f) - 180.0f;
             if (g_ride_off != 0.0f) job.weapons |= 4u;  // heading_deg below is the offset over the mount's heading (else absolute, as before)
             g_heading = st.mount_heading + g_ride_off;
             sx = 0.0f;
         }
-        g_ride_off_shared.store(stick_steer ? g_ride_off : 0.0f, std::memory_order_relaxed);
+        // (the review: not for a passenger: his body faces as the view does, as on foot; his seat may face any way)
+        g_ride_off_shared.store(stick_steer && !passenger ? g_ride_off : 0.0f, std::memory_order_relaxed);
         if (g_snap) {
             if (std::fabs(sx) > 0.7f && !g_snapped) {
                 g_heading += sx > 0 ? -g_snap_angle : g_snap_angle;
@@ -2162,7 +2219,12 @@ void on_frame_end(uint64_t) {
             static bool tg_on = false;
             const float tg_a = 1.0f - std::exp(-dt / (g_height_tau > 0.01f ? g_height_tau : 0.01f));
             // (round 128) at every table game (only poker raises the minigame's flag), and on a train's seat
-            const bool on = g_table_head.load(std::memory_order_relaxed) && holster::seated_view() && have_st && st.head_valid;
+            // (round 141) and whatever the option: a passenger in a vehicle (his seat's own place in it), and a mounted
+            // gun kept in first person (the user: "John needs to be a little further back, currently the gun clips into
+            // camera"; cycle RU8 on the mission's Gatling: his head 0.21 m behind the view put over his root, the gun's
+            // rear cut by the near plane)
+            const bool gun_view = g_on_mounted_gun_shared.load(std::memory_order_relaxed) && g_mounted_fp.load(std::memory_order_relaxed);
+            const bool on = ((g_table_head.load(std::memory_order_relaxed) && holster::seated_view()) || passenger || gun_view) && have_st && st.head_valid;
             bool used = false;
             if (on) {
                 const float hr_ = g_heading * 0.0174532925f, fx = -std::sin(hr_), fz = -std::cos(hr_);
@@ -2200,6 +2262,7 @@ void on_frame_end(uint64_t) {
                     job.right = tg_r;
                 }
             }
+            if (have_st) g_seat_heading_shared.store(st.heading_deg, std::memory_order_relaxed);
             g_table_view_active.store(used || tg_on, std::memory_order_relaxed);
             if (used != g_table_head_was) {
                 g_table_head_was = used;
@@ -2702,13 +2765,22 @@ std::string crouch_status() {
     return s;
 }
 float ride_turn_deg() { return g_ride_off_shared.load(std::memory_order_relaxed); }
-float torso_heading_deg() { return g_heading_shared.load(std::memory_order_relaxed) - g_ride_off_shared.load(std::memory_order_relaxed); }
+float torso_heading_deg() {
+    if (g_table_view_active.load(std::memory_order_relaxed)) return g_seat_heading_shared.load(std::memory_order_relaxed);  // (round 142)
+    return g_heading_shared.load(std::memory_order_relaxed) - g_ride_off_shared.load(std::memory_order_relaxed);
+}
 bool steer_by_head() { return g_steer_head.load(); }
 void set_steer_by_head(bool on) {
     if (g_steer_head.exchange(on) != on) log::info("[pose] horse steering by the %s", on ? "head" : "stick");
     config::set("Horse", "Steering", on ? "head" : "stick");
 }
 bool saddle_anchor() { return g_saddle.load(); }
+bool saddle_camera(float* lift, float* forward) {
+    if (!g_job_saddle.load(std::memory_order_relaxed)) return false;
+    *lift = g_job_saddle_h.load(std::memory_order_relaxed);
+    *forward = g_job_saddle_f.load(std::memory_order_relaxed);
+    return true;
+}
 bool saddle_climb() { return g_saddle_climb.load(); }
 void set_saddle_climb(bool on, bool save) {
     if (g_saddle_climb.exchange(on) != on) log::info("[pose] the saddle anchor follows climbs %d", on ? 1 : 0);

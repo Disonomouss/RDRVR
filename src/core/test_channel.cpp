@@ -38,6 +38,7 @@
 #include "core/dual.h"
 #include "core/physics.h"
 #include "core/gestures.h"
+#include "core/horseshoe.h"
 #include "core/offhand.h"
 #include "core/pgo.h"
 #include "core/probe.h"
@@ -370,6 +371,8 @@ std::string execute(const std::vector<std::string>& t) {
         camera_lever::set_view_yaw_offset(std::strtof(t[2].c_str(), nullptr));
         return "view yaw " + t[2];
     }
+    if (c == "cam" && t.size() >= 4 && t[1] == "near" && t[2] == "cones")  // cam near cones on|off (round 134, test only)
+        return camera_lever::near_cones(t[3] == "on" ? 1 : t[3] == "off" ? 0 : -1);
     if (c == "cam" && t.size() >= 2 && t[1] == "near")  // cam near [on|off]: (round 130) the eyes' near plane never a script shot's
         return camera_lever::near_fix_status(t.size() >= 3 ? (t[2] == "on" ? 1 : t[2] == "off" ? 0 : -1) : -1);
     if (c == "cam" && t.size() >= 2 && t[1] == "train")  // cam train [on|off]: (round 129) the frame's camera steadied on a train
@@ -610,7 +613,9 @@ std::string execute(const std::vector<std::string>& t) {
         ui_layer::status_text(st, sizeof(st));
         return st;
     }
-    if (c == "grabui" && t.size() >= 2) return ui_layer::grab(t[1]);
+    // grabui <file> [shrink]: the UI target's picture of the next frame; "shrink": of the first frame end after the Dead
+    // Eye X's hole is next made smaller (waits 30 s for it)
+    if (c == "grabui" && t.size() >= 2) return t.size() >= 3 && t[2] == "shrink" ? ui_layer::grab(t[1], 30000, true) : ui_layer::grab(t[1]);
     if (c == "menu") {
         // menu | menu on|off | menu find <label> | menu scroll <y> | menu grab <path.bmp> | menu desktop on|off
         if (t.size() >= 3 && t[1] == "grab") {
@@ -862,6 +867,11 @@ std::string execute(const std::vector<std::string>& t) {
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return c == "whistle" ? whistle::command(line) : wheel::command(line);
     }
+    if (c == "horseshoe") {  // horseshoe [on|off] [gain <x>]: (round 133) [Gestures] HorseshoeThrow
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return horseshoe::command(line);
+    }
     if (c == "offhand") {  // offhand [on|off] [dry on|off] [reset]: [Hands] OffHandItems (the session), each hand's item, the stab
         std::string line;
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
@@ -1053,6 +1063,8 @@ std::string execute(const std::vector<std::string>& t) {
         return "teleported: " + r;
     }
     if (c == "prepass") {  // prepass [on|off]: [Stereo] PrepassArrays (test only, stageVI-prepass.md milestone 2)
+        if (t.size() >= 2 && t[1] == "pred")  // prepass pred [off|game] (round 136, a probe): the game's occlusion predicates in pass 1
+            return prepass::predication_force(t.size() >= 3 ? (t[2] == "off" ? 1 : t[2] == "game" ? 0 : -1) : -1);
         if (t.size() >= 2 && (t[1] == "on" || t[1] == "off")) prepass::set_on(t[1] == "on");
         if (t.size() >= 2 && t[1] == "trace") prepass::trace_start(t.size() >= 3 ? std::atoi(t[2].c_str()) : 2);
         if (t.size() >= 4 && t[1] == "views" && t[2] == "size") prepass::views_size(t[3] == "on");

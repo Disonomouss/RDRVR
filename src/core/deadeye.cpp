@@ -141,6 +141,7 @@ Update_t o_update = nullptr;
 constexpr uintptr_t kTrigLast = 0x3b8;  // byte: the fire trigger as FUN_1403480a0 last read it
 constexpr uint8_t kDuelRtOn = 0x80;     // the trigger's press (half way)
 std::atomic<bool> g_duel_rt{false};
+std::atomic<bool> g_duel_no_turn{false};  // (round 138) [DeadEye] DuelNoTurn
 std::atomic<uint64_t> g_duel_calls{0}, g_duel_fires{0}, g_duel_nomark{0}, g_duel_short{0}, g_duel_other{0};
 // (round 116's review) a press that ended the time: the duel's outcome logged once judged, or the end not held
 uintptr_t g_duel_ended_D = 0;
@@ -304,6 +305,9 @@ std::atomic<bool> g_marks_hooked{false}, g_paint_hooked{false};
 std::atomic<uint64_t> g_hud_calls{0}, g_hud_swaps{0}, g_hud_kept{0}, g_hud_not_ours{0}, g_ui_runs{0}, g_ui_own{0}, g_ui_busy{0}, g_placed{0},
     g_paints{0}, g_paints_cleared{0}, g_layers{0}, g_hide_passes{0};
 std::atomic<double> g_de_ms{0.0};      // log::now_ms when Dead Eye's mode was last seen on (only that renews the window)
+// (round 139) the X's drawing, counted for its 5 s line: a draw asked while the marks' last update was too old (nothing
+// drawn that frame: a flicker's cause), the updates that placed fewer or more marks than the one before
+std::atomic<uint64_t> g_stale_reads{0}, g_count_changes{0};
 // the anchor's camera object, learnt on the game thread: channel 0's camera after kAnchorRun calls in a row with the
 // plugin saying its scripted camera is current (RDRVR_ACTOR_CAM_AWAY clear) and the same pointer there
 uintptr_t g_anchor_cand = 0, g_anchor_cam = 0;
@@ -331,6 +335,39 @@ double g_ms = 0;  // log::now_ms of the last marks' update (the drawing's freshn
 int g_hole_n = 0;
 Grid g_hole_grid;
 int g_hole_off[2] = {0, 0};
+// (round 140, the user: "in one case they were flickering") the hole's shrinking held back: the update that takes a
+// mark away (a mark fired, Dead Eye's end) runs a frame or more ahead of the UI picture being shown, which still has
+// that mark's X in its slot; with the hole already smaller, the X showed on the HUD's quad for those frames, at its
+// slot's place, once for every mark fired. The larger hole is kept kHoleKeepMs after each shrink (band())
+// (the review: the lag is in frames, and a hitch can be longer than any time) and until three more UI pictures were
+// drawn, for at most kHoleKeepMaxMs
+constexpr double kHoleKeepMs = 150.0, kHoleKeepMaxMs = 2000.0;
+uint64_t g_keep_frame = 0;  // ui_layer::frames_drawn() at the shrink
+int g_keep_n = 0;
+Grid g_keep_grid;
+int g_keep_off[2] = {0, 0};
+double g_keep_ms = -1e12;
+std::atomic<uint64_t> g_hole_kept{0};  // (the status: shrinks held back)
+std::atomic<int> g_shrink_from{0}, g_shrink_to{0};  // (the status: the last shrink)
+std::atomic<bool> g_hole_keep_on{true};  // ("deadeye holekeep off": the test's, the shrink at once as before)
+void hole_set(int n) {  // (under g_mutex) g_hole_n = n, a shrink remembered
+    if (n < g_hole_n) {
+        const double now = log::now_ms();
+        if (!(now - g_keep_ms < kHoleKeepMs && g_keep_n >= g_hole_n)) {  // (a larger one still kept stays)
+            g_keep_n = g_hole_n;
+            g_keep_grid = g_hole_grid;
+            g_keep_off[0] = g_hole_off[0];
+            g_keep_off[1] = g_hole_off[1];
+        }
+        g_keep_ms = now;
+        g_keep_frame = ui_layer::frames_drawn();
+        g_hole_kept.fetch_add(1, std::memory_order_relaxed);
+        g_shrink_from.store(g_hole_n, std::memory_order_relaxed);
+        g_shrink_to.store(n, std::memory_order_relaxed);
+        ui_layer::note_hole_shrink();  // (a test's grab waiting for this)
+    }
+    g_hole_n = n;
+}
 struct Drawn {
     float px[2], py[2];  // where the X was drawn, per eye (that eye's half of the layer, pixels; -1 not drawn)
     float u[2], v[2];    // the same as fractions of the eye's view (0..1, left to right, top to bottom)
@@ -535,9 +572,29 @@ void publish(int n) {
         g_marks[k].slot[0] += static_cast<float>(g_grid_off[0]);
         g_marks[k].slot[1] += static_cast<float>(g_grid_off[1]);
     }
+    if (n != g_n) g_count_changes.fetch_add(1, std::memory_order_relaxed);
     g_n = n;
     g_ms = log::now_ms();
-    g_hole_n = n;  // the elements past n hidden by the game in this same update
+    {   // (round 139) what the X's drawing did, every 5 s while marks show
+        static double said = 0.0;
+        static uint64_t z[8] = {};
+        static int most = 0;
+        if (n > most) most = n;
+        if (n > 0 && g_ms - said > 5000.0) {
+            const uint64_t c[8] = {g_ui_runs.load(), g_ui_own.load(), g_hud_not_ours.load(), g_hide_passes.load(), g_layers.load(), g_stale_reads.load(),
+                                   g_count_changes.load(), g_ui_busy.load()};
+            log::info("[deadeye] the X: %d marks now (most %d) | since the last line: updates placed in the slots %llu, the game's own placements %llu, "
+                      "left to a script's camera %llu, hide passes %llu, frames drawn %llu, draws asked with the marks too old (not drawn) %llu, the "
+                      "marks' number changed %llu times, another thread inside %llu",
+                      n, most, static_cast<unsigned long long>(c[0] - z[0]), static_cast<unsigned long long>(c[1] - z[1]),
+                      static_cast<unsigned long long>(c[2] - z[2]), static_cast<unsigned long long>(c[3] - z[3]), static_cast<unsigned long long>(c[4] - z[4]),
+                      static_cast<unsigned long long>(c[5] - z[5]), static_cast<unsigned long long>(c[6] - z[6]), static_cast<unsigned long long>(c[7] - z[7]));
+            for (int i = 0; i < 8; ++i) z[i] = c[i];
+            said = g_ms;
+            most = n;
+        }
+    }
+    hole_set(n);  // the elements past n hidden by the game in this same update
     g_hole_grid = g_grid;
     g_hole_off[0] = g_grid_off[0];
     g_hole_off[1] = g_grid_off[1];
@@ -549,13 +606,13 @@ void publish_hidden(int placed, uint64_t tested) {
     std::lock_guard lock(g_mutex);
     g_n = 0;
     g_ms = log::now_ms();
-    if (tested >= static_cast<uint64_t>(placed)) g_hole_n = 0;
+    if (tested >= static_cast<uint64_t>(placed)) hole_set(0);
     g_hole_live.store(g_hole_n, std::memory_order_relaxed);
 }
 void game_placed() {  // an update of the game's own: every element where the game puts it (none left in a slot)
     g_ui_own.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(g_mutex);
-    g_hole_n = 0;
+    hole_set(0);
     g_hole_live.store(0, std::memory_order_relaxed);
 }
 void hk_marks_ui(uintptr_t T, uintptr_t vp) {
@@ -666,6 +723,7 @@ void init() {
     g_latched = g_level.load();
     g_sepia = config::get_bool("DeadEye", "Sepia", true);
     g_duel_rt = config::get_bool("DeadEye", "DuelTriggerFires", false);
+    g_duel_no_turn = config::get_bool("DeadEye", "DuelNoTurn", false);  // (round 138)
     log::info("[deadeye] level %d (0: the game's), sepia %d, the duel's right trigger fires %d", g_level.load(), g_sepia.load() ? 1 : 0,
               g_duel_rt.load() ? 1 : 0);
     // his key names, so his users' inis carry over
@@ -712,6 +770,34 @@ void set_level(int l) {
 int unlocked() { return g_unlocked.load(std::memory_order_relaxed); }
 bool sepia() { return g_sepia.load(std::memory_order_relaxed); }
 bool duel_trigger_fires() { return g_duel_rt.load(std::memory_order_relaxed); }
+// (round 138, the user: "during duels, add an option to disable right stick turning. It is sensitive and I often turn
+// while trying to Mark with dead eye") [DeadEye] DuelNoTurn, off: while the game's duel mode is on (player info +0x3be
+// bit 2: set by the duel's FUN_1403526d0 when its Dead Eye begins, the marking, and cleared at the duel's end; the gate
+// rounds 116 and 117 ran under), the right stick does not turn the view (pose.cpp); the flick up for an X and the
+// game's own use of the stick stay. (The review: one read of the player info, not the actor's chain to the duel's
+// state: read each frame on the presenting thread, a freed actor's slot after a lost duel could fault, and what that
+// state holds outside a duel is not known.) No duel in the simulator: the log says when one is seen and when it is over
+bool duel_no_turn() { return g_duel_no_turn.load(std::memory_order_relaxed); }
+void set_duel_no_turn(bool on, bool save) {
+    if (g_duel_no_turn.exchange(on) != on) log::info("[deadeye] no stick turning in a duel: %s", on ? "on" : "off");
+    if (save) config::set("DeadEye", "DuelNoTurn", on ? "1" : "0");
+}
+// (round 142, the user: "Worked, but took a moment after the duel for turning control to return"; their log: the
+// duel judged at 222.2 s, the mode's bit off at 234.2: 12 s on) only while the duel's Dead Eye paints (Dead Eye's
+// phase R +0x20 == 2, R = player info +0x410: the duel_pre's own test): once the marks are fired, the stick turns again
+bool in_duel() {
+    static std::atomic<int> was{-1};
+    uintptr_t P = 0, R = 0;
+    uint8_t f = 0;
+    int32_t phase = 0;
+    const bool mode = rd(anchors::addr(anchors::Id::PlayerInfo), &P) && P && raw(P + kPaint, &f, 1) && (f & 4) != 0;
+    const bool on = mode && raw(P + 0x410, &R, 8) && R && raw(R + 0x20, &phase, 4) && phase == 2;
+    const int prev = was.exchange(on ? 1 : 0);
+    if (prev != (on ? 1 : 0) && (on || prev >= 0))  // (the first read with no duel says nothing)
+        log::info("[deadeye] the duel's Dead Eye %s%s", on ? "paints" : "over (or not painting)",
+                  on && duel_no_turn() ? ": the right stick does not turn the view (DuelNoTurn)" : "");
+    return on;
+}
 void set_duel_trigger_fires(bool on, bool save) {
     if (g_duel_rt.exchange(on) != on) log::info("[deadeye] the duel's right trigger fires the marks: %s", on ? "on" : "off");
     if (save) config::set("DeadEye", "DuelTriggerFires", on ? "1" : "0");
@@ -759,7 +845,11 @@ int marks(Mark* out, int max, float* crop_px, float* deg) {
     *deg = g_deg.load(std::memory_order_relaxed);
     if (!g_marks_on.load(std::memory_order_relaxed) || !g_marks_hooked.load(std::memory_order_relaxed)) return 0;
     std::lock_guard lock(g_mutex);
-    if (log::now_ms() - g_ms > kFreshMs) return 0;
+    if (log::now_ms() - g_ms > kFreshMs) {
+        // (round 139) counted only with marks listed and Dead Eye's mode seen on in the last 100 ms (the review: not the tail after it)
+        if (g_n > 0 && log::now_ms() - g_de_ms.load(std::memory_order_relaxed) < 100.0) g_stale_reads.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
     *crop_px = static_cast<float>(g_hole_grid.p);  // the published update's grid (the slots' pitch)
     const int n = g_n < max ? g_n : max;
     std::memcpy(out, g_marks, sizeof(Mark) * static_cast<size_t>(n));
@@ -769,16 +859,21 @@ int marks(Mark* out, int max, float* crop_px, float* deg) {
 bool band(int out[4]) {
     if (!g_marks_hooked.load(std::memory_order_relaxed)) return false;  // (on or off: a stale X there is kept out too)
     std::lock_guard lock(g_mutex);
-    const int n = g_hole_n;
-    const Grid& g = g_hole_grid;
+    // (round 140) a hole just made smaller is kept at its larger size for kHoleKeepMs: the picture shown is older
+    const double since = log::now_ms() - g_keep_ms;
+    const bool kept = g_hole_keep_on.load(std::memory_order_relaxed) && g_keep_n > g_hole_n &&
+                      (since < kHoleKeepMs || (since < kHoleKeepMaxMs && ui_layer::frames_drawn() < g_keep_frame + 3));
+    const int n = kept ? g_keep_n : g_hole_n;
+    const Grid& g = kept && g_hole_n <= 0 ? g_keep_grid : g_hole_grid;
+    const int* off = kept && g_hole_n <= 0 ? g_keep_off : g_hole_off;
     if (n <= 0 || g.p <= 0) return false;
     // only the slots in use, with the grid and the shift the elements were placed with: row 0 from the grid's left,
     // further rows above (the HUD keeps the rest)
     const int cols = n < g.per_row ? n : g.per_row, rows = (n + g.per_row - 1) / g.per_row;
-    out[0] = g.x0 + g_hole_off[0];
-    out[1] = g.yb - rows * g.p + g_hole_off[1];
-    out[2] = g.x0 + cols * g.p + g_hole_off[0];
-    out[3] = g.yb + g_hole_off[1];
+    out[0] = g.x0 + off[0];
+    out[1] = g.yb - rows * g.p + off[1];
+    out[2] = g.x0 + cols * g.p + off[0];
+    out[3] = g.yb + off[1];
     return true;
 }
 
@@ -808,6 +903,10 @@ std::string command(const std::string& line) {
             g_sepia = v == "on";
         } else if (w == "duelrt" && (in >> v)) {  // (item 6) [DeadEye] DuelTriggerFires
             set_duel_trigger_fires(v == "on", false);
+        } else if (w == "duelnoturn" && (in >> v)) {  // (round 138) [DeadEye] DuelNoTurn
+            set_duel_no_turn(v == "on", false);
+        } else if (w == "holekeep" && (in >> v)) {  // (round 140, the test's)
+            g_hole_keep_on = v == "on";
         } else if (w == "marks" && (in >> v)) {
             set_marks_on(v == "on", false);
         } else if (w == "barrel" && (in >> v)) {
@@ -903,8 +1002,9 @@ std::string command(const std::string& line) {
     o += list;
     o += " | ";
     std::lock_guard lock(g_mutex);
-    std::snprintf(b, sizeof(b), "last %d marks %.0f ms ago | band %s %d %d %d %d (%d px tall of %u) | layer %ux%u frames %llu", g_n,
-                  log::now_ms() - g_ms, has_band ? "on" : "off", bd[0], bd[1], bd[2], bd[3], has_band ? bd[3] - bd[1] : 0, uh, g_layer_w, g_layer_h,
+    std::snprintf(b, sizeof(b), "last %d marks %.0f ms ago | band %s %d %d %d %d (%d px tall of %u; shrinks %llu, the last %d -> %d, held %d) | layer %ux%u frames %llu", g_n,
+                  log::now_ms() - g_ms, has_band ? "on" : "off", bd[0], bd[1], bd[2], bd[3], has_band ? bd[3] - bd[1] : 0, uh,
+                  static_cast<unsigned long long>(g_hole_kept.load()), g_shrink_from.load(), g_shrink_to.load(), g_hole_keep_on.load() ? 1 : 0, g_layer_w, g_layer_h,
                   static_cast<unsigned long long>(g_layers.load()));
     o += b;
     for (int k = 0; k < g_n && k < 8; ++k) {

@@ -1618,7 +1618,7 @@ void end_open_frame(bool presenting = false) {
     const uint32_t scope_after = nlayers;  // (the quads added after the scope's: kept out of a scoped eye)
     if (full && !cinema_on) {
         const uint32_t cap = g_max_layers.load(std::memory_order_relaxed) < kLayerArray ? g_max_layers.load(std::memory_order_relaxed) : kLayerArray;
-        const int room = static_cast<int>(cap) - static_cast<int>(nlayers) - (wheel::wheel_mode() ? 4 : 3);
+        const int room = static_cast<int>(cap) - static_cast<int>(nlayers) - (wheel::wheel_mode() || wheel::open() ? 4 : 3);
         const dual::State dws = dual::state();
         const bool de = deadeye::showing();  // the Dead Eye X (marks shown): one more layer kept, under the reticles
         // run 10 item 8: a second reticle only while dual wielding (not a carry)

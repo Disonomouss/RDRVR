@@ -96,6 +96,7 @@ std::atomic<double> g_tp_done_ms{0.0};
 // the player's last shot as launched: start, velocity direction, and the angle to the barrel ray then (degrees)
 float g_shot_start[3] = {}, g_shot_dir[3] = {}, g_shot_err = -1;
 std::atomic<uint64_t> g_rays{0}, g_overrides{0}, g_no_gun{0}, g_no_hand{0}, g_fires{0}, g_swaps{0}, g_hand_rays{0};
+std::atomic<uint64_t> g_mounted_rays{0}, g_mounted_shots{0};  // (round 141) a mounted gun's rays left the game's; its rounds
 // item 1b: the aim ray's and barrel_ray's barrels from the drawn build's matrix (body::item_gun) or the live W +0x80
 std::atomic<uint64_t> g_ray_built{0}, g_ray_live{0}, g_br_built{0}, g_br_live{0};
 // the last override, for the status line (game thread writes, the test channel reads: torn reads are harmless)
@@ -243,6 +244,13 @@ float* hk_aim_ray(uintptr_t self, float* out, const float* yp) {
         }
     }
     if (!g_barrel.load(std::memory_order_relaxed) || !out || !pose::anchor_active()) return r;
+    // (round 141) a mounted gun: the game's own ray always. Its hands are free now with the grips open, and a free right
+    // hand's "item as drawn" as the ray is what turned the turret after the hand (cycle RU9: the gun spun; the same as
+    // 2026-10-13's and round 139's): the turret is aimed by the stick alone
+    if (pose::on_mounted_gun()) {
+        g_mounted_rays.fetch_add(1, std::memory_order_relaxed);
+        return r;
+    }
     if (dead_eye_firing_marks()) {
         g_de_skips.fetch_add(1, std::memory_order_relaxed);
         return r;
@@ -1154,6 +1162,7 @@ void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, 
     g_player_spawns.fetch_add(1, std::memory_order_relaxed);
     if (wtype >= 26 && wtype <= 28) {  // (2026-10-13) a mounted gun's shot: the game's own, and the anchor stands down (pose.cpp)
         g_mounted_shot_ms.store(log::now_ms(), std::memory_order_relaxed);
+        g_mounted_shots.fetch_add(1, std::memory_order_relaxed);
         o_spawn(W, proj, count, pellets, speed, u6, no_bloom, seed, turret);
         return;
     }
@@ -1811,6 +1820,7 @@ bool grip_throw_busy() {
 // the Browning, the cannon) within `ms`: the turret is the game's (GET_WEAPON_IN_HAND may not name it)
 uint64_t player_shots() { return g_player_shot_n.load(std::memory_order_relaxed); }
 bool mounted_gun_fired(double ms) { return log::now_ms() - g_mounted_shot_ms.load(std::memory_order_relaxed) < ms; }
+uint64_t mounted_shots() { return g_mounted_shots.load(std::memory_order_relaxed); }
 bool mounted_shot(float d[3], double* ms) {
     std::lock_guard lock(g_mounted_mutex);
     if (g_mounted_dir_ms < 0.0) return false;
@@ -1818,10 +1828,14 @@ bool mounted_shot(float d[3], double* ms) {
     *ms = g_mounted_dir_ms;
     return true;
 }
-bool knife_tip(int* axis, float pivot[3]) {
+// (round 142, the user: "Make the throwing knife default hand position the throwing one in which it is held by the blade")
+// whenever the throwing knife is the item placed in the hand (item_w 25), not only while its throw is readied
+bool knife_tip(int item_w, int* axis, float pivot[3]) {
     const int f = g_tip_force.load(std::memory_order_relaxed);
     const bool on = f > 0 || (f == 0 && g_knife_tip.load(std::memory_order_relaxed) && g_grip_throw.load(std::memory_order_relaxed) &&
-                              g_hold_G.load(std::memory_order_relaxed) != 0 && g_hold_weapon.load(std::memory_order_relaxed) == 25);
+                              ((item_w == 25 && log::now_ms() >= g_aim_tail_until.load(std::memory_order_relaxed)) ||
+                               (g_hold_G.load(std::memory_order_relaxed) != 0 && g_hold_weapon.load(std::memory_order_relaxed) == 25)));
+    // (the review: not from the let-go through the launch, the game's LT tail: the knife leaves the hand as the game holds it)
     if (!on) return false;
     *axis = g_tip_axis.load(std::memory_order_relaxed);
     {

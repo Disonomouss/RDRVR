@@ -111,6 +111,9 @@ std::string crouch_status();         // "pose crouch": drop, H, y_stand, want/ha
 // holsters' frame, the facing lock, the elbow hints
 float torso_heading_deg();
 bool saddle_anchor();
+// (round 135) riding with the saddle anchor, the camera stands at the rider's averaged head plus these: the view's lift
+// and its offset ahead along the mount's heading; false when the job carries no saddle (on foot, a wagon, the anchor off)
+bool saddle_camera(float* lift, float* forward);
 // [Horse] SaddleClimb (run 6 item 8, on): with the saddle anchor, the plugin feeds the horse's own vertical speed into
 // the height's filter (it fell behind climbs) and keeps the view above the rider's root + 0.5 m
 bool saddle_climb();

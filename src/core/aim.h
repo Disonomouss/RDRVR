@@ -109,6 +109,7 @@ uint64_t player_shots();
 // The player's gun controller G ([[actor +0x38 (ped)] +0xaa8] +8; +0x24 John's fire clip phase), 0 when none. Game thread.
 uintptr_t player_gun_ctl();
 bool mounted_gun_fired(double ms);  // the player shot a mounted gun (the Gatling, the Browning, the cannon) within ms
+uint64_t mounted_shots();  // (round 141) the mounted guns' rounds so far
 bool mounted_shot(float d[3], double* ms);  // a mounted gun's last round: its direction (world) and when
 void on_exit();  // the process exit: others' shots since the last log line
 // the pad's triggers (the pad's thread): the trigger with the grip holding a throwable arms it (the game's LT, then its
@@ -118,7 +119,7 @@ std::string throw_flight();
 double game_throw_launch_ms();  // (GOAL-offhand-changes C1) the player's last thrown item launched by the game's own throw (log::now_ms)  // (GOAL-offhand-changes C13) the last thrown projectile's flight ("offhand": its line)
 void throw_hold_tick();  // the game thread, once a frame (the visibility build): the held throw pinned, or let go
 // the throwing knife's readied throw held by its tip: its local turn axis (0-2) and pivot (the blade's middle)
-bool knife_tip(int* axis, float pivot[3]);
+bool knife_tip(int item_w, int* axis, float pivot[3]);  // (round 142: item_w the item placed in the hand)
 std::string tip_command(const std::string& w, const std::string& v);  // gestures tip/tipaxis/tippivot; the readback
 void set_grip_throw(bool on, bool save = true);
 // [Aim] PerfectAccuracy (run 3 item 3, research\run3\accuracy.md; on by default since run 8): the player's shots leave exactly

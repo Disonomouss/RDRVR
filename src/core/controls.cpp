@@ -188,6 +188,9 @@ int g_menu_dir = -1;  // the stick's step direction held: 0 up, 1 down, 2 left, 
 double g_menu_dir_since = 0.0, g_menu_next_step = 0.0, g_menu_step_until = 0.0;
 constexpr double kStepPulse = 70.0, kStepFirstRepeat = 450.0, kStepRepeat = 180.0;
 std::atomic<uint64_t> g_wheel_steps{0};  // the wheel's D-pad steps from the holding hand's stick
+// (round 145, the review) [Holsters] WheelSteer=sticks: after the wheel closes, each stick held back until it is let go
+// (under 0.3): the left one held on a kind does not walk John at the pick, the right one does not turn him (the pad's thread)
+bool g_wheel_stick_hold[2] = {false, false};
 // The map screen (2026-10-11, the user: "the map is no longer usable. Does not respond to controls"): it pans by the
 // left stick's analog axes only and zooms by LT/RT (the game's action table: @MAP.SCROLL_* on the stick's directions,
 // no D-pad; @UI.ZOOM_OUT/IN on LT/RT), so MenuControls leaves it the raw stick and triggers. Its byte (anchor MapOpen)
@@ -374,6 +377,9 @@ bool pad(xinput::PadState* out) {
     }
     // [Hands] DualWield: the second gun's own (a carried long gun is never fired: its hand's trigger stays the game's aim)
     if (const dual::State ds = dual::state(); ds.on && !ds.carry) (ds.ctrl ? r : l).trigger = 0.0f;
+    // (round 143, the review) each controller's own trigger, before the mirror and the triggers' swap (the wheel at a holster)
+    const float ctrl_trig[2] = {l.trigger, r.trigger};
+    bool trig_swap_applied = false;
     if (g_left_handed.load(std::memory_order_relaxed)) std::swap(l, r);  // the mirror: every role swapped
     {  // the gun in the layout's other hand (drawn by it): its trigger fires, the other aims; changed only with both let go
         // (2026-10-31, the off-hand build step 1, R16) not for the lasso: in either hand the left trigger aims and the
@@ -386,7 +392,10 @@ bool pad(xinput::PadState* out) {
         // in: that change, as the swap's own, only with both triggers let go (the review: a held one would change sides)
         static bool table_was = false;
         if (const bool tg = holster::table_game(); tg != table_was && ((holster::game_gate() & 1) != 0 || (l.trigger < 0.15f && r.trigger < 0.15f))) table_was = tg;
-        if (g_trig_swapped && !(holster::game_gate() & 1) && !table_was) std::swap(l.trigger, r.trigger);
+        if (g_trig_swapped && !(holster::game_gate() & 1) && !table_was) {
+            std::swap(l.trigger, r.trigger);
+            trig_swap_applied = true;
+        }
     }
     xinput::PadState p;
     // the chord for controllers without a menu button: both B buttons are the menu button (and not B / Y)
@@ -480,7 +489,9 @@ bool pad(xinput::PadState* out) {
     {  // [Reload] ManualActions: a revolver opens by a flick down (that cone consumed); RevolverControl=cock: its click held down
         // (not while the layout's right hand holds the wheel: its stick is the wheel's D-pad then, not the gun's flicks)
         const int wh = wheel::holder();
-        const bool wheel_right = wh >= 0 && wheel::stick_dpad() && (wh == 1) != g_left_handed.load(std::memory_order_relaxed);
+        // (round 145: steered by the sticks, both sticks are the wheel's while it is open)
+        const bool wheel_right = (wh >= 0 && (wheel::steer_by_sticks() || (wheel::stick_dpad() && (wh == 1) != g_left_handed.load(std::memory_order_relaxed)))) ||
+                                 g_wheel_stick_hold[1];
         bool rclick = (r.buttons & hands::kStick) != 0;
         RdrvrActorState s0{};
         const bool seated = api::actor_state(&s0) && (s0.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING));
@@ -494,7 +505,8 @@ bool pad(xinput::PadState* out) {
         // the other one) held down and clicked opens it; that click never the game's L3 (nor the crouch, the chord's wait:
         // gone from the buttons from its press); not filtered while it is the wheel's D-pad
         // (2026-10-29: riding too, its brake as the crouch held back until the click is held in; the stick's walk wait on foot only)
-        const bool wheel_left = wh >= 0 && wheel::stick_dpad() && (wh == 1) == g_left_handed.load(std::memory_order_relaxed);
+        const bool wheel_left = (wh >= 0 && (wheel::steer_by_sticks() || (wheel::stick_dpad() && (wh == 1) == g_left_handed.load(std::memory_order_relaxed)))) ||
+                                g_wheel_stick_hold[0];
         bool lclick = (l.buttons & hands::kStick) != 0;
         actions::filter_second_stick(g_left_handed.load(std::memory_order_relaxed) ? 1 : 0, &l.stick[0], &l.stick[1], &lclick, rclk_raw, seated,
                                      wheel_left);  // (the wheel's D-pad: not filtered, its state reset)
@@ -593,9 +605,30 @@ bool pad(xinput::PadState* out) {
     {  // [Holsters] Mode=wheel (run 8 item 5): a free grip holds the game's weapon wheel, steered by the hand
         bool free[2] = {false, false}, taken[2] = {false, false};
         for (int h = 0; h < 2; ++h) free[swapped ? 1 - h : h] = g_grip_down[h];
+        // (round 143) [Holsters] WheelAtHolster: each controller's trigger, pulled (over 0.6, held over 0.3) at a holster with
+        // its hand empty (the holsters' own test, holster::wheel_zone)
+        static bool trig_on[2] = {false, false};
+        bool trig[2], taken_trig[2] = {false, false};
+        int tz[2];
+        for (int c = 0; c < 2; ++c) {
+            const float t = ctrl_trig[c];
+            trig_on[c] = trig_on[c] ? t > 0.3f : t > 0.6f;
+            trig[c] = trig_on[c];
+            tz[c] = holster::wheel_zone(c);
+        }
+        wheel::poll_triggers(trig, tz, taken_trig);
+        wheel::poll_sticks(l.stick);  // (round 145) [Holsters] WheelSteer=sticks: the layout's left stick
         wheel::poll(now, free, taken);
         for (int h = 0; h < 2; ++h)
             if (taken[swapped ? 1 - h : h]) g_grip_down[h] = false;
+        // (the trigger holding the wheel is not the game's: controller c's, wherever the mirror and the swap put it; nor a
+        // trigger pressed at a holster where the wheel may open: its first frame drew the last weapon, cycle HP29)
+        for (int c = 0; c < 2; ++c) {
+            if (!taken_trig[c] && !(trig[c] && tz[c] >= 0)) continue;
+            int at = g_left_handed.load(std::memory_order_relaxed) ? 1 - c : c;
+            if (trig_swap_applied) at = 1 - at;
+            (at == 0 ? l : r).trigger = 0.0f;
+        }
     }
     // each source's value (0..1: a button is 0 or 1, a trigger analog), then onto its target: a button target is
     // pressed above half, an LT/RT target takes the largest value mapped to it
@@ -893,18 +926,34 @@ bool pad(xinput::PadState* out) {
        // back (the left one does not walk, the right one does not turn; the wheel's own stick is the hand's place)
         static int s_dir = -1;
         static double s_since = 0, s_next = 0, s_until = 0, s_held_since = 0;
+        static bool s_was_sticks = false, s_armed = false;
         const int wc = wheel::holder();
         if (wc < 0) s_held_since = 0;
         else if (s_held_since == 0) s_held_since = now;
-        if (wc >= 0 && wheel::stick_dpad()) {
-            const bool right_side = (wc == 1) != swapped;  // the layout's right hand holds it (the left-handed swap)
+        // (round 145) [Holsters] WheelSteer=sticks: the layout's right stick is the D-pad, the left one the wheel's own
+        const bool by_sticks = wheel::steer_by_sticks();
+        if (wc < 0 && s_was_sticks) g_wheel_stick_hold[0] = g_wheel_stick_hold[1] = true;  // (the review) closed: held till let go
+        s_was_sticks = wc >= 0 && by_sticks;
+        if (wc < 0) s_armed = false;
+        if (g_wheel_stick_hold[0]) {
+            if (std::fabs(l.stick[0]) < 0.3f && std::fabs(l.stick[1]) < 0.3f) g_wheel_stick_hold[0] = false;
+            else p.lx = p.ly = 0;
+        }
+        if (g_wheel_stick_hold[1]) {
+            if (std::fabs(rx) < 0.3f && std::fabs(ry) < 0.3f) g_wheel_stick_hold[1] = false;
+            else rx = ry = 0.0f;
+        }
+        if (wc >= 0 && (by_sticks || wheel::stick_dpad())) {
+            const bool right_side = by_sticks || (wc == 1) != swapped;  // the layout's right hand holds it (the left-handed swap)
             const float sx = right_side ? rx : l.stick[0], sy = right_side ? ry : l.stick[1];
             const float ax = std::fabs(sx), ay = std::fabs(sy);
             const float on = s_dir >= 0 ? 0.35f : 0.6f;  // let go below 0.35 once held
             int dir = -1;
             // left and right only (the review: up is the game's whistle, and the wheel picks with left and right); and from
             // 250 ms after the grip (the game opens its wheel after 0.2 s of LB: a push before would reach the game itself)
-            if (ax > ay && ax > on && now - s_held_since >= 250.0) dir = sx > 0.0f ? 3 : 2;
+            // (round 145, the review) steered by the sticks, a right stick already held at the open (a turn) steps nothing until let go
+            if (ax < 0.3f && ay < 0.3f) s_armed = true;
+            if (ax > ay && ax > on && now - s_held_since >= 250.0 && (s_armed || !by_sticks)) dir = sx > 0.0f ? 3 : 2;
             if (dir != s_dir) {
                 s_dir = dir;
                 s_since = now;
@@ -918,7 +967,7 @@ bool pad(xinput::PadState* out) {
             static const uint16_t kWheelDir[4] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
             if (dir >= 0 && now < s_until) p.buttons |= kWheelDir[dir];
             if (right_side) rx = ry = 0.0f;
-            else p.lx = p.ly = 0;
+            if (!right_side || by_sticks) p.lx = p.ly = 0;  // (steered by the sticks: the left one neither walks)
         } else {
             s_dir = -1;
         }

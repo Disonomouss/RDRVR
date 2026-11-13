@@ -36,12 +36,23 @@ std::atomic<bool> g_flip_y{false};
 std::atomic<int> g_grips{3};  // bit 0 the left controller's grip, bit 1 the right's
 
 std::atomic<bool> g_stick_dpad{true};  // [Holsters] WheelStickDpad: the holding hand's stick as the D-pad (controls.cpp)
+// (round 145, the user: "Weapon wheel should be controlled with joysticks. Left to select gun catagory, right as D pad to
+// switch between each gun within the catagory.") [Holsters] WheelSteer: sticks (the layout's left stick is the game's
+// wheel stick, kept where it was last pushed; the layout's right stick left or right is the D-pad, controls.cpp) | hand
+std::atomic<bool> g_by_sticks{true};
+float g_lstick_in[2] = {0.0f, 0.0f};  // the layout's left stick at this poll (poll_sticks, the pad's thread)
+bool g_lstick_armed = false;          // (the review) the left stick let go (under 0.3) since the open: a stick held then (a walk) picks nothing
+uint64_t g_steps0 = 0;                // controls::wheel_steps() at the open (the review: the D-pad's steps alone are a pick)
 int g_ctrl = -1;              // the controller holding the wheel open (-1: closed)
 double g_open_ms = 0.0, g_release_ms = 0.0;
 bool g_releasing = false;     // the grip let go before the minimum hold: LB held to it, then a cancel
 float g_centre[3] = {};       // the hand at the press (LOCAL)
 float g_right[3] = {1, 0, 0}, g_up[3] = {0, 1, 0};  // the head's axes at the press (LOCAL)
 float g_head_q[4] = {0, 0, 0, 1};                   // the head's turn at the press (the hand quad faces it)
+// (round 144, the user: the trigger's wheel "should appear in front of you, not on the hand like the normal weapon wheel
+// use") the wheel opened by a trigger at a holster: its quad 0.5 m ahead of the eyes at the press, level, a little low
+float g_front[3] = {0, 0, 0};
+bool g_front_on = false;
 std::atomic<bool> g_at_hand{true};                  // [Holsters] WheelAtHand
 float g_rect[4] = {0.33f, 0.04f, 0.71f, 0.74f};     // [Holsters] WheelRect (set at init only)
 std::mutex g_quad_mutex;                            // the press's centre and turn: the pad's poll writes, the XR frame reads
@@ -54,6 +65,19 @@ std::atomic<int> g_ctrl_pub{-1}, g_sector_pub{-1};   // the poll's state for the
 std::atomic<float> g_stick_pub[2] = {0.0f, 0.0f};
 bool g_free_was[2] = {false, false};                // a press opens the wheel, not a grip still held
 int g_pend_ctrl = -1, g_pend_weapon = -1;            // a commit's hand, until the weapon in hand changes (or 1.5 s)
+// (round 143) the trigger at a holster: the inputs of this poll (set by poll_triggers just before poll), whether the open
+// wheel was opened by one, its holster; the pick handed to the holsters
+bool g_trig[2] = {false, false}, g_trig_was[2] = {false, false};
+double g_trig_edge_ms[2] = {-1e12, -1e12};  // the trigger's press (a hand reaching the holster a frame after it still opens)
+bool g_trig_used[2] = {false, false};       // this press opened the wheel already
+int g_trig_zone_in[2] = {-1, -1};
+bool g_by_trig = false;
+int g_trig_zone = -1;
+bool* g_taken_trig = nullptr;
+std::atomic<int> g_assign_zone{-1}, g_assign_weapon{-1}, g_assign_ctrl{-1};
+std::atomic<uint64_t> g_trig_opens{0}, g_trig_picks{0};
+std::atomic<int> g_cancel_weapon{-2};       // (round 143) a trigger wheel cancelled: the weapon in hand then
+std::atomic<bool> g_cancel_pending{false};
 double g_pend_until = 0.0;
 void publish() {
     g_ctrl_pub.store(g_ctrl, std::memory_order_relaxed);
@@ -78,16 +102,30 @@ bool hand_pos(int c, float out[3]) {
     return true;
 }
 
-void begin(int c, double now) {
+void begin(int c, double now, const char* by = "grip") {
     float p[3];
     if (!hand_pos(c, p)) return;
     xr::EyeView v[2];
+    const bool front = std::strcmp(by, "grip") != 0;  // (round 144) the trigger's: in front of the eyes
+    bool front_ok = false;
     if (xr::eye_views_peek(v)) {  // a peek: not a scene pass's hand-out
-        const float rx[3] = {1, 0, 0}, uy[3] = {0, 1, 0};
+        const float rx[3] = {1, 0, 0}, uy[3] = {0, 1, 0}, fz[3] = {0, 0, -1};
         rotate(v[0].orientation, rx, g_right);
         rotate(v[0].orientation, uy, g_up);
+        float f[3];
+        rotate(v[0].orientation, fz, f);
+        const float fl = std::sqrt(f[0] * f[0] + f[2] * f[2]);
         std::lock_guard lock(g_quad_mutex);
         std::memcpy(g_head_q, v[0].orientation, sizeof(g_head_q));
+        if (front && fl > 0.2f) {
+            const float yaw = std::atan2(-f[0], -f[2]);  // the head's yaw alone: the quad level, facing the eyes
+            g_head_q[0] = 0.0f, g_head_q[1] = std::sin(yaw * 0.5f), g_head_q[2] = 0.0f, g_head_q[3] = std::cos(yaw * 0.5f);
+            for (int k = 0; k < 3; ++k) g_front[k] = 0.5f * (v[0].position[k] + v[1].position[k]);
+            g_front[0] += f[0] / fl * 0.5f;
+            g_front[2] += f[2] / fl * 0.5f;
+            g_front[1] -= 0.12f;
+            front_ok = true;
+        }
     } else {
         g_right[0] = 1, g_right[1] = g_right[2] = 0;
         g_up[1] = 1, g_up[0] = g_up[2] = 0;
@@ -95,19 +133,44 @@ void begin(int c, double now) {
     {
         std::lock_guard lock(g_quad_mutex);
         std::memcpy(g_centre, p, sizeof(p));
+        g_front_on = front_ok;
     }
     g_ctrl = c;
     g_open_ms = now;
     g_releasing = false;
     g_stick[0] = g_stick[1] = 0.0f;
     g_sector = -1;
+    g_lstick_armed = false;
+    g_steps0 = controls::wheel_steps();
     g_open = true;
     g_opens.fetch_add(1, std::memory_order_relaxed);
     controllers::pulse(c, 0.2f, 15);
-    log::info("[wheel] the %s grip: the weapon wheel (LB held), the centre at the hand", c ? "right" : "left");
+    log::info("[wheel] the %s %s: the weapon wheel (LB held), %s", c ? "right" : "left", by,
+              g_by_sticks.load(std::memory_order_relaxed) ? "steered by the sticks (the left its kind, the right the D-pad)" : "the centre at the hand");
 }
 
 void steer() {
+    if (g_by_sticks.load(std::memory_order_relaxed)) {  // (round 145) the left stick: a push past 0.6 picks its sector,
+        // kept when the stick is let go (the highlight stays: the trigger or the grip let go picks it); no push: a cancel
+        const float x = g_lstick_in[0], y = g_lstick_in[1];
+        const float m = std::sqrt(x * x + y * y);
+        g_last_off.store(m, std::memory_order_relaxed);
+        if (!g_lstick_armed) {
+            if (m < 0.3f) g_lstick_armed = true;
+            return;
+        }
+        if (!(m > 0.6f)) return;
+        g_stick[0] = x / m;
+        g_stick[1] = y / m;
+        float deg = std::atan2(g_stick[1], g_stick[0]) * 57.29578f;
+        if (deg < 0) deg += 360.0f;
+        const int s = static_cast<int>((deg + 22.5f) / 45.0f) % 8;
+        if (s != g_sector) {
+            g_sector = s;
+            controllers::pulse(g_ctrl, 0.12f, 10);
+        }
+        return;
+    }
     float p[3];
     if (!hand_pos(g_ctrl, p)) return;
     float d[3];
@@ -382,6 +445,8 @@ void pause_guard() {
 
 void init() {
     g_stick_dpad = config::get_bool("Holsters", "WheelStickDpad", true);
+    g_by_sticks = config::get_string("Holsters", "WheelSteer", "sticks") != "hand";
+    log::info("[wheel] WheelSteer %s", g_by_sticks.load() ? "sticks (the left stick picks the kind, the right stick's left and right the D-pad)" : "hand");
     const std::string m = config::get_string("Holsters", "Mode", "holsters");
     g_mode = m == "wheel";
     float dz = config::get_float("Holsters", "WheelDeadZone", 0.04f);
@@ -440,16 +505,27 @@ void set_stick_dpad(bool on, bool save) {
     if (g_stick_dpad.exchange(on) != on) log::info("[wheel] the holding hand's stick as the D-pad: %s", on ? "on" : "off");
     if (save) config::set("Holsters", "WheelStickDpad", on ? "1" : "0");
 }
+void poll_sticks(const float left[2]) {
+    g_lstick_in[0] = left[0];
+    g_lstick_in[1] = left[1];
+}
+bool steer_by_sticks() { return g_by_sticks.load(std::memory_order_relaxed); }
+void set_steer_by_sticks(bool on, bool save) {
+    if (g_by_sticks.exchange(on) != on) log::info("[wheel] the wheel steered by %s", on ? "the sticks" : "the hand");
+    if (save) config::set("Holsters", "WheelSteer", on ? "sticks" : "hand");
+}
 bool hand_quad(float pos[3], float orient[4], float rect[4]) {
-    if (!g_open.load(std::memory_order_relaxed) || !g_at_hand.load(std::memory_order_relaxed)) return false;
+    if (!g_open.load(std::memory_order_relaxed)) return false;
     std::lock_guard lock(g_quad_mutex);
-    std::memcpy(pos, g_centre, 12);
+    if (!g_front_on && !g_at_hand.load(std::memory_order_relaxed)) return false;
+    std::memcpy(pos, g_front_on ? g_front : g_centre, 12);  // (round 144: the trigger's wheel in front of the eyes)
     std::memcpy(orient, g_head_q, 16);
     std::memcpy(rect, g_rect, 16);
     return true;
 }
 void cancel() {
     end_pause("the controllers' pad stopped (the menu, or not in use)");  // (nothing while not paused)
+    g_by_trig = false;
     if (g_ctrl < 0) return;
     xinput::set_override(0, false, 0, 0, 0);
     g_ctrl = -1;
@@ -459,11 +535,44 @@ void cancel() {
     log::info("[wheel] cancelled: the controllers' pad stopped (the menu, or not in use)");
 }
 
+void poll_triggers(const bool trig[2], const int trig_zone[2], bool taken_trig[2]) {
+    for (int c = 0; c < 2; ++c) {
+        g_trig[c] = trig[c];
+        g_trig_zone_in[c] = trig_zone[c];
+        taken_trig[c] = false;
+    }
+    g_taken_trig = taken_trig;
+}
+bool take_cancel(int* weapon_before) {
+    if (!g_cancel_pending.exchange(false)) return false;
+    *weapon_before = g_cancel_weapon.load();
+    return true;
+}
+bool take_assign(int* zone, int* weapon_before, int* ctrl) {
+    const int z = g_assign_zone.exchange(-1);
+    if (z < 0) return false;
+    *zone = z;
+    *weapon_before = g_assign_weapon.load();
+    *ctrl = g_assign_ctrl.load();
+    return true;
+}
+
 void poll(double now, const bool free[2], bool taken[2]) {
     taken[0] = taken[1] = false;
     const bool pressed[2] = {free[0] && !g_free_was[0], free[1] && !g_free_was[1]};
     g_free_was[0] = free[0];
     g_free_was[1] = free[1];
+    // (round 143) a trigger pulled at a holster (its hand empty): a press opens the wheel as a free grip does in the wheel's
+    // mode; g_taken_trig (poll_triggers' out) says which trigger it holds
+    // (the press counted for 150 ms: the holsters' zone, a frame of theirs behind, may come just after it)
+    bool tpress[2];
+    for (int c = 0; c < 2; ++c) {
+        if (g_trig[c] && !g_trig_was[c]) g_trig_edge_ms[c] = now, g_trig_used[c] = false;
+        tpress[c] = g_trig[c] && !g_trig_used[c] && now - g_trig_edge_ms[c] < 150.0 && g_trig_zone_in[c] >= 0;
+        g_trig_was[c] = g_trig[c];
+    }
+    bool* taken_trig = g_taken_trig;
+    g_taken_trig = nullptr;  // (one poll's)
     collect(now);  // [Holsters] WheelPause: the warp natives' results taken
     if (g_pend_ctrl >= 0) {  // a commit: the gun hand moves once the game has changed the weapon (the review's finding)
         RdrvrActorState st{};
@@ -474,7 +583,8 @@ void poll(double now, const bool free[2], bool taken[2]) {
             g_pend_ctrl = -1;
         }
     }
-    if (!g_mode.load(std::memory_order_relaxed)) {
+    const bool mode = g_mode.load(std::memory_order_relaxed);
+    if (!mode && !(g_ctrl >= 0 && g_by_trig) && !(g_ctrl < 0 && (tpress[0] || tpress[1]))) {
         end_pause("the mode off (the holsters)");
         if (g_ctrl >= 0) {  // switched off while open: let go at once
             xinput::set_override(0, false, 0, 0, 0);
@@ -486,31 +596,51 @@ void poll(double now, const bool free[2], bool taken[2]) {
     }
     const int grips = g_grips.load(std::memory_order_relaxed);
     if (g_ctrl < 0 && now >= g_release_ms) {
-        for (int c = 0; c < 2; ++c)
-            if (pressed[c] && (grips & (1 << c))) {
-                begin(c, now);
-                g_pause_done = false;  // [Holsters] WheelPause: this open may pause once
-                break;
-            }
+        if (mode)
+            for (int c = 0; c < 2; ++c)
+                if (pressed[c] && (grips & (1 << c))) {
+                    begin(c, now);
+                    g_by_trig = false;
+                    g_pause_done = false;  // [Holsters] WheelPause: this open may pause once
+                    break;
+                }
+        if (g_ctrl < 0 && !mode)  // (round 143) the trigger at a holster
+            for (int c = 0; c < 2; ++c)
+                if (tpress[c]) {
+                    g_trig_used[c] = true;
+                    begin(c, now, "trigger at a holster");
+                    g_by_trig = true;
+                    g_trig_zone = g_trig_zone_in[c];
+                    g_trig_opens.fetch_add(1, std::memory_order_relaxed);
+                    log::info("[wheel] the %s trigger at a holster (zone %d): the weapon wheel; the pick goes into that holster", c ? "right" : "left", g_trig_zone);
+                    g_pause_done = false;
+                    break;
+                }
     }
     if (g_ctrl >= 0) {
-        taken[g_ctrl] = true;
+        if (g_by_trig) {
+            if (taken_trig) taken_trig[g_ctrl] = true;
+        } else {
+            taken[g_ctrl] = true;
+        }
         if (g_paused) pause_guard();  // the game closed its wheel, the actor, mounting, Dead Eye, a grab, the option off
-        const bool held = free[g_ctrl] && !g_releasing;
+        const bool held = (g_by_trig ? g_trig[g_ctrl] : free[g_ctrl]) && !g_releasing;
         if (held) {
             steer();
             xinput::set_override(XINPUT_GAMEPAD_LEFT_SHOULDER, true, g_stick[0], g_stick[1], kRefreshMs);
             // [Holsters] WheelPause: started once the game shows its wheel (its open timer runs on the scaled dt), then
             // renewed as a lease while the grip holds
             if (g_paused) lease(now);
-            else if (!g_pause_done && g_pause_opt.load(std::memory_order_relaxed) && now - g_open_ms >= kMinHoldMs) try_start(now);
+            else if (!g_by_trig && !g_pause_done && g_pause_opt.load(std::memory_order_relaxed) && now - g_open_ms >= kMinHoldMs) try_start(now);
         } else if (now - g_open_ms < kMinHoldMs) {  // let go too soon: LB held to the minimum, then a cancel (no holster tap)
             g_releasing = true;
             g_sector = -1;
             xinput::set_override(XINPUT_GAMEPAD_LEFT_SHOULDER, true, 0, 0, kRefreshMs);
         } else {
             // LB let go: the stick kept (the game equips the highlight at the release), then let go too
-            const bool commit = g_sector >= 0 && !g_releasing;
+            // (round 145, the review) steered by the sticks, the D-pad's steps alone pick too (the game's highlighted kind)
+            const bool stepped = g_by_sticks.load(std::memory_order_relaxed) && controls::wheel_steps() != g_steps0;
+            const bool commit = (g_sector >= 0 || stepped) && !g_releasing;
             xinput::set_override(0, true, commit ? g_stick[0] : 0.0f, commit ? g_stick[1] : 0.0f, static_cast<uint32_t>(kStickTailMs));
             g_last_sector.store(commit ? g_sector : -1, std::memory_order_relaxed);
             if (commit) {
@@ -521,15 +651,27 @@ void poll(double now, const bool free[2], bool taken[2]) {
                 g_pend_until = now + 1500.0;
                 log::info("[wheel] let go: the sector %d (%d degrees from the hand's right), the weapon into the %s hand", g_sector, g_sector * 45,
                           g_ctrl ? "right" : "left");
+                if (g_by_trig) {  // (round 143) the pick goes into the holster the trigger was pulled at
+                    g_assign_weapon.store(g_pend_weapon);
+                    g_assign_ctrl.store(g_ctrl);
+                    g_assign_zone.store(g_trig_zone);
+                    g_trig_picks.fetch_add(1, std::memory_order_relaxed);
+                }
             } else {
                 g_cancels.fetch_add(1, std::memory_order_relaxed);
                 log::info("[wheel] let go in the dead zone (or too soon): cancelled");
+                if (g_by_trig) {  // (round 143, cycle HP30: from empty hands the game drew the last weapon at the cancel's LB)
+                    RdrvrActorState st{};
+                    g_cancel_weapon.store(api::actor_state(&st) ? st.weapon : -2);
+                    g_cancel_pending.store(true);
+                }
             }
             // [Holsters] WheelPause: LB's release reaches the game at its next pad poll, the cancel at the next script
             // tick: within a frame of each other, so the draw (the game equips at the release) plays at full speed
             end_pause(commit ? "a pick" : "no pick (the dead zone)");
             g_ctrl = -1;
             g_open = false;
+            g_by_trig = false;
             g_release_ms = now + kStickTailMs + 100.0;  // no new wheel until the stick is let go
         }
     }
@@ -554,6 +696,10 @@ std::string command(const std::string& line) {
                 }
                 if (v == "hold") g_lease_hold = true;  // test only: this pause's renewals stop (the lease's own end)
             }
+        }
+        if (w == "steer") {  // wheel steer sticks|hand: [Holsters] WheelSteer for the session
+            std::string v;
+            if (in >> v) set_steer_by_sticks(v != "hand", false);
         }
         if (w == "dpad") {  // wheel dpad on|off: [Holsters] WheelStickDpad for the session
             std::string v;
@@ -596,7 +742,10 @@ std::string command(const std::string& line) {
                   static_cast<unsigned long long>(g_pauses.load()),
                   static_cast<unsigned long long>(g_leases.load()), static_cast<unsigned long long>(g_pause_ends.load()),
                   static_cast<unsigned long long>(g_set_calls.load()), static_cast<unsigned long long>(g_cancel_calls.load()), g_end_why.load());
-    return std::string(b) + " | stick dpad " + (g_stick_dpad.load() ? "1" : "0") + ", steps " + std::to_string(controls::wheel_steps()) + p;
+    // (the review's cycle HP23: r35 reads "the last end:" to the line's end: the trigger's counts before the pause's part)
+    return std::string(b) + " | steer " + (g_by_sticks.load() ? "sticks" : "hand") + ", stick dpad " + (g_stick_dpad.load() ? "1" : "0") + ", steps " + std::to_string(controls::wheel_steps()) +
+           " | at a holster by a trigger: opens " + std::to_string(g_trig_opens.load()) + ", picks " + std::to_string(g_trig_picks.load()) +
+           (g_by_trig ? " (open now, zone " + std::to_string(g_trig_zone) + ")" : "") + p;
 }
 
 }  // namespace rdrvr::wheel

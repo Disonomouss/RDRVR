@@ -27,12 +27,14 @@
 #include "core/api.h"
 #include "core/audio.h"
 #include "core/body.h"
+#include "core/prepass_arrays.h"
 #include "core/xr_blit.h"
 #include "core/xr_image.h"
 #include "core/holster.h"
 #include "core/reload.h"
 #include "core/gestures.h"
 #include "core/gun_melee.h"
+#include "core/horseshoe.h"
 #include "core/offhand.h"
 #include "core/camera_lever.h"
 #include "core/config.h"
@@ -1381,6 +1383,17 @@ void page_body() {
     }
 }
 
+// (round 145) [Holsters] WheelSteer: the wheel steered by the sticks or by the hand
+void wheel_steer_row() {
+    const bool st = wheel::steer_by_sticks();
+    const char* const kTip = "The left stick picks the kind of weapon (push toward it: it stays picked when you let the stick go), the right stick's left and right pick the weapon of that kind (the game's D-pad); neither stick walks nor turns while the wheel is open. Or move the hand toward a weapon, as before.";
+    ImGui::TextUnformatted("The wheel steered by:");
+    ImGui::SameLine();
+    if (radio("The sticks", st, kTip)) wheel::set_steer_by_sticks(true, true);
+    ImGui::SameLine();
+    if (radio("The hand", !st, kTip)) wheel::set_steer_by_sticks(false, true);
+}
+
 void page_holsters() {
     heading("The holsters");
     bool on = holster::holsters_enabled();
@@ -1391,8 +1404,8 @@ void page_holsters() {
     sub_begin(on);
     {  // run 8 item 5: [Holsters] Mode
         const bool wm = wheel::wheel_mode();
-        const char* const kModeTip = "Draw by reaching to the holsters, or hold a grip to open the game's weapon wheel, move toward "
-                                     "a weapon and let go (the holsters then draw nothing; the chest still gives rounds).";
+        const char* const kModeTip = "Draw by reaching to the holsters, or hold a grip to open the game's weapon wheel, pick a "
+                                     "weapon and let go (the holsters then draw nothing; the chest still gives rounds).";
         ImGui::TextUnformatted("Weapons by:");
         ImGui::SameLine();
         if (radio("The holsters", !wm, kModeTip)) wheel::set_wheel_mode(false, true);
@@ -1400,11 +1413,14 @@ void page_holsters() {
         if (radio("The weapon wheel", wm, kModeTip)) wheel::set_wheel_mode(true, true);
         if (wm) {  // [Holsters] WheelStickDpad (2026-10-26)
             ImGui::Indent();
+            wheel_steer_row();
             bool sd = wheel::stick_dpad();
+            ImGui::BeginDisabled(wheel::steer_by_sticks());  // (the sticks' steering has its own D-pad: the right stick)
             if (check("The wheel's hand: its stick is the D-pad", &sd,
-                      "While a grip holds the wheel open, push that hand's stick left or right to pick another gun of the highlighted "
-                      "kind (the game's D-pad); the stick neither walks nor turns meanwhile."))
+                      "Steered by the hand: while a grip holds the wheel open, push that hand's stick left or right to pick another gun "
+                      "of the highlighted kind (the game's D-pad); the stick neither walks nor turns meanwhile."))
                 wheel::set_stick_dpad(sd, true);
+            ImGui::EndDisabled();
             // [Holsters] WheelPause, WheelPauseScale (2026-10-27, the user: "Weapon wheel pausing game until you pick a
             // weapon"): off by default
             bool wp = wheel::wheel_pause();
@@ -1418,6 +1434,16 @@ void page_holsters() {
                        "How fast the world runs while the wheel is open: 0.02 is nearly still, 0.08 slow motion (a press 0.01; never 0)."))
                 wheel::set_wheel_pause_scale(ps, true);
             sub_end();
+            ImGui::Unindent();
+        } else {  // (round 143) [Holsters] WheelAtHolster
+            ImGui::Indent();
+            bool wh = holster::wheel_at_holster();
+            if (check("Hold a trigger at a holster: the weapon wheel", &wh,
+                      "With both hands empty, put a hand on a holster and hold its trigger: the game's weapon wheel opens in front of you. Pick a "
+                      "weapon and let go of the trigger: that weapon becomes the holster's and is put away there (let go without "
+                      "picking: nothing changes)."))
+                holster::set_wheel_at_holster(wh, true);
+            if (wh) wheel_steer_row();
             ImGui::Unindent();
         }
     }
@@ -1818,8 +1844,10 @@ void page_guns() {
         offhand::set_torch_lit(ohl, true);
     bool mfp = pose::mounted_first_person();  // 2026-10-13: [Hands] MountedGunFirstPerson
     if (check("Mounted guns in first person (experimental)##Mounted guns in first person", &mfp,
-              "The Gatling, the Browning and the cannon: first person kept, John's hands on the gun, and the gun turned toward where your "
-              "gun hand points (it learns the gun's barrel from your first shot). Off: the game's own camera and aim while you use one."))
+              "The Gatling, the Browning and the cannon: first person kept. Your hands are free until you grip. Hold the left grip and move "
+              "your hand to swing the gun, as by its rear handle; hold the right grip and turn your hand in a circle, as a crank, to "
+              "fire: the faster you turn, the faster it fires, up to the gun's own rate at about a turn a second (the trigger fires "
+              "too). Off: the game's own camera and aim while you use one."))
         pose::set_mounted_first_person(mfp, true);
 
     heading("Dead Eye");
@@ -1845,6 +1873,11 @@ void page_guns() {
                   "score enough to win, the duel ends there and they fire (with too few the time runs on). Off: the game's way "
                   "(the right trigger places the X's, the duel fires them). Needs the right stick's flick up on."))
             deadeye::set_duel_trigger_fires(dr, true);
+        bool dn = deadeye::duel_no_turn();  // (round 138) [DeadEye] DuelNoTurn
+        if (check("In a duel, the right stick does not turn you", &dn,
+                  "In first person, while a duel's Dead Eye runs (from its start until the marks are fired), pushing the right stick "
+                  "sideways does not turn your view, so a flick up for an X cannot turn you by accident."))
+            deadeye::set_duel_no_turn(dn, true);
     }
     {  // [Hands] DeadEyeMarks, DeadEyeMarkDegrees, DeadEyeBarrelPaint (run 28 item 1c; after optimumbox's fork, v0.8.11.9,
        // commit ac942427, MIT; his key names)
@@ -2533,6 +2566,11 @@ void page_gestures() {
               "throw. A lit one held too long goes off in your hand."))
         aim::set_grip_throw(gt);
     sub_end();
+    bool hsh = horseshoe::enabled();  // (round 133) [Gestures] HorseshoeThrow
+    if (check("Horseshoes: throw with your own arm", &hsh,
+              "At the game of horseshoes the shoe is in your right hand: hold the grip, swing your arm and let go to throw it. It flies "
+              "with your hand's speed and direction (times Throw strength). Off: the game's own meter and buttons."))
+        horseshoe::set_enabled(hsh, true);
     bool me = gestures::melee_by_swing();
     if (check("Melee by swing", &me, "A fast swing of either hand punches with the fists, stabs with the knife or strikes with the torch."))
         gestures::set_melee_by_swing(me);

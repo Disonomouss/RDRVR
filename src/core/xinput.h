@@ -33,6 +33,10 @@ uint8_t pad_rt();  // (GOAL-after-0.8.13.2 item 6) pad 0's right trigger as the 
 // Run 8 item 5 (the weapon wheel): the last word on pad 0 for `ms` (0 ends it), after the head turn and the merge:
 // `buttons` or'd, and with `stick` the right stick set to (rx, ry) (-1..1; the turn otherwise gives the game 0)
 void set_override(uint16_t buttons, bool stick, float rx, float ry, uint32_t ms);
+// (round 139) pad 0's right trigger held full for `ms` (0 ends it): a mounted gun fired by its crank
+void set_rt_override(uint32_t ms);
+// (round 143) pad 0's left trigger held full for `ms` (0 ends it): the wheel's pick drawn at a holster
+void set_lt_override(uint32_t ms);
 // Headset round 2: true once after both stick clicks (L3 + R3) were held on the real pad for a second.
 bool take_recentre_combo();
 // 2026-10-27 ([XR] PhysicalCrouch): milliseconds since the real pad's own L3 was last seen down (huge: never)

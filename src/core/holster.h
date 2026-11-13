@@ -206,6 +206,9 @@ void set_foregrip_snap(bool on, bool save);
 constexpr int kWeapons = 38;
 const char* weapon_label(int w);  // "Cattleman Revolver"; "" out of range
 const char* weapon_token(int w);  // "Cattleman" (the ini's token); "" out of range
+// (round 141) on a mounted gun driven by the hands: this controller's grip is open (its arm follows the controller;
+// held, the arm is the game's, on the gun's handle or its crank). h: the controller (0 left, 1 right)
+bool turret_hand_free(int h);
 bool turret_ready();  // [Hands] MountedGunFirstPerson: the turret drive read the mounted gun within 0.5 s (pose keeps first person only then)
 bool weapon_choice();
 void set_weapon_choice(bool on);  // also written to the user ini
@@ -216,6 +219,11 @@ void set_any_weapon(bool on);
 constexpr int kRounds = 38;  // kWeapons (an eWeapon past the last)
 int zone_weapon(int z);           // -1: automatic
 void set_zone_weapon(int z, int w, bool save);
+// (round 143) [Holsters] WheelAtHolster (off): a trigger held at a holster with that hand empty opens the weapon wheel;
+// the pick becomes that holster's weapon and is put away there (wheel.cpp)
+bool wheel_at_holster();
+void set_wheel_at_holster(bool on, bool save);
+int wheel_zone(int c);  // the holster controller c's empty hand is at while the option is on (-1: none; any thread)
 bool zone_takes_weapons(int z);   // not the chest (its rounds)
 bool zone_any(int z);             // a gun holster (the hips, the backs): AnyWeapon's (2026-10-13)
 int zone_piece(int z);            // its belt piece (body::Piece index; body::kPieces the mirrored left holster), -1 none

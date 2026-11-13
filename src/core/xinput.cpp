@@ -46,6 +46,10 @@ std::atomic<uint16_t> g_ov_buttons{0};
 std::atomic<SHORT> g_ov_rx{0}, g_ov_ry{0};
 std::atomic<bool> g_ov_stick{false};
 std::atomic<ULONGLONG> g_ov_until{0};
+std::atomic<ULONGLONG> g_ov_rt_until{0};  // (round 139) the right trigger held full until then (a mounted gun's crank)
+std::atomic<bool> g_ov_rt_was{false};
+std::atomic<ULONGLONG> g_ov_lt_until{0};  // (round 143) the left trigger held full until then
+std::atomic<bool> g_ov_lt_was{false};
 std::atomic<bool> g_ov_was{false};  // the override was on at the last poll: its end gets a fresh packet
 std::atomic<float> g_turn_deg{0.0f}, g_right_x{0.0f};
 // Headset round 2: a recentre on the gamepad, both stick clicks held for 1 s (read before any injection).
@@ -178,6 +182,24 @@ DWORD WINAPI hk_GetState(DWORD user, XINPUT_STATE* st) {
     } else if (user == 0 && st && r == ERROR_SUCCESS && g_ov_was.exchange(false)) {
         st->dwPacketNumber = ++g_packet;  // the override's end is a state change (LB and the stick let go)
     }
+    if (user == 0 && st && r == ERROR_SUCCESS && GetTickCount64() < g_ov_rt_until.load(std::memory_order_relaxed)) {
+        if (st->Gamepad.bRightTrigger != 255) {
+            st->Gamepad.bRightTrigger = 255;
+            st->dwPacketNumber = ++g_packet;
+        }
+        g_ov_rt_was.store(true, std::memory_order_relaxed);
+    } else if (user == 0 && st && r == ERROR_SUCCESS && g_ov_rt_was.exchange(false)) {
+        st->dwPacketNumber = ++g_packet;  // (the trigger let go)
+    }
+    if (user == 0 && st && r == ERROR_SUCCESS && GetTickCount64() < g_ov_lt_until.load(std::memory_order_relaxed)) {
+        if (st->Gamepad.bLeftTrigger != 255) {
+            st->Gamepad.bLeftTrigger = 255;
+            st->dwPacketNumber = ++g_packet;
+        }
+        g_ov_lt_was.store(true, std::memory_order_relaxed);
+    } else if (user == 0 && st && r == ERROR_SUCCESS && g_ov_lt_was.exchange(false)) {
+        st->dwPacketNumber = ++g_packet;
+    }
     if (user == 0 && st && r == ERROR_SUCCESS) {
         const WORD b = st->Gamepad.wButtons, up = static_cast<WORD>(b & ~g_last_buttons);
         if (up & XINPUT_GAMEPAD_RIGHT_SHOULDER) g_rb_presses.fetch_add(1, std::memory_order_relaxed);
@@ -222,6 +244,9 @@ void set_override(uint16_t buttons, bool stick, float rx, float ry, uint32_t ms)
     g_ov_stick.store(stick, std::memory_order_relaxed);
     g_ov_until.store(ms ? GetTickCount64() + ms : 0, std::memory_order_relaxed);
 }
+
+void set_rt_override(uint32_t ms) { g_ov_rt_until.store(ms ? GetTickCount64() + ms : 0, std::memory_order_relaxed); }
+void set_lt_override(uint32_t ms) { g_ov_lt_until.store(ms ? GetTickCount64() + ms : 0, std::memory_order_relaxed); }
 
 bool take_recentre_combo() { return g_recentre_combo.exchange(false); }
 float pad_left_mag() { return g_pad_lmag.load(std::memory_order_relaxed); }

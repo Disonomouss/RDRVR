@@ -40,6 +40,7 @@ void note_pipeline(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps);  // 
 void before_indirect(ID3D12GraphicsCommandList* cl);  // an ExecuteIndirect in a region: the game's pipeline, not a twin
 bool take_skip_clear();  // after clear_dsv/clear_rtv: true = skip that clear (consumed)
 bool predication_off();
+std::string predication_force(int set);  // (round 136) "prepass pred off|game": 1 off, 0 the game's, -1 read
 void set_instanced(bool on);
 // Every game bind while on and outside a region: the game binds the pre-pass's targets before it clears them, so the
 // region's start binds them again with the slices.

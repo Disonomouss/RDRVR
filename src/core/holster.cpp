@@ -31,6 +31,7 @@
 #include "core/hooks.h"
 #include "core/log.h"
 #include "core/menu.h"
+#include "core/horseshoe.h"
 #include "core/offhand.h"
 #include "core/pose.h"
 #include "core/pso.h"
@@ -334,49 +335,113 @@ std::atomic<double> g_turret_ready_ms{-1e12};  // the mounted gun's matrices las
 bool turret_ready_now() { return log::now_ms() - g_turret_ready_ms.load(std::memory_order_relaxed) < 500.0; }
 // [Hands] MountedGunFirstPerson (2026-10-13, experimental; the user: "Can we attempt to make the gatling gun controllable
 // in first person with motion controls?"): on a mounted gun with first person kept, the turret (the game's: the right
-// stick turns it) is turned toward the gun hand's ray by the right stick put to the game (xinput's override): the
-// stick's push from the yaw and pitch between the ray and the barrel, full at 20 degrees, none within 1. The barrel is
-// one of the firing object's matrices' axes (W +0x80, the gun's, and +0xd0, the shoot-from's: for a turret its barrels
-// bone): the gun's -c until a round shows which axis it leaves along. The stick's sense in each direction is learnt:
-// pushed one way, the barrel turning the other way flips it. The simulator has no mounted gun to try it on.
+// stick turns it while the game's own camera holds the channel, round 137) is turned by the right stick put to the game
+// (xinput's override): the stick's push from the yaw and pitch between the wanted direction and the barrel, full at 20
+// degrees, none within 1. The barrel is one of the firing object's matrices' axes (W +0x80, the gun's, and +0xd0, the
+// shoot-from's: for a turret its barrels bone): the gun's -c until a round shows which axis it leaves along. The stick's
+// sense in each direction is learnt: pushed one way, the barrel turning the other way flips it.
+// (round 139, the user on the mission's Gatling with the gun following the gun hand's ray: "It turns but it is
+// unintuitive. Right hand should manually work the lever on the right to fire. Left hand should snap on to gun with
+// grip and control its movement.") The hands on the gun:
+//  - John's arms stay on the gun as the game has them (a free arm following its controller made the gun spin: its
+//    matrix comes from his animated hand; cycle RU6). The LEFT grip takes the gun's handle from wherever the hand is:
+//    the gun turns about its pivot as the hand moves, as a real one held by its rear handle: the pivot is taken kLever
+//    ahead of the hand along the barrel at the grab (so nothing jumps), and the wanted direction is from the hand
+//    through it. Let go, the gun stays where it is (no push);
+//  - the RIGHT grip takes the crank: turning the hand in a circle (about the gun's
+//    side axis; its middle the hand's own place low-passed) fires while it turns: the game's right trigger held for it.
+//    The trigger itself fires as before.
+constexpr float kLever = 0.5f;       // the handle behind the pivot (m): the hand's travel per radian of the gun's turn
+constexpr float kCrankMin = 0.015f;  // the hand at least this far from its circle's middle to have an angle (m)
+// (round 141, the user: "Crank should turn with the hands speed, if possible fire rate should be relative to hand speed.
+// Default being the maximum speed.") The crank fires by its angle: once it has turned kCrankEngage one way (a push and
+// pull turns both ways and never gets there), a round for every kCrankShot of turn (the trigger pressed kCrankPulseMs
+// for each), and from kCrankFull on the trigger is held: the gun's own rate, the most there is
+constexpr float kCrankEngage = 2.8f;    // rad one way before the first round (under half a turn; the review: one push
+                                        // and pull stroke past the middle sweeps up to 2.4)
+constexpr float kCrankShot = 0.6283f;   // rad a round: ten a turn
+constexpr float kCrankFull = 5.6f;      // rad/s (0.9 of a turn a second): the trigger held
+constexpr float kCrankStop = 0.8f;      // rad/s: under it for 0.3 s the crank has stopped
+constexpr uint32_t kCrankPulseMs = 60;
 struct TurretState {
-    int axis = 2 * 2 + 1;  // the barrel's axis: (matrix * 3 + row) * 2 + negated: the gun's c negated
+    // the barrel's axis: (matrix * 3 + row) * 2 + negated. (Round 141) the shoot-from's c negated (cycle RU8: on the
+    // Gatling the same direction as the gun matrix's -c within 0.2 degrees), and only the shoot-from's axes taken from a
+    // round: the gun's matrix comes from John's hand, and his hands are free now
+    int axis = (3 + 2) * 2 + 1;
     double cal_ms = -1.0;  // the round it was taken from
     float sx = 1.0f, sy = 1.0f;  // the stick's learnt sense (1: as guessed, -1: flipped)
     double win_ms = 0.0;  // the learning window's start, the barrel's yaw and pitch then, the push held through it
     float win_yaw = 0.0f, win_pitch = 0.0f, win_rx = 0.0f, win_ry = 0.0f;
     bool active = false;
+    double on_ms = 0.0;  // (round 137) the drive's start: no sense learnt in its first 1.5 s (the gun swings into place then)
     double log_ms = 0.0;
     double flip_ms[2] = {0.0, 0.0};  // the last flip of each sense; three each and the learning stops (no steady answer)
     int flips[2] = {0, 0};
+    // (round 139) the hands on the gun
+    bool l_held = false, r_held = false, pushing = false;
+    double l_ms = 0.0;         // the handle taken (the senses learnt only 0.5 s on)
+    float pivot[3] = {};       // where the gun turns about, as taken at the grab (from the view's origin, the world's axes)
+    float c_mid[3] = {};       // the crank hand's circle's middle (the same)
+    float c_ang = 0.0f, c_rate = 0.0f;  // its last angle about the middle (rad), its SIGNED turn rate smoothed (rad/s)
+    bool c_have = false;
+    double fire_ms = -1e12, last_ms = 0.0;
+    bool firing = false;
+    uint64_t grabs = 0, cranks = 0;
+    // (round 141) the crank by its angle
+    float c_turn = 0.0f;   // the turn one way since it last stopped or turned back (rad, signed)
+    float c_shot = 0.0f;   // the turn since the last round (rad)
+    double c_slow_ms = -1.0;  // under kCrankStop since (ms; -1 not)
+    float c_back = 0.0f;      // (round 142) the turn the other way since the crank last turned its own way (rad)
+    bool c_full = false;      // (round 142) at the gun's own rate (left only under 0.6 of kCrankFull for 0.25 s)
+    double c_dip_ms = -1.0;
+    uint64_t pulses = 0, holds = 0;  // rounds asked one by one; frames with the trigger held
 };
 TurretState g_turret;
+std::atomic<bool> g_turret_on{false};  // the drive on (any thread: the grips are the gun's then, grip_consumed)
+std::atomic<bool> g_wheel_hol{false};    // (round 143) [Holsters] WheelAtHolster
+std::atomic<int> g_wheel_zone[2] = {-1, -1};  // the holster each controller's empty hand is at (the trigger's wheel)
+// (the review: none after an early return of the frame) its time: older than 100 ms, none. (Cycle HP29: cleared at the
+// frame's top instead, the pad's poll inside the frame saw none there and let the trigger's first frame reach the game,
+// which drew the last weapon)
+std::atomic<double> g_wheel_zone_ms{-1e12};
+std::atomic<uint64_t> g_wheel_assigned{0}, g_wheel_assign_lost{0}, g_wheel_lt_draws{0};
+std::atomic<bool> g_turret_held[2] = {};  // (round 141) the hand's grip holds the gun (its arm the game's)
+std::atomic<bool> g_turret_arms_free{true};  // ("holster turret arms free|game": the test's switch)
+std::atomic<bool> g_turret_gun_axis{false};  // (the review) the barrel taken from the gun's own matrix (no shoot-from axis fits
+                                             // this gun's rounds): that matrix comes from John's hand, so his arms stay the game's
+void turret_off(TurretState& T, const char* why) {
+    if (T.pushing) xinput::set_override(0, false, 0.0f, 0.0f, 0);
+    if (T.firing) xinput::set_rt_override(0);
+    T.pushing = T.firing = T.l_held = T.r_held = false;
+    g_turret_on.store(false, std::memory_order_relaxed);
+    g_turret_held[0].store(false, std::memory_order_relaxed);
+    g_turret_held[1].store(false, std::memory_order_relaxed);
+    T.c_turn = T.c_shot = T.c_back = 0.0f;
+    T.c_slow_ms = T.c_dip_ms = -1.0;
+    T.c_full = false;
+    if (!T.active) return;
+    T.active = false;
+    T.axis = (3 + 2) * 2 + 1;  // (each gun from the shoot-from's -c again)
+    g_turret_gun_axis.store(false, std::memory_order_relaxed);
+    T.flips[0] = T.flips[1] = 0;
+    log::info("[turret] the hands' control off (%s): the handle taken %llu times, the crank fired %llu times", why,
+              static_cast<unsigned long long>(T.grabs), static_cast<unsigned long long>(T.cranks));
+}
 void turret_drive(const body::BodyPoints* bp, uintptr_t actor, double now) {
     TurretState& T = g_turret;
-    // the gun read whether or not the anchor is on (pose waits on it: turret_ready); driven only with the anchor on, a
-    // mounted gun in hand now (not a shot's 1.5 s after) and the gun hand tracked
+    // the gun read whether or not the anchor is on (pose waits on it: turret_ready); driven only with the anchor on and a
+    // mounted gun in hand now (not a shot's 1.5 s after)
     const bool want = actor && pose::mounted_gun_held() && pose::mounted_first_person();
     uintptr_t wmgr = 0, item = 0, W = 0;
     float M[2][16];
     const bool readable = want && rd(actor + 0x70, &wmgr) && wmgr && rd(wmgr + 0x80, &item) && item && rd(item + 0xa0, &W) && W &&
                           rd(W + 0x80, &M[0]) && rd(W + 0xd0, &M[1]);
     if (readable) g_turret_ready_ms.store(now, std::memory_order_relaxed);
-    bool tracked = false;
-    if (bp) {
-        const float* Rg = bp->target_rot[bp->gun];
-        float n = 0.0f;
-        for (int k = 0; k < 9; ++k) n += Rg[k] * Rg[k];
-        tracked = n > 1.5f;  // (a rotation's 3; a frame without the controller all zeros)
-    }
-    if (!(readable && tracked && pose::anchor_active())) {
-        if (T.active) {
-            xinput::set_override(0, false, 0.0f, 0.0f, 0);
-            T.active = false;
-            T.flips[0] = T.flips[1] = 0;  // (the next gun's senses may flip again; its axis and senses start from this one's)
-            log::info("[turret] the motion aim off (%s)", !want ? "the mounted gun left" : !readable ? "the gun not read" : !tracked ? "the gun hand not tracked" : "first person off");
-        }
+    if (!(readable && pose::anchor_active())) {
+        turret_off(T, !want ? "the mounted gun left" : !readable ? "the gun not read" : "first person off");
         return;
     }
+    if (!bp || !bp->cam_ok) return;  // (the review: a missed read of the body's points is a frame skipped, not a let-go)
     auto axis_of = [&](int ax, float out[3]) {
         const int m = ax / 6, r = (ax / 2) % 3;
         const float sg = (ax & 1) ? -1.0f : 1.0f;
@@ -394,12 +459,22 @@ void turret_drive(const body::BodyPoints* bp, uintptr_t actor, double now) {
             T.cal_ms = ms;
             int best = -1;
             float bd = 0.966f;
-            for (int ax = 0; ax < 12; ++ax) {
+            for (int ax = 6; ax < 12; ++ax) {  // (round 141: the shoot-from's first)
                 float a[3];
                 if (!axis_of(ax, a)) continue;
                 const float dt = a[0] * d[0] + a[1] * d[1] + a[2] * d[2];
                 if (dt > bd) bd = dt, best = ax;
             }
+            // (the review) a gun whose shoot-from matrix has no axis along its rounds (only the Gatling was measured): the
+            // gun's own matrix as before round 141, and the arms the game's on it (turret_hand_free)
+            if (best < 0)
+                for (int ax = 0; ax < 6; ++ax) {
+                    float a[3];
+                    if (!axis_of(ax, a)) continue;
+                    const float dt = a[0] * d[0] + a[1] * d[1] + a[2] * d[2];
+                    if (dt > bd) bd = dt, best = ax;
+                }
+            if (best >= 0) g_turret_gun_axis.store(best < 6, std::memory_order_relaxed);
             if (best >= 0 && best != T.axis) {
                 log::info("[turret] the barrel is the %s matrix's %c%c (a round along it within %.1f deg; was %d)", best / 6 ? "shoot-from" : "gun",
                           (best & 1) ? '-' : '+', "abc"[(best / 2) % 3], std::acos(std::fmin(1.0f, bd)) * 57.29578f, T.axis);
@@ -408,28 +483,82 @@ void turret_drive(const body::BodyPoints* bp, uintptr_t actor, double now) {
         }
     }
     float b[3];
-    if (!axis_of(T.axis, b)) return;
-    // the gun hand's ray (the barrel in the controller's target axes, as the reticle's)
-    float bt[3] = {0.0f, 0.174f, -0.985f}, u[3];
-    aim::barrel_in_target(bt);
-    const float* Rg = bp->target_rot[bp->gun];
-    for (int k = 0; k < 3; ++k) u[k] = Rg[k * 3] * bt[0] + Rg[k * 3 + 1] * bt[1] + Rg[k * 3 + 2] * bt[2];
+    if (!axis_of(T.axis, b)) {  // (the review) a shoot-from matrix not read as one: the gun's -c, the arms the game's
+        if (T.axis < 6 || !axis_of(2 * 2 + 1, b)) return;
+        g_turret_gun_axis.store(true, std::memory_order_relaxed);
+    }
     auto yaw_of = [](const float* v) { return std::atan2(-v[0], -v[2]) * 57.29578f; };  // (the heading's sense: left positive)
     auto pitch_of = [](const float* v) { return std::asin(std::fmax(-1.0f, std::fmin(1.0f, v[1]))) * 57.29578f; };
     const float by = yaw_of(b), bpitch = pitch_of(b);
-    const float ey = std::remainder(yaw_of(u) - by, 360.0f), ep = pitch_of(u) - bpitch;
-    auto push = [](float e) { return std::fabs(e) < 1.0f ? 0.0f : std::fmax(-1.0f, std::fmin(1.0f, e / 20.0f)); };
-    const float rx = -push(ey) * T.sx, ry = push(ep) * T.sy;  // (the guess: the stick right turns it right, up tilts it up)
-    xinput::set_override(0, true, rx, ry, 150);
     if (!T.active) {
         T.active = true;
-        T.win_ms = now, T.win_yaw = by, T.win_pitch = bpitch, T.win_rx = rx, T.win_ry = ry;
-        log::info("[turret] the motion aim on (the barrel the %s matrix's axis %d)", T.axis / 6 ? "shoot-from" : "gun", T.axis);
+        g_turret_on.store(true, std::memory_order_relaxed);
+        T.on_ms = now;
+        T.last_ms = now;
+        T.sx = T.sy = 1.0f;  // (each gun from the guess, the Gatling's true senses: cycle RU6, a stand-in's flips carried over)
+        T.grabs = T.cranks = 0;
+        log::info("[turret] the hands' control on (the barrel the %s matrix's axis %d): the left grip takes the handle and moves the gun, the right grip "
+                  "takes the crank and a turning hand fires", T.axis / 6 ? "shoot-from" : "gun", T.axis);
     }
-    // learning the sense: a push held a third of a second; the barrel turned against it flips it
+    const float dt = static_cast<float>(std::fmax(0.001, std::fmin(0.1, (now - T.last_ms) / 1000.0)));
+    T.last_ms = now;
+    // the controllers' places in the world's axes (their own: the body's hand points are not published with the arms' IK
+    // off, cycle RU6: taken from them, the grip let go and took again every frame), from the view's own origin (the
+    // review: a pivot and a crank's middle kept as world points were left behind by a moving wagon, 0.5 m in a tenth of
+    // a second: the same frame's camera carries the origin and the hands, so the mount's travel is in neither)
+    const hands::Hand hc[2] = {hands::get(0), hands::get(1)};
+    float hw[2][3] = {};
+    bool hok[2] = {false, false};
+    {
+        const float zero[3] = {0.0f, 0.0f, 0.0f}, qid[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        float o[3], wr[9];
+        const bool o_ok = camera_lever::local_to_world(bp->cam, zero, qid, o, wr) && std::isfinite(o[0] + o[1] + o[2]);
+        for (int h = 0; h < 2 && o_ok; ++h) {
+            if (!(hc[h].valid || hc[h].grip_valid)) continue;
+            hok[h] = camera_lever::local_to_world(bp->cam, hc[h].grip_valid ? hc[h].grip_pos : hc[h].pos, hc[h].grip_valid ? hc[h].grip_rot : hc[h].rot, hw[h], wr) &&
+                     std::isfinite(hw[h][0] + hw[h][1] + hw[h][2]);
+            for (int k = 0; k < 3; ++k) hw[h][k] -= o[k];
+        }
+    }
+    const float gl = hc[0].grip, gr = hc[1].grip;
+    // ---- the left hand on the handle
+    const bool l_now = hok[0] && (T.l_held ? gl > 0.3f : gl > 0.6f);
+    if (l_now && !T.l_held) {
+        for (int k = 0; k < 3; ++k) T.pivot[k] = hw[0][k] + kLever * b[k];
+        T.l_ms = now;
+        ++T.grabs;
+        if (T.grabs <= 20) log::info("[turret] the left hand took the handle (the barrel yaw %.1f pitch %.1f)", by, bpitch);
+    }
+    T.l_held = l_now;
+    float u[3] = {b[0], b[1], b[2]}, ey = 0.0f, ep = 0.0f, rx = 0.0f, ry = 0.0f;
+    // (round 137, cycle RU6 on the mission's Gatling: with the push e/20 the barrel stopped 4 to 5 degrees short, the stick
+    // at 0.2: inside the pad's right-stick dead zone, 0.265) from 1 degree out the push starts above the dead zone
+    auto push = [](float e) {
+        const float m = std::fabs(e);
+        if (m < 1.0f) return 0.0f;
+        const float p = 0.30f + 0.70f * std::fmin(1.0f, (m - 1.0f) / 19.0f);
+        return e < 0.0f ? -p : p;
+    };
+    if (T.l_held) {
+        float d[3] = {T.pivot[0] - hw[0][0], T.pivot[1] - hw[0][1], T.pivot[2] - hw[0][2]};
+        const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (l > 0.15f)  // (the hand pushed up to the pivot has no direction: the barrel's kept)
+            for (int k = 0; k < 3; ++k) u[k] = d[k] / l;
+        ey = std::remainder(yaw_of(u) - by, 360.0f), ep = pitch_of(u) - bpitch;
+        rx = -push(ey) * T.sx, ry = push(ep) * T.sy;  // (the guess: the stick right turns it right, up tilts it up)
+        xinput::set_override(0, true, rx, ry, 150);
+        T.pushing = true;
+    } else if (T.pushing) {
+        xinput::set_override(0, false, 0.0f, 0.0f, 0);
+        T.pushing = false;
+    }
+    // learning the sense: a push held a third of a second; the barrel turned against it flips it (not while the gun is
+    // taken, round 137, nor in the half second after the handle is: the gun settles)
     const bool held_x = std::fabs(T.win_rx) > 0.4f && std::fabs(rx) > 0.4f && (rx > 0) == (T.win_rx > 0);
     const bool held_y = std::fabs(T.win_ry) > 0.4f && std::fabs(ry) > 0.4f && (ry > 0) == (T.win_ry > 0);
-    if (now - T.win_ms > 330.0) {
+    if (now - T.on_ms < 1500.0 || !T.l_held || now - T.l_ms < 500.0) {
+        T.win_ms = now, T.win_yaw = by, T.win_pitch = bpitch, T.win_rx = rx, T.win_ry = ry;
+    } else if (now - T.win_ms > 330.0) {
         const float dy = std::remainder(by - T.win_yaw, 360.0f), dp = bpitch - T.win_pitch;
         auto may_flip = [&](int i) {
             if (T.flips[i] >= 3 || now - T.flip_ms[i] < 1000.0) return false;
@@ -437,20 +566,114 @@ void turret_drive(const body::BodyPoints* bp, uintptr_t actor, double now) {
             if (++T.flips[i] == 3) log::info("[turret] the %s sense flipped three times: no steady answer to the stick, its learning stopped", i ? "up-down" : "left-right");
             return true;
         };
-        if (held_x && std::fabs(dy) > 2.0f && (dy > 0) != (-T.win_rx * T.sx > 0) && may_flip(0)) {  // wanted: the yaw's change along -rx
+        // (round 139: over 6 degrees against the push, not 2: a wagon's own turn is not the gun's answer)
+        if (held_x && std::fabs(dy) > 6.0f && (dy > 0) != (-T.win_rx * T.sx > 0) && may_flip(0)) {  // wanted: the yaw's change along -rx
             T.sx = -T.sx;
             log::info("[turret] the stick's left-right sense flipped (the barrel turned %.1f deg against the push)", dy);
         }
-        if (held_y && std::fabs(dp) > 2.0f && (dp > 0) != (T.win_ry * T.sy > 0) && may_flip(1)) {
+        if (held_y && std::fabs(dp) > 6.0f && (dp > 0) != (T.win_ry * T.sy > 0) && may_flip(1)) {
             T.sy = -T.sy;
             log::info("[turret] the stick's up-down sense flipped (the barrel tilted %.1f deg against the push)", dp);
         }
         T.win_ms = now, T.win_yaw = by, T.win_pitch = bpitch, T.win_rx = rx, T.win_ry = ry;
     }
-    if (now - T.log_ms > 1000.0) {
+    // ---- the right hand on the crank
+    const bool r_now = hok[1] && (T.r_held ? gr > 0.3f : gr > 0.6f);
+    if (r_now) {
+        const float* h = hw[1];
+        if (!T.r_held) {
+            std::memcpy(T.c_mid, h, sizeof(T.c_mid));
+            T.c_have = false;
+            T.c_rate = 0.0f;
+        }
+        const float am = 1.0f - std::exp(-dt / 0.5f);
+        for (int k = 0; k < 3; ++k) T.c_mid[k] += (h[k] - T.c_mid[k]) * am;
+        // the crank's plane: along the barrel (level) and up
+        float fl = std::sqrt(b[0] * b[0] + b[2] * b[2]), fx = fl > 1e-3f ? b[0] / fl : 0.0f, fz = fl > 1e-3f ? b[2] / fl : 1.0f;
+        const float vx = (h[0] - T.c_mid[0]) * fx + (h[2] - T.c_mid[2]) * fz, vy = h[1] - T.c_mid[1];
+        float inst = 0.0f;  // (signed: a tremor's turns back and forth cancel in the smoothing, a crank's add up)
+        if (vx * vx + vy * vy > kCrankMin * kCrankMin) {
+            const float ang = std::atan2(vy, vx);
+            if (T.c_have) inst = std::remainder(ang - T.c_ang, 6.2831853f) / dt;
+            T.c_ang = ang;
+            T.c_have = true;
+        } else {
+            T.c_have = false;
+        }
+        T.c_rate += (std::fmax(-40.0f, std::fmin(inst, 40.0f)) - T.c_rate) * (1.0f - std::exp(-dt / 0.15f));
+    } else {
+        T.c_rate = 0.0f;
+        T.c_have = false;
+    }
+    T.r_held = r_now;
+    // (round 141) the fire by the crank's angle
+    bool firing = false;
+    {
+        const float w = r_now ? T.c_rate : 0.0f, aw = std::fabs(w);
+        // (round 142, the user: "Cranking also felt difficult to keep consistent"; their log: at 1-3 turns a second the turn
+        // read "turned back" every second or two (the hand's circle off the measured plane: its angle runs backwards a
+        // moment), and every time the fire stopped and had to engage again) a turn back resets only past 0.9 rad, a stop
+        // only after 0.5 s, and the full rate holds through a dip
+        if (aw < kCrankStop) {
+            if (T.c_slow_ms < 0.0) T.c_slow_ms = now;
+            if (now - T.c_slow_ms > 500.0 || !r_now) T.c_turn = T.c_shot = T.c_back = 0.0f;  // stopped: the next turn engages anew
+        } else {
+            T.c_slow_ms = -1.0;
+            if ((w > 0.0f) != (T.c_turn > 0.0f) && T.c_turn != 0.0f) {
+                T.c_back += aw * dt;
+                if (T.c_back > 0.9f) T.c_turn = T.c_shot = T.c_back = 0.0f;  // turned back for real
+            } else {
+                T.c_back = std::fmax(0.0f, T.c_back - aw * dt);
+                T.c_turn += w * dt;
+            }
+        }
+        const bool engaged = std::fabs(T.c_turn) >= kCrankEngage;
+        if (!engaged) {
+            T.c_full = false;
+        } else if (aw >= kCrankFull) {
+            T.c_full = true;
+            T.c_dip_ms = -1.0;
+        } else if (T.c_full) {
+            if (aw >= 0.6f * kCrankFull) T.c_dip_ms = -1.0;
+            else if (T.c_dip_ms < 0.0) T.c_dip_ms = now;
+            else if (now - T.c_dip_ms > 250.0) T.c_full = false;
+        }
+        if (engaged && T.c_full) {  // the gun's own rate
+            xinput::set_rt_override(150);
+            T.c_shot = 0.0f;
+            T.fire_ms = now;
+            ++T.holds;
+            firing = true;
+        } else if (engaged) {
+            T.c_shot += aw * dt;
+            if (T.c_shot >= kCrankShot) {
+                T.c_shot = std::fmin(T.c_shot - kCrankShot, kCrankShot);  // (no backlog of rounds)
+                xinput::set_rt_override(kCrankPulseMs);
+                T.fire_ms = now;
+                ++T.pulses;
+            }
+            firing = now - T.fire_ms < 400.0;
+        } else if (T.firing && now - T.fire_ms < 150.0) {
+            firing = true;  // (a held trigger's last 150 ms run out by the override itself)
+        }
+        // (the review) the grip let go, or the crank stopped or turned back: the trigger let go at once
+        if (!engaged && T.firing) {
+            xinput::set_rt_override(0);
+            firing = false;
+        }
+        if (firing && !T.firing) ++T.cranks;
+        if (!firing && T.firing && now - T.fire_ms >= 150.0) xinput::set_rt_override(0);
+    }
+    T.firing = firing;
+    g_turret_held[0].store(T.l_held, std::memory_order_relaxed);
+    g_turret_held[1].store(T.r_held, std::memory_order_relaxed);
+    if (now - T.log_ms > 1000.0 && (T.l_held || T.r_held)) {
         T.log_ms = now;
-        log::info("[turret] the ray yaw %.1f pitch %.1f, the barrel yaw %.1f pitch %.1f (off %.1f %.1f), the stick %.2f %.2f (senses %+.0f %+.0f)",
-                  yaw_of(u), pitch_of(u), by, bpitch, ey, ep, rx, ry, T.sx, T.sy);
+        log::info("[turret] the left hand %s: wanted yaw %.1f pitch %.1f, the barrel yaw %.1f pitch %.1f (off %.1f %.1f), the stick %.2f %.2f (senses "
+                  "%+.0f %+.0f) | the right hand %s: the crank's turn %.1f rad/s (%.1f rad one way)%s; rounds asked one by one %llu, frames with the "
+                  "trigger held %llu",
+                  T.l_held ? "on the handle" : "free", yaw_of(u), pitch_of(u), by, bpitch, ey, ep, rx, ry, T.sx, T.sy, T.r_held ? "on the crank" : "free",
+                  std::fabs(T.c_rate), T.c_turn, firing ? ", firing" : "", static_cast<unsigned long long>(T.pulses), static_cast<unsigned long long>(T.holds));
     }
 }
 uintptr_t player_actor() {
@@ -663,6 +886,11 @@ struct ThrownOnBone {
     int w;
     float roll, drop;
 };
+// (round 142, cycle UN4's pictures: at the knife's own pose the torch stands as the knife does, its handle up at the belt
+// behind the holster and its head down along the back of the thigh; turned 90 or 180 degrees it stuck out behind or
+// ran up the back. Placed by hand as the sheath is: OwnBeltSheathOffset/Turn move it with the knife's place)
+#define TORCH_ROLL 0.0f
+#define TORCH_DROP 0.0f
 const ThrownOnBone kThrownOnBone[] = {
     {23, 90.0f, 0.0f},     // the fire bottle (throw_molotov01x)
     {24, -90.0f, 0.0f},    // dynamite (throw_dynamite01x)
@@ -673,6 +901,9 @@ const ThrownOnBone kThrownOnBone[] = {
     {35, 90.0f, 0.0f},     // holy water
     {36, 90.0f, 0.0f},     // undead bait
     {37, 90.0f, 0.0f},     // boom bait
+    // (round 142, the user: "Add torch model to belt in undead nightmare") the torch at the knife's place (its pose on
+    // the knife's: TORCH_ROLL, TORCH_DROP)
+    {33, TORCH_ROLL, TORCH_DROP},
 };
 const ThrownOnBone& thrown_on_bone(int w) {
     for (const ThrownOnBone& t : kThrownOnBone)
@@ -1114,6 +1345,84 @@ void put_item_away(int32_t actor, int weapon = -1) {
 const uint32_t kMeleeModeSelected = 0xAC1285A3;
 
 void holster_frame() {
+    {  // (round 143) [Holsters] WheelAtHolster: a pick from the wheel a trigger opened at a holster: once the game has put a
+       // new weapon in hand (4 s at most, no grip pressed meanwhile), that holster's weapon and put away into it
+        static int a_zone = -1, a_before = -2;
+        static double a_until = 0.0, a_pick_ms = 0.0;
+        static bool a_lt = false;
+        static int x_before = -2;  // (cycle HP30) a cancel: a weapon the game draws within 1 s of it is put away
+        static double x_until = 0.0;
+        {
+            int b = -2;
+            if (wheel::take_cancel(&b) && b != -2) x_before = b, x_until = log::now_ms() + 1000.0;
+            if (x_before != -2) {
+                RdrvrActorState xs{};
+                if (log::now_ms() > x_until) {
+                    x_before = -2;
+                } else if (api::actor_state(&xs) && xs.valid && xs.weapon >= 0 && xs.weapon != x_before) {
+                    put_item_away(xs.actor, xs.weapon);
+                    log::info("[holster] the wheel at a holster cancelled: the game drew %s at its close: put away",
+                              xs.weapon < kWeapons ? kWeaponLabel[xs.weapon] : "an item");
+                    x_before = -2;
+                }
+            }
+        }
+        static int c_w = -1;  // (cycle HP27) the weapon put away for the pick, checked again once
+        static double c_ms = 0.0;
+        if (c_w >= 0 && log::now_ms() - c_ms > 700.0) {  // still in hand (the draw's own end ran over the put-away): again
+            RdrvrActorState cs{};
+            if (api::actor_state(&cs) && cs.valid && cs.weapon == c_w) {
+                put_item_away(cs.actor, c_w);
+                log::info("[holster] the wheel at a holster: %s still in hand after the put-away: put away again", kWeaponLabel[c_w]);
+            }
+            c_w = -1;
+        }
+        int z = -1, before = -2, ctrl = -1;
+        if (wheel::take_assign(&z, &before, &ctrl) && before != -2) {  // (the review: not with the weapon before unknown)
+            a_zone = z;
+            a_before = before;
+            // (cycle HP24: a draw came over 1.5 s after the pick: 4 s, the window closed by any grip pressed instead, so a
+            // grip draw from another holster is never taken for the pick's)
+            a_until = log::now_ms() + 4000.0;
+            a_pick_ms = log::now_ms();
+            a_lt = false;
+        }
+        if (a_zone >= 0 && (hands::get(0).grip > 0.6f || hands::get(1).grip > 0.6f)) {
+            log::info("[holster] the wheel at a holster: a grip pressed before the pick's weapon came: nothing changed");
+            a_zone = -1;
+        }
+        if (a_zone >= 0) {
+            RdrvrActorState st{};
+            const bool have = api::actor_state(&st) && st.valid;
+            if (have && st.weapon >= 0 && st.weapon < kWeapons && st.weapon != a_before) {
+                const int w = st.weapon;
+                // (the review) only a weapon this holster can draw (its slots, or any with AnyWeapon): else left in hand
+                if (!g_any_weapon.load(std::memory_order_relaxed) && !weapon_fits(g_zones[a_zone], w, st.equip_slot[w])) {
+                    log::info("[holster] the wheel at a holster: %s does not go in the %s (AnyWeapon off): left in hand", kWeaponLabel[w], g_zones[a_zone].key);
+                } else {
+                    set_zone_weapon(a_zone, w, true);
+                    xinput::set_lt_override(0);  // (cycle HP27: LT still held drew it again after the put-away)
+                    put_item_away(st.actor, w);
+                    c_w = w;
+                    c_ms = log::now_ms();
+                    g_wheel_assigned.fetch_add(1, std::memory_order_relaxed);
+                    log::info("[holster] the wheel at a holster: %s into the %s (its weapon now), put away", kWeaponLabel[w], g_zones[a_zone].key);
+                }
+                a_zone = -1;
+            } else if (!a_lt && log::now_ms() - a_pick_ms > 400.0) {
+                // (cycles HP24, HP25: from empty hands the game often only selects the pick, drawing it at the next trigger:
+                // seconds later) LT pressed for it, the game's own draw of the selected weapon (the aim's)
+                xinput::set_lt_override(200);
+                a_lt = true;
+                g_wheel_lt_draws.fetch_add(1, std::memory_order_relaxed);
+            } else if (log::now_ms() > a_until) {
+                g_wheel_assign_lost.fetch_add(1, std::memory_order_relaxed);
+                log::info("[holster] the wheel at a holster: no new weapon in hand within 4 s (weapon %d; the pick an empty place?): nothing changed",
+                          have ? st.weapon : -1);
+                a_zone = -1;
+            }
+        }
+    }
     static bool grip_down[2] = {false, false}, pending[2] = {false, false};
     static int pending_w[2] = {-1, -1};  // (item 4.6) the weapon in hand at the press that armed `pending`
     static int zone_in[2] = {-1, -1}, press_zone[2] = {-1, -1};
@@ -1296,6 +1605,8 @@ void holster_frame() {
             g_game_gate.store(gate_now, std::memory_order_relaxed);
         }
     }
+    body::table_clip_frame();  // (round 145) poker's sit-down: the players drawn at John's head
+    horseshoe::frame();  // (round 133) [Gestures] HorseshoeThrow: the shoe thrown by the hand while horseshoes' script runs
     const double hold_letgo = g_hold_letgo.load(std::memory_order_relaxed);
     for (int h = 0; h < 2; ++h) {
         const float g = hands::get(h).grip;
@@ -2641,7 +2952,20 @@ void holster_frame() {
         // hold may still let John shoot: his put-aways and the reloads' takes stay)
         // (round 128, the review: not by the table games found by the control held in a gringo: a bed, a camp fire or a
         // mission's use spot holds the control as long, and the control held already refuses a draw into empty hands)
-        if ((gate & 1) || ((gate & 2) && !in_hand && !ds.on && !ds.carry && !offhand::held(h))) in_z[h] = -1;
+        // (round 139) nor on a mounted gun in first person: the grips take its handle and its crank
+        if ((gate & 1) || g_turret.active || ((gate & 2) && !in_hand && !ds.on && !ds.carry && !offhand::held(h))) in_z[h] = -1;
+        {  // (round 143) [Holsters] WheelAtHolster: this hand empty (not the gun's, nothing of the off hand's, its grip open)
+           // at a holster of weapons, no table game or held control: its trigger may open the wheel (wheel.cpp)
+            // (the review: with a weapon in either hand the other trigger has its own jobs: the game's aim, the lasso's, a bolt's)
+            const bool armed = in_hand && st.weapon >= 0;
+            const bool free_hand = !armed && !ds.on && !offhand::held(0) && !offhand::held(1) && hands::get(h).grip < 0.3f;
+            const int wz = g_wheel_hol.load(std::memory_order_relaxed) && !wheel::wheel_mode() && !(gate & 3) && free_hand && in_z[h] >= 0 &&
+                                   zone_takes_weapons(in_z[h])
+                               ? in_z[h]
+                               : -1;
+            g_wheel_zone[h].store(wz, std::memory_order_relaxed);
+            g_wheel_zone_ms.store(log::now_ms(), std::memory_order_relaxed);
+        }
         {  // ([Reload] RoundSource: the status line's)
             float ring = 0.0f;
             g_palm_y[h].store(palm_y_of(jh), std::memory_order_relaxed);
@@ -4288,10 +4612,20 @@ void holster_frame() {
            // the scan's refresh: the review)
             const float* anc2 = bp.bone_ok[body::kPelvisPoint] ? bp.bone[body::kPelvisPoint] : bp.root;
             // (the review) none at the belt while that item is in a hand: the knife (22) in hand or the off hand's, the lasso (21)
-            const bool knife_out = (in_hand && st.weapon == 22) || offhand::held_weapon(0) == 22 || offhand::held_weapon(1) == 22;
-            const bool lasso_out = in_hand && st.weapon == 21;
             // (round 102) the knife and the lasso only once owned (the weapon manager's list; before its first read, taken as owned)
             auto owned_item = [&](int w) { return !st.owned_tick || (st.owned >> w & 1); };
+            // (round 142) Undead Nightmare: the torch (33) at the knife's place when the knife's holster is set to the torch,
+            // or no knife is owned and the torch is (the review: not by the melee slot's item, which is the torch while it is
+            // drawn: the knife would leave the belt then)
+            int knife_w = 22;
+            {
+                int kc = -1;
+                for (int zi = 0; zi < kZones; ++zi)
+                    if (!std::strcmp(zones[zi].key, "Knife")) kc = zones[zi].weapon;
+                if (st.owned_tick && (st.owned >> 33 & 1) && (kc == 33 || !(st.owned >> 22 & 1))) knife_w = 33;
+            }
+            const bool knife_out = (in_hand && st.weapon == knife_w) || offhand::held_weapon(0) == knife_w || offhand::held_weapon(1) == knife_w;
+            const bool lasso_out = in_hand && st.weapon == 21;
             {
                 std::lock_guard lock(g_bp_mutex);
                 for (int i = 0; i < 3; ++i) g_bp_frame[i] = hr[i], g_bp_frame[3 + i] = up[i], g_bp_frame[6 + i] = hf[i], g_bp_frame[9 + i] = anc2[i];
@@ -4337,12 +4671,15 @@ void holster_frame() {
                 if (wfrag && !in_a_hand && offhand::thrown_left(w, static_cast<uint32_t>(st.actor)) == 1) tfrag = wfrag, tw = w;
             }
             for (int k = 0; k < kBeltProps; ++k) {
-                const bool out = (k == 0 && (knife_out || !owned_item(22))) || (k == 2 && (lasso_out || !owned_item(21)));
+                const bool torch = k == 0 && knife_w == 33;
+                const char* torch_frag = torch ? offhand::item_fragment(33) : nullptr;
+                const bool out = (k == 0 && (knife_out || !owned_item(knife_w))) || (k == 2 && (lasso_out || !owned_item(21))) || (torch && !torch_frag);
+                // (round 142) the torch whatever the outfit's own knife: it is not the outfit's
                 bool want = k == 1 ? (model ? sheath || satchel : (satchel && (!thrown_on || tw >= 0)) || (thrown_on && tw >= 0))
-                                   : on && !out && (force || !body::piece_present(k + 1));
+                                   : on && !out && (force || torch || !body::piece_present(k + 1));
                 float pz[12], an[3] = {anc2[0], anc2[1], anc2[2]};  // (the review: a bone's prop anchored by the pelvis its set drew)
-                if (want) want = belt_prop_pose(k, hr, up, hf, k == 1 && model ? bp.root : anc2, pz, an, model, k == 1 ? tw : -1);
-                const char* frag = k == 1 && model ? "player_default" : k == 1 && tw >= 0 ? tfrag : kBeltPropFrag[k];
+                if (want) want = belt_prop_pose(k, hr, up, hf, k == 1 && model ? bp.root : anc2, pz, an, model, k == 1 ? tw : torch ? 33 : -1);
+                const char* frag = k == 1 && model ? "player_default" : k == 1 && tw >= 0 ? tfrag : torch ? torch_frag : kBeltPropFrag[k];
                 if (k == 1) {  // (round 120) the throwable shown, for placing it by hand
                     g_thr_shown_w = want && tw >= 0 ? tw : -1;
                     // (round 121) the outfit's own satchel, once the throwable's object is made (the review: not while it is made;
@@ -5154,6 +5491,7 @@ void init() {
     g_release_margin = config::get_float("Holsters", "ReleaseMargin", 1.3f);
     g_weapon_choice = config::get_bool("Holsters", "WeaponChoice", true);
     g_any_weapon = config::get_bool("Holsters", "AnyWeapon", false);
+    g_wheel_hol = config::get_bool("Holsters", "WheelAtHolster", false);  // (round 143)
     {
         char b[200];
         int o = std::snprintf(b, sizeof(b), "[holster] weapons: choice %d, any %d:", g_weapon_choice.load() ? 1 : 0, g_any_weapon.load() ? 1 : 0);
@@ -5344,7 +5682,8 @@ void set_holsters_enabled(bool on) {
     if (g_holsters.exchange(on) != on) log::info("[holster] body holsters: %s", on ? "on" : "off");
     config::set("Holsters", "Enabled", on ? "1" : "0");
 }
-bool grip_consumed(int h) { return h >= 0 && h < 2 && g_consumed[h].load(std::memory_order_relaxed); }
+// (round 139, the review: on a mounted gun in first person the grips are the gun's: not the game's LB and RB, nor the wheel's)
+bool grip_consumed(int h) { return h >= 0 && h < 2 && (g_consumed[h].load(std::memory_order_relaxed) || g_turret_on.load(std::memory_order_relaxed)); }
 float two_hand_blend() { return g_two_blend.load(std::memory_order_relaxed); }
 void foregrip(float off[3], float* radius) {
     std::lock_guard lock(g_zone_mutex);
@@ -5602,6 +5941,10 @@ void set_foregrip_snap(bool on, bool save) {
 const char* weapon_label(int w) { return w >= 0 && w < kWeapons ? kWeaponLabel[w] : ""; }
 const char* weapon_token(int w) { return w >= 0 && w < kWeapons ? kWeaponToken[w] : ""; }
 bool turret_ready() { return turret_ready_now(); }  // [Hands] MountedGunFirstPerson: the mounted gun read within 0.5 s
+bool turret_hand_free(int h) {  // (round 141; any thread) h: the controller (0 left, 1 right)
+    return h >= 0 && h < 2 && g_turret_on.load(std::memory_order_relaxed) && g_turret_arms_free.load(std::memory_order_relaxed) &&
+           !g_turret_gun_axis.load(std::memory_order_relaxed) && !g_turret_held[h].load(std::memory_order_relaxed);
+}
 bool weapon_choice() { return g_weapon_choice.load(); }
 void set_weapon_choice(bool on) {
     g_weapon_choice = on;
@@ -5630,6 +5973,15 @@ void set_zone_weapon(int z, int w, bool save) {
     if (save) config::set("Holsters", (std::string(key) + "Weapon").c_str(), token_of(w));
 }
 bool zone_takes_weapons(int z) { return z >= 0 && z < kZones && g_zones[z].slots[0] >= 0; }
+bool wheel_at_holster() { return g_wheel_hol.load(std::memory_order_relaxed); }
+void set_wheel_at_holster(bool on, bool save) {
+    if (g_wheel_hol.exchange(on) != on) log::info("[holster] a trigger held at a holster opens the weapon wheel (WheelAtHolster): %s", on ? "on" : "off");
+    if (save) config::set("Holsters", "WheelAtHolster", on ? "1" : "0");
+}
+int wheel_zone(int c) {
+    if (c < 0 || c >= 2 || log::now_ms() - g_wheel_zone_ms.load(std::memory_order_relaxed) > 100.0) return -1;
+    return g_wheel_zone[c].load(std::memory_order_relaxed);
+}
 bool zone_any(int z) { return z >= 0 && z < kZones && gun_zone(g_zones[z]); }
 // the belt piece a holster is on (RingsFollowHolsters): its body::Piece index, body::kPieces the mirrored left holster
 // (while drawn), -1 none
@@ -6761,6 +7113,10 @@ std::string command(const std::string& line) {
             std::string y;
             in >> y;
             pose::set_mounted_first_person(y == "on");
+        } else if (x == "arms") {  // (round 141) holster turret arms free|game: the arms free with the grips open, or the game's always
+            std::string y;
+            in >> y;
+            g_turret_arms_free = y != "game";
         }
         const uintptr_t actor = player_actor();
         uintptr_t wmgr = 0, item = 0, W = 0, info = 0;
@@ -6770,12 +7126,16 @@ std::string command(const std::string& line) {
         float g[16] = {}, f[16] = {};
         rd(W + 0x80, &g);
         rd(W + 0xd0, &f);
-        char b[600];
+        char b[900];
         std::snprintf(b, sizeof(b),
                       "turret: weapon %d | gun a (%.3f %.3f %.3f) b (%.3f %.3f %.3f) c (%.3f %.3f %.3f) at (%.2f %.2f %.2f) | shoot-from a (%.3f %.3f "
-                      "%.3f) b (%.3f %.3f %.3f) c (%.3f %.3f %.3f) at (%.2f %.2f %.2f)",
+                      "%.3f) b (%.3f %.3f %.3f) c (%.3f %.3f %.3f) at (%.2f %.2f %.2f) | hands: active %d, the left on the handle %d (taken %llu), the "
+                      "right on the crank %d (turn %.1f rad/s, firing %d, fired %llu) | rounds %llu (asked one by one %llu, frames with the trigger held %llu), arms free %d",
                       wt, g[0], g[1], g[2], g[4], g[5], g[6], g[8], g[9], g[10], g[12], g[13], g[14], f[0], f[1], f[2], f[4], f[5], f[6], f[8], f[9],
-                      f[10], f[12], f[13], f[14]);
+                      f[10], f[12], f[13], f[14], g_turret.active ? 1 : 0, g_turret.l_held ? 1 : 0, static_cast<unsigned long long>(g_turret.grabs),
+                      g_turret.r_held ? 1 : 0, std::fabs(g_turret.c_rate), g_turret.firing ? 1 : 0, static_cast<unsigned long long>(g_turret.cranks),
+                      static_cast<unsigned long long>(aim::mounted_shots()), static_cast<unsigned long long>(g_turret.pulses),
+                      static_cast<unsigned long long>(g_turret.holds), g_turret_arms_free.load() ? 1 : 0);
         return b;
     }
     if (v == "bases") {  // holster bases: each zone's base, the root and the right (the twins' mirror)
@@ -6926,6 +7286,15 @@ std::string command(const std::string& line) {
         std::string x;
         in >> x;
         g_instant = x != "off";
+    }
+    if (v == "wheelhere") {  // (round 143) holster wheelhere on|off: [Holsters] WheelAtHolster for the session; the zones now
+        std::string x;
+        in >> x;
+        if (x == "on" || x == "off") set_wheel_at_holster(x == "on", false);
+        return "wheel at a holster " + std::string(g_wheel_hol.load() ? "on" : "off") + ": the zones of the controllers' empty hands " +
+               std::to_string(g_wheel_zone[0].load()) + " " + std::to_string(g_wheel_zone[1].load()) + ", assigned " +
+               std::to_string(g_wheel_assigned.load()) + ", lost " + std::to_string(g_wheel_assign_lost.load()) + ", drawn by LT " +
+               std::to_string(g_wheel_lt_draws.load());
     }
     if (v == "on" || v == "off") set_keeps_drawn(v == "on");
     char b[400];

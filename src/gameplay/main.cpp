@@ -485,6 +485,11 @@ uint32_t actor_flags(int32_t actor) {
     if (invoke(0xD39C4A9E, {a}) & 0xff) f |= RDRVR_ACTOR_IN_COVER;   // IS_ACTOR_USING_COVER
     if (invoke(0xF270EAC1, {a}) & 0xff) f |= RDRVR_ACTOR_MOUNTED;    // IS_ACTOR_RIDING_AND_IN_SADDLE (IS_ACTOR_MOUNTED is 0 for the rider)
     if (invoke(0xDC99C124, {a}) & 0xff) f |= RDRVR_ACTOR_DRIVING;    // IS_ACTOR_DRIVING_VEHICLE
+    // (round 141) a passenger: riding a vehicle, not driving it, not in a saddle
+    // (the review) nor on a train (IS_ACTOR_ON_TRAIN: the train's seat and its walk have their own rules, the gate's)
+    if (!(f & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING)) && (invoke(0xDE19A1F9, {a}) & 0xff) &&  // IS_ACTOR_RIDING_VEHICLE
+        !(invoke(0xD36E2D54, {a, 0}) & 0xff))
+        f |= RDRVR_ACTOR_PASSENGER;
     return f;
 }
 
@@ -547,7 +552,7 @@ void mount_state(int32_t actor, uint32_t flags, RdrvrActorState* st) {
     int32_t m = 0;
     if (flags & RDRVR_ACTOR_MOUNTED) {
         m = static_cast<int32_t>(invoke(0xDD31EC4E, {static_cast<uint64_t>(static_cast<uint32_t>(actor))}));  // GET_MOUNT
-    } else if (flags & RDRVR_ACTOR_DRIVING) {
+    } else if (flags & (RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_PASSENGER)) {  // (round 141: a passenger's vehicle too)
         m = static_cast<int32_t>(invoke(0xA0936EB6, {static_cast<uint64_t>(static_cast<uint32_t>(actor))}));  // GET_VEHICLE
         if (m) st->flags |= RDRVR_ACTOR_VEHICLE;
     }
@@ -624,7 +629,15 @@ void camera_tick(uint64_t tick) {
     alignas(16) float pos[4] = {};
     invoke(0x99BD9D6F, {static_cast<uint64_t>(static_cast<uint32_t>(actor)), reinterpret_cast<uint64_t>(pos)});  // GET_POSITION
     float actor_heading = as_f32(invoke(0x42DE39F0, {static_cast<uint64_t>(static_cast<uint32_t>(actor))}));    // GET_HEADING
+    // (round 137, the user in the Assault on Fort Mercer with [Hands] MountedGunFirstPerson: "Could not turn gun"; cycle RU6,
+    // the mission replayed: under the game's own camera the right stick turns the Gatling, with the anchor's camera current
+    // on the channel it does not answer the stick at all) weapons bit 16: a mounted gun in first person: the anchor's
+    // camera kept and placed but taken off the channel, so the game's own camera (its Gatling_Camera) is current and
+    // turns the gun; the core draws the eyes from John's head as in a script's shot (RDRVR_ACTOR_CAM_AWAY)
+    const bool leave = (job.weapons & 16u) != 0;
+    static bool left = false;
     if (!g_cam) {
+        left = false;
         uint64_t layout = invoke(0xB52A3D48, {});  // GET_AMBIENT_LAYOUT
         g_cam = static_cast<int32_t>(invoke(0x0B1569C5, {layout & 0xffffffffu, reinterpret_cast<uint64_t>(kNoName), 0}));
         if (!g_cam) return;
@@ -693,7 +706,19 @@ void camera_tick(uint64_t tick) {
     float ra = job.orient_mode == 2 ? heading : 0.0f, rb = job.orient_mode == 1 ? heading : job.orient_mode == 3 ? -heading : 0.0f,
           rc = job.orient_mode == 0 ? heading : 0.0f;
     invoke(0x486F4461, {static_cast<uint64_t>(g_cam), vec2(ra, rb), f32(rc), 0});                 // SET_CAMERA_ORIENTATION
-    if (job.weapons & 2u) {  // [Body] KeepAnchorCamera: another camera on the channel (a shop's): ours current again
+    // (round 137) a mounted gun in first person: off the channel while it lasts; current again after, once the game's own
+    // gameplay camera holds the channel (bit 8; the review: a mission's shot that takes John off the gun keeps its
+    // camera, as under the rule of 2026-10-11 below; the eyes stay at John's head meanwhile)
+    if (leave && !left) {
+        invoke(0x423DB420, {static_cast<uint64_t>(g_cam), 0});  // REMOVE_CAMERA_FROM_CHANNEL
+        left = true;
+        g_api->log(0, "camera anchor: a mounted gun in first person: our camera off the channel (the game's own turns the gun)");
+    } else if (!leave && left && (job.weapons & 8u)) {
+        invoke(0x3EA55678, {static_cast<uint64_t>(g_cam), 0, 0, 0, 0, 0, 0, 0, 0, 0});  // SET_CURRENT_CAMERA_ON_CHANNEL
+        left = false;
+        g_api->log(0, "camera anchor: the mounted gun left: our camera current again");
+    }
+    if ((job.weapons & 2u) && !leave && !left) {  // [Body] KeepAnchorCamera: another camera on the channel (a shop's): ours current again
         static uint64_t retakes = 0, last_take = 0;
         // 2026-10-10 (the user: stuck before a mid-mission cutscene, no control, the cutscene never shown; its pause menu
         // came up): a mission's script that takes the channel back every tick fought the anchor (about 45 takes a

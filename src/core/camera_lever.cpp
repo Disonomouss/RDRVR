@@ -169,7 +169,10 @@ uint64_t g_tc_build = 0, g_tc_frames = 0, g_tc_far = 0;
 double g_tc_ms = 0.0, g_tc_sum = 0.0, g_tc_log_ms = 0.0;
 const float* train_cam(const float* cam, const RdrvrActorState& st) {
     const int gate = holster::game_gate();
-    if (!g_train_cam.load(std::memory_order_relaxed) || !(gate & 8)) {
+    // (round 141, the user in the Fort Mercer mission's wagon: "movement is stuttery") a passenger in a vehicle as on a
+    // train's seat: his root keeps its place in it
+    const bool passenger = (st.flags & RDRVR_ACTOR_PASSENGER) != 0;
+    if (!g_train_cam.load(std::memory_order_relaxed) || (!(gate & 8) && !passenger)) {
         g_tc_lp_ok = false;
         return cam;
     }
@@ -201,7 +204,7 @@ const float* train_cam(const float* cam, const RdrvrActorState& st) {
     }
     // (cycle RA2: walking, the root runs up to 16 cm ahead of his place, and its start and stop would push the view: measured
     // on any train, taken out only while he sits, the gate's bit 32, where the root keeps its place in the car)
-    if (!(gate & 32)) return cam;
+    if (!(gate & 32) && !passenger) return cam;
     if (!(g_tc_res[0] * g_tc_res[0] + g_tc_res[1] * g_tc_res[1] + g_tc_res[2] * g_tc_res[2] < 0.5f * 0.5f)) {  // (also not a number)
         ++g_tc_far;
         return cam;
@@ -210,9 +213,9 @@ const float* train_cam(const float* cam, const RdrvrActorState& st) {
     for (int k = 0; k < 3; ++k) t_fp_cam[12 + k] = st.camera_pos[k] + g_tc_res[k];
     if (now - g_tc_log_ms > 10000.0 && g_tc_frames) {
         g_tc_log_ms = now;
-        log::info("[cam] seated on a train: the frame's camera steadied on John as drawn; on trains %llu frames so far: the root against his "
+        log::info("[cam] %s: the frame's camera steadied on John as drawn; on trains %llu frames so far: the root against his "
                   "place off its own average by %.0f mm on average, at most %.0f (over 0.5 m, left: %llu); the root from his place now (%.2f %.2f %.2f) m",
-                  static_cast<unsigned long long>(g_tc_frames), g_tc_sum / static_cast<double>(g_tc_frames), static_cast<double>(g_tc_max),
+                  passenger ? "riding in a vehicle" : "seated on a train", static_cast<unsigned long long>(g_tc_frames), g_tc_sum / static_cast<double>(g_tc_frames), static_cast<double>(g_tc_max),
                   static_cast<unsigned long long>(g_tc_far), static_cast<double>(g_tc_lp[0]), static_cast<double>(g_tc_lp[1]), static_cast<double>(g_tc_lp[2]));
     }
     return t_fp_cam;
@@ -786,6 +789,73 @@ std::atomic<bool> g_active{false}, g_log{false};
 std::atomic<uint64_t> g_scenes{0}, g_applied{0};
 thread_local void* t_scene_vp = nullptr;  // the viewport SceneRender is drawing, while it runs
 
+// (round 134: NearPlaneFix's light cone. In Thieves' Landing's house, facing the lit doorway with a script's near plane of
+// 0.5 m, the porch lamp's cone beyond the door was drawn over the door.) The light cones' draw (FUN_140700ee0(the
+// light-volume list), rdr2_lightcone, called by SceneRender at 0x5c4368) gives its shader the near plane of the active
+// camera's own viewport, the master ([[CamManager] + [that +0x48] * 8 + 8] + 0x190, its near at +0x340: 0x700f6f,
+// 0x701b05), not the one the scene is drawn with: the shader reads the depth image, drawn with the eyes' 0.1 m, as drawn
+// with the script's 0.5 m, and takes the door in front of the lamp for farther than the cone. The update thread writes
+// the master's near plane again every frame (cycle RU4: set at the scene's start, it was the script's again at the cones'
+// draw: x64dbg at 0x701b05, the master 0.29, the scene's viewport 0.1), and the frame's own viewport and cull views made
+// the eyes' did not help (cycles RU2, RU3). So the master's near plane is the eyes' around the cones' draw itself, and
+// put back after. (The review) swapped as bits against a value of the hook's own (one step over 0.1: never the game's),
+// so only the hook's own value is ever put back over; an update write inside the call wins (that draw's cones may show
+// for the one frame: counted). Only while this pass's own viewport is drawn with the eyes' near plane. "cam near cones
+// on|off" (test only)
+std::atomic<bool> g_near_cones{true};
+std::atomic<uint64_t> g_near_cones_fixed{0}, g_near_cones_written{0};
+float* master_near_ptr() {  // (the game's own reads of 0x700f6f-0x700f7f: made only when it will make them, a cone listed)
+    __try {
+        const uintptr_t cm = *reinterpret_cast<const uintptr_t*>(anchors::addr(anchors::Id::CamManager));
+        if (!cm) return nullptr;
+        const int32_t idx = *reinterpret_cast<const int32_t*>(cm + 0x48);
+        if (idx < 0 || idx > 7) return nullptr;
+        const uintptr_t cam = *reinterpret_cast<const uintptr_t*>(cm + static_cast<uintptr_t>(idx) * 8 + 8);
+        if (!cam) return nullptr;
+        return reinterpret_cast<float*>(cam + 0x190 + 0x340);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+using LightCones_t = void (*)(void* list);
+LightCones_t o_LightCones = nullptr;
+void hk_LightCones(void* list) {
+    float* p = nullptr;
+    // (its count, list +8: the game reads it at 0x700f64 and leaves without a look at the camera when it is 0)
+    if (list && g_near_cones.load(std::memory_order_relaxed) && g_near_fix.load(std::memory_order_relaxed) &&
+        g_eyes_at_head.load(std::memory_order_relaxed) && t_scene_vp && f32(t_scene_vp, 0x340) <= kEyeNear * 1.02f &&
+        *reinterpret_cast<const uint16_t*>(static_cast<const char*>(list) + 8) != 0)
+        p = master_near_ptr();
+    if (!p) {
+        o_LightCones(list);
+        return;
+    }
+    const float mine_f = std::nextafter(kEyeNear, 1.0f);
+    LONG mine;
+    std::memcpy(&mine, &mine_f, sizeof(mine));
+    volatile LONG* const lp = reinterpret_cast<volatile LONG*>(p);
+    const LONG was = InterlockedExchange(lp, mine);
+    float was_f;
+    std::memcpy(&was_f, &was, sizeof(was_f));
+    if (!(was_f > kEyeNear * 1.02f && was_f < 100.0f)) {  // (the game's own near plane the eyes' already, or no near plane)
+        InterlockedCompareExchange(lp, was, mine);
+        o_LightCones(list);
+        return;
+    }
+    o_LightCones(list);
+    if (InterlockedCompareExchange(lp, was, mine) != mine) g_near_cones_written.fetch_add(1, std::memory_order_relaxed);
+    g_near_game.store(was_f, std::memory_order_relaxed);
+    g_near_cones_fixed.fetch_add(1, std::memory_order_relaxed);
+}
+// (the review) the hook writes through offsets read in the function's body: its own bytes there checked at install
+// (0x700f76: movsxd rax, [rdx+0x48]; mov rax, [rdx+rax*8+8]; add rax, 0x190 | 0x701b05: movss xmm0, [rax+0x340])
+bool light_cones_code_ok() {
+    static const uint8_t a[] = {0x48, 0x63, 0x42, 0x48, 0x48, 0x8b, 0x44, 0xc2, 0x08, 0x48, 0x05, 0x90, 0x01, 0x00, 0x00};
+    static const uint8_t b[] = {0xf3, 0x0f, 0x10, 0x80, 0x40, 0x03, 0x00, 0x00};
+    const uintptr_t f = anchors::addr(anchors::Id::LightConesDraw);
+    return !std::memcmp(reinterpret_cast<const void*>(f + 0x96), a, sizeof(a)) && !std::memcmp(reinterpret_cast<const void*>(f + 0xc25), b, sizeof(b));
+}
+
 Offset current() {
     std::lock_guard lock(g_mutex);
     return g_offset;
@@ -1167,6 +1237,7 @@ void hk_SetCamera(void* vp, const float* cam) {
 }
 
 alignas(16) float g_cover_cam[16];  // the yawed camera handed to the visibility build (it may keep the pointer)
+alignas(16) float g_cover_back_cam[16];  // (round 136) the same drawn back along its view (body::vis_reach)
 
 void hk_VisibilityBuild(void* renderer, void* vp, void* cam_game, void* a4) {
     // [Body] FirstPersonMoments: culled for the anchor's camera too (its copy: the build may keep the pointer)
@@ -1182,7 +1253,17 @@ void hk_VisibilityBuild(void* renderer, void* vp, void* cam_game, void* a4) {
         xr::EyeView v[2];
         if (xr::eye_views_peek(v) && xr_eye_camera(static_cast<const float*>(cam), 2, g_cover_cam, true)) {
             std::memcpy(g_cover_vp, vp, kViewportSize);
-            o_SetCamera(g_cover_vp, g_cover_cam);
+            // (round 136) a prop drawn in a drawn hand is listed by the GAME's hand's place (at horseshoes by John's hip, out
+            // of the view looking down the pitch: the shoe gone from your hand): while such props may be, the list is built
+            // from this camera drawn back along its own view, the same frustum: it holds the eyes' whole view and
+            // everything within an arm's length of them. The forest's level view below keeps the eyes' place
+            float* vis_cam = g_cover_cam;
+            if (const float back = body::vis_reach(); back > 0.0f) {
+                std::memcpy(g_cover_back_cam, g_cover_cam, sizeof(g_cover_back_cam));
+                for (int k = 0; k < 3; ++k) g_cover_back_cam[12 + k] += back * g_cover_back_cam[8 + k];  // (row 2: the camera's back)
+                vis_cam = g_cover_back_cam;
+            }
+            o_SetCamera(g_cover_vp, vis_cam);
             const float m = kCoverMarginDeg / 57.29577951f;
             float hw = 0, hh = 0;
             for (int e = 0; e < 2; ++e) {
@@ -1193,7 +1274,7 @@ void hk_VisibilityBuild(void* renderer, void* vp, void* cam_game, void* a4) {
             if (g_head_cover_builds.fetch_add(1, std::memory_order_relaxed) == 0)
                 log::info("[cam] head cover: culling for the head pose, %.1f x %.1f deg (both eyes + %.0f deg)",
                           2 * std::atan(hw) * 57.29578f, 2 * std::atan(hh) * 57.29578f, kCoverMarginDeg);
-            o_VisibilityBuild(renderer, g_cover_vp, g_cover_cam, a4);
+            o_VisibilityBuild(renderer, g_cover_vp, vis_cam, a4);
             if (g_level_w2s.load(std::memory_order_relaxed) && level_from(static_cast<const float*>(cam), g_cover_cam, g_w2s_cam)) {
                 std::memcpy(g_w2s_vp, g_cover_vp, kViewportSize);
                 o_SetCamera(g_w2s_vp, g_w2s_cam);
@@ -1484,6 +1565,12 @@ bool install() {
     ok = hooks::install("RDR VisibilityBuild", reinterpret_cast<void*>(anchors::addr(anchors::Id::VisibilityBuild)),
                         hk_VisibilityBuild, &o_VisibilityBuild) &&
          ok;
+    // (round 134) an optional anchor: without it a lamp's light cone may show over what hides it while a script's near plane holds
+    if (anchors::present(anchors::Id::LightConesDraw) && anchors::present(anchors::Id::CamManager) &&
+        (!light_cones_code_ok() ||
+         !hooks::install("RDR light cones' draw (NearPlaneFix)", reinterpret_cast<void*>(anchors::addr(anchors::Id::LightConesDraw)), hk_LightCones,
+                         &o_LightCones)))
+        log::warn("[cam] the light cones' draw's hook not installed: with a script's near plane a lamp's light cone may show over what hides it");
     g_level_billboards = config::get_bool("XR", "LevelBillboards", true);
     g_level_grass = config::get_bool("XR", "LevelGrass", true);
     g_level_w2s = config::get_bool("XR", "LevelForestView", true);
@@ -1741,12 +1828,24 @@ void set_first_person_moments(bool on) {
     if (g_fpm.exchange(on) != on) log::info("[cam] first-person moments (a script's camera: the eyes kept at John's head) %s", on ? "on" : "off");
 }
 bool first_person_moments() { return g_fpm.load(); }
+bool first_person_ready() {
+    if (!g_fpm.load(std::memory_order_relaxed)) return false;
+    std::lock_guard lock(g_fp_mutex);
+    return g_fp_ref_ok;
+}
 std::string near_fix_status(int set) {  // "cam near [on|off]" (set: 1 on, 0 off, -1 read): (round 130) the eyes' near plane
     if (set >= 0) g_near_fix = set == 1;
-    char b[200];
-    std::snprintf(b, sizeof(b), "near fix %d: %llu projections put at %.2f m, the game's near plane then %.3f m | the scene's near now %.3f",
-                  g_near_fix.load() ? 1 : 0, static_cast<unsigned long long>(g_near_fixed.load()), kEyeNear, g_near_game.load(), g_scene_near.load());
+    char b[400];
+    std::snprintf(b, sizeof(b), "near fix %d: %llu projections put at %.2f m, the game's near plane then %.3f m | the scene's near now %.3f | "
+                  "the light cones drawn with it %llu times (%s%s), the game's written again meanwhile %llu",
+                  g_near_fix.load() ? 1 : 0, static_cast<unsigned long long>(g_near_fixed.load()), kEyeNear, g_near_game.load(), g_scene_near.load(),
+                  static_cast<unsigned long long>(g_near_cones_fixed.load()), g_near_cones.load() ? "on" : "off", o_LightCones ? "" : ", not hooked",
+                  static_cast<unsigned long long>(g_near_cones_written.load()));
     return b;
+}
+std::string near_cones(int set) {  // "cam near cones on|off" (test only): the light cones' part of the fix
+    if (set >= 0) g_near_cones = set == 1;
+    return near_fix_status(-1);
 }
 std::string train_cam_status(int set) {  // "cam train [on|off]" (set: 1 on, 0 off, -1 read)
     if (set >= 0) g_train_cam = set == 1;

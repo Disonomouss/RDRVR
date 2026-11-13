@@ -44,6 +44,10 @@ void set_head_cover(bool on);
 // choice after their headset round: skinning stayed first person)
 void set_first_person_moments(bool on);
 bool first_person_moments();
+// (round 137) the eyes can be drawn at John's head while another camera holds the channel: the option on and the
+// reference taken (the anchor's own camera seen current and still once this session)
+bool first_person_ready();
+std::string near_cones(int set);        // (round 134, test only) "cam near cones on|off": the light cones' part of it
 std::string near_fix_status(int set);   // (round 130) "cam near [on|off]": the eyes' near plane never a script shot's
 std::string train_cam_status(int set);  // (round 129) "cam train [on|off]": the frame's camera steadied on a train
 std::string fp_status();  // "cam fp": on, frames drawn so, the reference's check against the real camera

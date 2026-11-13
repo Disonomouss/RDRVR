@@ -45,6 +45,7 @@ std::atomic<uint64_t> g_subst{0}, g_frames_drawn{0}, g_subst_at_frame_end{0};
 
 // grab
 std::atomic<int> g_grab_phase{0};  // 1 armed, 2 copied (waiting for the fence), 0 idle
+std::atomic<bool> g_grab_on_shrink{false};  // (round 140) armed by note_hole_shrink instead
 ID3D12CommandAllocator* g_alloc = nullptr;
 ID3D12GraphicsCommandList* g_list = nullptr;
 ID3D12Resource* g_readback = nullptr;
@@ -242,7 +243,8 @@ ID3DBlob* compile(Compile_t fn, const char* entry, const char* target) {
     return SUCCEEDED(hr) ? code : nullptr;
 }
 
-ID3D12PipelineState* make_pso(ID3D12Device* dev, ID3DBlob* ps, DXGI_FORMAT fmt, bool blend) {
+// over: the source premultiplied, laid over what is there (colour and alpha: src + dst (1 - src.a)); else as `blend` says
+ID3D12PipelineState* make_pso(ID3D12Device* dev, ID3DBlob* ps, DXGI_FORMAT fmt, bool blend, bool over = false) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = g_root;
     pd.VS = {g_vs->GetBufferPointer(), g_vs->GetBufferSize()};
@@ -250,7 +252,15 @@ ID3D12PipelineState* make_pso(ID3D12Device* dev, ID3DBlob* ps, DXGI_FORMAT fmt, 
     auto& rt = pd.BlendState.RenderTarget[0];
     rt.RenderTargetWriteMask = blend ? (D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE)
                                      : D3D12_COLOR_WRITE_ENABLE_ALL;
-    if (blend) {
+    if (over) {
+        rt.BlendEnable = TRUE;
+        rt.SrcBlend = D3D12_BLEND_ONE;
+        rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.BlendOp = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    } else if (blend) {
         rt.BlendEnable = TRUE;
         rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
         rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
@@ -515,12 +525,23 @@ void stop(const char* why) {
 
 bool stopped() { return g_stopped.load(); }
 
-std::string grab(const std::string& path, unsigned timeout_ms) {
+void note_hole_shrink() {
+    if (g_grab_on_shrink.exchange(false)) g_grab_phase = 1;
+}
+uint64_t frames_drawn() { return g_frames_drawn.load(std::memory_order_relaxed); }
+
+std::string grab(const std::string& path, unsigned timeout_ms, bool on_shrink) {
     if (!g_ready.load()) return "ERROR the UI target is not made (NOT MEASURED)";
     if (!g_redirect.load()) return "ERROR the redirect is off (NOT MEASURED)";
     ResetEvent(g_done);
-    g_grab_phase = 1;
+    if (on_shrink) {
+        g_grab_phase = 0;  // (the review: a copy armed by a shrink just after an earlier wait's end)
+        g_grab_on_shrink = true;
+    } else {
+        g_grab_phase = 1;
+    }
     if (WaitForSingleObject(g_done, timeout_ms) != WAIT_OBJECT_0) {
+        g_grab_on_shrink = false;
         g_grab_phase = 0;
         return "ERROR no frame drew the UI (NOT MEASURED)";
     }
@@ -626,11 +647,22 @@ bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw
 // The Dead Eye X (deadeye.cpp; after optimumbox's fork, v0.8.11.9, commit ac942427, MIT: his draw_sprites): `dst` (in
 // RENDER_TARGET, an acquired XR image) cleared to transparent, then each sprite's rect drawn from the UI target about
 // its slot, box-filtered at its scale, in the quad's form (linear premultiplied). One list of its own (the [4] view).
+// (round 138, the user: "You can only see the last placed one"; cycle RP8, six marks on one stranger: all six X in their
+// slots in the UI image, one in the eyes) each sprite's rect was written over what was there, its transparent pixels too:
+// marks closer together than an X is wide (several on one man) wiped each other out but the last drawn. The sprites are
+// laid OVER one another now (their own pipeline: the box shader's premultiplied output blended)
+ID3D12PipelineState* g_pso_sprite = nullptr;
+DXGI_FORMAT g_sprite_fmt = DXGI_FORMAT_UNKNOWN;
 bool draw_sprites(ID3D12Resource* dst, DXGI_FORMAT fmt, const Sprite* sp, int n) {
     ID3D12Device* dev = state::device.load();
     ID3D12CommandQueue* q = xr::image_queue();
     if (!has_ui() || !dev || !q || !dst || !ensure_draw(dev)) return false;
-    ID3D12PipelineState* pso = quad_pso(dev, fmt, true);
+    if (!g_pso_sprite || fmt != g_sprite_fmt) {
+        if (g_pso_sprite) g_pso_sprite->Release();
+        g_pso_sprite = make_pso(dev, g_ps_quad_box, fmt, false, true);
+        g_sprite_fmt = fmt;
+    }
+    ID3D12PipelineState* pso = g_pso_sprite;
     if (!pso) return false;
     Draw& d = g_draw_marks;
     const int s = d.slot;

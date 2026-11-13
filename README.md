@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.14 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.15 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -270,7 +270,8 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
 - New in 0.8.10, experimental and off (tried in the developer's simulator only, which cannot put John behind a mounted
   gun): **Mounted guns in first person** (the Guns tab) keeps first person on a mounted gun and turns the gun toward
   where your gun hand points (it learns the gun's barrel from your first shot). While it is on, the right stick no
-  longer turns the gun: if the gun does not follow your hand, turn it off.
+  longer turns the gun: if the gun does not follow your hand, turn it off. (Reworked in 0.8.15: by your hands on its
+  handle and crank, see below.)
 - New in 0.8.10 (tried in the developer's simulator only): **World scale** (the Comfort tab), how big the world looks.
 - Fixed in 0.8.11 (used in the developer's Quest 3): a gun drawn outside and then taken indoors shimmered when held
   still and jittered when moved (one of its draws took your hand's place from the frame before; `[Hands] StaleGunFix`,
@@ -497,6 +498,38 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
     shadow on the ground; off, none.
   - 0.8.13.1's and 0.8.13.2's fix for headsets whose runtime refuses frames (the freeze at the wrist HUD) is judged
     over more frames now: a runtime that refuses only some of them no longer loses the prompts and the menu.
+- New in 0.8.15 (no reset: the settings you changed are kept. On unless you turn them off: mounted guns in first
+  person, horseshoes by your own arm, the duel's right stick not turning you, and the weapon wheel by a trigger at a
+  holster. The weapon wheel is now steered by the sticks, the grip's wheel too ("Weapons by: The weapon wheel"): "The
+  wheel steered by: The hand" keeps the earlier way):
+  - Used in the developer's Quest 3:
+    - **Mounted guns in first person** (the Guns tab), reworked: the view stays at John's head behind the gun, your
+      hands are free until you grip; hold the left grip and move the hand to swing the gun as by its rear handle, hold
+      the right grip and turn the hand in circles as a crank to fire (the faster you turn, the faster it fires, up to
+      the gun's own rate). Used on the Gatling in "The Assault on Fort Mercer"; the Browning and the cannon not yet.
+    - **Horseshoes by your own arm** ("Horseshoes: throw with your own arm", the Gestures tab): the shoe is in your
+      right hand; hold the grip, swing and let go to throw it. The shoe stays in your hand while you hold it.
+    - **The weapon wheel at a holster** ("Hold a trigger at a holster: the weapon wheel", the Holsters tab): with
+      both hands empty, put a hand on a holster and hold its trigger: the game's weapon wheel opens in front of you.
+      The left stick picks the kind of weapon, the right stick left or right the weapon of that kind (the game's
+      D-pad); let go of the trigger and that weapon becomes the holster's and goes into it. A weapon that holster
+      cannot take (a rifle at a hip, unless any weapon may go in any holster) stays in your hand.
+    - **The weapon wheel steered by the sticks** ("The wheel steered by: The sticks / The hand", the Holsters tab):
+      as above for the grip's wheel too ("Weapons by: The weapon wheel"). The Hand keeps the earlier way (move the
+      hand toward a weapon).
+    - **In a duel, the right stick does not turn you** (the Guns tab, with Dead Eye's rows): while the duel's Dead
+      Eye runs, until the marks are fired, so a flick up for an X cannot turn you.
+    - Riding: John's body sits under your view in the saddle from the moment he mounts, not ahead of it.
+    - As a passenger (a wagon, a stagecoach) you turn with the vehicle, as on a train's seat, with the view at
+      John's head.
+    - Dead Eye's X's: every mark's X is drawn (marks close together hid all but the last), and an X no longer
+      flickers as a mark is used up.
+    - The table games: poker's, liar's dice's and five finger fillet's players stay at the table as you sit down
+      (the games left them undrawn while their own cameras looked elsewhere).
+    - The throwing knife is held by the blade, ready to throw. In Undead Nightmare the torch hangs on the belt
+      where the knife's sheath is when you have no knife (or when the knife holster is set to the torch).
+    - Fixed: the lasso's throw showed John's body stepping in front of the view; a lamp's light cone showed in the air
+      at five finger fillet; a horseshoe vanished from the hand after a second.
 
 ## Requirements
 
@@ -514,7 +547,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.14.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.15.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -671,8 +704,10 @@ The body holsters: how you draw and hold, what they follow, placing them by hand
 | Setting | What it does | Default |
 |---|---|---|
 | **Body holsters** | Reach to a holster and grip to draw; let go of the weapon to put it away (anywhere with "Hold the grip to keep the gun", else at its holster). A short buzz marks a holster. | On |
-| ↳ **Weapons by: The holsters / The weapon wheel** | Draw by reaching to the holsters, or hold a grip to open the game's weapon wheel, move toward a weapon and let go (the holsters then draw nothing; the chest still gives rounds). | The holsters |
-| ↳ ↳ **The wheel's hand: its stick is the D-pad** (with the weapon wheel; new in 0.8.12) | While a grip holds the wheel open, push that hand's stick left or right to pick another gun of the highlighted kind (the game's D-pad); the stick neither walks nor turns meanwhile. | On |
+| ↳ **Weapons by: The holsters / The weapon wheel** | Draw by reaching to the holsters, or hold a grip to open the game's weapon wheel, pick a weapon and let go (the holsters then draw nothing; the chest still gives rounds). | The holsters |
+| ↳ ↳ **Hold a trigger at a holster: the weapon wheel** (with the holsters; new in 0.8.15) | With both hands empty, put a hand on a holster and hold that hand's trigger: the game's weapon wheel opens in front of you. Pick a weapon and let go of the trigger: it becomes that holster's weapon and goes into it (let go without picking: nothing changes). A weapon that holster cannot take stays in your hand. | On |
+| ↳ ↳ **The wheel steered by: The sticks / The hand** (new in 0.8.15) | The sticks: the left stick picks the kind of weapon (it stays picked when you let the stick go), the right stick's left and right pick the weapon of that kind (the game's D-pad); neither walks nor turns you while the wheel is open. The hand: move the hand toward a weapon. | The sticks |
+| ↳ ↳ **The wheel's hand: its stick is the D-pad** (with the weapon wheel steered by the hand; new in 0.8.12) | While a grip holds the wheel open, push that hand's stick left or right to pick another gun of the highlighted kind (the game's D-pad); the stick neither walks nor turns meanwhile. | On |
 | ↳ ↳ **The world stands still while the wheel is open** (new in 0.8.12) | While a grip holds the wheel open, the world nearly stops (the game's own time warp, as Dead Eye's) until you let go. Not while Dead Eye is on or a hand holds an object. | On |
 | ↳ ↳ ↳ **The world's speed meanwhile** | How fast the world runs while the wheel is open, 0.01 per press (0.01 to 0.08×): 0.02 is nearly still, 0.08 slow motion. | 0.02× |
 | ↳ **Putting a gun away selects the fists** | Holstering also switches to unarmed, so your fists come up instead of drawing the gun again (since 0.8.11 with both triggers held: "Fists on both triggers"). | On |
@@ -728,10 +763,11 @@ The gun in your hand: the reticle, the scope, how it fires, the free hand, Dead 
 | **Guns touch** (new in 0.8.12) | Your two guns (dual wield, the copy, a carried long gun) and your hands and arms don't pass through each other: a gun that touches the other gun, your other hand or an arm is drawn held against it, with a buzz. With the revolvers cocked by a flick, the other gun swept back across a single action's hammer cocks it. Looks only; a hand holding a round, a magazine, the foregrip or a part is never pushed off it. | On |
 | **Items in the free hand** (new in 0.8.12) | With a gun in one hand, grip at the knife's sheath or the satchel with the other hand to draw the knife, the torch or a throwable into it: the gun stays in hand and keeps aiming, shooting and reloading. A fast stab or slash hits as the game's knife; a fast swing of the torch knocks them and sets them alight; a slow move does neither. Let go of a throwable during a throw and it flies with your hand's speed; let go slowly, or of the knife or the torch, and it goes back where it came from. | On |
 | **The free hand's torch lit (experimental)** (new in 0.8.12) | Undead Nightmare: the torch drawn into your free hand burns with the game's own flame and light. It needs the torch to be one of your weapons the game has ready; otherwise it stays unlit. Needs Items in the free hand. | On |
-| **Mounted guns in first person (experimental)** (new in 0.8.10, not yet tried on a real mounted gun) | The Gatling, the Browning and the cannon: first person kept, John's hands on the gun, and the gun turned toward where your gun hand points (it learns the gun's barrel from your first shot). While on, the right stick no longer turns the gun: if the gun does not follow your hand, turn it off. Off: the game's own camera and aim while you use one. | Off |
+| **Mounted guns in first person (experimental)** (new in 0.8.10, reworked in 0.8.15; used on the Gatling; the Browning and the cannon not yet) | The Gatling, the Browning and the cannon: first person kept, the view at John's head. Your hands are free until you grip. Hold the left grip and move your hand to swing the gun, as by its rear handle; hold the right grip and turn your hand in a circle, as a crank, to fire: the faster you turn, the faster it fires, up to the gun's own rate at about a turn a second (the trigger fires too). Off: the game's own camera and aim while you use one. | On |
 | **Dead Eye level: The game's / 1: slow motion / 2: marks as you sweep / 3: marks by the button** (new in 0.8.12) | Which Dead Eye you use, up to the level the story has unlocked (the row says which): slow motion only, the marks painted as you sweep over targets, or the marks painted with the button. A change applies at the next Dead Eye. | The game's |
 | **Dead Eye's sepia colour** (new in 0.8.12) | Dead Eye's sepia screen colour. Off: the colours stay as they are; the slow motion and the rest stay. | On |
 | **In a duel, the right trigger fires** (new in 0.8.14) | In a duel, flick the right stick up to place each X, then pull the right trigger to fire at them: once your X's score enough to win, the duel ends there and they fire (with too few the time runs on). Off: the game's way (the right trigger places the X's, the duel fires them). Needs the right stick's flick up on. | On |
+| **In a duel, the right stick does not turn you** (new in 0.8.15) | In first person, while a duel's Dead Eye runs (from its start until the marks are fired), pushing the right stick sideways does not turn your view, so a flick up for an X cannot turn you by accident. | On |
 | **Dead Eye's X on each mark** (new in 0.8.12) | The game's X on each target you mark in Dead Eye, drawn on the target in the headset (it showed nowhere before). While marks show, a small part of the floating HUD is left out. Turned on while the game runs, it applies after a restart. | On |
 | ↳ **Its size** | How big each X looks, 0.5° per press (0.5 to 15°). | 3.0° |
 | **Dead Eye marks where the barrel points** (new in 0.8.12) | A mark painted with the button lands on whoever your barrel points at. Off: the game picks the target from its flat camera's view, which in the headset often is not the one you aim at. Turned on after the game started with it off, it applies after a restart. | On |
@@ -820,6 +856,7 @@ Actions you do with your own hand movements.
 | **Throw by hand** | Dynamite, fire bottles, throwing knives and tomahawks fly with your hand's speed and direction: pull the trigger and swing. | On |
 | ↳ **Throw strength** | How hard throws fly, as a multiple of your hand's speed, 0.1 per press (0.5× to 4.0×). | 2.0× |
 | ↳ **Throw by letting go of the grip** (new in 0.7.0) | Hold the grip to hold the throwable, pull the trigger to light or ready it, then swing and let go of the grip to throw. A lit one held too long goes off in your hand; since 0.8.12 dynamite or a fire bottle lit and let go slowly drops from your hand, still lit (`[Gestures] DropLitSlow`). | On |
+| **Horseshoes: throw with your own arm** (new in 0.8.15) | At the game of horseshoes the shoe is in your right hand: hold the grip, swing your arm and let go to throw it. It flies with your hand's speed and direction (times Throw strength). Off: the game's own meter and buttons. | On |
 | **Melee by swing** | A fast swing of either hand punches, stabs with the knife or strikes with the torch. With "Fists on both triggers" on (0.8.11), the fists punch only while both triggers are held, whatever this says. | On |
 | **Lasso by hand** | With the lasso in hand, it is thrown as chosen below; a yank back pulls on the rope. | On |
 | ↳ **Thrown by: Trigger / Swing / Either / Lock on** (Lock on new in 0.8.12) | Trigger: the lasso hand's trigger. Swing: a fast swing toward the aim. Either. Lock on: hold the left trigger (the game's aim) to lock on to the one you look at and spin the lasso, then the right trigger or a throwing swing throws it, whichever hand holds the lasso (left-handed: mirrored). Let go of the left trigger without either and nothing is thrown; keep it held to keep them on the rope. | Lock on |
@@ -975,10 +1012,6 @@ Shown only while Ped Gunfight Overhaul (a separate RedHook mod by another author
   ends up in the gun or in the air.
 - In the theatre the film's own picture pulses in brightness on the flat screen (the room around it is steady in the
   developer's recording: the game's old-film look, as far as that shows).
-- Horseshoes is hard to play from first person: the game's meter and John's swing are made for its own camera. A throw
-  by your own arm is planned.
-- At five finger fillet near a lamp (indoors or at night) the lamp's light can show as a lit cone in the air (seen in
-  the developer's simulator; the fix that keeps the table whole causes it). Being looked into.
 - Looking down the duster's side in the sun, a second outline of the coat can show as a darker patch on the ground
   beside it. Being looked into.
 - A revolver at the right hip can sometimes show a second copy of itself that trails slightly behind (the game's own

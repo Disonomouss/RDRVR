@@ -34,6 +34,7 @@
 #include "core/held_prop.h"
 #include "core/xr.h"
 #include "core/holster.h"
+#include "core/horseshoe.h"
 #include "core/round_draw.h"
 #include "core/hooks.h"
 #include "core/image_mem.h"
@@ -177,6 +178,7 @@ struct Rig {
     int att_wrist[2] = {-1, -1};  // wrist_l_Attachment, wrist_r_Attachment: where the game hangs a held item
     int att_arm[2] = {-1, -1};    // arm_l_Attachment, arm_r_Attachment (poker01 hangs John's second card on the left one)
     int att_elbow[2] = {-1, -1};  // elbow_l_Attachment (poker01 hangs the dealer's deck on it while he deals), elbow_r_Attachment (chips)
+    int att_pelvis = -1;          // pelvis_Attachment (round 135: five finger fillet hangs the knife on it, the animation carries it to his hand)
     int finger[2][15] = {};       // thumb_01..03, finger_11..43 of each hand (-1: absent)
     bool mirror_ok = false;       // the rest skeleton is left/right symmetric across a plane (n . x = c), within 5 mm
     float mir_n[3] = {1, 0, 0}, mir_c = 0, mir_res = 1e9f;
@@ -299,6 +301,9 @@ bool build_rig(uintptr_t data, const std::string& up_name) {
         g_rig.att_wrist[h] = bone_index(bones, count, (std::string("wrist") + sfx + "_Attachment").c_str());
         g_rig.att_arm[h] = bone_index(bones, count, (std::string("arm") + sfx + "_Attachment").c_str());
         g_rig.att_elbow[h] = bone_index(bones, count, (std::string("elbow") + sfx + "_Attachment").c_str());
+        if (h == 0) {
+            g_rig.att_pelvis = bone_index(bones, count, "pelvis_Attachment");
+        }
         int cl = bone_index(bones, count, (std::string("clavicle") + sfx).c_str());
         if (cl >= 0) g_rig.clav_set[h] = subtree(bones, count, cl);
     }
@@ -832,6 +837,43 @@ uint64_t g_cloth_check_frame = ~0ull;  // (the draw hook, under g_draw_mutex)
 std::atomic<uint64_t> g_cloth_pin_calls{0}, g_cloth_pin_fixed{0}, g_cloth_pin_stale{0}, g_cloth_pin_others{0}, g_cloth_pin_bad{0};
 std::atomic<float> g_cloth_pin_move{0.0f};  // the last shifted cloth's largest point move (m)
 std::atomic<bool> g_cloth_pin_hooked{false};  // the display write's hook installed (else ClothFollows stays, ClothPins idle)
+// (round 134, a diagnostic for the headset: the duster's second outline (the user's picture of 2026-11-11: a patch of
+// shadowed ground with the coat's outline beside the coat) came in no simulator cycle, RP1 and RU1-RU5, over 80 views.)
+// Its two possible sources counted where they would show: John's set as each pass of a frame draws it, the root's place
+// (the coat hangs on it) after the frame's correction, and the cloth's vertex buffer the draws take (one of four a frame,
+// by the index at RDR+0x2ac1eac the update thread sets at its frame's start: 0x5c5e02; read at draw time: 0x15fdb4).
+// The first pass of a frame against the later ones; under g_draw_mutex, said in the coat's 10 s line
+struct PassRoot {
+    uint64_t frame = ~0ull;
+    float root[3] = {};
+    int32_t idx = -1;
+};
+PassRoot g_pass_root;
+// (round 135; the user's video VirtualDesktop.Android-20261111-184908-0.mp4 and their log: the root and the buffer the same
+// in every pass, 0 of 400,000 draws; the coat's cloth is not in the picture where the shadowed patch has its outline)
+// the cloth's own geometry draws counted: by the pass of the entity call they are made in (0-7), or outside any (8). Its
+// model and geometry index learned at its display write (the game's own choice: FUN_140a07c70); plain atomics
+std::atomic<uintptr_t> g_cloth_model{0};
+std::atomic<uint32_t> g_cloth_gi{0};
+std::atomic<uint64_t> g_cloth_geom_draws[9] = {};
+uintptr_t g_cloth_model_of = 0;  // (the display write's thread) the controller it was learned for
+void cloth_model_learn(uintptr_t ctrl) {
+    if (ctrl == g_cloth_model_of) return;
+    uintptr_t drw = 0, sel = 0, lodp = 0, models = 0, model = 0;
+    int32_t lod = -1;
+    uint32_t mi = 0, gi = 0;
+    if (!rd(ctrl + 0xd0, &drw) || !drw || !rd(ctrl + 0xd8, &sel)) return;
+    if (!sel && (!rd(ctrl + 0xe0, &sel) || !sel)) return;
+    if (!rd(sel + 0x60, &lod) || !rd(sel + 0x64, &mi) || !rd(sel + 0x68, &gi) || lod < 0 || lod > 3 || mi > 255 || gi > 255) return;
+    if (!rd(drw + 0x50 + static_cast<uintptr_t>(lod) * 8, &lodp) || !lodp || !rd(lodp, &models) || !models ||
+        !rd(models + static_cast<uintptr_t>(mi) * 8, &model) || !model)
+        return;
+    g_cloth_gi.store(gi, std::memory_order_relaxed);
+    g_cloth_model.store(model, std::memory_order_relaxed);
+    g_cloth_model_of = ctrl;  // (the review: only once learned; tried again at each write until then)
+}
+uint64_t g_pass_root_n = 0, g_pass_root_apart = 0, g_pass_idx_changed = 0;
+float g_pass_root_max = 0.0f;
 std::atomic<uintptr_t> g_john_cloth_ctrl{0};  // the controller last found John's ("skel body clothsrc": its skinned source)
 // run 5 (held_prop): the world correction that moves a draw now at (Rc: its axes as columns, pc) onto the wanted pose
 // (12 floats: the axes X, Y, Z, then the position): A = Rt Rc^T, a = pt - A pc
@@ -4245,6 +4287,31 @@ std::atomic<uint64_t> g_still_off_cam{0};  // (the body job's, outside g_draw_mu
 // over 1.5 m (a teleport, a new mount) re-learns it: the body stays where it sat in the saddle standing.
 std::atomic<bool> g_body_with_cam{true};
 std::atomic<uint64_t> g_still_resets{0}, g_still_resets_riding{0}, g_still_kept_riding{0};
+// (round 135, the user: "When you get on a horse and start moving immediately, Johns body is either too far back or too
+// far forward. It moves to a good place if you stop the horse for a moment. Need to be in the right place immediately."
+// Their logs of 2026-11-11: riding off at once, the offset held was the one learned on foot, (0.00 1.81 0.05), 0.44 m
+// from the riding one, (0.00 1.82 0.49), for the whole ride: learned only while the camera stands.) Riding with the
+// saddle anchor, the offset is known without standing: the camera stands at the rider's head as averaged over the mount,
+// plus the view's lift and forward offset, so its offset from his root is his own skeleton's head against its root, one
+// frame's (cycle MG1: the actor's GET_POSITION against the mount's was 0.36 m off the standing offset at a canter, the
+// head's bone lagging the mount). It is taken once the frame's camera stands at the saddle (the review: the job carries
+// the saddle a tick or two before the camera is there; known by the live offset within 0.2 m of the saddle's, level) and
+// followed for his first 2.5 s in the saddle while he moves under 3 m/s (his place is the script tick's: its lag grows
+// with the speed), over 0.6 s (round 136: the gait's swing averaged out); standing and after that the old rule (learned standing, held moving: the
+// body rigid with the camera whatever the gallop does to his seat). Counted and shown in "skel still"
+// (round 140, their log of 2026-11-12: twice the held offset 0.64-0.67 m ahead against the live 0.20-0.26, two and three
+// seconds into a ride. The old gallop traces (run 12): the camera stands 0.10-0.15 m ahead of his root at rest and at a
+// walk and 0.25-0.37 m at a gallop (it follows his head, averaged over 1 s, and he leans); mounting, his head swings
+// further. So the offset "by his skeleton" of the first 2.5 s was whatever lean those seconds had, frozen: the "two
+// places" of cycles HP1-HP13.) Now: by the saddle the body is at its RESTING place under the camera from the frame he
+// sits, and stays there for the ride (rigid with the camera: the holsters stay under the player's hands at a gallop);
+// the rest is the offset of a calm stand (the place the user called good), remembered for the session and learned
+// slowly at each stand, before the first one 0.07 m (his resting head over his root) plus the view's own offsets
+constexpr float kRideRest = 0.07f, kRideRestSpan = 0.10f;
+std::atomic<uint64_t> g_still_by_saddle{0}, g_still_rest_learned{0};
+double g_seat_view_end_ms = -1e12;  // (round 142) the last frame with the seated view (the body's frame thread)
+float g_ride_diag[9] = {};  // the resting offset, the live one, the held one (right, up, forward), the last riding frame
+bool g_ride_diag_by = false;
 bool g_still_init = false;
 float g_feet_err[2] = {0, 0};  // run 10 item 9 stage 2: each drawn foot's distance from its animated place (m), the last set
 float g_knee_deg[2] = {0, 0}, g_knee_rng[2][2] = {{1e9f, -1e9f}, {1e9f, -1e9f}}, g_hip_h[2] = {0, 0};  // run 10 item 8b (under g_draw_mutex)
@@ -6105,6 +6172,9 @@ extern std::atomic<uint32_t> g_belt_model_mask;  // (round 103; below)
 // with a place lit on it, the part's glow (glow_draw; off: one thread-local read)
 void hk_draw_geom(uintptr_t shader, uintptr_t model, uint64_t gi, uintptr_t mset, uint64_t a5, uint64_t a6) {
     note_draw_thread();  // (item 4.2)
+    if (model && model == g_cloth_model.load(std::memory_order_relaxed) &&
+        static_cast<uint32_t>(gi & 0xffffffffull) == g_cloth_gi.load(std::memory_order_relaxed))
+        g_cloth_geom_draws[t_dve_live ? static_cast<int>(t_draw_pass & 7) : 8].fetch_add(1, std::memory_order_relaxed);
     if (g_belt_model_mask.load(std::memory_order_relaxed)) belt_model_geom_note(model, mset, reinterpret_cast<uintptr_t>(_ReturnAddress()));
     draw_geom_game(shader, model, gi, mset, a5, a6);
     if (t_glow) glow_draw(shader, model, gi, mset, a5, a6);
@@ -9654,6 +9724,7 @@ struct HandRigid {
     float p0[3] = {};    // (the re-review) its own place then (world): a prop the world holds (a chip by a planted hand) never moves
     int n = 0;           // frames in a row rigid since
     bool moved = false, on = false;
+    bool shoe = false;   // (round 136) at the right hand's attachment (within 5 cm) when its run began: the horseshoe, while one is held
     uint64_t frame = ~0ull;
 };
 constexpr int kHandRigid = 32;
@@ -9668,6 +9739,20 @@ std::atomic<float> g_hand_rigid_dp{0.0f}, g_hand_rigid_dot{1.0f};  // the last r
 // properly"; no run was ever taken) while a minigame runs, the draws of props on a hand's or an arm's attachment drawn
 // with that hand's correction [left, right]
 std::atomic<uint64_t> g_table_hand_draws[2] = {};
+// (round 136, the user at horseshoes: "the horseshoe was in johns hand for a second, then it was gone. You could still
+// throw"; cycle RP5, a shoe hung on John's wrist as the script hangs it: in the drawn hand while the eyes look down at
+// his hip, gone looking ahead or up, and looking up not one of its draws reaches the entity hook) a prop drawn with a
+// hand's correction is listed for the frame where the GAME has it, by his animated hand: at horseshoes that hand hangs
+// by his hip, out of the view when you look down the pitch, and the visibility build leaves the shoe out of the frame's
+// list. While a hand's prop may be drawn away from its place (a held horseshoe; round 141: no longer a table game,
+// where the camera drawn back stood behind a wall and the other players were gone) the build's camera is
+// drawn back along its view by vis_reach() (camera_lever's hook): the same frustum then holds the eyes' whole view and
+// everything within an arm's length of them, whatever the head's turn. (Cycle RP6: that alone shows the shoe looking
+// ahead and up; the draw's own cull, the pass's planes, did not hide it.) "skel body handvis <0|1>"
+std::atomic<int> g_hand_vis_mode{1};
+std::atomic<uint64_t> g_hand_vis_builds{0};
+constexpr float kHandVisBack = 1.3f;  // (an arm's length over the sine of the smaller half angle, 54 deg)
+std::atomic<uint64_t> g_table_pelvis_draws{0};  // (round 135) of them a prop at the pelvis attachment given to a hand (fillet's knife)
 // (round 121, the user: "Deck when it is johns deal moves with left hand always. Chips stack move with right hand. Can
 // they both sit on the table? Deck in hand when John is actively dealing though") a prop near a hand's attachment is that
 // hand's only once it has moved with the game's hand: each time the hand's attachment has moved 1.5 cm in the world
@@ -9828,6 +9913,7 @@ void hands_move_tick(const BuildBones& b) {
 // a held one's answer: seated in a minigame with both hands still, -2 (drawn as the game has it: the deck on the table)
 int hand_rigid_answer(const HandRigid* e) {
     if (!e->on) return -1;
+    if (e->hand == 1 && e->shoe && horseshoe::holds()) return 1;  // (round 133: the horseshoe is the right hand's whatever the hands do)
     return g_hands_move.rest ? -2 : e->hand;
 }
 int hand_rigid(const float* rc, uintptr_t drawable, uintptr_t inst) {
@@ -9888,6 +9974,10 @@ int hand_rigid(const float* rc, uintptr_t drawable, uintptr_t inst) {
         std::memcpy(e->p0, rc + 12, sizeof(e->p0));
         e->n = 0;
         e->moved = e->on = false;
+        // (round 136) the shoe hangs at the wrist's attachment (within 3 cm, cycle RP6); cycle RP5: the game's holstered
+        // revolver, 6 to 24 cm from his hanging hand, was taken for the right hand's too and drawn in it beside the shoe.
+        // (The review: under the revolver's nearest; whether a horseshoe is held is asked where the flag is used)
+        e->shoe = hand == 1 && best_d < 0.05f * 0.05f;
         e->frame = g_body_frame;
     };
     // (item 4.1's review) a held one judged the frame before the pause stays held across its jump (judged rigid again below)
@@ -9919,7 +10009,9 @@ int hand_rigid(const float* rc, uintptr_t drawable, uintptr_t inst) {
         const float wx = rc[12] - e->p0[0], wy = rc[13] - e->p0[1], wz = rc[14] - e->p0[2];
         e->moved = mx * mx + my * my + mz * mz > 0.05f * 0.05f && wx * wx + wy * wy + wz * wz > 0.05f * 0.05f;
     }
-    if (!e->on && e->moved && e->n >= 8) {
+    // (round 133) the horseshoe the script hung on his right wrist: the hand's without a move first (the game's arm stands
+    // still until the script's swing is asked for)
+    if (!e->on && (e->moved || (e->shoe && horseshoe::holds())) && e->n >= 8) {
         e->on = true;
         if (g_hand_rigid_on.fetch_add(1, std::memory_order_relaxed) < 20)
             log::info("[props] a prop held rigid in John's %s hand's frame (drawable %llx, %.0f mm from the hand attachment): matched to that hand",
@@ -11437,11 +11529,11 @@ uint64_t hk_obj_set_matrix(uintptr_t obj, const float* m) {
                                                  static_cast<double>(A[k * 3 + 2]) * src[14] + ad[k]);
     g_place_buf[15] = src[15];
     fixed_grip_placed(lf ? 0 : 1, A, ad, g_place_buf);
-    {  // [Gestures] ThrowByGrip: the readied throwing knife by its tip, turned 180 deg about its local axis through the
-       // pivot c: the other two axes negated, the origin moved by 2 c along them
+    {  // [Gestures] ThrowByGrip: the throwing knife by its tip (round 142: whenever it is in hand), turned 180 deg about its
+       // local axis through the pivot c: the other two axes negated, the origin moved by 2 c along them
         int ax = 0;
         float c[3];
-        if (aim::knife_tip(&ax, c)) {
+        if (aim::knife_tip(item_w, &ax, c)) {
             for (int i = 0; i < 3; ++i) {
                 if (i == ax) continue;
                 for (int k = 0; k < 3; ++k) {
@@ -12793,6 +12885,28 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     }
                 }
                 transform_set(sm, count, 0, g_frame, off_cur);
+                if (g_cloth_pins_cfg.load(std::memory_order_relaxed)) {  // (round 134, the diagnostic: PassRoot)
+                    const float rt[3] = {sm[3] + off_cur[0], sm[7] + off_cur[1], sm[11] + off_cur[2]};
+                    // (the review: a plain read, never a checked one in the draw hook: a static of the image that the game's
+                    // own draws read just so, 0x15fdb4)
+                    static const volatile int32_t* const cip =
+                        anchors::present(anchors::Id::ClothDrawIndex) ? reinterpret_cast<const volatile int32_t*>(anchors::addr(anchors::Id::ClothDrawIndex)) : nullptr;
+                    const int32_t ci = cip ? *cip : -1;
+                    if (g_pass_root.frame != g_body_frame) {
+                        g_pass_root.frame = g_body_frame;
+                        std::memcpy(g_pass_root.root, rt, sizeof(rt));
+                        g_pass_root.idx = ci;
+                    } else {
+                        const float dx = rt[0] - g_pass_root.root[0], dy = rt[1] - g_pass_root.root[1], dz = rt[2] - g_pass_root.root[2];
+                        const float d = 1000.0f * std::sqrt(dx * dx + dy * dy + dz * dz);
+                        ++g_pass_root_n;
+                        if (std::isfinite(d)) {
+                            if (d > 1.0f) ++g_pass_root_apart;
+                            if (d > g_pass_root_max) g_pass_root_max = d;
+                        }
+                        if (ci != g_pass_root.idx) ++g_pass_idx_changed;
+                    }
+                }
                 if (const int pv = g_rig.pelvis; pv > 0 && pv < count && static_cast<size_t>(pv) * 3 + 2 < g_rig.jbind.size()) {
                     const float* m = sm + pv * 12;  // (the shadows round: the eyes' pelvis, for the outside draw's against it)
                     const float* j = &g_rig.jbind[static_cast<size_t>(pv) * 3];
@@ -13128,7 +13242,47 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                         const float d = dx * dx + dy * dy + dz * dz;
                         if (d < td) td = d, th = side, tab = ab;
                     }
-                    if (th >= 0 && (best < 0 || td <= best_d || best == g_rig.att_arm[th])) {
+                    // (round 135, the user at five finger fillet with John's own arms: "knife is to right of hand"; their
+                    // picture: the knife beside the fist, a few centimetres off) fivefingerfillet hangs the knife on
+                    // pelvis_attachment and the animation carries that bone to his hand: the props' match gave it the
+                    // pelvis attachment's correction, the hips', while the hand is drawn with the arm's. While its script
+                    // runs with his own arms, a prop at the pelvis attachment is the nearer hand's (judged on its own
+                    // attachment, as the cards)
+                    bool at_pelvis = false;
+                    if (g_rig.att_pelvis >= 0 && body::table_game_arms() && !g_frame.ik[0] && !g_frame.ik[1] &&
+                        (holster::minigame() & 4) != 0 && holster::minigame_fresh()) {
+                        const float* pp = nullptr;
+                        const float* wp_[2] = {nullptr, nullptr};
+                        for (size_t i = 0; i * 3 + 2 < ap.size(); ++i) {
+                            const int ab = g_rig.attach[i];
+                            if (ab == g_rig.att_pelvis) pp = &ap[i * 3];
+                            for (int sd = 0; sd < 2; ++sd)
+                                if (ab >= 0 && ab == g_rig.att_wrist[sd]) wp_[sd] = &ap[i * 3];
+                        }
+                        if (pp) {
+                            const float dx = rc[12] - pp[0], dy = rc[13] - pp[1], dz = rc[14] - pp[2];
+                            const float d = dx * dx + dy * dy + dz * dz;
+                            // (the review) also with a hand's attachment within 3 cm (the bone is in his fist): the pelvis
+                            // attachment the nearer of the two is the prop's own
+                            if (d < 0.03f * 0.03f && (th < 0 || d <= td)) {
+                                float dn = 0.25f * 0.25f;  // (the knife's hold: within a hand's length of that wrist)
+                                int ps = -1;
+                                for (int sd = 0; sd < 2; ++sd) {
+                                    if (!wp_[sd]) continue;
+                                    const float ex = rc[12] - wp_[sd][0], ey = rc[13] - wp_[sd][1], ez = rc[14] - wp_[sd][2];
+                                    const float e2 = ex * ex + ey * ey + ez * ez;
+                                    if (e2 < dn) dn = e2, ps = sd;
+                                }
+                                if (ps >= 0) {
+                                    th = ps;
+                                    td = d;
+                                    tab = g_rig.att_pelvis;
+                                    at_pelvis = true;
+                                }
+                            }
+                        }
+                    }
+                    if (th >= 0 && (best < 0 || td <= best_d || best == g_rig.att_arm[th] || (at_pelvis && best == g_rig.att_pelvis))) {
                         int held_now = 0, hside = th;
                         {
                             std::lock_guard lock(g_draw_mutex);
@@ -13147,6 +13301,7 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                             best = g_rig.att_wrist[hside];
                             best_d = td;
                             g_table_hand_draws[hside].fetch_add(1, std::memory_order_relaxed);
+                            if (at_pelvis) g_table_pelvis_draws.fetch_add(1, std::memory_order_relaxed);
                         } else {
                             best = -1;  // drawn as the game has it (on the table)
                         }
@@ -14571,6 +14726,7 @@ int cloth_display_shift(uintptr_t ctrl, uintptr_t* cur_out) {
         return 0;
     }
     g_john_cloth_ctrl.store(ctrl, std::memory_order_relaxed);
+    cloth_model_learn(ctrl);  // (round 135: for its draws' count)
     // (round 127, the user on round 126's coat: "Still flickers slightly") each point is moved only WITHIN the game's hips'
     // frame: taken in the live hips' frame (this frame's, as the cloth is), put through the correction as of the frame it
     // was made for (the hips' change below the waist to the upper spine's above), kept as its place in the drawn hips'
@@ -14738,6 +14894,10 @@ void cloth_measure(uintptr_t ctrl, int np) {
 // handle, then the flag at +8). While blackjack's script runs (asked every script tick by its name) at a table game, a
 // "do not draw" for an actor other than John, or for an object, goes on as "draw". The other table games hide theirs as
 // before (liar's dice, five finger fillet and arm wrestling each hide a player at times). "skel drawkeep"
+// (round 142, the user: "When sitting down to play poker and five finger fillet, opponents disappear", still after round
+// 141's change: the scripts hide them too: poker01 SET_DRAW_ACTOR(player, 0) for every player but John at its
+// shots (poker01.txt:20009), fivefingerfillet its opponent (fivefingerfillet.txt:12258, 8776)) actors kept drawn at
+// poker and five finger fillet as at blackjack (objects at blackjack only: the dealer's deck)
 using ActorSetDraw_t = void (*)(uintptr_t actor, bool draw);
 using NativeHandler_t = void (*)(uintptr_t ctx);
 ActorSetDraw_t o_actor_set_draw = nullptr;
@@ -14761,15 +14921,22 @@ bool draw_keep_now() {  // (the review: by the script alone: the holsters' poll 
     if (g_draw_keep_test.load(std::memory_order_relaxed)) return true;
     return g_draw_keep_cfg.load(std::memory_order_relaxed) && blackjack_runs();
 }
+// (round 142) an actor's "do not draw" kept as "draw": blackjack, five finger fillet (minigame bit 4) or poker (32); (round
+// 145) liar's dice (2) too: its setup hides the other players until John's idle plays (liarsdice.txt:13438, as fillet's)
+bool draw_keep_actor_now() {
+    if (draw_keep_now()) return true;
+    return g_draw_keep_cfg.load(std::memory_order_relaxed) && (holster::minigame() & (2 | 4 | 32)) != 0 && holster::minigame_fresh();
+}
 bool draw_keep_john(uintptr_t actor) {  // John's own actor (never kept drawn); also when his actor cannot be told (the review)
     if (g_draw_keep_test.load(std::memory_order_relaxed)) return false;
     const uintptr_t john = player_actor_ptr();
     return !john || actor == john;
 }
 void hk_actor_set_draw(uintptr_t actor, bool draw) {
-    if (!draw && actor && draw_keep_now() && !draw_keep_john(actor)) {
-        if (g_draw_kept[0].fetch_add(1, std::memory_order_relaxed) < 10)
-            log::info("[props] blackjack: an actor (%p) told not to be drawn: kept drawn (the dealer, for the game's own camera)", reinterpret_cast<void*>(actor));
+    if (!draw && actor && draw_keep_actor_now() && !draw_keep_john(actor)) {
+        if (g_draw_kept[0].fetch_add(1, std::memory_order_relaxed) < 20)
+            log::info("[props] a table game (%s): an actor (%p) told not to be drawn: kept drawn (a player hidden for the game's own camera)",
+                      blackjack_runs() ? "blackjack" : (holster::minigame() & 32) ? "poker" : (holster::minigame() & 2) ? "liar's dice" : "five finger fillet", reinterpret_cast<void*>(actor));
         draw = true;
     }
     o_actor_set_draw(actor, draw);
@@ -14805,7 +14972,52 @@ void hk_cloth_display(uintptr_t ctrl, float* m) {
     if (n > 0) cloth_measure(ctrl, n);
 }
 
+// (round 145, the user: poker "still hid them", their video at the bunkhouse table (poker_hen): the table and its chairs
+// empty for 4 s as John sat, the players back as the hand began) poker01's start turns the game's character clipping off
+// (RENDERING_ENABLE_CHARACTER_CLIPPING 0x6AF07F86 (0): its handler 0x1406fa7e0 sets [*0x142ac50d0]+0x687; each view's
+// setup 0x140684b78 keeps its flags' bit 0x20 only while that byte is on). With it off, while the sit-down's own camera
+// stands at a far seat of that small table, the players are not drawn in the eyes at John's head; the flat game shows that
+// camera's shot, which never looks at them. Cycle RU15 at that table: as the user saw; the native (1) from the press: the
+// players drawn throughout; (1) kept for the whole game: John's own hat in the seated view. So: on (1) from the sit-down
+// (poker's script running, the control held) until the hand begins (the minigame's flag), then the script's own off (0)
+// back while poker still runs; any other end left as it is (the script's cleanup turns it on). [Debug] BlackjackDealerShown.
+std::atomic<uint64_t> g_clip_sent{0};
+std::atomic<bool> g_clip_on_pub{false};
+bool g_clip_on = false;
+double g_clip_since = 0.0, g_clip_last = 0.0;
+uint64_t g_clip_req = 0;
+void clip_send(int v, double now) {
+    if (g_clip_req) api::cancel_op(g_clip_req);  // (its result never read: dropped)
+    const uint64_t a[1] = {static_cast<uint64_t>(v)};
+    g_clip_req = api::queue_native(0x6AF07F86u, a, 1, 0, nullptr);
+    g_clip_last = now;
+    g_clip_sent.fetch_add(1, std::memory_order_relaxed);
+}
+
 }  // namespace
+
+void table_clip_frame() {
+    const int gate = holster::game_gate();
+    const bool poker = (holster::minigame() & 32) != 0 && holster::minigame_fresh();
+    const bool want = g_draw_keep_cfg.load(std::memory_order_relaxed) && poker && (gate & 2) && !(gate & 1);
+    const double now = log::now_ms();
+    if (want) {
+        if (!g_clip_on) {
+            g_clip_on = true;
+            g_clip_since = now;
+            g_clip_last = -1e12;
+            log::info("[props] poker's sit-down (gate %d): the game's character clipping kept on (the players drawn at John's head)", gate);
+        }
+        // at most once a second, for 20 s at most (the sit-down takes 4-6 s)
+        if (now - g_clip_since < 20000.0 && now - g_clip_last >= 1000.0) clip_send(1, now);
+    } else if (g_clip_on) {
+        g_clip_on = false;
+        if (poker) clip_send(0, now);  // the script's own value while it runs
+        log::info("[props] poker's sit-down over after %.1f s (gate %d): the character clipping %s", (now - g_clip_since) / 1000.0, gate,
+                  poker ? "back off, as the script has it" : "left to the script");
+    }
+    g_clip_on_pub.store(g_clip_on, std::memory_order_relaxed);
+}
 
 // ---- [Holsters] InteractionHighlights=parts (run 29 item 2): the glow on the gun's surface, its switches and its status
 bool part_glow_live(int id) {
@@ -15884,6 +16096,22 @@ void set_locks_torso(bool on) {
     g_cfg_lock_torso = on;
 }
 
+// (round 136) how far the visibility build's camera is drawn back along the view (m; 0: not): while a table game or a held
+// horseshoe has props drawn in the drawn hands, away from the game's hands (the update thread: atomics only)
+float vis_reach() {
+    if (!(g_hand_vis_mode.load(std::memory_order_relaxed) & 1) || !g_held_fix_cfg.load(std::memory_order_relaxed) ||
+        g_hand_rigid_mode.load(std::memory_order_relaxed) == 0 || !g_active.load(std::memory_order_relaxed))
+        return 0.0f;
+    // (round 141, the user: "When sitting down to play poker and five finger fillet, opponents disappear." Cycle RP15,
+    // John's back to a house's wall: the camera drawn back 1.3 m stood on the wall's other side, and the list was the
+    // other side's: the yard's people gone, the view dark. At a table his chair is by a wall, and the cards and the
+    // knife are over the table, in the view: no table game draws it back any more. A held horseshoe still does: a pitch
+    // is in the open, and the shoe hangs by his hip)
+    if (!horseshoe::holds() && g_hand_rigid_mode.load(std::memory_order_relaxed) != 2) return 0.0f;
+    g_hand_vis_builds.fetch_add(1, std::memory_order_relaxed);
+    return kHandVisBack;
+}
+
 void on_visibility_build() {  // sampled always (the left-handed transplant needs the side); HeldPropFix gates the use
     aim::throw_hold_tick();      // [Gestures] ThrowByGrip: a held throw's clip pinned, or let go
     HeldSample h;
@@ -16265,7 +16493,16 @@ void before_scene(const float* cam) {
     // while a table game runs, John drawn as the game seats him
     // (the review) by the view's own state (at the head, or easing back from it), not the minigame flag: the body seated
     // exactly while the view is at the seated head
-    if (stance != 0 && pose::table_game_view_active()) {
+    // (round 142) and not turned by the facing lock: the view stands at his head as the game has it, so the body must stand
+    // as the game has it too (the user, a passenger: "when you turn your head, it strays from John's body"; on the
+    // mounted gun the grips held the game's arms "only to the initial position": the lock turned John, who turns with
+    // the gun, back to the view's heading, and his arms off the gun)
+    const bool seat_view = pose::table_game_view_active();
+    if (seat_view) {
+        lock_facing = false;
+        g_seat_view_end_ms = log::now_ms();  // (the lock eased back in from here once it ends)
+    }
+    if (stance != 0 && seat_view) {
         stance = 0;
         g_table_seated_frames.fetch_add(1, std::memory_order_relaxed);
     }
@@ -16393,6 +16630,42 @@ void before_scene(const float* cam) {
                     const float a = static_cast<float>(1.0 - std::exp(-dt / 0.5));
                     const bool riding = (flags & RDRVR_ACTOR_MOUNTED) != 0;
                     const bool keep = riding && g_body_with_cam.load(std::memory_order_relaxed);  // [Horse] BodyWithCamera
+                    // (round 140) riding with the saddle anchor: the body at its RESTING place under the camera, from the
+                    // frame he sits down and for the whole ride (r0: remembered from the last calm stand of the session,
+                    // before the first one his resting head over his root, 0.07 m, plus the view's own offsets)
+                    const float tv[3] = {ov[0], ov[1], ov[2]};
+                    bool by_saddle = false;
+                    static bool by_was = false, rode = false, r0_ok = false;
+                    static float r0[3] = {}, seed[3] = {}, seed_l = 0.0f, seed_f = 0.0f;  // (seed: the rest before any stand)
+                    static double by_since = -1e12, stand_since = -1.0;
+                    bool armed = false;  // (a gun in hand: his aiming lean is no rest)
+                    if (!keep) rode = false;  // (a ride's own: the next mount takes the resting place at once again)
+                    if (keep) {
+                        RdrvrActorState rs{};
+                        float sd_l = 0.0f, sd_f = 0.0f;
+                        if (api::actor_state(&rs) && rs.valid && rs.mount && pose::saddle_camera(&sd_l, &sd_f)) {
+                            by_saddle = true;
+                            armed = rs.weapon >= 0;
+                            if (r0_ok && (sd_l != seed_l || sd_f != seed_f)) {
+                                // (the review) the view's lift or forward offset changed in the menu: the rest with it
+                                r0[1] += sd_l - seed_l, seed[1] += sd_l - seed_l;
+                                r0[2] += sd_f - seed_f, seed[2] += sd_f - seed_f;
+                                seed_l = sd_l, seed_f = sd_f;
+                            }
+                            if (!r0_ok) {
+                                // the height: the one held on foot (the view's own over the still body: the same riding,
+                                // their logs of 2026-11-11: 1.81 on foot, 1.82 riding), else the bind head's with the lift
+                                const float y0 = jh + sd_l - (s_pd_ok ? s_pd : 0.0f);
+                                r0[0] = 0.0f;
+                                r0[1] = o_ok && std::fabs(o_lp[1] - y0) < 0.15f ? o_lp[1] : y0;
+                                r0[2] = kRideRest + sd_f;
+                                r0_ok = std::isfinite(r0[1] + r0[2]);
+                                if (!r0_ok) by_saddle = false;
+                                std::memcpy(seed, r0, sizeof(seed));
+                                seed_l = sd_l, seed_f = sd_f;
+                            }
+                        }
+                    }
                     // (2026-11-04, GOAL-next-items item 8: John's body inside the horse, the camera right; not in the
                     // simulator) riding, the held offset more than 0.25 m from the live one for a second: said, at most
                     // one each 5 s and 100 a session, with what the held one was learned or kept by
@@ -16403,7 +16676,8 @@ void before_scene(const float* cam) {
                         seen_ms = now;
                         const float g = std::sqrt((ov[0] - o_lp[0]) * (ov[0] - o_lp[0]) + (ov[1] - o_lp[1]) * (ov[1] - o_lp[1]) +
                                                   (ov[2] - o_lp[2]) * (ov[2] - o_lp[2]));
-                        if (riding && o_ok && g > 0.25f) {
+                        // (round 140: not by the saddle, where the held one is the resting place whatever his lean)
+                        if (riding && o_ok && !by_saddle && g > 0.25f) {
                             if (gap_since < 0.0) gap_since = now;
                             if (now - gap_since >= 1000.0 && now - said_ms >= 5000.0 && said < 100) {
                                 said_ms = now;
@@ -16420,17 +16694,67 @@ void before_scene(const float* cam) {
                             gap_since = -1.0;
                         }
                     }
-                    if (o_ok && jump > 0.3f && jump <= 1.5f && dt <= 1.0 && keep) g_still_kept_riding.fetch_add(1, std::memory_order_relaxed);
-                    if (!o_ok || jump > (keep ? 1.5f : 0.3f) || dt > 1.0) {
+                    if (o_ok && jump > 0.3f && jump <= 1.5f && dt <= 1.0 && keep && !by_saddle) g_still_kept_riding.fetch_add(1, std::memory_order_relaxed);
+                    if (by_saddle) {
+                        // (round 140) the resting place: taken at once as he sits down (the one learned on foot gone:
+                        // "Need to be in the right place immediately"), eased to within the ride (the saddle's job
+                        // missing a tick, the rest's own learning), never the live one: the body stays rigid with the
+                        // camera whatever the gait does to his lean
+                        const bool first = !rode || !o_ok || dt > 1.0;
+                        if (!by_was || first) {  // (the review: also after frames this block was skipped: the stand timed anew)
+                            if (!by_was) by_since = now;
+                            stand_since = -1.0;
+                        }
+                        if (first) {
+                            std::memcpy(o_lp, r0, sizeof(o_lp));
+                            if (!o_ok || dt > 1.0) c_speed = 0.0f;
+                            if (!rode)  // (the review: at most 60 a session: a mounted flag that flickers says it each time)
+                                log::limited("body.ride.rest", 60,
+                                             "[body] riding: the body at its resting place under the camera (%.3f %.3f %.3f) from this frame; the "
+                                             "live offset (%.3f %.3f %.3f); the rest learned standing in %llu frames so far",
+                                             r0[0], r0[1], r0[2], ov[0], ov[1], ov[2], static_cast<unsigned long long>(g_still_rest_learned.load()));
+                        } else {
+                            const float a2 = static_cast<float>(1.0 - std::exp(-dt / 0.25));
+                            for (int k = 0; k < 3; ++k) o_lp[k] += (r0[k] - o_lp[k]) * a2;
+                        }
+                        rode = true;
+                        g_still_by_saddle.fetch_add(1, std::memory_order_relaxed);
+                        // the rest learned: the horse standing for 2.5 s (his lean's average, 1 s, run out), 4 s into the
+                        // ride (the mounting's own), the live offset within 0.25 m of the rest (no odd pose: cycle GL1,
+                        // his head 0.5 m ahead for 3 s standing), over 2 s. (The review) Not with a gun in hand (he leans
+                        // to aim), not in a hitch's frame, and never further than 0.10 m from the rest before any stand:
+                        // a long lean on a standing horse cannot walk it to the lean's place
+                        if (c_speed < 0.1f) {
+                            if (stand_since < 0.0) stand_since = now;
+                        } else {
+                            stand_since = -1.0;
+                        }
+                        if (armed) stand_since = -1.0;
+                        // (round 141, cycle HP18: at a stand John pats his horse's neck, his head 0.3 m ahead for seconds: within
+                        // 0.25 m that walked the rest 0.10 m, to its bound: within 0.08 m now, a sway's reach)
+                        if (stand_since >= 0.0 && now - stand_since >= 2500.0 && now - by_since >= 4000.0 && dt < 0.1 &&
+                            (ov[0] - r0[0]) * (ov[0] - r0[0]) + (ov[2] - r0[2]) * (ov[2] - r0[2]) < 0.08f * 0.08f && std::fabs(ov[1] - r0[1]) < 0.08f) {
+                            const float a3 = static_cast<float>(1.0 - std::exp(-dt / 2.0));
+                            for (int k = 0; k < 3; ++k) {
+                                r0[k] += (ov[k] - r0[k]) * a3;
+                                r0[k] = std::fmax(seed[k] - kRideRestSpan, std::fmin(r0[k], seed[k] + kRideRestSpan));
+                            }
+                            g_still_rest_learned.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    } else if (!o_ok || jump > (keep ? 1.5f : 0.3f) || dt > 1.0) {
                         if (o_ok) {
                             g_still_resets.fetch_add(1, std::memory_order_relaxed);
                             if (riding) g_still_resets_riding.fetch_add(1, std::memory_order_relaxed);
                         }
-                        std::memcpy(o_lp, ov, sizeof(o_lp));
+                        std::memcpy(o_lp, tv, sizeof(o_lp));
                         c_speed = 0.0f;
-                    } else {
-                        if (c_speed < 0.1f)
-                            for (int k = 0; k < 3; ++k) o_lp[k] += (ov[k] - o_lp[k]) * a;
+                    } else if (c_speed < 0.1f) {
+                        for (int k = 0; k < 3; ++k) o_lp[k] += (ov[k] - o_lp[k]) * a;
+                    }
+                    by_was = by_saddle;
+                    if (riding) {
+                        for (int k = 0; k < 3; ++k) g_ride_diag[k] = r0_ok ? r0[k] : 0.0f, g_ride_diag[3 + k] = ov[k], g_ride_diag[6 + k] = o_lp[k];
+                        g_ride_diag_by = by_saddle;
                     }
                     o_ok = true;
                     f.still_t[0] = f.cam[12] - (ch * o_lp[0] - sh * o_lp[2]);
@@ -16445,6 +16769,15 @@ void before_scene(const float* cam) {
             prev_ok = true;
             f.still = true;
             f.ride_keep = (flags & RDRVR_ACTOR_MOUNTED) && g_body_with_cam.load(std::memory_order_relaxed);
+            // (round 138, the user: "When you throw the lasso, you can see johns body step in front of the camera"; cycle
+            // RP8, a throw at a stranger recorded: for two tenths of a second John's whole body stood 0.7 m ahead of the
+            // eyes, seen from behind; "skel still": 168 sets refused in that throw) the throw's animation lunges his spine
+            // over 0.5 m from the pinned place, and those sets took the animation's pose. With the lasso in hand the
+            // still body is pinned while the animation is within 1.5 m, as riding (a fall or a ragdoll is farther)
+            {
+                RdrvrActorState ls{};
+                if (api::actor_state(&ls) && ls.weapon == 21) f.ride_keep = true;  // (the lasso)
+            }
             {
                 std::lock_guard lock(g_cfg_mutex);
                 f.still_feet = g_cfg_still_feet;
@@ -16597,10 +16930,16 @@ void before_scene(const float* cam) {
         // (round 130, the user with it on: "Liars dice does not work, is better without the setting. Make it unaffected by it")
         // not while liar's dice's script runs (holster::minigame bit 2); (round 132: "Johns hands don't interact with the
         // game, so exclude it from the option like with liars dice. Give users control of their hands") nor blackjack's (bit 1)
+        // (round 133) nor at horseshoes with the shoe thrown by your own arm ([Gestures] HorseshoeThrow)
         const bool table_arms = g_table_arms_cfg.load(std::memory_order_relaxed) && holster::table_game() && !(holster::game_gate() & 1) &&
-                                !(holster::minigame() & 3);
+                                !(holster::minigame() & 3) && !horseshoe::active();
         if (table_arms && hh == 0) g_table_arms_frames.fetch_add(1, std::memory_order_relaxed);
-        f.ik[hh] = !pose::on_mounted_gun() && !table_arms;  // (2026-10-13: a mounted gun: the targets kept for its aim, the arms left on its handles)
+        // (2026-10-13: a mounted gun: the arms left on its handles. Round 139, cycle RU6: a free arm following its controller
+        // there brought the old fault back, the gun's own matrix comes from his animated hand and the gun spun with it.
+        // Round 141, the user: "Hands should snap on to gun, be free when not holding grips": the drive reads the barrel
+        // from the shoot-from matrix alone now (the turret's own bone), and a hand whose grip is open follows its
+        // controller; held, the arm is the game's again, on the handle or the crank)
+        f.ik[hh] = (!pose::on_mounted_gun() || holster::turret_hand_free(f.ctrl[hh])) && !table_arms;  // (the review: by its controller)
         if (hh == 1 && g_ik_test.load()) {  // along the actor's forward (the root bone's -z), level
             float fx = -w[8], fz = -w[10], fl = std::sqrt(fx * fx + fz * fz);
             if (fl > 1e-3f) {
@@ -16769,6 +17108,10 @@ void before_scene(const float* cam) {
             az /= al;
             f.yaw = std::atan2(az * cfx - ax * cfz, ax * cfx + az * cfz);
             f.lock = true;
+            // (round 142, the review) back from the seated view (no lock there): the lock's turn eased in over 0.5 s, so the
+            // body turns to the view's heading instead of popping round
+            const double since = log::now_ms() - g_seat_view_end_ms;
+            if (since >= 0.0 && since < 500.0) f.yaw *= static_cast<float>(since / 500.0);
         }
     }
     // the shift, in the world: back along the root's forward (the model faces the root bone's -z: measured, a +z shift
@@ -17045,11 +17388,33 @@ void before_scene(const float* cam) {
                         an = g_cloth_anchor_n, ae = g_cloth_anchor_est, am = g_cloth_anchor_max;
                         sn = g_cloth_step_n, ss = g_cloth_step_sum, smx = g_cloth_step_max;
                     }
+                    uint64_t pn = 0, pa = 0, pi = 0;
+                    float pm = 0.0f;
+                    char cg[160] = "";
+                    {
+                        int at = 0;
+                        for (int k = 0; k < 9 && at < static_cast<int>(sizeof(cg)) - 24; ++k)
+                            if (const uint64_t c = g_cloth_geom_draws[k].load(std::memory_order_relaxed)) {
+                                if (k < 8)
+                                    at += std::snprintf(cg + at, sizeof(cg) - static_cast<size_t>(at), " pass %d: %llu", k, static_cast<unsigned long long>(c));
+                                else
+                                    at += std::snprintf(cg + at, sizeof(cg) - static_cast<size_t>(at), " outside a call: %llu", static_cast<unsigned long long>(c));
+                            }
+                    }
+                    {
+                        std::lock_guard lock(g_draw_mutex);
+                        pn = g_pass_root_n, pa = g_pass_root_apart, pi = g_pass_idx_changed, pm = g_pass_root_max;
+                        g_pass_root_max = 0.0f;  // (the review: each 10 s's own largest)
+                    }
                     log::info("[body] 10 s: the coat written in the game's hips' frame %llu times so far (left as the game's %llu); the hips in the "
                               "root's frame: a write against its frame's draw, %llu frames, off mean %.2f max %.2f mm; one frame to the next mean "
-                              "%.2f max %.2f mm",
+                              "%.2f max %.2f mm | a frame's later passes against its first, %llu draws: the root over 1 mm apart in %llu (at most "
+                              "%.1f mm in these 10 s), the cloth's buffer another in %llu | the cloth's own draws so far:%s",
                               static_cast<unsigned long long>(placed), static_cast<unsigned long long>(g_cloth_place_refused.load()),
-                              static_cast<unsigned long long>(an), an ? ae / an : 0.0, am, sn ? ss / sn : 0.0, smx);
+                              static_cast<unsigned long long>(an), an ? ae / an : 0.0, am, sn ? ss / sn : 0.0, smx,
+                              static_cast<unsigned long long>(pn), static_cast<unsigned long long>(pa), static_cast<double>(pm),
+                              static_cast<unsigned long long>(pi),
+                              cg[0] ? cg : g_cloth_model.load(std::memory_order_relaxed) ? " none seen (its model known)" : " its model not learned");
                 }
             }
             {  // (round 120) a minigame's props on the hands' and arms' attachments, drawn with the hand's correction
@@ -17062,9 +17427,12 @@ void before_scene(const float* cam) {
                 }
                 if (th[0] != th0[0] || th[1] != th0[1] || th[2] != th0[2] || th[3] != th0[3])
                     log::info("[props] 10 s, a minigame: props on the hands' and arms' attachments drawn with the hand's correction: left %llu, right %llu; "
-                              "by his other attachments as the game's %llu; held in a resting hand as the game's %llu (his pelvis %.2f m over his place)",
+                              "by his other attachments as the game's %llu; held in a resting hand as the game's %llu (his pelvis %.2f m over his place); "
+                              "at the pelvis attachment given to a hand (fillet's knife) %llu so far | the frames listed from a camera drawn "
+                              "back (the hands' props kept in the list) %llu so far",
                               static_cast<unsigned long long>(th[0] - th0[0]), static_cast<unsigned long long>(th[1] - th0[1]),
-                              static_cast<unsigned long long>(th[2] - th0[2]), static_cast<unsigned long long>(th[3] - th0[3]), pel_h);
+                              static_cast<unsigned long long>(th[2] - th0[2]), static_cast<unsigned long long>(th[3] - th0[3]), pel_h,
+                              static_cast<unsigned long long>(g_table_pelvis_draws.load()), static_cast<unsigned long long>(g_hand_vis_builds.load()));
                 for (int i = 0; i < 4; ++i) th0[i] = th[i];
             }
             {  // (round 95) a copy turned off the gun in hand since the last line
@@ -17681,7 +18049,8 @@ std::string command(const std::string& line) {
         if (v == "test" || v == "notest") g_draw_keep_test = v == "test" ? 1 : 0;
         return std::string("draw keep ") + (g_draw_keep_cfg.load() ? "1" : "0") + " (hooked " + (g_draw_keep_hooked.load() ? "1" : "0") + ", test " +
                std::to_string(g_draw_keep_test.load()) + ", blackjack's script " + (blackjack_runs() ? "1" : "0") + "): kept drawn: actors " +
-               std::to_string(g_draw_kept[0].load()) + ", objects " + std::to_string(g_draw_kept[1].load()) + " | the world's at first sight " +
+               std::to_string(g_draw_kept[0].load()) + ", objects " + std::to_string(g_draw_kept[1].load()) + " | poker's sit-down clipping on " +
+               (g_clip_on_pub.load() ? "1" : "0") + ", sent " + std::to_string(g_clip_sent.load()) + " | the world's at first sight " +
                std::to_string(g_world_first.load());
     }
     if (sub == "prerun") {  // skel prerun [on|off]: (round 130) the frame's corrections made ahead of John's own draw
@@ -18875,7 +19244,7 @@ std::string command(const std::string& line) {
             if (v == "reset") return "still diagnostic reset";
         }
         static const char* const kName[kStillDiag] = {"pelvis", "spine00", "spine03", "clavicle_l", "clavicle_r", "arm_l", "arm_r", "head", "foot_l", "foot_r", "holster"};
-        char b[200];
+        char b[360];
         std::snprintf(b, sizeof(b), "still: stance %d, %llu frames, sets pinned %llu, refused %llu, frames not under the camera %llu |", st,
                       static_cast<unsigned long long>(g_still_n), static_cast<unsigned long long>(g_still_sets),
                       static_cast<unsigned long long>(g_still_refused), static_cast<unsigned long long>(g_still_off_cam.load()));
@@ -18887,6 +19256,11 @@ std::string command(const std::string& line) {
         std::snprintf(b, sizeof(b), " knees L %.1f (%.1f..%.1f) R %.1f (%.1f..%.1f) deg, hips over the feet L %.3f R %.3f m, feet off their planted place L %.4f R %.4f m |",
                       g_knee_deg[0], g_knee_rng[0][0], g_knee_rng[0][1], g_knee_deg[1], g_knee_rng[1][0], g_knee_rng[1][1], g_hip_h[0], g_hip_h[1],
                       g_feet_err[0], g_feet_err[1]);
+        r += b;
+        std::snprintf(b, sizeof(b), " riding, by the saddle %d: the resting offset (%.3f %.3f %.3f), live (%.3f %.3f %.3f), held (%.3f %.3f %.3f); "
+                      "by the saddle %llu frames, the rest learned standing in %llu |", g_ride_diag_by ? 1 : 0, g_ride_diag[0], g_ride_diag[1], g_ride_diag[2], g_ride_diag[3], g_ride_diag[4],
+                      g_ride_diag[5], g_ride_diag[6], g_ride_diag[7], g_ride_diag[8], static_cast<unsigned long long>(g_still_by_saddle.load()),
+                      static_cast<unsigned long long>(g_still_rest_learned.load()));
         r += b;
         for (int i = 0; i < kStillDiag; ++i) {
             const float* q = g_still_rng[i];
@@ -19501,6 +19875,9 @@ std::string command(const std::string& line) {
             g_hand_rigid_mode = s == "off" ? 0 : s == "always" ? 2 : 1;
             std::lock_guard lock(g_draw_mutex);
             for (HandRigid& x : g_hand_rigid) x = HandRigid{};
+        } else if (v == "handvis") {  // (round 136) 1: the visibility build's camera drawn back while a hand's prop may be; 0 never
+            int n = 1;
+            if (in >> n) g_hand_vis_mode = n & 1;
         }
         char out[600];
         std::snprintf(out, sizeof(out),
@@ -19517,11 +19894,11 @@ std::string command(const std::string& line) {
                       static_cast<unsigned long long>(g_head_foreign.load()), static_cast<unsigned long long>(g_head_lost.load()));
         std::string o = out;
         {  // (GOAL-doorway-and-poker item 2) props held rigid in a hand's frame
-            char hb[640];
+            char hb[760];
             std::snprintf(hb, sizeof(hb), " | hand-held props %llu, their draws %llu (mode %d; judged near a hand %llu, restarted %llu: the last %.1f mm, "
                           "dot %.4f; not judged, the table full %llu; kept across a pause %llu; a minigame's, by the attachments: left %llu, right %llu, "
                           "judged left on the table %llu, not judged (full) %llu, by John's other attachments left as the game's %llu, "
-                          "held in a resting hand drawn as the game's %llu)",
+                          "held in a resting hand drawn as the game's %llu) | handvis %d: builds drawn back %llu",
                           static_cast<unsigned long long>(g_hand_rigid_on.load()),
                           static_cast<unsigned long long>(g_hand_rigid_draws.load()), g_hand_rigid_mode.load(),
                           static_cast<unsigned long long>(g_hand_rigid_near.load()), static_cast<unsigned long long>(g_hand_rigid_restarts.load()),
@@ -19529,7 +19906,8 @@ std::string command(const std::string& line) {
                           static_cast<unsigned long long>(g_hand_rigid_kept.load()), static_cast<unsigned long long>(g_table_hand_draws[0].load()),
                           static_cast<unsigned long long>(g_table_hand_draws[1].load()), static_cast<unsigned long long>(g_table_left.load()),
                           static_cast<unsigned long long>(g_table_full.load()), static_cast<unsigned long long>(g_table_arm_left.load()),
-                          static_cast<unsigned long long>(g_table_rest_draws.load()));
+                          static_cast<unsigned long long>(g_table_rest_draws.load()), g_hand_vis_mode.load(),
+                          static_cast<unsigned long long>(g_hand_vis_builds.load()));
             o += hb;
         }
         {  // the remembered props: each one's bone, head, and instance (whose they are)

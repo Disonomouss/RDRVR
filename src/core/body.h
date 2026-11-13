@@ -19,6 +19,8 @@ namespace rdrvr::body {
 bool install();  // the entity draw hook
 bool hide_enabled();         // [Body] HideHead
 void set_hide_enabled(bool on);
+// (round 145) poker's sit-down: the game's character clipping kept on until the hand begins (body.cpp); each frame
+void table_clip_frame();
 int stance();                // [Body] Stance: 0 the game's animation, 1 upper body upright, 2 the forward/back lean removed, 3 still
 void set_stance(int s);
 float body_back();           // [Body] BodyBack: metres the drawn body sits behind the camera's place
@@ -147,6 +149,9 @@ void set_transplant_fingers(int mode);  // also written to the user ini
 // The visibility build (camera_lever.cpp's hook, the update thread, just before the game builds its draw records):
 // the item in hand's game matrix is sampled, so the draws of its prop are known by that matrix ([Body] HeldPropFix).
 void on_visibility_build();
+// (round 136) how far (m) the visibility build's camera is drawn back along the view, 0 not: while props are drawn in the
+// drawn hands away from the game's (a table game, a held horseshoe), so that the frame's list has what is by the eyes
+float vis_reach();
 // The drawn body's points for the holsters (world, from the latest corrected player set): each hand's wrist target
 // (where the IK puts the wrist: the controller), the holster bones and the root joint. False when stale (250 ms).
 // 6 the lasso (its rope bone: the Lasso holster, 2026-10-13)

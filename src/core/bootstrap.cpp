@@ -57,6 +57,7 @@
 #include "core/reload.h"
 #include "core/gestures.h"
 #include "core/gun_melee.h"
+#include "core/horseshoe.h"
 #include "core/offhand.h"
 #include "core/controls.h"
 #include "core/test_channel.h"
@@ -168,6 +169,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     controls::init();
     pose::init();
     holster::init();
+    horseshoe::init();  // (round 133) [Gestures] HorseshoeThrow
     aim::init();
     scope::init();  // (r55 item 11) [Scope]
     reload::init();
@@ -214,6 +216,7 @@ DWORD WINAPI bootstrap_thread(void*) {
         eye_shape::install();
         body::install();
         holster::install();
+        horseshoe::install();  // (round 133) its four hooks
         aim::install();
         dual::install();
         deadeye::install();

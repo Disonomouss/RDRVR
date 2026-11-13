@@ -19,6 +19,17 @@ void set_wheel_mode(bool on, bool save);
 // controls::pad, each poll: free[c] is controller c's grip down and free (not the holsters', a grab's, a part's).
 // Returns true for the controllers whose grip the wheel takes this poll (taken[c]); drives the pad's override itself.
 void poll(double now_ms, const bool free[2], bool taken[2]);
+// (round 143, the user: "Add option to have holding a trigger while hand is on a holster open the weapon wheel. Then
+// whatever weapon you select is put into that holster.") [Holsters] WheelAtHolster, off: with the holsters (not
+// Mode=wheel), a trigger pulled with its hand empty at a holster (trig_zone[c], the holsters' own test) opens the same
+// wheel, steered by that hand as above; the trigger let go picks (in the dead zone: nothing). The pick's holster is
+// handed to the holsters (take_assign) to become its weapon, the weapon put away into it. taken_trig[c]: that
+// controller's trigger held back from the game while it holds the wheel.
+void poll_triggers(const bool trig[2], const int trig_zone[2], bool taken_trig[2]);
+// the last trigger-wheel pick: the holster, the weapon in hand at the pick, the controller; once (false: none)
+bool take_assign(int* zone, int* weapon_before, int* ctrl);
+// a trigger-wheel cancelled (the weapon in hand then); once. The game may draw the last weapon at the cancel's LB
+bool take_cancel(int* weapon_before);
 bool open();          // the wheel's button held by the mod now
 // The controller whose grip holds the wheel open now (-1: none). controls::pad: that hand's stick is the D-pad while it
 // is (2026-10-26, the user: "should be able to use joystick of whichever hands grip opened it to act as dpad. So you can
@@ -26,6 +37,14 @@ bool open();          // the wheel's button held by the mod now
 int holder();
 bool stick_dpad();
 void set_stick_dpad(bool on, bool save);
+// (round 145, the user: "Weapon wheel should be controlled with joysticks. Left to select gun catagory, right as D pad to
+// switch between each gun within the catagory.") [Holsters] WheelSteer=sticks (the default; hand: as before): every
+// wheel the mod holds open (a grip's in Mode=wheel, a trigger's at a holster) takes the layout's left stick as the game's
+// wheel stick (kept where last pushed past 0.6; never pushed: a cancel) and the layout's right stick's left and right as
+// the D-pad (controls::pad); neither stick walks nor turns meanwhile. poll_sticks: the layout's left stick, before poll.
+void poll_sticks(const float left[2]);
+bool steer_by_sticks();
+void set_steer_by_sticks(bool on, bool save);
 void cancel();        // the pad's poll stopped (the menu, no controllers): the wheel let go, nothing committed
 // The hand-placed wheel ([Holsters] WheelAtHand, on): while open, where its quad goes (LOCAL: the hand at the press, the
 // head's turn then) and the UI target's rect it shows (fractions x0 y0 x1 y1, [Holsters] WheelRect). False: no quad.

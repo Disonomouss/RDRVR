@@ -29,6 +29,11 @@ bool sepia();
 // from the right stick flicked up, FlickUpRB); off by default
 bool duel_trigger_fires();
 void set_duel_trigger_fires(bool on, bool save = true);
+// (round 138) [DeadEye] DuelNoTurn (off): while a duel runs the right stick does not turn the view; in_duel(): the game's
+// duel mode on now (player info +0x3be bit 2: from the duel's Dead Eye's start to its end; read once a frame, pose's)
+bool duel_no_turn();
+void set_duel_no_turn(bool on, bool save = true);
+bool in_duel();
 void set_sepia(bool on);  // also written to the user ini
 
 // Run 28 item 1c (after optimumbox's fork, v0.8.11.9, commit ac942427, MIT; research\run28\deadeye.md):

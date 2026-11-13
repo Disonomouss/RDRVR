@@ -94,6 +94,7 @@ add_library(rdrvr_core SHARED
     src/core/wheel.cpp
     src/core/gun_melee.cpp
     src/core/offhand.cpp
+    src/core/horseshoe.cpp
     src/core/pgo.cpp
     src/core/probe.cpp
     src/core/dual.cpp

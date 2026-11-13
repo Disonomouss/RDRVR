@@ -200,6 +200,10 @@ typedef struct RdrvrActorState {
 #define RDRVR_ACTOR_MOUNTED 4u    // IS_ACTOR_RIDING_AND_IN_SADDLE (a horse; IS_ACTOR_MOUNTED stays 0 for the rider)
 #define RDRVR_ACTOR_DRIVING 8u    // IS_ACTOR_DRIVING_VEHICLE (a wagon, a coach)
 #define RDRVR_ACTOR_VEHICLE 16u   // run 10 item 3: the mount fields hold the driven vehicle (GET_VEHICLE), not a horse
+// (round 141, the user: riding in the mission's wagon and in a stagecoach "John does not turn with" it) riding a vehicle
+// without driving it (IS_ACTOR_RIDING_VEHICLE; cycle RU8, the Fort Mercer wagon: 1 with IS_ACTOR_DRIVING_VEHICLE 0, and
+// GET_VEHICLE gives the wagon): the mount fields hold the vehicle then too (RDRVR_ACTOR_VEHICLE with it)
+#define RDRVR_ACTOR_PASSENGER 64u
 #define RDRVR_ACTOR_CAM_AWAY 32u  // 2026-10-12: the anchor's scripted camera made but not current on channel 0 (a script's holds it)
 
 typedef struct RdrvrApi {

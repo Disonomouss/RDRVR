@@ -21,7 +21,11 @@ void set_redirect(bool on);
 // redirect is off for this start and set_redirect(true) keeps it off; the UI stays in the game's own image.
 void stop(const char* why);
 bool stopped();
-std::string grab(const std::string& path, unsigned timeout_ms = 3000);
+std::string grab(const std::string& path, unsigned timeout_ms = 3000, bool on_shrink = false);
+// (round 140, a test's) the Dead Eye X's hole made smaller on the game thread: a grab waiting for that is armed, so the
+// picture written is the one shown at the first frame end after the shrink ("grabui <file> shrink")
+void note_hole_shrink();
+uint64_t frames_drawn();  // the frames whose UI was drawn into the target so far
 void status_text(char* out, size_t len);
 // Step 2. While the redirect is on, each frame's UI is also drawn back onto the monitor's back buffer (blended in
 // display space, the game's Gamma applied), so the desktop keeps its HUD. For the XR quad layer (presenting thread,

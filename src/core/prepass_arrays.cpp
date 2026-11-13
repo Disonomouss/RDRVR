@@ -2288,7 +2288,26 @@ bool take_skip_clear() {
     t_skip_clear = false;
     return s;
 }
-bool predication_off() { return g_pred_off.load(std::memory_order_relaxed); }
+// (round 136, a test: "prepass pred off|game") the game's occlusion predicates dropped in pass 1 too. The game leaves a
+// draw out of the picture when its occlusion query (a box, where the GAME has the thing) counted no pixel, while the
+// depth pass before it draws everything: a guess at the duster's dark outline. The user with it on as an option
+// ([Render] DrawOccluded, round 138): "Nothing changed": not it; the option taken out again (round 139), the test
+// command kept
+std::atomic<bool> g_pred_force_off{false};
+std::atomic<uint64_t> g_pred_dropped{0};
+bool predication_off() {
+    if (g_pred_off.load(std::memory_order_relaxed)) return true;
+    if (!g_pred_force_off.load(std::memory_order_relaxed)) return false;
+    g_pred_dropped.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+std::string predication_force(int set) {
+    if (set >= 0) g_pred_force_off = set == 1;
+    char b[120];
+    std::snprintf(b, sizeof(b), "predication in pass 1: %s (dropped by the switch %llu)", g_pred_force_off.load() ? "off" : "the game's",
+                  static_cast<unsigned long long>(g_pred_dropped.load()));
+    return b;
+}
 void set_instanced(bool on) {
     if (on && !g_inst_hooked.load()) {
         log::warn("[prepass] instanced not on: start with [Stereo] PrepassInstanced=1, PrepassArrays=1, PrepassViews=2 and InstancedShaders");
