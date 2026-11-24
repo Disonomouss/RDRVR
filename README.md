@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.16 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.16.1 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -530,6 +530,10 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
       where the knife's sheath is when you have no knife (or when the knife holster is set to the torch).
     - Fixed: the lasso's throw showed John's body stepping in front of the view; a lamp's light cone showed in the air
       at five finger fillet; a horseshoe vanished from the hand after a second.
+- New in 0.8.16.1 (a hotfix; no reset): the developer's own placed rounds (each round's place in the left hand,
+  pistol-sized rounds, rifle rounds and shells; the right hand mirrors them) are now the default for "Place each round
+  by hand". They replace "The round in your" place for those rounds: if you had set your own there, press "Forget the
+  placed rounds" (the Reloading tab, for each hand) to use it again.
 - New in 0.8.16 (no reset: the settings you changed are kept. On unless you turn them off: the lean while breaking a
   horse, and no gun drawn by the triggers in the saddle):
   - Used in the developer's Quest 3:
@@ -571,7 +575,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.16.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.16.1.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -840,7 +844,7 @@ Reloading by hand, where the rounds come from, the round in your hand, every gun
 | **Rounds seen in the hand: Off / The mod's rounds / The game's shotgun shells too** (was "A round seen in the hand" before 0.8.12) | Draws the rounds you took between your fingers (and the row at the chest). The game's shotgun shells too: a shotgun's shells are the game's own model, lit by the game. | The mod's rounds |
 | **Each gun's own round (the new models)** (new in 0.8.12) | Each gun's round at its real size, textured and lit as the game's own props. Off: the old simple rounds. | On |
 | **The round in your: Left hand / Right hand**, then **Offset / Direction / Turn / Tilt / Brightness** (each hand its own since 0.8.12) | Where the round sits in that hand's fingers (2 mm per press, up to 20 cm), which way it points (Along the fingers, Out of the hand, or Custom by its turn and tilt, 5° per press, each all the way round), and how bright the drawn rounds are (0.25 per press, the chest's too). The right hand uses the left's until you set it. | Custom: left turn 0°, tilt −50°; right turn −175°, tilt −65°; brightness 0.50 |
-| ↳ **Place each round by hand** (new in 0.8.16) | The menu closes. Take rounds at the chest with a gun in the other hand and hold the hand still where you look at it: one round stays still in the air while the others follow your hand. Move your hand until that round sits right in your fingers, then press A or X on the gun hand: it is set, and the next round stays still (B or Y goes back one). Pistol-sized rounds (the revolvers', the pistols', the repeaters'), rifle rounds and shotgun shells (and the Blunderbuss's cartridges) are each set apart; a hand not set uses the other's, mirrored. Once placed, they replace the place above for that set. No round goes into the gun while placing. **Forget the placed rounds** clears the chosen hand's: it goes back to the place above (or to the other hand's placed rounds, mirrored, if that hand has them). | None placed (the place above) |
+| ↳ **Place each round by hand** (new in 0.8.16) | The menu closes. Take rounds at the chest with a gun in the other hand and hold the hand still where you look at it: one round stays still in the air while the others follow your hand. Move your hand until that round sits right in your fingers, then press A or X on the gun hand: it is set, and the next round stays still (B or Y goes back one). Pistol-sized rounds (the revolvers', the pistols', the repeaters'), rifle rounds and shotgun shells (and the Blunderbuss's cartridges) are each set apart; a hand not set uses the other's, mirrored. Once placed, they replace the place above for that set. No round goes into the gun while placing. **Forget the placed rounds** clears the chosen hand's: it goes back to the place above (or to the other hand's placed rounds, mirrored, if that hand has them). | The developer's left-hand places (since 0.8.16.1; the right mirrors them) |
 | **Every gun's rings: The foregrip / The foregrip ring / The loading ring (Offset / Size arrows)** | The shared foregrip, foregrip ring and loading ring for every gun without its own (the Guns tab, This gun), 5 mm per press. | Foregrip ring 0.110 m, loading ring 0.050 m |
 | ↳ **A round goes in at a touch** | The round loads when it touches the loading ring; off, your wrist has to be inside the ring. | On |
 | **Work each gun's action by hand** | After a shot, work the bolt, lever or pump yourself before the trigger fires again, and open and shut the guns to load them, as the rows below say. | On |
