@@ -4,12 +4,14 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "core/aim.h"
 #include "core/api.h"
+#include "core/body.h"
 #include "core/camera_lever.h"
 #include "core/deadeye.h"
 #include "core/prepass_arrays.h"
@@ -716,6 +718,284 @@ void pc_reset() {
     g_pc_since = -1.0;
 }
 // the presenting thread, the anchor active: the hysteresis and hold, the edge's press, its check and retry
+// (2026-11-23, the user: "In the horse breaking minigame, I need a visual indicator of which way the horse is bucking the
+// player. Tilt the camera in the direction John is leaning.") [Horse] BreakingTilt: while breaking a horse (the game's
+// minigame flag, raised by tamewildhorse, or its script running by name; John on a horse) the view rolls about the horse's forward as John's upper body
+// leans: (the review) the game's own head bone against the horse's position, across the horse's right (less the rider's
+// usual offset, taken while riding before), times BreakingTiltStrength (now the fallback: the game's balance below),
+// at most BreakingTiltMax degrees, smoothed (BreakingTiltSmoothing s). Eased back to level when it ends. The view's up
+// goes toward the side he leans to, as a head leaning with him. "pose breaktilt [force <deg>|off]" (a test aid)
+std::atomic<bool> g_brk_on{true};
+std::atomic<float> g_brk_scale{1.0f}, g_brk_max{45.0f}, g_brk_tau{0.08f};
+std::atomic<float> g_brk_force{1000.0f};  // a test's roll (degrees) whatever the game does; 1000: none
+std::atomic<float> g_brk_lean_pub{0.0f}, g_brk_roll_pub{0.0f};
+std::atomic<int> g_brk_active_pub{0};
+std::atomic<uint64_t> g_brk_frames{0}, g_brk_starts{0};
+std::atomic<float> g_brk_peak{0.0f};
+std::atomic<float> g_brk_blend_pub{0.0f};
+std::atomic<int> g_brk_blend_ok_pub{0};
+std::atomic<bool> g_brk_reverse{false};  // [Horse] BreakingTiltReverse: the other side (should the balance's sign be the other way)
+std::atomic<int> g_brk_test{0};  // "pose breaktilt game 1|2": a breaking wherever John is (2: it ends as a won one; a test only)
+// (2026-11-24, the user: "The view tilts, but it should lean as well") [Horse] BreakingLean: the tilt's centre this far
+// below the head (metres), a body leaning from the saddle: at 45 degrees and 0.7 m the eyes go 0.49 m to the side
+std::atomic<float> g_brk_lean_m{0.7f};
+// (2026-11-24, the user's log: a breaking won, tamewildhorse ran on with its balance held at -0.46, the view tilted 20 deg
+// until the game was closed) the balance unchanged this long: the bucking over, the view level (the meter never rests
+// while the horse bucks: the kicks and the pendulum move it every frame)
+std::atomic<double> g_brk_still_ms{700.0};  // ("pose breaktilt still <ms>": a test's longer window, the session only)
+std::atomic<int> g_brk_settled_pub{0};
+// (2026-11-24, the user: "Add option for horse breaking to be in third person.") [Horse] BreakingThirdPerson: while the
+// horse bucks, the anchor stands down (the game's own camera, in stereo, as with First person off or on a mounted gun);
+// first person again once the bucking is over (the balance at rest, the rule above) or the breaking ends (John thrown,
+// off the horse). No tilt then: the game's camera shows John leaning
+std::atomic<bool> g_brk_tp{false};
+std::atomic<int> g_brk_tp_pub{0};
+std::atomic<uint64_t> g_brk_tp_starts{0};
+void brk_frame(const RdrvrActorState& st, bool have_st, double now, float stick_x) {
+    static float drawn = 0.0f, peak = 0.0f;
+    static double last = 0.0;
+    static bool was = false;
+    const float dt = last > 0.0 ? static_cast<float>((now - last) * 0.001) : 0.0f;
+    last = now;
+    if (dt > 0.5f) drawn = 0.0f;  // (the review) back after a gap (the anchor off: a cutscene): from level
+    // (the review) a horse only (not a wagon, not the car crank's car), and its own heading; the lean from the game's own
+    // pose: the head bone against the horse's position, across the horse (the drawn torso is straightened by [Body]
+    // Stance), less the rider's usual offset (taken while riding outside the breaking, 2 s)
+    const bool horse = have_st && (st.flags & RDRVR_ACTOR_MOUNTED) && !(st.flags & (RDRVR_ACTOR_VEHICLE | RDRVR_ACTOR_DRIVING));
+    const bool by_name = (holster::minigame() & 64) != 0 && holster::minigame_fresh();
+    const int test_mode = g_brk_test.load(std::memory_order_relaxed);  // "pose breaktilt game 1|2": a breaking wherever John is (a test)
+    const bool test_brk = test_mode != 0;
+    // (2026-11-24) the game's breaking, whatever the view (BreakingThirdPerson takes the anchor down for it); a flag's
+    // flicker under 0.5 s is no end
+    const bool brk_game = (horse && ((holster::game_gate() & 1) != 0 || by_name)) || test_brk;
+    static double game_ms = -1.0e9;
+    if (brk_game) game_ms = now;
+    const bool in_game = brk_game || now - game_ms < 500.0;
+    const bool tp_opt = g_brk_tp.load(std::memory_order_relaxed);
+    // (the review) called only while the anchor is wanted this frame (on_frame_end): no anchor_active(), a frame stale here
+    const bool breaking = g_brk_on.load(std::memory_order_relaxed) && !tp_opt && in_game;
+    const float hd = (horse ? st.mount_heading : torso_heading_deg()) * 0.0174532925f;
+    const float fwd[3] = {-std::sin(hd), 0.0f, -std::cos(hd)}, right[3] = {std::cos(hd), 0.0f, -std::sin(hd)};
+    static float base = 0.0f;
+    static bool base_ok = false;
+    float lean = 0.0f;
+    bool lean_ok = false;
+    if (horse && st.head_valid && g_up_axis == 1) {
+        const float v[3] = {st.head_pos[0] - st.mount_pos[0], st.head_pos[1] - st.mount_pos[1], st.head_pos[2] - st.mount_pos[2]};
+        const float lat = v[0] * right[0] + v[2] * right[2];
+        if (v[1] > 0.3f && v[1] < 3.5f && std::isfinite(lat)) {
+            lean = std::atan2(lat, v[1]) * 57.2957795f;
+            lean_ok = true;
+        }
+    }
+    if (!horse) base_ok = false;
+    if (lean_ok && !breaking) {  // the rider's usual offset, outside the breaking
+        const float a = dt > 0.0f ? 1.0f - std::exp(-dt / 2.0f) : 0.0f;
+        base = base_ok ? base + (lean - base) * a : lean;
+        base_ok = true;
+    }
+    if (lean_ok && base_ok) lean -= base;
+    g_brk_lean_pub.store(lean_ok ? lean : 0.0f, std::memory_order_relaxed);
+    // (2026-11-23, the user's second try: "Still can't tell which way I am tilting. Too much movement. It doesn't feel like
+    // I am leaning 45 degrees either way.") The head bone's lean was small (within 7 deg) and flipped side twice a second.
+    // The game's own balance instead: tamewildhorse.wsc keeps its meter (-10..10, a pendulum the horse's kicks and the left
+    // stick push) as the float decorator "HorseBreaking_Blend" (-1..1) on the player's object every frame, drives John's
+    // lean animation from it (SET_PANIM_PARAMS) and throws him at +-1 (below -1: Horse/Eject_Right, the player's Eject/045,
+    // 090, 135). So the tilt = the balance x BreakingTiltMax x BreakingTiltStrength: the full tilt at the throw. Read with
+    // DECOR_CHECK_EXIST and DECOR_GET_FLOAT (both safe on a missing decorator or a stale handle: RDR.exe 0x1402e7fc0 checks
+    // the handle's generation and answers false, the float 0); the head lean only when the game gives no balance.
+    static uint32_t ob_actor = 0, ob = 0, ob_for = 0;
+    static uint64_t ob_req = 0, chk_req = 0, get_req = 0;
+    static double ob_ms = 0.0, pair_ms = 0.0, blend_ms = -1.0e9, brk_since = 0.0, moved_ms = -1.0e9;
+    static float blend = 0.0f, blend_raw = std::numeric_limits<float>::quiet_NaN();
+    static bool was_brk = false;
+    static const char kBlendName[] = "HorseBreaking_Blend";
+    if (in_game && !was_brk) {  // (2026-11-24: the game's breaking, so a cutscene's or the third person's anchor gap keeps it)
+        brk_since = now;
+        blend_raw = std::numeric_limits<float>::quiet_NaN();  // (the review) the last breaking's held balance is no rest for this one
+        moved_ms = now;
+    }
+    was_brk = in_game;
+    // (the review) a request given up after 1 s: cancelled before the plugin took it, or taken and its result gone (posted
+    // and not kept, the results map cleared, a script that died mid-tick), or 3 s whatever: never pending for good
+    const auto given_up = [now](uint64_t q, double ms) {
+        return now - ms > 1000.0 && (api::cancel_op(q) || api::result_posted(q, nullptr) || now - ms > 3000.0);
+    };
+    const bool want_blend = (g_brk_on.load(std::memory_order_relaxed) || tp_opt) && have_st && brk_game && st.actor != 0;
+    if (ob_req) {
+        RdrvrNativeResult r{};
+        if (api::wait_native(ob_req, &r, 0)) {
+            ob_req = 0;
+            ob = static_cast<uint32_t>(r.value);
+            ob_actor = ob_for;  // (the review) the actor it was asked for, not this frame's
+        } else if (given_up(ob_req, ob_ms)) {
+            ob_req = 0;
+        }
+    }
+    if (chk_req && get_req) {
+        RdrvrNativeResult rc{}, rg{};
+        const bool hc = api::wait_native(chk_req, &rc, 0);
+        if (hc) chk_req = 0;
+        if (!hc && given_up(chk_req, pair_ms)) chk_req = 0;
+        if (api::wait_native(get_req, &rg, 0) || given_up(get_req, pair_ms)) {
+            get_req = 0;
+            if (hc && (rc.value & 0xff) == 0) {  // (the review) none on it: ask for the object again (a recreated one); the
+                ob = 0;                          // game's answer "no balance", so nothing held
+                blend_ms = -1.0e9;
+                blend_raw = std::numeric_limits<float>::quiet_NaN();
+            }
+            if (hc && (rc.value & 0xff) != 0 && rg.id) {
+                float f = 0.0f;
+                const uint32_t bits = static_cast<uint32_t>(rg.value);
+                std::memcpy(&f, &bits, sizeof(f));
+                if (std::isfinite(f)) {
+                    // (the review of BreakingThirdPerson) a read after a gap (the pause menu, a load, a hitch: no reads)
+                    // begins the rest's window again: the gap is no rest, though the value came back the same
+                    if (now - blend_ms > 400.0) moved_ms = now;
+                    if (!(std::fabs(f - blend_raw) < 1e-4f)) moved_ms = now;  // (NaN at first: moved)
+                    blend_raw = f;
+                    blend = std::fmax(-1.5f, std::fmin(1.5f, f));
+                    blend_ms = now;
+                }
+            }
+        }
+    } else if (chk_req || get_req) {  // one of the pair read: the other's result still to come
+        RdrvrNativeResult r{};
+        uint64_t& q = chk_req ? chk_req : get_req;
+        if (api::wait_native(q, &r, 0) || given_up(q, pair_ms)) q = 0;
+    }
+    if (want_blend) {
+        if (ob_actor != static_cast<uint32_t>(st.actor)) ob = 0;
+        if (!ob && !ob_req) {
+            ob_for = static_cast<uint32_t>(st.actor);
+            const uint64_t a[1] = {ob_for};
+            ob_req = api::queue_native(0x4A2063ECu, a, 1);  // GET_OBJECT_FROM_ACTOR(the player)
+            ob_ms = now;
+        } else if (ob && !chk_req && !get_req) {
+            const uint64_t a[2] = {ob, reinterpret_cast<uint64_t>(kBlendName)};
+            chk_req = api::queue_native(0xA0773F5Cu, a, 2);  // DECOR_CHECK_EXIST(its object, "HorseBreaking_Blend")
+            get_req = api::queue_native(0x8DE5382Fu, a, 2);  // DECOR_GET_FLOAT (the same tick, after the check)
+            pair_ms = now;
+        }
+    }
+    // (the review) a balance read during this breaking is held through a hitch or a pause (up to 3 s) rather than
+    // switching to the head lean, which is used only while no balance has come at all
+    const bool blend_ok = want_blend && (now - blend_ms < 400.0 || (in_game && blend_ms >= brk_since - 500.0 && now - blend_ms < 3000.0));
+    g_brk_blend_pub.store(blend_ok ? blend : 0.0f, std::memory_order_relaxed);
+    g_brk_blend_ok_pub.store(blend_ok ? 1 : 0, std::memory_order_relaxed);
+    // (the 0.8.16 review) the minigame flag on a horse alone is no breaking (another mounted activity could raise it):
+    // the lean, the right stick's hold and third person only with the taming script found by name or its balance read
+    const bool real = by_name || blend_ok || test_brk;
+    // (2026-11-24) the balance at rest: the bucking over (a won breaking, its script running on); a test's "game 1" holds
+    // its set balance as long as it likes
+    // (the review) shown by the reads themselves: a fresh read unchanged that long (a lost read or a hitch is no rest)
+    // (2026-11-24, the user's first person log: the balance held exactly -1.00 at the throw's edge, the meter at its clamp,
+    // was taken for at rest: the view went level just before each throw, two or three times a breaking) never at the edge
+    const bool settled = in_game && blend_ok && test_mode != 1 && now - blend_ms < 400.0 && std::fabs(blend_raw) < 0.97f &&
+                         blend_ms - moved_ms > g_brk_still_ms.load(std::memory_order_relaxed);
+    {
+        static bool said_settled = false;
+        if (settled && !said_settled) log::info("[pose] breaking: the game's balance at rest (%.2f) for %.1f s: the bucking over, the view level", blend, g_brk_still_ms.load() * 0.001);
+        said_settled = settled;
+    }
+    g_brk_settled_pub.store(settled ? 1 : 0, std::memory_order_relaxed);
+    {  // [Horse] BreakingThirdPerson: on from the breaking's start; once at rest, first person for the rest of it (a lost
+       // read or a hitch after is no new bucking: the camera not switched back and forth)
+        static bool tp_done = false, tp_live = false;
+        if (!in_game) tp_done = false;
+        if (settled) tp_done = true;
+        // (the review) no balance read for 3 s, 3 s into the breaking (none on John's object: never read, or taken off
+        // at a win while tamewildhorse runs on): first person, not the whole ride in third person
+        static bool said_none = false;
+        const bool no_balance = in_game && now - brk_since > 3000.0 && now - blend_ms > 3000.0;
+        if (no_balance && !tp_done && tp_opt && !said_none) log::info("[pose] breaking a horse: no balance from the game for 3 s: first person again");
+        said_none = no_balance;
+        if (no_balance) tp_done = true;
+        const bool tp_now = tp_opt && in_game && !tp_done && real;
+        if (tp_now != tp_live) {
+            tp_live = tp_now;
+            if (tp_now) g_brk_tp_starts.fetch_add(1, std::memory_order_relaxed);
+            log::info("[pose] breaking a horse: %s", tp_now ? "third person (BreakingThirdPerson): the game's camera until the bucking is over"
+                                                            : settled ? "the bucking over: first person again"
+                                                                      : "the breaking over: first person again");
+        }
+        g_brk_tp_pub.store(tp_now ? 1 : 0, std::memory_order_relaxed);
+    }
+    const bool tilting = breaking && !settled && real;
+    float target = 0.0f;
+    const float force = g_brk_force.load(std::memory_order_relaxed);
+    if (force < 999.0f) {
+        target = force;
+    } else if (settled) {
+        target = 0.0f;
+    } else if (breaking && blend_ok) {
+        // (2026-11-24, the user's third try: "Still doesn't work", pushing the stick away from the lean) their log: the
+        // balance goes the stick's way (the stick held right, it rose to +1 and stayed there 2-3 s until the throw; held
+        // left, to -1 the same). So the lean shows the side to push away from: a positive balance leans right (+), the
+        // stick pushed left brings it back (BreakingTiltReverse=1: the old side)
+        const float mx = g_brk_max.load(std::memory_order_relaxed);
+        const float side = g_brk_reverse.load(std::memory_order_relaxed) ? -1.0f : 1.0f;
+        target = std::fmax(-mx, std::fmin(mx, side * blend * mx * g_brk_scale.load(std::memory_order_relaxed)));
+    } else if (breaking && lean_ok && by_name) {
+        // (the review of the flip) John's head lean, with no balance from the game: his head leans right at a balance of -1
+        // (the user's logs), so the other side as well (BreakingTiltReverse: his side)
+        const float mx = g_brk_max.load(std::memory_order_relaxed);
+        const float side = g_brk_reverse.load(std::memory_order_relaxed) ? 1.0f : -1.0f;
+        target = std::fmax(-mx, std::fmin(mx, side * lean * 3.0f * g_brk_scale.load(std::memory_order_relaxed)));
+    }
+    if (breaking != was) {
+        was = breaking;
+        if (breaking) {
+            g_brk_starts.fetch_add(1, std::memory_order_relaxed);
+            peak = 0.0f;
+            log::info("[pose] breaking a horse: the view leans with the game's balance, level (BreakingTilt; strength %.2f, at most %.0f deg%s)",
+                      g_brk_scale.load(), g_brk_max.load(), g_brk_reverse.load() ? ", reversed" : "");
+        } else {
+            log::info("[pose] the horse breaking over: the view upright again (the largest lean %.1f deg)", peak);
+        }
+    }
+    const float tau = g_brk_tau.load(std::memory_order_relaxed);
+    const float al = dt <= 0.0f ? 0.0f : tau <= 0.0f ? 1.0f : 1.0f - std::exp(-dt / tau);
+    drawn += (target - drawn) * al;
+    if (std::fabs(drawn) < 0.01f && target == 0.0f) drawn = 0.0f;
+    if (!std::isfinite(drawn)) drawn = 0.0f;
+    if (std::fabs(drawn) > std::fabs(peak)) peak = drawn;
+    if (drawn != 0.0f) g_brk_frames.fetch_add(1, std::memory_order_relaxed);
+    {  // (2026-11-23) twice a second while breaking: does the horse's heading follow its spins (the view follows it)?
+        // (2026-11-24, the user: "I pushed the stick the opposite way to the way John was leaning and kept getting bucked
+        // off") the left stick sent to the game with it (its x now, and its mean, least and most over the half second)
+        static double said = 0.0;
+        static double sx_sum = 0.0;
+        static int sx_n = 0;
+        static float sx_lo = 0.0f, sx_hi = 0.0f;
+        if (in_game) {
+            if (sx_n == 0) sx_lo = sx_hi = stick_x;
+            sx_sum += stick_x;
+            ++sx_n;
+            sx_lo = std::fmin(sx_lo, stick_x);
+            sx_hi = std::fmax(sx_hi, stick_x);
+        }
+        if (in_game && now - said >= 500.0) {
+            said = now;
+            const float lx = st.head_pos[0] - st.mount_pos[0], lz = st.head_pos[2] - st.mount_pos[2];
+            log::info("[pose] breaking: the horse's heading %.1f deg, John's %.1f, the view's %.1f | his head from the horse %.2f m ahead, "
+                      "%.2f m right, %.2f m up; the lean %.1f deg (his seat's %.1f); the game's balance %s%.2f%s; the tilt %.1f%s | the left "
+                      "stick x %+.2f (over the half second: mean %+.2f, %+.2f..%+.2f)",
+                      st.mount_heading, st.heading_deg, body_heading_deg(), lx * fwd[0] + lz * fwd[2], lx * right[0] + lz * right[2],
+                      st.head_pos[1] - st.mount_pos[1], lean, base, blend_ok ? "" : "(none) ", blend, settled ? " (at rest)" : "", drawn,
+                      g_brk_tp_pub.load(std::memory_order_relaxed) ? " (third person)" : "", stick_x, sx_n ? sx_sum / sx_n : 0.0, sx_lo, sx_hi);
+            sx_sum = 0.0;
+            sx_n = 0;
+        }
+    }
+    g_brk_active_pub.store(tilting ? 1 : 0, std::memory_order_relaxed);  // (2026-11-24: settled, the view's turn the stick's again)
+    g_brk_roll_pub.store(drawn, std::memory_order_relaxed);
+    g_brk_peak.store(peak, std::memory_order_relaxed);
+    // (2026-11-24, the user: "remove the tilt, leave the lean") the eyes moved as a body leaning from the saddle, the
+    // horizon level (BreakingLean the lean's centre below the eyes; the angle the lean swings through as before)
+    camera_lever::set_view_roll(drawn, fwd[0], fwd[2], g_brk_lean_m.load(std::memory_order_relaxed), false);
+}
+
 void pc_frame(const RdrvrActorState& st, bool have_st, bool controllers, double now) {
     g_pc_press_frame = false;
     const bool have = have_st && (st.flags & RDRVR_ACTOR_CROUCHING);
@@ -1861,6 +2141,15 @@ void on_frame_end(uint64_t) {
         if (mounted && !(g_mounted_fp.load(std::memory_order_relaxed) && held && holster::turret_ready() && camera_lever::first_person_ready()))
             want = false;
     }
+    // (2026-11-23) [Horse] BreakingTilt, (2026-11-24) BreakingThirdPerson: run whenever the anchor could be on (in VR, in the
+    // game's play, First person on), so the breaking is followed while its third person has the anchor down
+    if (want) {
+        RdrvrActorState bs{};
+        const bool hb = api::actor_state(&bs);
+        // (the controllers' stick as the game gets it riding by the stick, unturned; 0 with a gamepad, not logged)
+        brk_frame(bs, hb, log::now_ms(), controllers ? pad.lx / 32767.0f : 0.0f);
+        if (g_brk_tp_pub.load(std::memory_order_relaxed)) want = false;
+    }
     if (want != g_active) {
         g_active = want;
         g_active_shared = want;
@@ -2051,6 +2340,13 @@ void on_frame_end(uint64_t) {
             // the view faces the horse and the left stick steers it; the right stick turns the view by an offset over
             // the mount's heading ([Horse] StickTurn), or not at all
             job.heading_from_mount = 1;
+            // (2026-11-23, [Horse] BreakingTilt; the user: "My view drifted off the horse") breaking a horse: the view held
+            // facing the horse, the right stick's turn none (the tilt is across the horse's forward)
+            if (g_brk_active_pub.load(std::memory_order_relaxed) && !passenger) {
+                if (g_ride_off != 0.0f) log::info("[pose] breaking a horse: the view's turn over the horse (%.1f deg) taken off: facing the horse", g_ride_off);
+                g_ride_off = 0.0f;
+                sx = 0.0f;
+            }
             if (g_ride_turn.load(std::memory_order_relaxed) || passenger) {  // (the review: a passenger whatever StickTurn says)
                 if (g_snap) {
                     if (std::fabs(sx) > 0.7f && !g_ride_snapped) {
@@ -2396,6 +2692,25 @@ void init() {
     g_saddle = config::get_bool("Horse", "SaddleAnchor", true);
     g_saddle_tau = config::get_float("Horse", "SaddleSmoothing", 0.15f);
     g_saddle_climb = config::get_bool("Horse", "SaddleClimb", true);
+    g_brk_on = config::get_bool("Horse", "BreakingTilt", true);
+    {
+        // (2026-11-23) BreakingTiltStrength on the game's balance (1: the full tilt at the throw); the old BreakingTiltScale
+        // (John's head lean, set to 3 for its weak signal) is no longer read
+        const float sc = config::get_float("Horse", "BreakingTiltStrength", 1.0f), mx = config::get_float("Horse", "BreakingTiltMax", 45.0f),
+                    tau = config::get_float("Horse", "BreakingTiltSmoothing", 0.15f);
+        g_brk_scale = std::isfinite(sc) ? std::fmax(0.0f, std::fmin(3.0f, sc)) : 1.0f;
+        g_brk_max = std::isfinite(mx) ? std::fmax(0.0f, std::fmin(60.0f, mx)) : 45.0f;
+        g_brk_tau = std::isfinite(tau) ? std::fmax(0.0f, std::fmin(1.0f, tau)) : 0.15f;
+        g_brk_reverse = config::get_bool("Horse", "BreakingTiltReverse", false);
+        const float lm = config::get_float("Horse", "BreakingLean", 0.7f);
+        g_brk_lean_m = std::isfinite(lm) ? std::fmax(0.0f, std::fmin(1.2f, lm)) : 0.7f;
+        g_brk_tp = config::get_bool("Horse", "BreakingThirdPerson", false);
+        if (g_brk_tp.load()) log::info("[pose] breaking a horse in third person (BreakingThirdPerson): the game's camera while the horse bucks");
+        log::info("[pose] breaking a horse, the view leans with the game's balance, level (BreakingTilt) %d: strength %.2f, at most %.0f deg, smoothed "
+                  "%.2f s%s, leaning from %.2f m below the eyes (BreakingLean)",
+                  g_brk_on.load() ? 1 : 0, g_brk_scale.load(), g_brk_max.load(), g_brk_tau.load(), g_brk_reverse.load() ? ", reversed" : "",
+                  g_brk_lean_m.load());
+    }
     g_ride_turn = config::get_bool("Horse", "StickTurn", true);
     g_armed_stand = config::get_string("Body", "ArmedStance", "stand") != "game";
     g_vehicle_heading = config::get_bool("Horse", "VehicleHeading", true);
@@ -2782,6 +3097,55 @@ bool saddle_camera(float* lift, float* forward) {
     return true;
 }
 bool saddle_climb() { return g_saddle_climb.load(); }
+bool breaking_tilt() { return g_brk_on.load(); }
+float breaking_tilt_scale() { return g_brk_scale.load(); }
+void set_breaking_tilt(bool on, float scale, bool save) {
+    scale = std::isfinite(scale) ? std::fmax(0.0f, std::fmin(3.0f, scale)) : 1.0f;
+    const bool was_on = g_brk_on.exchange(on);
+    const float was_sc = g_brk_scale.exchange(scale);
+    if (was_on != on || was_sc != scale) log::info("[pose] breaking a horse, the view tilts as John leans: %s (scale %.2f)", on ? "on" : "off", scale);
+    if (!save) return;
+    config::set("Horse", "BreakingTilt", on ? "1" : "0");
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.2f", scale);
+    config::set("Horse", "BreakingTiltStrength", b);
+}
+float breaking_lean() { return g_brk_lean_m.load(); }
+void set_breaking_lean(float m, bool save) {
+    m = std::isfinite(m) ? std::fmax(0.0f, std::fmin(1.2f, m)) : 0.7f;
+    if (g_brk_lean_m.exchange(m) != m) log::info("[pose] breaking a horse: the view leans from %.2f m below the eyes (BreakingLean)", m);
+    if (!save) return;
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.2f", m);
+    config::set("Horse", "BreakingLean", b);
+}
+bool breaking_third_person() { return g_brk_tp.load(); }
+void set_breaking_third_person(bool on, bool save) {
+    if (g_brk_tp.exchange(on) != on) log::info("[pose] breaking a horse in third person (BreakingThirdPerson): %s", on ? "on" : "off");
+    if (save) config::set("Horse", "BreakingThirdPerson", on ? "1" : "0");
+}
+std::string breaking_tilt_command(const std::string& arg, float v) {  // "pose breaktilt [force <deg>|off|game 0|1|2|lean <m>]"
+    if (arg == "game") g_brk_test = v > 1.5f ? 2 : v > 0.5f ? 1 : 0;  // "pose breaktilt game 1|2|0" (2: it settles as a real one)
+    else if (arg == "force") g_brk_force = std::isfinite(v) ? std::fmax(-60.0f, std::fmin(60.0f, v)) : 1000.0f;
+    else if (arg == "off") g_brk_force = 1000.0f;
+    else if (arg == "lean") set_breaking_lean(v, false);  // (the session only)
+    else if (arg == "still") g_brk_still_ms = std::isfinite(v) ? std::fmax(100.0, std::fmin(10000.0, static_cast<double>(v))) : 700.0;
+    else if (arg == "third") set_breaking_third_person(v > 0.5f, false);  // "pose breaktilt third 0|1" (the session only)
+    float sh[3], ax = 0.0f, az = 0.0f;
+    camera_lever::view_roll_shift(sh);
+    camera_lever::view_roll_axis(&ax, &az);
+    char b[768];
+    std::snprintf(b, sizeof(b),
+                  "breaktilt %d scale %.2f max %.0f lean %.2f | breaking %d, the game's balance %d %.2f, at rest %d, John's lean %.1f deg, the view's "
+                  "roll %.1f deg (this frame's %.1f), the eyes tipped %.1f deg, the eyes moved (%.3f %.3f %.3f) m along (%.3f %.3f), the largest %.1f, forced %s | starts %llu, frames tilted %llu"
+                  " | third person %d: now %d (the anchor %d), times %llu",
+                  g_brk_on.load() ? 1 : 0, g_brk_scale.load(), g_brk_max.load(), g_brk_lean_m.load(), g_brk_active_pub.load(),
+                  g_brk_blend_ok_pub.load(), g_brk_blend_pub.load(), g_brk_settled_pub.load(), g_brk_lean_pub.load(), g_brk_roll_pub.load(),
+                  camera_lever::view_roll_frame(), camera_lever::eye_tip_deg(), sh[0], sh[1], sh[2], ax, az, g_brk_peak.load(), g_brk_force.load() < 999.0f ? "yes" : "no",
+                  static_cast<unsigned long long>(g_brk_starts.load()), static_cast<unsigned long long>(g_brk_frames.load()),
+                  g_brk_tp.load() ? 1 : 0, g_brk_tp_pub.load(), anchor_active() ? 1 : 0, static_cast<unsigned long long>(g_brk_tp_starts.load()));
+    return b;
+}
 void set_saddle_climb(bool on, bool save) {
     if (g_saddle_climb.exchange(on) != on) log::info("[pose] the saddle anchor follows climbs %d", on ? 1 : 0);
     if (save) config::set("Horse", "SaddleClimb", on ? "1" : "0");

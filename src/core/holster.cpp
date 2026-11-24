@@ -1213,6 +1213,7 @@ std::string mini_text(int bits) {
     std::string r;
     for (int k = 0; k < 6; ++k)
         if (bits & (1 << k)) r += (r.empty() ? "" : ", ") + std::string(kMiniNames[k]);
+    if (bits & 64) r += (r.empty() ? "" : ", ") + std::string("horse breaking");
     return r.empty() ? "none" : r;
 }
 // false: something that is not a script's node (the walk ends there)
@@ -1245,6 +1246,8 @@ bool script_walk(uintptr_t node, int depth, int& budget, int& bits, std::string&
                 const size_t tl = std::strlen(kMiniTails[k]);
                 if (e >= tl && !std::memcmp(nm + e - tl, kMiniTails[k], tl)) bits |= 1 << k;
             }
+            // (2026-11-23, [Horse] BreakingTilt) bit 6 (64): breaking a horse (tamewildhorse; any script named for it)
+            if (std::strstr(nm, "tamewildhorse") || std::strstr(nm, "horsebreak") || std::strstr(nm, "horse_break")) bits |= 64;
             if (names.size() < 6000) {
                 if (!names.empty()) names += ' ';
                 names.append(rawnm, n);
@@ -2207,7 +2210,7 @@ void holster_frame() {
         *d_wrist = std::sqrt(dx * dx + dy * dy + dz * dz);
         *d_round = -1.0f;
         float pz[12];
-        if (round_draw::pose(bp, rj, pz)) {
+        if (round_draw::round_pose(bp, rj, 0, pz)) {  // (2026-11-14: the first round's own place once set)
             const float ex = pz[9] - lp[0], ey = pz[10] - lp[1], ez = pz[11] - lp[2];
             *d_round = std::sqrt(ex * ex + ey * ey + ez * ez);
             std::lock_guard lock(g_zone_mutex);
@@ -3818,7 +3821,8 @@ void holster_frame() {
                 }
             }
         }
-        if (round_held[h] && !round_mag[h] && (down || auto_rounds[h])) {  // the round reaches the gun: in it goes
+        // (2026-11-14) placing each held round by hand: no round goes in meanwhile
+        if (round_held[h] && !round_mag[h] && (down || auto_rounds[h]) && !round_draw::hand_placing()) {  // the round reaches the gun: in it goes
             const int rj = bp.ctrl[0] == h ? 0 : 1;  // John's hand holding the round
             const bool to_sec = round_tgt[h] == 1;  // (DualWieldCrossReload: the second gun's loading point and ring)
             const float* lp = to_sec ? load_sec : load_pt;
@@ -3935,7 +3939,7 @@ void holster_frame() {
                 sx.clip += static_cast<float>(recent_in[h]);
                 sx.spare -= static_cast<float>(recent_in[h]);
             }
-            const int in = d < lrr + 0.04f ? put_in(h, left, sx) : 0;
+            const int in = d < lrr + 0.04f && !round_draw::hand_placing() ? put_in(h, left, sx) : 0;
             if (in < 0) {  // the copy's spare not settled: its rounds go in when it is (within a second)
                 defer_n[h] = left;
                 defer_ms[h] = now_ms;

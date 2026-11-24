@@ -117,6 +117,15 @@ bool saddle_camera(float* lift, float* forward);
 // [Horse] SaddleClimb (run 6 item 8, on): with the saddle anchor, the plugin feeds the horse's own vertical speed into
 // the height's filter (it fell behind climbs) and keeps the view above the rider's root + 0.5 m
 bool saddle_climb();
+// (2026-11-23) [Horse] BreakingTilt, BreakingTiltStrength: breaking a horse, the view rolls with the game's balance (pose.cpp's notes)
+bool breaking_tilt();
+float breaking_tilt_scale();
+void set_breaking_tilt(bool on, float scale, bool save);
+float breaking_lean();  // (2026-11-24) [Horse] BreakingLean: the tilt's centre this far below the eyes (m)
+void set_breaking_lean(float m, bool save);
+bool breaking_third_person();  // (2026-11-24) [Horse] BreakingThirdPerson: the game's camera while the horse bucks
+void set_breaking_third_person(bool on, bool save);
+std::string breaking_tilt_command(const std::string& arg, float v);  // "pose breaktilt [force <deg>|off|game n|lean m]": the status line
 void set_saddle_climb(bool on, bool save);
 // "pose trace on|off|reset|dump <file>": a row per script tick while riding (a test aid), written as CSV on dump
 std::string trace_command(const std::string& verb, const std::string& arg);

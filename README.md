@@ -4,7 +4,7 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.15 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.16 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
@@ -530,6 +530,30 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
       where the knife's sheath is when you have no knife (or when the knife holster is set to the torch).
     - Fixed: the lasso's throw showed John's body stepping in front of the view; a lamp's light cone showed in the air
       at five finger fillet; a horseshoe vanished from the hand after a second.
+- New in 0.8.16 (no reset: the settings you changed are kept. On unless you turn them off: the lean while breaking a
+  horse, and no gun drawn by the triggers in the saddle):
+  - Used in the developer's Quest 3:
+    - **Breaking a wild horse: your view leans** ("Breaking a horse: lean the view", the Comfort tab's riding rows):
+      while the horse bucks, your view leans out to one side, as if leaning from the saddle (about half a metre at the
+      full lean), with the horizon kept level. The lean follows the game's own balance, the meter that throws John at
+      its end: push the left stick away from the lean to keep your seat. "Lean strength" and "Lean from the saddle"
+      set how soon and how far it leans (at the full lean the eyes also drop about 20 cm); once the horse has stopped
+      bucking the view comes back over the saddle. While it bucks the view stays facing the horse (the right stick
+      does not turn it).
+    - **Each round placed in the hand by hand** ("Place each round by hand", the Reloading tab): take rounds at your
+      chest with a gun in the other hand and hold the hand still where you look at it: one round stays still in the
+      air while the others follow your hand. Move the hand until that round sits right in your fingers and press A or
+      X on the gun hand (B or Y goes back one). Pistol-sized rounds (the revolvers', the pistols' and the repeaters'),
+      rifle rounds and shotgun shells (and the Blunderbuss's cartridges) are each set apart; a hand you have not set
+      uses the other's, mirrored. Once placed, they replace "The round in your" place for that set: "Forget the
+      placed rounds" (each hand) goes back to it.
+    - **The triggers draw no gun in the saddle** (`[Horse] TriggerNoDraw` in `RDRVR.ini`, no menu row): with the
+      holsters on (not the weapon wheel), on a horse or a wagon's bench with nothing in hand, the triggers no longer
+      pull out the selected gun (the game's aim and attack did): guns come from a holster. A gun in hand still aims
+      and fires with them.
+  - Tried in the developer's simulator:
+    - **Breaking a horse: third person** (the Comfort tab, off): while the horse bucks, the game's own third person
+      camera (in stereo) instead of the lean; first person again once the bucking is over or John is thrown.
 
 ## Requirements
 
@@ -547,7 +571,7 @@ OpenXR runtime should work (see [Compatibility](#compatibility)).
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.15.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.16.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
@@ -669,6 +693,10 @@ How you see and move: the first-person view, walking and crouching in your room,
 | **View from the saddle** | A steady view above the saddle, so the gallop's bounce stays out of it. | On |
 | ↳ **Keep its height on climbs** | Stops the saddle view sinking toward the saddle on a steep climb. | On |
 | ↳ **Saddle smoothing** | How much the saddle view's height is smoothed, 0.05 s per press (0 to 0.60 s). | 0.15 s |
+| **Breaking a horse: third person** (new in 0.8.16) | Breaking a wild horse, the game's own third person camera (in stereo) while the horse bucks, and first person again once it settles or John is thrown. The lean below is for first person only. | Off |
+| **Breaking a horse: lean the view** (new in 0.8.16) | Breaking a wild horse, your view leans out to one side as the horse bucks (the game's own balance), the horizon kept level: push the left stick away from the lean to keep your seat. While it bucks the view stays facing the horse (the right stick does not turn it); back over the saddle once the horse stops bucking. | On |
+| ↳ **Lean strength** (new in 0.8.16) | 1: the full lean just as John is thrown; more leans further sooner, less is gentler (0.25 per press, 0.25 to 3). | 1.00 |
+| ↳ **Lean from the saddle** (new in 0.8.16) | How far the view leans: as a body leaning from a point this far below your eyes, 0.1 m per press (0 to 1.2 m; 0.7 m is about half a metre to the side at the full lean; 0: no lean). | 0.7 m |
 | **Left stick click brakes** | On a horse or wagon, hold the left stick click to brake (pull the stick back too for a hard stop); on foot it still crouches. | On |
 
 ### Body
@@ -812,6 +840,7 @@ Reloading by hand, where the rounds come from, the round in your hand, every gun
 | **Rounds seen in the hand: Off / The mod's rounds / The game's shotgun shells too** (was "A round seen in the hand" before 0.8.12) | Draws the rounds you took between your fingers (and the row at the chest). The game's shotgun shells too: a shotgun's shells are the game's own model, lit by the game. | The mod's rounds |
 | **Each gun's own round (the new models)** (new in 0.8.12) | Each gun's round at its real size, textured and lit as the game's own props. Off: the old simple rounds. | On |
 | **The round in your: Left hand / Right hand**, then **Offset / Direction / Turn / Tilt / Brightness** (each hand its own since 0.8.12) | Where the round sits in that hand's fingers (2 mm per press, up to 20 cm), which way it points (Along the fingers, Out of the hand, or Custom by its turn and tilt, 5° per press, each all the way round), and how bright the drawn rounds are (0.25 per press, the chest's too). The right hand uses the left's until you set it. | Custom: left turn 0°, tilt −50°; right turn −175°, tilt −65°; brightness 0.50 |
+| ↳ **Place each round by hand** (new in 0.8.16) | The menu closes. Take rounds at the chest with a gun in the other hand and hold the hand still where you look at it: one round stays still in the air while the others follow your hand. Move your hand until that round sits right in your fingers, then press A or X on the gun hand: it is set, and the next round stays still (B or Y goes back one). Pistol-sized rounds (the revolvers', the pistols', the repeaters'), rifle rounds and shotgun shells (and the Blunderbuss's cartridges) are each set apart; a hand not set uses the other's, mirrored. Once placed, they replace the place above for that set. No round goes into the gun while placing. **Forget the placed rounds** clears the chosen hand's: it goes back to the place above (or to the other hand's placed rounds, mirrored, if that hand has them). | None placed (the place above) |
 | **Every gun's rings: The foregrip / The foregrip ring / The loading ring (Offset / Size arrows)** | The shared foregrip, foregrip ring and loading ring for every gun without its own (the Guns tab, This gun), 5 mm per press. | Foregrip ring 0.110 m, loading ring 0.050 m |
 | ↳ **A round goes in at a touch** | The round loads when it touches the loading ring; off, your wrist has to be inside the ring. | On |
 | **Work each gun's action by hand** | After a shot, work the bolt, lever or pump yourself before the trigger fires again, and open and shut the guns to load them, as the rows below say. | On |
@@ -1012,8 +1041,8 @@ Shown only while Ped Gunfight Overhaul (a separate RedHook mod by another author
   ends up in the gun or in the air.
 - In the theatre the film's own picture pulses in brightness on the flat screen (the room around it is steady in the
   developer's recording: the game's old-film look, as far as that shows).
-- Looking down the duster's side in the sun, a second outline of the coat can show as a darker patch on the ground
-  beside it. Being looked into.
+- Looking down the duster's side in the sun, a dark panel can show beside the coat, like a second outline of it in
+  the air (not on the ground). Being looked into.
 - A revolver at the right hip can sometimes show a second copy of itself that trails slightly behind (the game's own
   holstered gun; the Cattleman's turned, the Schofield's near the chest). Being looked into.
 - A dual-wield copy of the Cattleman can sit turned in the hand (its barrel pointing sideways), seen after walking out

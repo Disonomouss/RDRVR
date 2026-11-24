@@ -136,6 +136,19 @@ void set_mag_row(int weapon, int n, int rounds, const float at[3], const float r
 // The round's drawn pose for John's `hand` from the body's points: 12 floats, the axes X, Y (base to tip), Z, then the
 // position (world). False when that hand's points are not valid.
 bool pose(const body::BodyPoints& bp, int hand, float* out);
+// (2026-11-14, the user: "set the position of each bullet in the hand for a more natural look ... adjust it by moving my
+// hand while the bullet is frozen and press a button when it is in the right position") [Reload] HandRounds<Pistol|Rifle|
+// Shell><Left|Right>: each of the handful's rounds its own place in the hand (round_draw.cpp's notes). Placing (the
+// session): the round being placed frozen in the world; the gun hand's A or X sets it (the next frozen), B or Y back one.
+bool hand_placing();          // placing on
+bool hand_placing_buttons();  // a round frozen: the gun hand's A/X and B/Y are the placing's (controls holds them back)
+void set_hand_placing(bool on);
+void clear_hand_rounds(int hand);  // John's hand 0 left, 1 right: its own places forgotten (all three sets)
+std::string hand_placing_text();   // the menu's line
+// the r-th held round's pose as drawn (12 floats: X Y Z, the round's base P; its own place once set, the frozen one while
+// placing). The holsters' thread (its own handful direction kept).
+bool round_pose(const body::BodyPoints& bp, int hand, int r, float* out);
+int shown_count(int count);  // the rounds drawn for `count` held (placing: all RoundsPerGrab)
 // 2026-10-27 ([Reload] RoundInHand = 2, the game's shells everywhere a shell is drawn): the poses of the shells drawn
 // now, in the order record() draws them (the handful's from the pinch out, then the row's from its left), 12 floats
 // each as pose()'s, at most `max`; *n_hand: how many are the hand's (the rest are the row's, placed by the body). Only

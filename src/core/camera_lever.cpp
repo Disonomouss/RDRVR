@@ -282,6 +282,23 @@ float g_q0[4] = {0, 0, 0, 1}, g_p0[3] = {0, 0, 0};  // recentre: yaw-only orient
 // camera's: pose turns the view to the snap's target at once while the game camera, turned by the stick, catches up
 std::atomic<float> g_view_yaw_off{0.0f};
 std::atomic<float> g_view_yaw_frame{0.0f};  // (the review) latched once a frame (hk_SceneRender): both eyes the same yaw
+// (2026-11-23, [Horse] BreakingTilt) a roll (degrees) of the eye cameras about a level world axis (the horse's forward),
+// about the head's centre: pose sets it while breaking a horse; latched once a frame as the yaw
+std::atomic<float> g_view_roll{0.0f}, g_view_roll_fx{0.0f}, g_view_roll_fz{-1.0f};
+std::atomic<float> g_view_roll_frame{0.0f}, g_view_roll_ffx{0.0f}, g_view_roll_ffz{-1.0f};
+std::atomic<double> g_view_roll_ms{-1e12};  // (the review) its last set: not renewed within 200 ms (the anchor off), level
+// (2026-11-24, the user: "The view tilts, but it should lean as well") the roll's centre this far (game metres) below the
+// head's centre, a body leaning from the saddle: the eyes swing out to the side as they tilt; latched with the roll
+std::atomic<float> g_view_roll_drop{0.0f}, g_view_roll_fdrop{0.0f};
+// (2026-11-24, the user: "remove the tilt, leave the lean") false: the eyes only moved as the roll would move the head's
+// centre (the lean from the saddle), the horizon kept level; latched with the roll
+std::atomic<bool> g_view_roll_turn{true}, g_view_roll_fturn{true};
+std::atomic<float> g_roll_shift_pub[3] = {0.0f, 0.0f, 0.0f};  // the head's centre moved by the roll this frame (world, the test's)
+std::atomic<float> g_eye_tip_pub{0.0f};  // (2026-11-24, the test's) an eye camera's right axis above level, as drawn (degrees)
+// (the review) the head's centre (LOCAL) the eyes rolled about this frame: local_to_world and world_to_local roll the
+// tracked space about it too, so the hands, the rings and the quads stay on the controllers in the tilted view
+std::atomic<float> g_roll_mid[3] = {0.0f, 0.0f, 0.0f};
+std::atomic<bool> g_roll_mid_ok{false};
 // (round 93 check 3, the user: "The camera flicks over then back slightly and moves smoothly to where it flicked to") the
 // snap's view held at its end: the yaw taken in hk_SceneRender from that frame's own camera (pose's was from an older one:
 // the view fell behind the camera's speed-up and caught up in its slow-down), and the place where the camera will stand
@@ -492,6 +509,53 @@ bool xr_eye_camera(const float* cam, int eye, float* out, bool peek = false, boo
         out[12] = C[0] + px * cs + pz * sn + sh[0];
         out[14] = C[2] - px * sn + pz * cs + sh[1];
     }
+    // (2026-11-23, [Horse] BreakingTilt) the view rolled about the level axis k (the horse's forward) through the head's
+    // centre: +deg takes the view's up toward the horse's right (k x up = right), as a head leaning right
+    if (const float ro = g_view_roll_frame.load(std::memory_order_relaxed); ro != 0.0f && std::isfinite(ro)) {
+        float kx = g_view_roll_ffx.load(std::memory_order_relaxed), kz = g_view_roll_ffz.load(std::memory_order_relaxed);
+        const float kl = std::sqrt(kx * kx + kz * kz);
+        if (kl > 1e-3f) {
+            kx /= kl, kz /= kl;
+            const float k[3] = {kx, 0.0f, kz};
+            float dc[3] = {0.0f, 0.0f, 0.0f}, C[3];
+            if (g_xr_head_position.load(std::memory_order_relaxed)) {
+                const float wi = ws_inv();
+                for (int i = 0; i < 3; ++i) dc[i] = (mid[i] - p0[i]) * wi;
+                for (int i = 0; i < 3; ++i) g_roll_mid[i].store(mid[i], std::memory_order_relaxed);
+                g_roll_mid_ok.store(true, std::memory_order_relaxed);
+            } else {
+                g_roll_mid_ok.store(false, std::memory_order_relaxed);  // (the eyes about the frame camera's position)
+            }
+            const float pc[3] = {r0[0] * dc[0] + r0[1] * dc[1] + r0[2] * dc[2], r0[3] * dc[0] + r0[4] * dc[1] + r0[5] * dc[2],
+                                 r0[6] * dc[0] + r0[7] * dc[1] + r0[8] * dc[2]};
+            for (int i = 0; i < 3; ++i) C[i] = cam[12 + i] + pc[0] * a[i] + pc[1] * b[i] + pc[2] * c[i];
+            C[1] -= g_view_roll_fdrop.load(std::memory_order_relaxed);  // (2026-11-24) leaning from the saddle, not the head
+            const float r = ro * 0.0174532925f, cs = std::cos(r), sn = std::sin(r);
+            auto rot = [&](float* v) {  // Rodrigues about k
+                const float kv = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+                const float cx[3] = {k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0]};
+                for (int i = 0; i < 3; ++i) v[i] = v[i] * cs + cx[i] * sn + k[i] * kv * (1.0f - cs);
+            };
+            const float drop = g_view_roll_fdrop.load(std::memory_order_relaxed);
+            float m[3] = {0.0f, drop, 0.0f};  // the head's centre from the roll's centre
+            rot(m);
+            if (g_view_roll_fturn.load(std::memory_order_relaxed)) {
+                for (int row = 0; row < 12; row += 4) rot(out + row);
+                float p[3] = {out[12] - C[0], out[13] - C[1], out[14] - C[2]};
+                rot(p);
+                for (int i = 0; i < 3; ++i) out[12 + i] = C[i] + p[i];
+            } else {  // the lean alone: both eyes moved with the head's centre, not turned
+                out[12] += m[0], out[13] += m[1] - drop, out[14] += m[2];
+            }
+            {  // (the review) the head's centre moved by the roll (the same for both eyes; the test's)
+                g_roll_shift_pub[0].store(m[0], std::memory_order_relaxed);
+                g_roll_shift_pub[1].store(m[1] - drop, std::memory_order_relaxed);
+                g_roll_shift_pub[2].store(m[2], std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!peek && (eye == 0 || eye == 1))  // (the lean alone: the horizon level, the test's; y up)
+        g_eye_tip_pub.store(std::asin(std::fmax(-1.0f, std::fmin(1.0f, out[1]))) * 57.2957795f, std::memory_order_relaxed);
     return true;
 }
 // [XR] RoomScale's take-off (see g_p0_base): once a presented frame, while the room-scale walk owns the walk
@@ -959,6 +1023,14 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
         }
         g_view_shift_ok.store(shift, std::memory_order_relaxed);
         g_view_yaw_frame.store(yo, std::memory_order_relaxed);
+        g_view_roll_frame.store(log::now_ms() - g_view_roll_ms.load(std::memory_order_relaxed) < 200.0 ? g_view_roll.load(std::memory_order_relaxed) : 0.0f,
+                                std::memory_order_relaxed);  // ([Horse] BreakingTilt; not renewed: level)
+        g_view_roll_ffx.store(g_view_roll_fx.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        g_view_roll_ffz.store(g_view_roll_fz.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        g_view_roll_fdrop.store(g_view_roll_drop.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        g_view_roll_fturn.store(g_view_roll_turn.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        if (g_view_roll_frame.load(std::memory_order_relaxed) == 0.0f)
+            for (auto& s : g_roll_shift_pub) s.store(0.0f, std::memory_order_relaxed);
         float m[16];
         if (snap && g_vyt_weight.load(std::memory_order_relaxed) >= 1.0f && xr_eye_camera(cam, 2, m, true, false)) {
             const float vh = std::atan2(m[8], m[10]) * 57.2957795f;
@@ -1672,6 +1744,23 @@ bool level_grass_active() {
            g_double.load(std::memory_order_relaxed);
 }
 
+void set_view_roll(float deg, float fwd_x, float fwd_z, float drop, bool turn) {
+    g_view_roll_turn.store(turn, std::memory_order_relaxed);
+    g_view_roll_drop.store(std::isfinite(drop) ? std::fmax(0.0f, std::fmin(1.5f, drop)) : 0.0f, std::memory_order_relaxed);
+    g_view_roll_ms.store(log::now_ms(), std::memory_order_relaxed);
+    g_view_roll_fx.store(fwd_x, std::memory_order_relaxed);
+    g_view_roll_fz.store(fwd_z, std::memory_order_relaxed);
+    g_view_roll.store(std::isfinite(deg) ? deg : 0.0f, std::memory_order_relaxed);
+}
+float view_roll_frame() { return g_view_roll_frame.load(std::memory_order_relaxed); }
+float eye_tip_deg() { return g_eye_tip_pub.load(std::memory_order_relaxed); }
+void view_roll_axis(float* fx, float* fz) {
+    *fx = g_view_roll_ffx.load(std::memory_order_relaxed);
+    *fz = g_view_roll_ffz.load(std::memory_order_relaxed);
+}
+void view_roll_shift(float* out) {
+    for (int i = 0; i < 3; ++i) out[i] = g_roll_shift_pub[i].load(std::memory_order_relaxed);
+}
 void set_view_yaw_offset(float deg) { g_view_yaw_off.store(std::isfinite(deg) ? deg : 0.0f, std::memory_order_relaxed); }
 float view_yaw_offset() { return g_view_yaw_off.load(std::memory_order_relaxed); }
 void set_view_yaw_target(bool on, float target_deg, float weight, bool fresh) {
@@ -2113,6 +2202,42 @@ float lean_split(float n[3], float L) {
     return lean;
 }
 
+// ([Horse] BreakingTilt, the review) the frame's roll as a world rotation (row-major) about its centre C for this frame
+// camera `cam`, as the eyes took it; false: none this frame
+// (2026-11-24, the lean alone) and a move t after it: world = C + Rr (w - C) + t (t zero with the roll, Rr I without)
+bool frame_roll(const float* cam, const float* q0, const float* p0, float* Rr, float* C, float* t) {
+    const float ro = g_view_roll_frame.load(std::memory_order_relaxed);
+    if (ro == 0.0f || !std::isfinite(ro)) return false;
+    float kx = g_view_roll_ffx.load(std::memory_order_relaxed), kz = g_view_roll_ffz.load(std::memory_order_relaxed);
+    const float kl = std::sqrt(kx * kx + kz * kz);
+    if (kl < 1e-3f) return false;
+    kx /= kl, kz /= kl;
+    float dc[3] = {0.0f, 0.0f, 0.0f};
+    if (g_roll_mid_ok.load(std::memory_order_relaxed) && g_xr_head_position.load(std::memory_order_relaxed)) {
+        const float wi = ws_inv();
+        for (int i = 0; i < 3; ++i) dc[i] = (g_roll_mid[i].load(std::memory_order_relaxed) - p0[i]) * wi;
+    }
+    float q0c[4] = {-q0[0], -q0[1], -q0[2], q0[3]}, r0[9];
+    quat_matrix(q0c, r0);
+    const float pc[3] = {r0[0] * dc[0] + r0[1] * dc[1] + r0[2] * dc[2], r0[3] * dc[0] + r0[4] * dc[1] + r0[5] * dc[2],
+                         r0[6] * dc[0] + r0[7] * dc[1] + r0[8] * dc[2]};
+    for (int i = 0; i < 3; ++i) C[i] = cam[12 + i] + pc[0] * cam[i] + pc[1] * cam[4 + i] + pc[2] * cam[8 + i];
+    C[1] -= g_view_roll_fdrop.load(std::memory_order_relaxed);  // (2026-11-24) the eyes' centre: from the saddle
+    const float r = ro * 0.0174532925f, cs = std::cos(r), sn = std::sin(r), k[3] = {kx, 0.0f, kz};
+    if (!g_view_roll_fturn.load(std::memory_order_relaxed)) {  // the eyes' move alone (the head's centre, as the eyes took it)
+        const float drop = g_view_roll_fdrop.load(std::memory_order_relaxed);
+        for (int i = 0; i < 9; ++i) Rr[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+        t[0] = -kz * drop * sn, t[1] = drop * (cs - 1.0f), t[2] = kx * drop * sn;
+        return true;
+    }
+    t[0] = t[1] = t[2] = 0.0f;
+    // Rodrigues as a matrix: R = cs I + sn [k]x + (1 - cs) k k^T
+    const float K[9] = {0.0f, -k[2], k[1], k[2], 0.0f, -k[0], -k[1], k[0], 0.0f};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) Rr[i * 3 + j] = (i == j ? cs : 0.0f) + sn * K[i * 3 + j] + (1.0f - cs) * k[i] * k[j];
+    return true;
+}
+
 bool local_to_world(const float* cam, const float* pos, const float* rot, float* wpos, float* wrot) {
     if (!cam) return false;
     float q0[4], p0[3];
@@ -2135,6 +2260,17 @@ bool local_to_world(const float* cam, const float* pos, const float* rot, float*
         for (int r = 0; r < 3; ++r)
             for (int col = 0; col < 3; ++col) wrot[r * 3 + col] = a[r] * m[0 * 3 + col] + b[r] * m[1 * 3 + col] + c[r] * m[2 * 3 + col];
     }
+    float Rr[9], C[3], t[3];
+    if (frame_roll(cam, q0, p0, Rr, C, t)) {  // ([Horse] BreakingTilt) the tracked space rolled with the eyes
+        const float d[3] = {wpos[0] - C[0], wpos[1] - C[1], wpos[2] - C[2]};
+        for (int i = 0; i < 3; ++i) wpos[i] = C[i] + Rr[i * 3] * d[0] + Rr[i * 3 + 1] * d[1] + Rr[i * 3 + 2] * d[2] + t[i];
+        if (rot && wrot) {
+            float w2[9];
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j) w2[i * 3 + j] = Rr[i * 3] * wrot[j] + Rr[i * 3 + 1] * wrot[3 + j] + Rr[i * 3 + 2] * wrot[6 + j];
+            std::memcpy(wrot, w2, sizeof(w2));
+        }
+    }
     return true;
 }
 
@@ -2156,7 +2292,13 @@ bool world_to_local(const float* cam, const float* wpos, float* lpos) {
     const float ab[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
     const float det = a[0] * bc[0] + a[1] * bc[1] + a[2] * bc[2];
     if (std::fabs(det) < 1e-6f) return false;
-    const float v[3] = {wpos[0] - cam[12], wpos[1] - cam[13], wpos[2] - cam[14]};
+    float wp[3] = {wpos[0], wpos[1], wpos[2]};
+    float Rr[9], C[3], t[3];
+    if (frame_roll(cam, q0, p0, Rr, C, t)) {  // ([Horse] BreakingTilt) local_to_world's roll undone first (R^T)
+        const float d[3] = {wp[0] - t[0] - C[0], wp[1] - t[1] - C[1], wp[2] - t[2] - C[2]};
+        for (int i = 0; i < 3; ++i) wp[i] = C[i] + Rr[i] * d[0] + Rr[3 + i] * d[1] + Rr[6 + i] * d[2];
+    }
+    const float v[3] = {wp[0] - cam[12], wp[1] - cam[13], wp[2] - cam[14]};
     const float sc = det * ws_inv();  // (prel = N^-1 (w - d), then times the scale)
     const float prel[3] = {(bc[0] * v[0] + bc[1] * v[1] + bc[2] * v[2]) / sc, (ca[0] * v[0] + ca[1] * v[1] + ca[2] * v[2]) / sc,
                            (ab[0] * v[0] + ab[1] * v[1] + ab[2] * v[2]) / sc};
@@ -2218,7 +2360,13 @@ bool world_to_local_rel(const float* cam, const float* wpos, float* prel, float*
     const float ab[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
     const float det = a[0] * bc[0] + a[1] * bc[1] + a[2] * bc[2];
     if (std::fabs(det) < 1e-6f) return false;
-    const float v[3] = {wpos[0] - cam[12], wpos[1] - cam[13], wpos[2] - cam[14]};
+    float wp[3] = {wpos[0], wpos[1], wpos[2]};
+    float Rr[9], C[3], t[3];
+    if (frame_roll(cam, q0, p0, Rr, C, t)) {  // ([Horse] BreakingTilt) local_to_world's roll undone first (R^T)
+        const float d[3] = {wp[0] - t[0] - C[0], wp[1] - t[1] - C[1], wp[2] - t[2] - C[2]};
+        for (int i = 0; i < 3; ++i) wp[i] = C[i] + Rr[i] * d[0] + Rr[3 + i] * d[1] + Rr[6 + i] * d[2];
+    }
+    const float v[3] = {wp[0] - cam[12], wp[1] - cam[13], wp[2] - cam[14]};
     const float sc = det * ws_inv();
     const float pr[3] = {(bc[0] * v[0] + bc[1] * v[1] + bc[2] * v[2]) / sc, (ca[0] * v[0] + ca[1] * v[1] + ca[2] * v[2]) / sc,
                          (ab[0] * v[0] + ab[1] * v[1] + ab[2] * v[2]) / sc};

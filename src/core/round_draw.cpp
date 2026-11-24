@@ -22,8 +22,11 @@
 #include "core/config.h"
 #include "core/d3d_hooks.h"
 #include "core/held_prop.h"
+#include "core/controllers.h"
+#include "core/hands.h"
 #include "core/holster.h"
 #include "core/log.h"
+#include "core/menu.h"
 #include "core/state.h"
 #include "core/pso.h"
 
@@ -1774,7 +1777,360 @@ bool pose(const body::BodyPoints& bp, int hand, float* out) {
     return true;
 }
 
+// ---- (2026-11-14) each held round's own place in the hand, set by hand ([Reload] HandRounds*)
+// The user: "I'd like to be able to set the position of each bullet in the hand for a more natural look. I want to be
+// able to adjust it by moving my hand while the bullet is frozen and press a button when it is in the right position in
+// my hand." (their answers: three sets by size, the pistols' and revolvers' rounds, the rifles', the shotgun shells; one
+// hand's mirrored onto the other until that hand's own is set; the gun hand's lower button sets the round.)
+// Each of the handful's rounds (up to 8, in the order they are drawn from the pinch out) may have its own place: its base
+// and its direction (base to tip) in the hand's frame (the IK target's axes, the drawn wrist's when they are not filled,
+// as pose() takes them; from the hand's point, bp.hand). A slot not set for that hand takes the other hand's mirrored
+// (across the hand's side, x: the controllers' frames share their axes), else the handful's place as before.
+// Placing (the menu, the session only): with rounds held, the round being placed stays where it is in the world (frozen)
+// while the others follow the hand; move the hand until it sits right, then the gun hand's A (right) or X (left): its
+// place in the hand saved, the next round frozen. B or Y: back one round. After the last round shown the placing ends.
+// While placing, all RoundsPerGrab rounds are drawn whatever the gun's room, and no round goes into the gun.
 namespace {
+constexpr int kHrGroups = 3, kHrSlots = 8;
+const char* const kHrGroupKey[kHrGroups] = {"Pistol", "Rifle", "Shell"};
+// (by size: the Carbine's, the Winchester's, the Henry's and the Evans' rounds are pistol-sized, the pistols' set)
+const char* const kHrGroupName[kHrGroups] = {"pistol-sized rounds", "rifle rounds", "shotgun shells"};
+struct HrSlot {
+    bool set = false;
+    float p[3] = {0.0f, 0.0f, 0.0f};  // the round's base in the hand's frame (m)
+    float y[3] = {0.0f, 1.0f, 0.0f};  // its base-to-tip direction there
+};
+std::mutex g_hr_mutex;
+HrSlot g_hr[2][kHrGroups][kHrSlots];  // [John's hand 0 left, 1 right][group][slot], under g_hr_mutex
+std::atomic<bool> g_hr_on{false};      // placing (the session)
+std::atomic<bool> g_hr_frozen{false};  // a round frozen now (the buttons are the placing's)
+// under g_hr_mutex: the round placed now, its hand and group, and its frozen world pose
+int g_hr_cur = 0, g_hr_hand = -1, g_hr_group = -1, g_hr_shown = 0;
+float g_hr_fp[3] = {0.0f, 0.0f, 0.0f}, g_hr_fy[3] = {0.0f, 1.0f, 0.0f};
+std::atomic<int> g_hr_grab{8};  // RoundsPerGrab, read as the placing starts
+std::atomic<bool> g_hr_latch{false};    // a placing press still held: A/B held back from the game until let go
+std::atomic<int> g_hr_latch_ctrl{-1};   // its controller
+std::mutex g_dir_mutex;
+float g_dir_pub[3] = {0.0f, 0.0f, 0.0f};  // record's handful direction (the last good), for round_pose
+std::atomic<uint64_t> g_hr_placed{0};
+
+int hr_group(int kind) {
+    if (kind == kKShell || kind == kKPaper) return 2;
+    if (kind == kKRifle || kind == kKBig) return 1;
+    return kind >= 0 ? 0 : -1;
+}
+// the hand's frame as pose() takes it (columns its axes, world); nullptr: neither valid
+const float* hr_frame(const body::BodyPoints& bp, int hand) {
+    auto det3 = [](const float* m) {
+        return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+    };
+    if (std::fabs(det3(bp.target_rot[hand]) - 1.0f) < 0.1f) return bp.target_rot[hand];
+    if (std::fabs(det3(bp.wrist_drawn[hand]) - 1.0f) < 0.1f) return bp.wrist_drawn[hand];
+    return nullptr;
+}
+void hr_to_world(const float* R, const float* v, float* o) {
+    for (int k = 0; k < 3; ++k) o[k] = R[k * 3] * v[0] + R[k * 3 + 1] * v[1] + R[k * 3 + 2] * v[2];
+}
+void hr_to_local(const float* R, const float* v, float* o) {
+    for (int j = 0; j < 3; ++j) o[j] = R[j] * v[0] + R[3 + j] * v[1] + R[6 + j] * v[2];
+}
+// a pose's X and Z across its Y (as pose() makes them)
+void hr_axes(float* out) {
+    float *X = out, *Y = out + 3, *Z = out + 6;
+    const float t[3] = {std::fabs(Y[1]) < 0.9f ? 0.0f : 1.0f, std::fabs(Y[1]) < 0.9f ? 1.0f : 0.0f, 0.0f};
+    X[0] = t[1] * Y[2] - t[2] * Y[1];
+    X[1] = t[2] * Y[0] - t[0] * Y[2];
+    X[2] = t[0] * Y[1] - t[1] * Y[0];
+    normalize3(X);
+    Z[0] = X[1] * Y[2] - X[2] * Y[1];
+    Z[1] = X[2] * Y[0] - X[0] * Y[2];
+    Z[2] = X[0] * Y[1] - X[1] * Y[0];
+}
+// the r-th held round's pose (12 floats: X Y Z P), from the handful's (pz: pose(), S: handful_dir, gap: held_gap).
+// frozen: the placing's frozen round drawn where it was frozen
+void round_world(const body::BodyPoints& bp, int hand, int kind, int r, const float* pz, const float* S, float gap, bool frozen, float* out) {
+    const int g = hr_group(kind);
+    std::memcpy(out, pz, 12 * sizeof(float));
+    for (int k = 0; k < 3; ++k) out[9 + k] = pz[9 + k] + S[k] * gap * static_cast<float>(r);
+    if (g < 0 || r < 0 || r >= kHrSlots || hand < 0 || hand > 1) return;
+    float P[3], Y[3];
+    {
+        std::lock_guard lock(g_hr_mutex);
+        if (frozen && g_hr_frozen.load(std::memory_order_relaxed) && hand == g_hr_hand && g == g_hr_group && r == g_hr_cur) {
+            std::memcpy(out + 3, g_hr_fy, sizeof(g_hr_fy));
+            std::memcpy(out + 9, g_hr_fp, sizeof(g_hr_fp));
+            hr_axes(out);
+            return;
+        }
+        const HrSlot& own = g_hr[hand][g][r];
+        const HrSlot& other = g_hr[1 - hand][g][r];
+        if (!own.set && !other.set) return;
+        const float* R = hr_frame(bp, hand);
+        if (!R) return;
+        float lp[3], ly[3];
+        std::memcpy(lp, own.set ? own.p : other.p, sizeof(lp));
+        std::memcpy(ly, own.set ? own.y : other.y, sizeof(ly));
+        if (!own.set) lp[0] = -lp[0], ly[0] = -ly[0];  // the other hand's, mirrored across the hand's side
+        hr_to_world(R, lp, P);
+        hr_to_world(R, ly, Y);
+    }
+    for (int k = 0; k < 3; ++k) P[k] += bp.hand[hand][k];
+    normalize3(Y);
+    if (!(std::isfinite(P[0]) && std::isfinite(P[1]) && std::isfinite(P[2]) && std::isfinite(Y[0]) && std::isfinite(Y[1]) && std::isfinite(Y[2])))
+        return;
+    std::memcpy(out + 3, Y, sizeof(Y));
+    std::memcpy(out + 9, P, sizeof(P));
+    hr_axes(out);
+}
+std::string hr_key(int hand, int g) { return std::string("HandRounds") + kHrGroupKey[g] + (hand ? "Right" : "Left"); }
+// a set as its ini value: each slot "x y z ax ay az" (its base and direction in the hand's frame) or "-", "; " between
+void hr_save(int hand, int g) {
+    std::string v;
+    {
+        std::lock_guard lock(g_hr_mutex);
+        int last = -1;
+        for (int s = 0; s < kHrSlots; ++s)
+            if (g_hr[hand][g][s].set) last = s;
+        for (int s = 0; s <= last; ++s) {
+            const HrSlot& x = g_hr[hand][g][s];
+            char b[96];
+            if (x.set)
+                std::snprintf(b, sizeof(b), "%.4f %.4f %.4f %.3f %.3f %.3f", x.p[0], x.p[1], x.p[2], x.y[0], x.y[1], x.y[2]);
+            else
+                std::snprintf(b, sizeof(b), "-");
+            if (s) v += "; ";
+            v += b;
+        }
+    }
+    config::set("Reload", hr_key(hand, g).c_str(), v.c_str());
+}
+void hr_load() {
+    for (int hand = 0; hand < 2; ++hand)
+        for (int g = 0; g < kHrGroups; ++g) {
+            const std::string v = config::get_string("Reload", hr_key(hand, g).c_str(), "");
+            std::lock_guard lock(g_hr_mutex);
+            size_t at = 0;
+            int n = 0;
+            for (int s = 0; s < kHrSlots; ++s) {
+                g_hr[hand][g][s] = HrSlot{};
+                if (at > v.size()) continue;
+                const size_t e = v.find(';', at);
+                const std::string part = v.substr(at, e == std::string::npos ? std::string::npos : e - at);
+                at = e == std::string::npos ? v.size() + 1 : e + 1;
+                float f[6];
+                if (std::sscanf(part.c_str(), "%f %f %f %f %f %f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5]) != 6) continue;
+                bool ok = true;
+                for (float x : f) ok = ok && std::isfinite(x);
+                const float l = std::sqrt(f[3] * f[3] + f[4] * f[4] + f[5] * f[5]);
+                if (!ok || l < 0.5f || std::fabs(f[0]) > 0.3f || std::fabs(f[1]) > 0.3f || std::fabs(f[2]) > 0.3f) continue;
+                HrSlot& x = g_hr[hand][g][s];
+                x.set = true;
+                for (int k = 0; k < 3; ++k) x.p[k] = f[k], x.y[k] = f[3 + k] / l;
+                ++n;
+            }
+            if (n) log::info("[round] %s hand's own places for the %s: %d of %d rounds", hand ? "right" : "left", kHrGroupName[g], n, kHrSlots);
+        }
+}
+}  // namespace
+
+bool hand_placing() { return g_hr_on.load(std::memory_order_relaxed); }
+bool hand_placing_buttons() {
+    return (g_hr_on.load(std::memory_order_relaxed) && g_hr_frozen.load(std::memory_order_relaxed)) || g_hr_latch.load(std::memory_order_relaxed);
+}
+void set_hand_placing(bool on) {
+    if (on) {
+        const int n = holster::rounds_per_grab();
+        g_hr_grab.store(n < 1 ? 1 : n > kHrSlots ? kHrSlots : n, std::memory_order_relaxed);
+        std::lock_guard lock(g_hr_mutex);
+        g_hr_cur = 0, g_hr_hand = -1, g_hr_group = -1;
+    }
+    g_hr_frozen.store(false, std::memory_order_relaxed);
+    if (g_hr_on.exchange(on) != on)
+        log::info("[round] placing each held round by hand: %s%s", on ? "on" : "off",
+                  on ? " (take rounds at the chest; move the hand to the frozen round; the gun hand's A or X sets it, B or Y goes back)" : "");
+}
+void clear_hand_rounds(int hand) {
+    if (hand < 0 || hand > 1) return;
+    {
+        std::lock_guard lock(g_hr_mutex);
+        for (int g = 0; g < kHrGroups; ++g)
+            for (int s = 0; s < kHrSlots; ++s) g_hr[hand][g][s] = HrSlot{};
+        g_hr_frozen.store(false, std::memory_order_relaxed);
+        g_hr_cur = 0;
+    }
+    for (int g = 0; g < kHrGroups; ++g) config::set("Reload", hr_key(hand, g).c_str(), "");
+    log::info("[round] %s hand's own round places forgotten (the other hand's mirrored, else the handful as before)", hand ? "right" : "left");
+}
+std::string hand_placing_text() {
+    char b[240];
+    std::lock_guard lock(g_hr_mutex);
+    int own[2][kHrGroups] = {};
+    for (int h = 0; h < 2; ++h)
+        for (int g = 0; g < kHrGroups; ++g)
+            for (int s = 0; s < kHrSlots; ++s) own[h][g] += g_hr[h][g][s].set ? 1 : 0;
+    if (g_hr_on.load(std::memory_order_relaxed) && g_hr_frozen.load(std::memory_order_relaxed) && g_hr_group >= 0)
+        std::snprintf(b, sizeof(b), "Placing round %d of %d (%s, %s hand): move your hand to it, then A or X on the gun hand. B or Y: back one.",
+                      g_hr_cur + 1, g_hr_shown, kHrGroupName[g_hr_group], g_hr_hand ? "right" : "left");
+    else if (g_hr_on.load(std::memory_order_relaxed))
+        std::snprintf(b, sizeof(b), "Placing: close the menu and take rounds at the chest with a gun in the other hand.");
+    else
+        std::snprintf(b, sizeof(b), "Placed: left hand %d pistol, %d rifle, %d shell; right hand %d pistol, %d rifle, %d shell (of %d each).",
+                      own[0][0], own[0][1], own[0][2], own[1][0], own[1][1], own[1][2], kHrSlots);
+    return b;
+}
+bool round_pose(const body::BodyPoints& bp, int hand, int r, float* out) {
+    float pz[12];
+    if (!pose(bp, hand, pz)) return false;
+    const int w = g_weapon.load(std::memory_order_relaxed), kind = kind_of(w);
+    const bool newm = g_models.load(std::memory_order_relaxed);
+    const Model& m = model_for(kind, audio::click_family(w), newm);
+    float dir[3], S[3];  // (the review) record's last good handful direction, as the drawn rounds use it (any thread)
+    {
+        std::lock_guard lock(g_dir_mutex);
+        std::memcpy(dir, g_dir_pub, sizeof(dir));
+    }
+    handful_dir(bp, hand, pz, std::max(r + 1, shown_count(g_count.load(std::memory_order_relaxed))), dir, S);
+    round_world(bp, hand, kind, r, pz, S, held_gap(m, audio::click_family(w), newm), true, out);
+    return true;
+}
+int shown_count(int count) {
+    return g_hr_on.load(std::memory_order_relaxed) ? std::max(count, g_hr_grab.load(std::memory_order_relaxed)) : count;
+}
+
+namespace {
+// The placing's step (the holsters' thread, each set_held): the frozen round, the gun hand's buttons
+void hr_tick() {
+    static uint32_t was = 0;
+    static bool need_still = true;    // (the review) the first round of a take frozen only once the hand is held still
+    static double held_from = 0.0, still_from = 0.0, bad_from = -1.0;
+    static float last_p[3] = {0.0f, 0.0f, 0.0f};
+    static double last_ms = 0.0;
+    const double now = log::now_ms();
+    {  // (the review) the placing's press held back from the game until both buttons are let go (between rounds, after the last)
+        const int lc = g_hr_latch_ctrl.load(std::memory_order_relaxed);
+        if (g_hr_latch.load(std::memory_order_relaxed) && (lc < 0 || (hands::get(lc).buttons & (hands::kA | hands::kB)) == 0))
+            g_hr_latch.store(false, std::memory_order_relaxed);
+    }
+    if (!g_hr_on.load(std::memory_order_relaxed)) {
+        g_hr_frozen.store(false, std::memory_order_relaxed);
+        was = 0;
+        need_still = true;
+        return;
+    }
+    const int hand = held_now() ? g_hand.load(std::memory_order_relaxed) : -1;
+    const int w = g_weapon.load(std::memory_order_relaxed), kind = kind_of(w), g = hr_group(kind);
+    body::BodyPoints bp;
+    const bool have = body::body_points(&bp);
+    const bool rounds = hand >= 0 && hand <= 1 && g >= 0;
+    if (!rounds || menu::visible()) {  // the rounds let go (or put in), or the menu: the frozen place dropped
+        g_hr_frozen.store(false, std::memory_order_relaxed);
+        was = 0;
+        need_still = true;
+        held_from = still_from = 0.0;
+        bad_from = -1.0;
+        return;
+    }
+    if (!have || !bp.hand_ok[hand]) {  // (the review) a frame or two without the hand: kept; dropped after 300 ms
+        if (bad_from < 0.0) bad_from = now;
+        if (now - bad_from > 300.0) {
+            g_hr_frozen.store(false, std::memory_order_relaxed);
+            need_still = true;
+        }
+        return;
+    }
+    bad_from = -1.0;
+    if (held_from == 0.0) held_from = now;
+    {  // the hand's speed (the wrist point): still below 0.15 m/s
+        const float dx = bp.hand[hand][0] - last_p[0], dy = bp.hand[hand][1] - last_p[1], dz = bp.hand[hand][2] - last_p[2];
+        const double dt = (now - last_ms) * 0.001;
+        const bool still = dt > 0.0 && dt < 0.5 && std::sqrt(dx * dx + dy * dy + dz * dz) / dt < 0.15;
+        if (!still) still_from = now;
+        std::memcpy(last_p, bp.hand[hand], sizeof(last_p));
+        last_ms = now;
+    }
+    const int n = std::min(kHrSlots, shown_count(g_count.load(std::memory_order_relaxed)));
+    const int gc = bp.ctrl[hand] == 0 ? 1 : 0;  // the gun hand's controller: the other
+    const int rc = 1 - gc;
+    std::unique_lock lock(g_hr_mutex);
+    if (hand != g_hr_hand || g != g_hr_group) {  // another hand or another size of round: from its first round
+        g_hr_hand = hand, g_hr_group = g, g_hr_cur = 0;
+        g_hr_frozen.store(false, std::memory_order_relaxed);
+    }
+    g_hr_shown = n;
+    if (g_hr_cur >= n) {
+        g_hr_cur = n - 1;
+        g_hr_frozen.store(false, std::memory_order_relaxed);  // (the review: not the old round's frozen pose)
+    }
+    if (!g_hr_frozen.load(std::memory_order_relaxed)) {  // the round to place frozen where it is drawn now
+        // the take's first: once the hand has been still 0.5 s (brought up from the chest to where it is looked at)
+        if (need_still && (now - still_from < 500.0 || now - held_from < 700.0)) return;
+        const int cur = g_hr_cur;
+        lock.unlock();
+        float out[12];
+        const bool ok = round_pose(bp, hand, cur, out);
+        lock.lock();
+        // (the review) the menu or a command may have changed the placing meanwhile
+        if (!ok || !g_hr_on.load(std::memory_order_relaxed) || g_hr_hand != hand || g_hr_group != g || g_hr_cur != cur) return;
+        std::memcpy(g_hr_fy, out + 3, sizeof(g_hr_fy));
+        std::memcpy(g_hr_fp, out + 9, sizeof(g_hr_fp));
+        g_hr_frozen.store(true, std::memory_order_relaxed);
+        need_still = false;
+        was = hands::get(gc).buttons & (hands::kA | hands::kB);  // (a button already held is no press)
+        controllers::pulse(rc, 0.2f, 15);
+        log::info("[round] placing: round %d of %d frozen (%s, %s hand)", g_hr_cur + 1, n, kHrGroupName[g], hand ? "right" : "left");
+        return;
+    }
+    const uint32_t b = hands::get(gc).buttons & (hands::kA | hands::kB), pressed = b & ~was;
+    was = b;
+    if (pressed) {
+        g_hr_latch_ctrl.store(gc, std::memory_order_relaxed);
+        g_hr_latch.store(true, std::memory_order_relaxed);
+    }
+    if (pressed & hands::kA) {
+        const float* R = hr_frame(bp, hand);
+        if (!R) return;
+        float d[3], lp[3], ly[3];
+        for (int k = 0; k < 3; ++k) d[k] = g_hr_fp[k] - bp.hand[hand][k];
+        hr_to_local(R, d, lp);
+        hr_to_local(R, g_hr_fy, ly);
+        normalize3(ly);
+        if (std::fabs(lp[0]) > 0.3f || std::fabs(lp[1]) > 0.3f || std::fabs(lp[2]) > 0.3f) {  // (the ini's own limit)
+            controllers::pulse(gc, 0.15f, 10);
+            log::info("[round] placing: round %d is %.2f m from the hand: not set (bring the hand to it)", g_hr_cur + 1,
+                      std::sqrt(lp[0] * lp[0] + lp[1] * lp[1] + lp[2] * lp[2]));
+            return;
+        }
+        HrSlot& x = g_hr[hand][g][g_hr_cur];
+        x.set = true;
+        std::memcpy(x.p, lp, sizeof(lp));
+        std::memcpy(x.y, ly, sizeof(ly));
+        g_hr_placed.fetch_add(1, std::memory_order_relaxed);
+        log::info("[round] placing: round %d of %d set (%s, %s hand): base (%.3f %.3f %.3f), direction (%.2f %.2f %.2f) in the hand", g_hr_cur + 1,
+                  n, kHrGroupName[g], hand ? "right" : "left", lp[0], lp[1], lp[2], ly[0], ly[1], ly[2]);
+        const int placed = g_hr_cur;
+        g_hr_frozen.store(false, std::memory_order_relaxed);
+        lock.unlock();
+        hr_save(hand, g);
+        lock.lock();
+        if (placed + 1 >= n) {  // the last one shown: done
+            g_hr_cur = 0;
+            lock.unlock();
+            controllers::pulse(gc, 0.5f, 40);
+            controllers::pulse(rc, 0.5f, 40);
+            set_hand_placing(false);
+            log::info("[round] placing: all %d rounds set (%s, %s hand)", n, kHrGroupName[g], hand ? "right" : "left");
+            return;
+        }
+        g_hr_cur = placed + 1;
+        controllers::pulse(gc, 0.35f, 20);
+    } else if (pressed & hands::kB) {
+        if (g_hr_cur > 0) --g_hr_cur;
+        g_hr_frozen.store(false, std::memory_order_relaxed);  // (frozen again where it is drawn now: its own place, if set)
+        controllers::pulse(gc, 0.2f, 15);
+        log::info("[round] placing: back to round %d", g_hr_cur + 1);
+    }
+}
+
 // the row's poses: standing (base to tip up), side by side along the body's right, centred on the zone (rz: the
 // right-handed third axis, X x Y: the body's back)
 void row_pose(const Row& row, int r, int nr, float gap, float* out) {
@@ -1928,6 +2284,7 @@ void init() {
     for (int k = 0; k < kKinds; ++k) lathe2(k, &g_kind[k]);
     build_mags();  // (2026-10-28) the magazines and the clip, in the same buffers
     g_grab_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    hr_load();  // (2026-11-14) each held round's own place in the hand
     {
         const int m = config::get_int("Reload", "RoundInHand", 0);
         g_mode = m < 0 ? 0 : m > 2 ? 2 : m;
@@ -2255,6 +2612,7 @@ void set_held(int john_hand, int weapon, int count, const float* fwd) {
     g_weapon.store(weapon, std::memory_order_relaxed);
     g_count.store(count < 1 ? 1 : count > 8 ? 8 : count, std::memory_order_relaxed);
     g_held_ms.store(log::now_ms(), std::memory_order_relaxed);
+    hr_tick();  // (2026-11-14) placing each held round by hand
     if (fwd) {
         std::lock_guard lock(g_fwd_mutex);
         const float l = std::sqrt(fwd[0] * fwd[0] + fwd[2] * fwd[2]);
@@ -2526,16 +2884,13 @@ int shell_poses(const body::BodyPoints& bp, float* out, int max, int* n_hand) {
     if (kind_of(w) == kKShell && g_on.load(std::memory_order_relaxed) && held_now() && hand >= 0 && hand <= 1 && bp.hand_ok[hand]) {
         float pz[12];
         if (pose(bp, hand, pz)) {  // the handful's, as record() places them
-            const int cnt = g_count.load(std::memory_order_relaxed);
+            const int cnt = shown_count(g_count.load(std::memory_order_relaxed));  // (placing: all RoundsPerGrab)
             static float s_dir[3] = {0.0f, 0.0f, 0.0f};  // (the holsters' thread's own: record keeps its)
             float S[3];
             handful_dir(bp, hand, pz, cnt, s_dir, S);
             const Model& m = model_for(kKShell, 3, newm);
             const float gap = held_gap(m, 3, newm);
-            for (int r = 0; r < cnt && n < max; ++r, ++n) {
-                std::memcpy(out + n * 12, pz, sizeof(pz));
-                for (int k = 0; k < 3; ++k) out[n * 12 + 9 + k] = pz[9 + k] + S[k] * gap * r;
-            }
+            for (int r = 0; r < cnt && n < max; ++r, ++n) round_world(bp, hand, kKShell, r, pz, S, gap, true, out + n * 12);  // (2026-11-14: each its own place)
         }
     }
     *n_hand = n;
@@ -2775,10 +3130,14 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     const int meas_mi = held_mi >= 0 ? held_mi : show_mi;  // (the seen and all counts' subject)
     const int weapon = g_weapon.load(std::memory_order_relaxed), kind = kind_of(weapon), fam = audio::click_family(weapon);
     const Model& m = model_for(kind, fam, newm);
-    const int held_n = round_ok ? g_count.load(std::memory_order_relaxed) : 0;
+    const int held_n = round_ok ? std::min(8, shown_count(g_count.load(std::memory_order_relaxed))) : 0;  // (placing: all RoundsPerGrab)
     static float s_dir[3] = {0.0f, 0.0f, 0.0f};
     float S[3] = {Z[0], Z[1], Z[2]};
-    if (round_ok) handful_dir(bp, hand, pz, held_n, s_dir, S);
+    if (round_ok) {
+        handful_dir(bp, hand, pz, held_n, s_dir, S);
+        std::lock_guard lock(g_dir_mutex);  // (2026-11-14) for round_pose: the frozen round where it was drawn
+        std::memcpy(g_dir_pub, s_dir, sizeof(g_dir_pub));
+    }
     const float hgap = held_gap(m, fam, newm);
     const int rkind = kind_of(row.weapon), rfam = audio::click_family(row.weapon);
     const Model& rm = model_for(rkind, rfam, newm);
@@ -3106,11 +3465,12 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         cl->BeginQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * kQ + e));
         if (round_ok) {
             subject(kSubHand);
-            for (int r = 0; r < held_n; ++r) {  // the handful, from the pinch out
-                const float Pr[3] = {P[0] + S[0] * hgap * r, P[1] + S[1] * hgap * r, P[2] + S[2] * hgap * r};
+            for (int r = 0; r < held_n; ++r) {  // the handful, from the pinch out (2026-11-14: each its own place once set)
                 if (r < 8 && skip_hand[r]) continue;  // the game's own shell is drawn there
-                place(X, Y, Z, Pr, nullptr);
-                crop(Pr);
+                float rp[12];
+                round_world(bp, hand, kind, r, pz, S, hgap, true, rp);
+                place(rp, rp + 3, rp + 6, rp + 9, nullptr);
+                crop(rp + 9);
                 cl->SetGraphicsRoot32BitConstants(0, kConsts, &k, 0);
                 draw(m);
             }
@@ -3502,6 +3862,30 @@ std::string command(const std::string& line) {
                           r.weapon >= 0 ? audio::click_family(r.weapon) : 0, r.n, r.ms > 0 ? log::now_ms() - r.ms : -1.0,
                           static_cast<unsigned long long>(g_row_drawn.load()), static_cast<unsigned long long>(g_row_px[0].load()),
                           static_cast<unsigned long long>(g_row_px[1].load()), kind_name(kind_of(r.weapon)));
+            return b;
+        } else if (v == "placeby" && (in >> c)) {  // placeby on|off|status|clear <0|1>: placing each held round by hand
+            if (c == "on" || c == "off") {
+                set_hand_placing(c == "on");
+            } else if (c == "clear") {
+                std::string hs;
+                clear_hand_rounds((in >> hs) ? std::atoi(hs.c_str()) : 0);
+            }
+            char b[240];
+            {
+                std::lock_guard lock(g_hr_mutex);
+                std::snprintf(b, sizeof(b), " | placeby %d frozen %d cur %d of %d hand %d group %d placed %llu frozen at (%.3f %.3f %.3f)",
+                              g_hr_on.load() ? 1 : 0, g_hr_frozen.load() ? 1 : 0, g_hr_cur, g_hr_shown, g_hr_hand, g_hr_group,
+                              static_cast<unsigned long long>(g_hr_placed.load()), g_hr_fp[0], g_hr_fp[1], g_hr_fp[2]);
+            }
+            return hand_placing_text() + b;
+        } else if (v == "pose" && (in >> c)) {  // pose <r>: the r-th held round's world pose as drawn (a test aid)
+            body::BodyPoints bp;
+            float o[12];
+            const int hh = g_hand.load();
+            if (!held_now() || hh < 0 || !body::body_points(&bp) || !round_pose(bp, hh, std::atoi(c.c_str()), o)) return "NO POSE (no round held)";
+            char b[200];
+            std::snprintf(b, sizeof(b), "round %d: at (%.4f %.4f %.4f) axis (%.3f %.3f %.3f), the hand at (%.4f %.4f %.4f)", std::atoi(c.c_str()),
+                          o[9], o[10], o[11], o[3], o[4], o[5], bp.hand[hh][0], bp.hand[hh][1], bp.hand[hh][2]);
             return b;
         } else if (v == "fan" && (in >> c)) {  // fan 1|-1: the handful's side of the pinch (a test aid; the session only)
             g_fan_sign = std::atof(c.c_str()) < 0.0f ? -1.0f : 1.0f;

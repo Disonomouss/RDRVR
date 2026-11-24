@@ -98,6 +98,14 @@ bool game_camera(float out[16]);  // (round 93) that camera's place across (x, z
 // (2026-11-06, GOAL-remaining 6c) a yaw (degrees) the eye cameras take over the game camera's, for the third person snap;
 // the centre eye's heading as drawn (game_heading's convention, degrees)
 void set_view_yaw_offset(float deg);
+// (2026-11-23, [Horse] BreakingTilt) the eye cameras rolled by `deg` about the level world axis (fwd_x, 0, fwd_z) through
+// the head's centre (+: the view's up toward the axis' right, a head leaning right); 0 none. Latched once a frame.
+// (2026-11-24) `drop`: the roll's centre that far (game metres) below the head's centre (a lean from the saddle)
+void set_view_roll(float deg, float fwd_x, float fwd_z, float drop = 0.0f, bool turn = true);  // turn false: the lean alone (level)
+float view_roll_frame();  // the roll the eye cameras took this frame (degrees)
+void view_roll_shift(float* out);  // the head's centre moved by the roll this frame (world metres)
+void view_roll_axis(float* fx, float* fz);  // the roll's level axis this frame (the horse's forward; its right (-fz, 0, fx))
+float eye_tip_deg();  // an eye camera's right axis above level as last drawn (degrees; the head level: the view's roll)
 float view_yaw_offset();
 // (round 93) the snap's view held at `target_deg` (game_heading's convention) and at the camera's place once turned (John's
 // place plus its start offset turned by the step), times `weight` (its ease out), from each frame's own camera at the

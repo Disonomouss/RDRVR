@@ -1210,6 +1210,30 @@ void page_comfort() {
     if (nudge1("Saddle smoothing", &stau, 0.05f, 0.0f, 0.6f, "%.2f s", "How much the view's height is smoothed (0 = none; a press 0.05 s)."))
         pose::set_saddle(saddle, stau, true);
     sub_end();
+    {  // (2026-11-24) [Horse] BreakingThirdPerson
+        bool btp = pose::breaking_third_person();
+        if (check("Breaking a horse: third person", &btp,
+                  "Breaking a wild horse, the view goes to the game's own third person camera while the horse bucks, and "
+                  "back to first person once it settles or John is thrown. The lean below is for first person only."))
+            pose::set_breaking_third_person(btp, true);
+    }
+    {  // (2026-11-23) [Horse] BreakingTilt, BreakingTiltStrength
+        bool bt = pose::breaking_tilt();
+        float bs = pose::breaking_tilt_scale();
+        // (2026-11-24, the user: "remove the tilt, leave the lean") the view leans to the side, the horizon level
+        const char* const kBtTip = "Breaking a wild horse, your view leans out to one side as the horse bucks (the game's own "
+                                   "balance), the horizon kept level: push the left stick the other way to keep your seat. "
+                                   "Strength 1: the full lean just as he is thrown; more leans further sooner, less is gentler.";
+        if (check("Breaking a horse: lean the view", &bt, kBtTip)) pose::set_breaking_tilt(bt, bs, true);
+        sub_begin(bt);
+        if (nudge1("Lean strength", &bs, 0.25f, 0.25f, 3.0f, "%.2f", kBtTip)) pose::set_breaking_tilt(bt, bs, true);
+        float bl = pose::breaking_lean();  // (2026-11-24) [Horse] BreakingLean
+        if (nudge1("Lean from the saddle", &bl, 0.1f, 0.0f, 1.2f, "%.1f m",
+                   "How far the view leans: as a body leaning from a point this far below your eyes (0.7 m: half a metre "
+                   "to the side at the throw; 0 = no lean)."))
+            pose::set_breaking_lean(bl, true);
+        sub_end();
+    }
     bool cb = controls::click_brake();
     if (check("Left stick click brakes", &cb,
               "On a horse or a wagon, hold the left stick click to slow down (with the stick pulled back for a hard stop). On "
@@ -2266,6 +2290,22 @@ void page_reloading() {
         done |= bc;
         if (ch) round_draw::set_place(pl, false, s_rhand);
         if (done) round_draw::set_place(pl, true, s_rhand);
+        // (2026-11-14, the user: each bullet's position in the hand set by moving the hand while it is frozen)
+        bool hp = round_draw::hand_placing();
+        if (check("Place each round by hand", &hp,
+                  "The menu closes. Take rounds at the chest with a gun in the other hand and hold the hand still where you "
+                  "look at it: one round stays still in the air while the others follow your hand. Move your hand until that "
+                  "round sits right in your fingers, then press A or X on the gun hand: it is set, and the next round stays "
+                  "still. B or Y goes back one round. Pistol-sized rounds (the revolvers', the pistols', the Carbine's, the "
+                  "Winchester's, the Henry's, the Evans'), rifle rounds and shotgun shells are each set apart; a hand you have "
+                  "not set uses the other hand's, mirrored. No round goes into the gun while placing.")) {
+            round_draw::set_hand_placing(hp);
+            if (hp) set_visible(false);
+        }
+        note(round_draw::hand_placing_text().c_str());
+        if (confirm_button(s_rhand ? "Forget the right hand's placed rounds" : "Forget the left hand's placed rounds", "Forget the placed rounds",
+                           "The chosen hand's rounds back to the place above (or the other hand's placed ones, mirrored)."))
+            round_draw::clear_hand_rounds(s_rhand);
     }
 
     heading("Every gun's rings (a press 5 mm)");

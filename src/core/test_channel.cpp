@@ -641,6 +641,8 @@ std::string execute(const std::vector<std::string>& t) {
         menu::status_text(st, sizeof(st));
         return st;
     }
+    if (c == "pose" && t.size() >= 2 && t[1] == "breaktilt")  // pose breaktilt [force <deg>|off] (2026-11-23, [Horse] BreakingTilt)
+        return pose::breaking_tilt_command(t.size() >= 3 ? t[2] : "", t.size() >= 4 ? static_cast<float>(std::atof(t[3].c_str())) : 0.0f);
     if (c == "pose" && t.size() >= 3 && t[1] == "tpsnapangle") {  // pose tpsnapangle <deg>: ThirdPersonSnapAngle for the session (round 98)
         pose::set_third_person_snap_angle(std::strtof(t[2].c_str(), nullptr), false);
         return "third person snap angle " + std::to_string(static_cast<int>(pose::third_person_snap_angle()));

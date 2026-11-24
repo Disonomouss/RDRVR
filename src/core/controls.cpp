@@ -28,6 +28,7 @@
 #include "core/offhand.h"
 #include "core/pose.h"
 #include "core/reload.h"
+#include "core/round_draw.h"
 #include "core/wheel.h"
 #include "core/whistle.h"
 #include "core/vr_mode.h"
@@ -104,6 +105,8 @@ double g_fist_arm_ms = 0.0;     // when the stance began (its LT waits for the f
 double g_fist_select_ms = -1e9;  // the last SET_PLAYER_MELEE_MODE_SELECTED sent by the stance
 bool g_fist_hold_rt = false;     // a gun came into the hand during a stance: RT held back until it is let go
 std::atomic<uint64_t> g_fist_held_back{0}, g_fist_passed{0}, g_fist_arms{0};
+std::atomic<bool> g_ride_no_draw{true};       // [Horse] TriggerNoDraw: riding with nothing in hand, LT and RT held back (no game draw)
+std::atomic<uint64_t> g_ride_lt_held{0};      // its frames held back
 std::atomic<uint64_t> g_thrown_rt_held{0};  // (round 122) frames of RT held back from the knives and the tomahawk in hand
 std::atomic<uint64_t> g_fist_gated{0};  // (round 125) frames a trigger was held while a minigame ran or the game held control: no stance
 double g_fist_said_ms = -1e9;           // the stance's last log line (the pad's thread)
@@ -321,6 +324,8 @@ void init() {
     g_trigger_aims = config::get_bool("Hands", "TriggerAims", true);
     g_fists_both = config::get_bool("Gestures", "FistsBothTriggers", true);
     g_aims_riding = config::get_bool("Hands", "TriggerAimsRiding", true);
+    g_ride_no_draw = config::get_bool("Horse", "TriggerNoDraw", true);
+    log::info("[controls] riding with nothing in hand, the triggers draw no gun (TriggerNoDraw) %d", g_ride_no_draw.load() ? 1 : 0);
     g_aim_lead_ms = config::get_float("Hands", "TriggerAimLeadMs", 400.0f);
     g_aim_raised = config::get_bool("Hands", "AimWhenRaised", true);
     g_sprint_drops = config::get_bool("Hands", "SprintDropsAim", true);
@@ -403,6 +408,11 @@ bool pad(xinput::PadState* out) {
     if (chord) {
         l.buttons &= ~static_cast<uint32_t>(hands::kB);
         r.buttons &= ~static_cast<uint32_t>(hands::kB);
+    }
+    // (2026-11-14) placing each held round by hand: a round frozen, the face buttons are the placing's (A/X sets, B/Y back)
+    if (round_draw::hand_placing_buttons()) {
+        l.buttons &= ~static_cast<uint32_t>(hands::kA | hands::kB);
+        r.buttons &= ~static_cast<uint32_t>(hands::kA | hands::kB);
     }
     // menu button: tap, hold, or a modifier for the right stick (D-pad) and A (Back)
     bool menu_down = chord || ((l.buttons | r.buttons) & hands::kMenu) != 0;
@@ -750,6 +760,19 @@ bool pad(xinput::PadState* out) {
         if (rt < 0.15f) g_fist_hold_rt = false;
         else rt = 0.0f;
     }
+    // [Horse] TriggerNoDraw (2026-11-14, the user: "Pressing left trigger on a horse pulls out a weapon. ... Remove"): in the
+    // saddle or on a bench with nothing in hand, the game's LT (its aim) draws the selected gun; with the holsters
+    // (Mode=holsters) a gun comes only from a holster: LT held back there. A gun in hand aims as before; the game's own
+    // control (a minigame, a scene) keeps its triggers.
+    {
+        const bool riding = have_st && (st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING));
+        if (g_ride_no_draw.load(std::memory_order_relaxed) && riding && st.weapon < 0 && holster::holsters_enabled() && !wheel::wheel_mode() && pose::anchor_active() &&
+            !game_menu_now() && !menu::visible() && !gated && (lt > 0.0f || rt > 0.0f)) {
+            // (the review: RT too: the game's attack with empty hands draws the last weapon, gestures.cpp's riding note)
+            if (lt > 0.15f || rt > 0.15f) g_ride_lt_held.fetch_add(1, std::memory_order_relaxed);
+            lt = rt = 0.0f;
+        }
+    }
     const bool on_map = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now() && map_open();  // only in a paused menu
     if (on_map) g_map_frames.fetch_add(1, std::memory_order_relaxed);
     const bool menu_mode = g_menu_ctl.load(std::memory_order_relaxed) && game_menu_now() && !on_map;
@@ -784,6 +807,20 @@ bool pad(xinput::PadState* out) {
         // raised gun's LT is let go from the press until SprintHoldMs after the last (RDR's sprint is tapped). A pull
         // still aims and fires; riding, A spurs and the stance stays.
         if (!riding && (p.buttons & XINPUT_GAMEPAD_A)) g_sprint_until = now + g_sprint_hold_ms;
+        {  // (2026-11-24, the user: "Pressing A did nothing on horseback") riding, A's press to the game logged (at most every 3 s)
+            static bool a_was = false;
+            static double a_said = -1e9;
+            const bool a_now = riding && (p.buttons & XINPUT_GAMEPAD_A) != 0;
+            if (a_now && !a_was && now - a_said > 3000.0) {
+                a_said = now;
+                const int gate = holster::game_gate();
+                log::info("[controls] riding: A sent to the game (the spur) | the left stick (%d %d), the game's gate %d (a minigame %d, the control "
+                          "held %d), the minigames' scripts %d, the menu %d",
+                          static_cast<int>(l.stick[0] * 32767.0f), static_cast<int>(l.stick[1] * 32767.0f), gate, gate & 1, (gate >> 1) & 1,
+                          holster::minigame(), menu::visible() ? 1 : 0);
+            }
+            a_was = a_now;
+        }
         const bool sprint = !riding && g_sprint_drops.load(std::memory_order_relaxed) && now < g_sprint_until;
         // [Hands] JumpDropsAim (run 7 item 1f): with a gun in hand the game takes no jump from its aim stance (the
         // simulator: the press reached the game, the aim pose dropped, no jump; with the fists the same press jumped).
@@ -1004,13 +1041,15 @@ void set_fists_both_triggers(bool on, bool save) {
     log::info("[controls] fists: %s", on ? "both triggers together for the fighting stance and the punch" : "each trigger as the game's");
 }
 std::string fists_status() {
-    char b[420];
+    char b[480];
     std::snprintf(b, sizeof(b), "fists both triggers %s: armed %d, arms %llu, frames held back %llu, passed %llu, the last unarmed pad lt %d rt %d"
-                  " | the knives' and the tomahawk's RT held back %llu | triggers left to the game (a minigame, control held) %llu",
+                  " | the knives' and the tomahawk's RT held back %llu | triggers left to the game (a minigame, control held) %llu"
+                  " | riding, LT and RT held back with nothing in hand (TriggerNoDraw %d) %llu",
                   g_fists_both.load() ? "on" : "off", g_fist_armed.load() ? 1 : 0, static_cast<unsigned long long>(g_fist_arms.load()),
                   static_cast<unsigned long long>(g_fist_held_back.load()), static_cast<unsigned long long>(g_fist_passed.load()),
                   g_fist_last_lt.load(), g_fist_last_rt.load(), static_cast<unsigned long long>(g_thrown_rt_held.load()),
-                  static_cast<unsigned long long>(g_fist_gated.load()));
+                  static_cast<unsigned long long>(g_fist_gated.load()), g_ride_no_draw.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_ride_lt_held.load()));
     return b;
 }
 
